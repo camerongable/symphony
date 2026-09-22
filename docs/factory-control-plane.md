@@ -17,11 +17,15 @@ adds durable coordination without replacing the existing Symphony worker loop.
 - Jira queues that can be scoped by authenticated user across projects, with
   optional project and direct-parent epic filters.
 - "all of" and "any of" label routing gates.
+- Named, non-ephemeral Codex worker threads with explicit model/effort routing
+  and protocol-level resume support. A shared `CODEX_HOME` makes completed
+  worker conversations reopenable from the Codex desktop task history.
 - Local `status`, `activate`, and `pause` operations.
 
 The full stage graph is not yet connected. In particular, this slice does not
 yet launch distinct specification, delivery, verification, or manual-validation
-tasks, nor does it push a verified SHA or create a GitLab draft merge request.
+tasks, persist their Codex thread IDs into factory run records, nor does it push
+a verified SHA or create a GitLab draft merge request.
 Keep the controller paused until those stage handlers are installed.
 
 ## Local administration

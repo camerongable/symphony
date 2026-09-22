@@ -1578,6 +1578,9 @@ defmodule SymphonyElixir.CoreTest do
             printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-1\"}}}'
             ;;
           4)
+            printf '%s\\n' '{\"id\":4,\"result\":{}}'
+            ;;
+          5)
             printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-1\"}}}'
             printf '%s\\n' '{\"method\":\"turn/completed\"}'
             exit 0
@@ -1658,12 +1661,15 @@ defmodule SymphonyElixir.CoreTest do
               printf '%s\\n' '{\"id\":1,\"result\":{}}'
               ;;
             2)
-              printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-live\"}}}'
               ;;
             3)
-              printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-live\"}}}'
+              printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-live\"}}}'
               ;;
             4)
+              printf '%s\\n' '{\"id\":4,\"result\":{}}'
+              ;;
+            5)
+              printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-live\"}}}'
               printf '%s\\n' '{\"method\":\"turn/completed\"}'
               ;;
             *)
@@ -1825,10 +1831,13 @@ defmodule SymphonyElixir.CoreTest do
             printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-cont"}}}'
             ;;
           4)
+            printf '%s\\n' '{"id":4,"result":{}}'
+            ;;
+          5)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-cont-1"}}}'
             printf '%s\\n' '{"method":"turn/completed"}'
             ;;
-          5)
+          6)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-cont-2"}}}'
             printf '%s\\n' '{"method":"turn/completed"}'
             ;;
@@ -1956,10 +1965,13 @@ defmodule SymphonyElixir.CoreTest do
             printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-max"}}}'
             ;;
           4)
+            printf '%s\\n' '{"id":4,"result":{}}'
+            ;;
+          5)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-max-1"}}}'
             printf '%s\\n' '{"method":"turn/completed"}'
             ;;
-          5)
+          6)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-max-2"}}}'
             printf '%s\\n' '{"method":"turn/completed"}'
             ;;

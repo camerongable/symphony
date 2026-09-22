@@ -9,6 +9,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @initialize_id 1
   @thread_start_id 2
   @turn_start_id 3
+  @thread_name_set_id 4
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @type session :: %{
@@ -19,6 +20,9 @@ defmodule SymphonyElixir.Codex.AppServer do
           thread_sandbox: String.t(),
           turn_sandbox_policy: map(),
           thread_id: String.t(),
+          thread_name: String.t() | nil,
+          model: String.t() | nil,
+          reasoning_effort: String.t() | nil,
           workspace: Path.t(),
           worker_host: String.t() | nil,
           dynamic_tool_binding: map()
@@ -38,6 +42,16 @@ defmodule SymphonyElixir.Codex.AppServer do
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
+
+    thread_options = %{
+      model: Keyword.get(opts, :model),
+      name: normalize_thread_name(Keyword.get(opts, :thread_name)),
+      reasoning_effort: Keyword.get(opts, :reasoning_effort),
+      resume_thread_id: Keyword.get(opts, :resume_thread_id),
+      service_name: Keyword.get(opts, :service_name, "symphony-orchestrator"),
+      thread_source: Keyword.get(opts, :thread_source, "symphony")
+    }
+
     dynamic_tool_binding = DynamicTool.bind()
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
@@ -46,7 +60,13 @@ defmodule SymphonyElixir.Codex.AppServer do
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
            {:ok, thread_id} <-
-             do_start_session(port, expanded_workspace, session_policies, dynamic_tool_binding) do
+             do_start_session(
+               port,
+               expanded_workspace,
+               session_policies,
+               dynamic_tool_binding,
+               thread_options
+             ) do
         {:ok,
          %{
            port: port,
@@ -56,6 +76,9 @@ defmodule SymphonyElixir.Codex.AppServer do
            thread_sandbox: session_policies.thread_sandbox,
            turn_sandbox_policy: session_policies.turn_sandbox_policy,
            thread_id: thread_id,
+           thread_name: thread_options.name,
+           model: thread_options.model,
+           reasoning_effort: thread_options.reasoning_effort,
            workspace: expanded_workspace,
            worker_host: worker_host,
            dynamic_tool_binding: dynamic_tool_binding
@@ -77,6 +100,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           auto_approve_requests: auto_approve_requests,
           turn_sandbox_policy: turn_sandbox_policy,
           thread_id: thread_id,
+          model: model,
+          reasoning_effort: reasoning_effort,
           workspace: workspace,
           dynamic_tool_binding: dynamic_tool_binding
         },
@@ -91,7 +116,19 @@ defmodule SymphonyElixir.Codex.AppServer do
         DynamicTool.execute(tool, arguments, dynamic_tool_binding, issue: issue)
       end)
 
-    case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
+    case start_turn(
+           port,
+           thread_id,
+           prompt,
+           issue,
+           %{
+             workspace: workspace,
+             approval_policy: approval_policy,
+             sandbox_policy: turn_sandbox_policy,
+             model: model,
+             reasoning_effort: reasoning_effort
+           }
+         ) do
       {:ok, turn_id} ->
         session_id = "#{thread_id}-#{turn_id}"
         Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id}")
@@ -304,28 +341,71 @@ defmodule SymphonyElixir.Codex.AppServer do
     Config.codex_runtime_settings(workspace, remote: true)
   end
 
-  defp do_start_session(port, workspace, session_policies, dynamic_tool_binding) do
+  defp do_start_session(port, workspace, session_policies, dynamic_tool_binding, thread_options) do
     case send_initialize(port) do
-      :ok -> start_thread(port, workspace, session_policies, dynamic_tool_binding)
+      :ok -> open_thread(port, workspace, session_policies, dynamic_tool_binding, thread_options)
       {:error, reason} -> {:error, reason}
     end
+  end
+
+  defp open_thread(port, workspace, session_policies, dynamic_tool_binding, thread_options) do
+    with {:ok, thread_id} <-
+           start_or_resume_thread(
+             port,
+             workspace,
+             session_policies,
+             dynamic_tool_binding,
+             thread_options
+           ),
+         :ok <- set_thread_name(port, thread_id, thread_options.name) do
+      {:ok, thread_id}
+    end
+  end
+
+  defp start_or_resume_thread(
+         port,
+         workspace,
+         session_policies,
+         _dynamic_tool_binding,
+         %{resume_thread_id: thread_id} = thread_options
+       )
+       when is_binary(thread_id) and thread_id != "" do
+    resume_thread(port, workspace, session_policies, thread_options)
+  end
+
+  defp start_or_resume_thread(
+         port,
+         workspace,
+         session_policies,
+         dynamic_tool_binding,
+         thread_options
+       ) do
+    start_thread(port, workspace, session_policies, dynamic_tool_binding, thread_options)
   end
 
   defp start_thread(
          port,
          workspace,
          %{approval_policy: approval_policy, thread_sandbox: thread_sandbox},
-         dynamic_tool_binding
+         dynamic_tool_binding,
+         thread_options
        ) do
-    send_message(port, %{
-      "method" => "thread/start",
-      "id" => @thread_start_id,
-      "params" => %{
+    params =
+      %{
         "approvalPolicy" => approval_policy,
         "sandbox" => thread_sandbox,
         "cwd" => workspace,
-        "dynamicTools" => dynamic_tool_binding.tool_specs
+        "dynamicTools" => dynamic_tool_binding.tool_specs,
+        "ephemeral" => false,
+        "serviceName" => thread_options.service_name,
+        "threadSource" => thread_options.thread_source
       }
+      |> put_if_present("model", thread_options.model)
+
+    send_message(port, %{
+      "method" => "thread/start",
+      "id" => @thread_start_id,
+      "params" => params
     })
 
     case await_response(port, @thread_start_id) do
@@ -340,11 +420,61 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
+  defp resume_thread(
+         port,
+         workspace,
+         %{approval_policy: approval_policy, thread_sandbox: thread_sandbox},
+         thread_options
+       ) do
+    params =
+      %{
+        "threadId" => thread_options.resume_thread_id,
+        "approvalPolicy" => approval_policy,
+        "sandbox" => thread_sandbox,
+        "cwd" => workspace
+      }
+      |> put_if_present("model", thread_options.model)
+
     send_message(port, %{
-      "method" => "turn/start",
-      "id" => @turn_start_id,
+      "method" => "thread/resume",
+      "id" => @thread_start_id,
+      "params" => params
+    })
+
+    case await_response(port, @thread_start_id) do
+      {:ok, %{"thread" => %{"id" => thread_id}}} -> {:ok, thread_id}
+      {:ok, payload} -> {:error, {:invalid_thread_payload, payload}}
+      other -> other
+    end
+  end
+
+  defp set_thread_name(_port, _thread_id, nil), do: :ok
+
+  defp set_thread_name(port, thread_id, thread_name) do
+    send_message(port, %{
+      "method" => "thread/name/set",
+      "id" => @thread_name_set_id,
       "params" => %{
+        "threadId" => thread_id,
+        "name" => thread_name
+      }
+    })
+
+    case await_response(port, @thread_name_set_id) do
+      {:ok, _response} -> :ok
+      other -> other
+    end
+  end
+
+  defp start_turn(
+         port,
+         thread_id,
+         prompt,
+         issue,
+         turn_options
+       ) do
+    params =
+      %{
         "threadId" => thread_id,
         "input" => [
           %{
@@ -352,11 +482,18 @@ defmodule SymphonyElixir.Codex.AppServer do
             "text" => prompt
           }
         ],
-        "cwd" => workspace,
+        "cwd" => turn_options.workspace,
         "title" => "#{issue.identifier}: #{issue.title}",
-        "approvalPolicy" => approval_policy,
-        "sandboxPolicy" => turn_sandbox_policy
+        "approvalPolicy" => turn_options.approval_policy,
+        "sandboxPolicy" => turn_options.sandbox_policy
       }
+      |> put_if_present("model", turn_options.model)
+      |> put_if_present("effort", turn_options.reasoning_effort)
+
+    send_message(port, %{
+      "method" => "turn/start",
+      "id" => @turn_start_id,
+      "params" => params
     })
 
     case await_response(port, @turn_start_id) do
@@ -364,6 +501,18 @@ defmodule SymphonyElixir.Codex.AppServer do
       other -> other
     end
   end
+
+  defp normalize_thread_name(name) when is_binary(name) do
+    case String.trim(name) do
+      "" -> nil
+      normalized -> normalized
+    end
+  end
+
+  defp normalize_thread_name(_name), do: nil
+
+  defp put_if_present(map, _key, nil), do: map
+  defp put_if_present(map, key, value), do: Map.put(map, key, value)
 
   defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
     receive_loop(

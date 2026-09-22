@@ -89,7 +89,11 @@ defmodule SymphonyElixir.AgentRunner do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issues_by_ids/1)
 
-    with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
+    with {:ok, session} <-
+           AppServer.start_session(workspace,
+             worker_host: worker_host,
+             thread_name: codex_thread_name(issue)
+           ) do
       try do
         do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
       after
@@ -204,6 +208,10 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp worker_host_for_log(nil), do: "local"
   defp worker_host_for_log(worker_host), do: worker_host
+
+  defp codex_thread_name(%Issue{identifier: identifier, title: title}) do
+    "#{identifier}: #{title}"
+  end
 
   defp normalize_issue_state(state_name) when is_binary(state_name) do
     state_name

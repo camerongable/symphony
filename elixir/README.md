@@ -21,6 +21,12 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 4. Sends a workflow prompt to Codex
 5. Keeps Codex working on the issue until the work is done
 
+Each issue worker uses a named, non-ephemeral Codex thread. When Symphony and
+the Codex desktop app use the same `CODEX_HOME`, the thread appears in the
+desktop task history after its first turn and can be reopened there. Symphony
+can also resume a recorded thread ID after restarting instead of creating a
+replacement conversation.
+
 During app-server sessions, the selected tracker adapter may advertise provider-native tools. The
 Linear serves `linear_graphql`, GitHub Issues serves `github_api`, Jira Cloud serves
 `jira_rest`, Asana serves `asana_api`, and GitLab serves `gitlab_api`. Symphony executes those

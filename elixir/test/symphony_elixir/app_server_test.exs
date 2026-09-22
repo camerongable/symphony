@@ -1,6 +1,113 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
+  test "app server creates named durable threads and resumes the same thread with its model route" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-durable-thread-#{System.unique_integer([:positive])}"
+      )
+
+    previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
+
+    on_exit(fn -> restore_env("SYMP_TEST_CODEx_TRACE", previous_trace) end)
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "PPL-123")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-durable-thread.trace")
+
+      File.mkdir_p!(workspace)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="\${SYMP_TEST_CODEx_TRACE:-/tmp/codex-durable-thread.trace}"
+      printf 'RUN\\n' >> "$trace_file"
+
+      while IFS= read -r line; do
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$line" in
+          *'"method":"initialize"'*)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          *'"method":"thread/start"'*|*'"method":"thread/resume"'*)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-visible"}}}'
+            ;;
+          *'"method":"thread/name/set"'*)
+            printf '%s\\n' '{"id":4,"result":{}}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      assert {:ok, started_session} =
+               AppServer.start_session(workspace,
+                 thread_name: " PPL-123: Durable Codex task ",
+                 model: "gpt-5.6-terra",
+                 reasoning_effort: "high",
+                 service_name: "symphony-factory",
+                 thread_source: "symphonyFactory"
+               )
+
+      assert started_session.thread_id == "thread-visible"
+      assert started_session.thread_name == "PPL-123: Durable Codex task"
+      assert started_session.model == "gpt-5.6-terra"
+      assert started_session.reasoning_effort == "high"
+      assert :ok = AppServer.stop_session(started_session)
+
+      assert {:ok, resumed_session} =
+               AppServer.start_session(workspace,
+                 resume_thread_id: "thread-visible",
+                 thread_name: "PPL-123: Durable Codex task",
+                 model: "gpt-5.6-sol",
+                 reasoning_effort: "xhigh"
+               )
+
+      assert resumed_session.thread_id == "thread-visible"
+      assert resumed_session.model == "gpt-5.6-sol"
+      assert resumed_session.reasoning_effort == "xhigh"
+      assert :ok = AppServer.stop_session(resumed_session)
+
+      payloads =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.filter(&String.starts_with?(&1, "JSON:"))
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+
+      assert start_payload = Enum.find(payloads, &(&1["method"] == "thread/start"))
+      assert get_in(start_payload, ["params", "ephemeral"]) == false
+      assert get_in(start_payload, ["params", "serviceName"]) == "symphony-factory"
+      assert get_in(start_payload, ["params", "threadSource"]) == "symphonyFactory"
+      assert get_in(start_payload, ["params", "model"]) == "gpt-5.6-terra"
+
+      assert resume_payload = Enum.find(payloads, &(&1["method"] == "thread/resume"))
+      assert get_in(resume_payload, ["params", "threadId"]) == "thread-visible"
+      assert get_in(resume_payload, ["params", "model"]) == "gpt-5.6-sol"
+
+      name_payloads = Enum.filter(payloads, &(&1["method"] == "thread/name/set"))
+      assert length(name_payloads) == 2
+
+      assert Enum.all?(name_payloads, fn payload ->
+               get_in(payload, ["params", "threadId"]) == "thread-visible" &&
+                 get_in(payload, ["params", "name"]) == "PPL-123: Durable Codex task"
+             end)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server rejects the workspace root and paths outside workspace root" do
     test_root =
       Path.join(
