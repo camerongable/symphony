@@ -8,6 +8,7 @@ defmodule SymphonyElixir.Orchestrator do
   import Bitwise, only: [<<<: 2]
 
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.Factory.TickLease
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -117,7 +118,13 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info(:run_poll_cycle, state) do
     state = refresh_runtime_config(state)
-    state = maybe_dispatch(state)
+
+    state =
+      case TickLease.run(Config.settings!().factory, fn -> maybe_dispatch(state) end) do
+        {:ran, updated_state} -> updated_state
+        {:skipped, _reason} -> state
+      end
+
     state = schedule_tick(state, state.poll_interval_ms)
     state = %{state | poll_check_in_progress: false}
 
@@ -870,7 +877,8 @@ defmodule SymphonyElixir.Orchestrator do
   defp candidate_issue?(_issue, _active_states, _terminal_states), do: false
 
   defp issue_routable?(%Issue{} = issue) do
-    Issue.routable?(issue, Config.settings!().tracker.required_labels)
+    tracker = Config.settings!().tracker
+    Issue.routable?(issue, tracker.required_labels, tracker.required_any_labels)
   end
 
   defp terminal_issue_state?(state_name, terminal_states) when is_binary(state_name) do

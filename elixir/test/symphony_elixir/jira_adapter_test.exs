@@ -80,8 +80,22 @@ defmodule SymphonyElixir.Jira.AdapterTest do
     assert {:error, :missing_jira_api_token} =
              JiraClient.validate_settings(tracker_settings(%{"api_token" => 123}))
 
-    assert {:error, :missing_jira_project_key} =
+    assert {:error, :invalid_jira_project_key} =
              JiraClient.validate_settings(tracker_settings(%{"project_key" => 123}))
+
+    assert :ok =
+             JiraClient.validate_settings(tracker_settings(%{"project_key" => nil}))
+
+    assert {:error, :invalid_jira_project_keys} =
+             JiraClient.validate_settings(tracker_settings(%{"project_keys" => "SYM"}))
+
+    assert {:error, :invalid_jira_epic_keys} =
+             JiraClient.validate_settings(tracker_settings(%{"epic_keys" => [" "]}))
+
+    assert {:error, :invalid_jira_assignee} =
+             tracker_settings(%{"project_key" => nil})
+             |> Map.put(:assignee, 42)
+             |> JiraClient.validate_settings()
 
     assert JiraClient.secret_environment_names(tracker_settings(%{"api_token" => "$SYMPHONY_JIRA_TOKEN"})) == ["JIRA_API_TOKEN", "SYMPHONY_JIRA_TOKEN"]
   end
@@ -300,6 +314,67 @@ defmodule SymphonyElixir.Jira.AdapterTest do
                fn _method, _path, _query, _body, _settings ->
                  flunk("empty Jira states should not make an HTTP request")
                end
+             )
+  end
+
+  test "client can poll a current-user queue across projects with optional epic filters" do
+    request_fun = fn "POST", "/rest/api/3/search/jql", %{}, body, settings ->
+      send(self(), {:jira_search, body, settings})
+
+      {:ok,
+       %{
+         status: 200,
+         body: %{
+           "issues" => [
+             raw_issue("10001", "SYM-1"),
+             raw_issue("20001", "OTHER-1", "READY", "OTHER")
+           ],
+           "isLast" => true
+         }
+       }}
+    end
+
+    settings =
+      tracker_settings(%{
+        "project_key" => nil,
+        "epic_keys" => ["PPL-8447", "OTHER-9"]
+      })
+      |> Map.put(:assignee, "currentUser()")
+
+    assert {:ok, issues} =
+             JiraClient.fetch_issues_by_states_for_test(
+               ["To Do", "READY"],
+               settings,
+               request_fun
+             )
+
+    assert Enum.map(issues, & &1.identifier) == ["SYM-1", "OTHER-1"]
+
+    assert_receive {:jira_search,
+                    %{
+                      "jql" => "parent IN (\"PPL-8447\", \"OTHER-9\") AND assignee = currentUser() AND status IN (\"To Do\", \"READY\")"
+                    }, %{project_keys: [], assignee: :current_user}}
+  end
+
+  test "client accepts cross-project ID refreshes only when project scope is absent" do
+    request_fun = fn _method, _path, _query, _body, _settings ->
+      {:ok,
+       %{
+         status: 200,
+         body: %{
+           "issues" => [
+             raw_issue("1", "SYM-1"),
+             raw_issue("2", "OTHER-2", "To Do", "OTHER")
+           ]
+         }
+       }}
+    end
+
+    assert {:ok, [%Issue{id: "1"}, %Issue{id: "2"}]} =
+             JiraClient.fetch_issues_by_ids_for_test(
+               ["1", "2"],
+               tracker_settings(%{"project_key" => nil}),
+               request_fun
              )
   end
 

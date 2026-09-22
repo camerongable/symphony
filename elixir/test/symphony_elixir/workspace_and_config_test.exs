@@ -434,9 +434,13 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Issue.routable?(issue, [])
     assert Issue.routable?(issue, ["symphony"])
     assert Issue.routable?(issue, ["SYMPHONY", "javascript"])
+    assert Issue.routable?(issue, [], ["security", "symphony"])
+    assert Issue.routable?(issue, ["javascript"], ["symphony"])
     refute Issue.routable?(issue, ["symph"])
     refute Issue.routable?(issue, [" "])
     refute Issue.routable?(issue, ["symphony", "security"])
+    refute Issue.routable?(issue, [], ["security", "backend"])
+    refute Issue.routable?(issue, ["security"], ["symphony"])
     refute Issue.routable?(%{issue | dispatchable: false}, ["symphony"])
   end
 

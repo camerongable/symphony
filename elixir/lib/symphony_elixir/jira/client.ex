@@ -1,6 +1,6 @@
 defmodule SymphonyElixir.Jira.Client do
   @moduledoc """
-  Thin Jira Cloud REST client for project-scoped issue polling.
+  Thin Jira Cloud REST client for scoped issue polling.
   """
 
   require Logger
@@ -92,7 +92,7 @@ defmodule SymphonyElixir.Jira.Client do
   defp fetch_state_pages(states, settings, next_page_token, request_fun, pages) do
     body =
       %{
-        "jql" => state_jql(settings.project_key, states),
+        "jql" => state_jql(settings, states),
         "fields" => @issue_fields,
         "maxResults" => @page_size
       }
@@ -210,7 +210,7 @@ defmodule SymphonyElixir.Jira.Client do
       is_nil(project_key) ->
         {:halt, {:error, :jira_unknown_payload}}
 
-      not same_project_key?(project_key, settings.project_key) ->
+      not project_in_scope?(project_key, settings.project_keys) ->
         {:cont, {:ok, issues_by_id}}
 
       true ->
@@ -235,7 +235,7 @@ defmodule SymphonyElixir.Jira.Client do
     status_category = get_in(fields, ["status", "statusCategory", "key"])
     blockers = extract_blockers(fields["issuelinks"])
 
-    if same_project_key?(issue_project_key(%{"fields" => fields}), settings.project_key) and
+    if project_in_scope?(issue_project_key(%{"fields" => fields}), settings.project_keys) and
          present_string?(id) and
          present_string?(key) and present_string?(title) and present_string?(state) do
       %Issue{
@@ -357,11 +357,19 @@ defmodule SymphonyElixir.Jira.Client do
 
   defp issue_project_key(raw_issue), do: get_in(raw_issue, ["fields", "project", "key"])
 
-  defp same_project_key?(left, right) when is_binary(left) and is_binary(right) do
-    String.downcase(String.trim(left)) == String.downcase(String.trim(right))
+  defp project_in_scope?(project_key, []) when is_binary(project_key), do: present_string?(project_key)
+
+  defp project_in_scope?(project_key, project_keys)
+       when is_binary(project_key) and is_list(project_keys) do
+    normalized_project_key = normalize_project_key(project_key)
+    Enum.any?(project_keys, &(normalize_project_key(&1) == normalized_project_key))
   end
 
-  defp same_project_key?(_left, _right), do: false
+  defp project_in_scope?(_project_key, _project_keys), do: false
+
+  defp normalize_project_key(project_key) do
+    project_key |> String.trim() |> String.downcase()
+  end
 
   defp parse_datetime(value) when is_binary(value) do
     normalized = Regex.replace(~r/([+-]\d{2})(\d{2})$/, value, "\\1:\\2")
@@ -415,8 +423,35 @@ defmodule SymphonyElixir.Jira.Client do
     base_url = resolve_setting(provider["base_url"], System.get_env("JIRA_BASE_URL"))
     email = resolve_setting(provider["email"], System.get_env("JIRA_EMAIL"))
     api_token = resolve_setting(provider["api_token"], System.get_env("JIRA_API_TOKEN"))
-    project_key = resolve_setting(provider["project_key"], nil)
 
+    with {:ok, project_key} <-
+           optional_resolved_setting(provider["project_key"], :invalid_jira_project_key),
+         {:ok, project_keys} <- project_keys(provider, project_key),
+         {:ok, epic_keys} <- optional_string_list(provider["epic_keys"], :invalid_jira_epic_keys),
+         {:ok, assignee} <- jira_assignee(tracker_settings, provider) do
+      validate_resolved_settings(
+        tracker_settings,
+        base_url,
+        email,
+        api_token,
+        project_key,
+        project_keys,
+        epic_keys,
+        assignee
+      )
+    end
+  end
+
+  defp validate_resolved_settings(
+         tracker_settings,
+         base_url,
+         email,
+         api_token,
+         project_key,
+         project_keys,
+         epic_keys,
+         assignee
+       ) do
     cond do
       not valid_base_url?(base_url) ->
         {:error, :invalid_jira_base_url}
@@ -427,9 +462,6 @@ defmodule SymphonyElixir.Jira.Client do
       not present_string?(api_token) ->
         {:error, :missing_jira_api_token}
 
-      not present_string?(project_key) ->
-        {:error, :missing_jira_project_key}
-
       true ->
         {:ok,
          %{
@@ -437,6 +469,9 @@ defmodule SymphonyElixir.Jira.Client do
            email: email,
            api_token: api_token,
            project_key: project_key,
+           project_keys: project_keys,
+           epic_keys: epic_keys,
+           assignee: assignee,
            terminal_states: terminal_states(tracker_settings)
          }}
     end
@@ -505,10 +540,91 @@ defmodule SymphonyElixir.Jira.Client do
     ]
   end
 
-  defp state_jql(project_key, states) do
+  defp state_jql(settings, states) do
     quoted_states = Enum.map_join(states, ", ", &jql_string/1)
-    "project = #{jql_string(project_key)} AND status IN (#{quoted_states})"
+
+    [
+      project_jql(settings.project_keys),
+      epic_jql(settings.epic_keys),
+      assignee_jql(settings.assignee),
+      "status IN (#{quoted_states})"
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join(" AND ")
   end
+
+  defp project_jql([]), do: nil
+  defp project_jql([project_key]), do: "project = #{jql_string(project_key)}"
+
+  defp project_jql(project_keys) do
+    "project IN (#{Enum.map_join(project_keys, ", ", &jql_string/1)})"
+  end
+
+  defp epic_jql([]), do: nil
+  defp epic_jql([epic_key]), do: "parent = #{jql_string(epic_key)}"
+
+  defp epic_jql(epic_keys) do
+    "parent IN (#{Enum.map_join(epic_keys, ", ", &jql_string/1)})"
+  end
+
+  defp assignee_jql(nil), do: nil
+  defp assignee_jql(:current_user), do: "assignee = currentUser()"
+  defp assignee_jql(assignee), do: "assignee = #{jql_string(assignee)}"
+
+  defp project_keys(provider, project_key) do
+    with {:ok, configured_keys} <-
+           optional_string_list(provider["project_keys"], :invalid_jira_project_keys) do
+      keys =
+        [project_key | configured_keys]
+        |> Enum.reject(&is_nil/1)
+        |> Enum.uniq_by(&normalize_project_key/1)
+
+      {:ok, keys}
+    end
+  end
+
+  defp jira_assignee(tracker_settings, provider) do
+    value = provider["assignee"] || Map.get(tracker_settings, :assignee)
+
+    case value do
+      nil -> {:ok, nil}
+      value when is_binary(value) -> normalize_jira_assignee(value)
+      _value -> {:error, :invalid_jira_assignee}
+    end
+  end
+
+  defp normalize_jira_assignee(value) do
+    trimmed = String.trim(value)
+
+    case String.downcase(trimmed) do
+      "" -> {:error, :invalid_jira_assignee}
+      value when value in ["currentuser()", "me"] -> {:ok, :current_user}
+      _value -> {:ok, trimmed}
+    end
+  end
+
+  defp optional_resolved_setting(nil, _error), do: {:ok, nil}
+
+  defp optional_resolved_setting(value, error) when is_binary(value) do
+    case resolve_setting(value, nil) do
+      nil -> {:error, error}
+      resolved -> {:ok, resolved}
+    end
+  end
+
+  defp optional_resolved_setting(_value, error), do: {:error, error}
+
+  defp optional_string_list(nil, _error), do: {:ok, []}
+
+  defp optional_string_list(values, error) when is_list(values) do
+    if Enum.all?(values, &present_string?/1) do
+      {:ok, values |> Enum.map(&String.trim/1) |> Enum.uniq()}
+    else
+      {:error, error}
+    end
+  end
+
+  defp optional_string_list(_values, error), do: {:error, error}
 
   defp jql_string(value) do
     escaped = value |> String.replace("\\", "\\\\") |> String.replace("\"", "\\\"")

@@ -56,6 +56,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:provider, :map, default: %{})
       field(:secret_environment_names, {:array, :string}, default: [])
       field(:required_labels, {:array, :string}, default: [])
+      field(:required_any_labels, {:array, :string}, default: [])
       field(:active_states, {:array, :string})
       field(:terminal_states, {:array, :string})
     end
@@ -73,12 +74,18 @@ defmodule SymphonyElixir.Config.Schema do
           :assignee,
           :provider,
           :required_labels,
+          :required_any_labels,
           :active_states,
           :terminal_states
         ],
         empty_values: []
       )
       |> update_change(:required_labels, fn labels ->
+        labels
+        |> Enum.map(&(String.trim(&1) |> String.downcase()))
+        |> Enum.uniq()
+      end)
+      |> update_change(:required_any_labels, fn labels ->
         labels
         |> Enum.map(&(String.trim(&1) |> String.downcase()))
         |> Enum.uniq()
@@ -289,6 +296,63 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule Factory do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:enabled, :boolean, default: false)
+      field(:database, :string)
+      field(:scope, :string, default: "assigned-jira-work")
+      field(:dispatcher_id, :string)
+      field(:lease_seconds, :integer, default: 240)
+      field(:maximum_specifiers, :integer, default: 2)
+      field(:maximum_writers, :integer, default: 2)
+      field(:maximum_validators, :integer, default: 2)
+      field(:writer_disk_gb, :integer, default: 15)
+      field(:models, :map, default: %{})
+      field(:repositories, :map, default: %{})
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(
+        attrs,
+        [
+          :enabled,
+          :database,
+          :scope,
+          :dispatcher_id,
+          :lease_seconds,
+          :maximum_specifiers,
+          :maximum_writers,
+          :maximum_validators,
+          :writer_disk_gb,
+          :models,
+          :repositories
+        ],
+        empty_values: []
+      )
+      |> validate_number(:lease_seconds, greater_than: 0)
+      |> validate_number(:maximum_specifiers, greater_than: 0)
+      |> validate_number(:maximum_writers, greater_than: 0)
+      |> validate_number(:maximum_validators, greater_than: 0)
+      |> validate_number(:writer_disk_gb, greater_than: 0)
+      |> validate_factory_required_fields()
+    end
+
+    defp validate_factory_required_fields(changeset) do
+      if get_field(changeset, :enabled) do
+        validate_required(changeset, [:database, :scope, :dispatcher_id])
+      else
+        changeset
+      end
+    end
+  end
+
   embedded_schema do
     embeds_one(:tracker, Tracker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:polling, Polling, on_replace: :update, defaults_to_struct: true)
@@ -299,6 +363,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:factory, Factory, on_replace: :update, defaults_to_struct: true)
   end
 
   @spec parse(map()) :: {:ok, %__MODULE__{}} | {:error, {:invalid_workflow_config, String.t()}}
@@ -393,6 +458,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
     |> cast_embed(:server, with: &Server.changeset/2)
+    |> cast_embed(:factory, with: &Factory.changeset/2)
   end
 
   defp finalize_settings(settings) do
@@ -460,7 +526,14 @@ defmodule SymphonyElixir.Config.Schema do
         turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
     }
 
-    %{settings | tracker: tracker, workspace: workspace, codex: codex}
+    factory = %{
+      settings.factory
+      | database: resolve_optional_path_value(settings.factory.database),
+        models: normalize_keys(settings.factory.models),
+        repositories: normalize_keys(settings.factory.repositories)
+    }
+
+    %{settings | tracker: tracker, workspace: workspace, codex: codex, factory: factory}
   end
 
   defp normalize_keys(value) when is_map(value) do
@@ -511,6 +584,15 @@ defmodule SymphonyElixir.Config.Schema do
 
       path ->
         path
+    end
+  end
+
+  defp resolve_optional_path_value(nil), do: nil
+
+  defp resolve_optional_path_value(value) do
+    case resolve_path_value(value, nil) do
+      nil -> nil
+      path -> Path.expand(path)
     end
   end
 

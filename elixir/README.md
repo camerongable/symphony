@@ -27,6 +27,10 @@ Linear serves `linear_graphql`, GitHub Issues serves `github_api`, Jira Cloud se
 tools with configured host-side auth and removes declared tracker-token environment variables from
 the Codex child, so the agent does not need a second tracker login.
 
+This fork also contains an opt-in, SQLite-backed local factory control-plane
+foundation. Its current capabilities and intentionally incomplete stage-graph
+boundary are documented in [Local factory control plane](../docs/factory-control-plane.md).
+
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
 
@@ -155,6 +159,10 @@ Notes:
 - `tracker.required_labels` is optional. When set, an issue must have every
   configured label to dispatch or continue running. Label matching ignores
   case and surrounding whitespace. A blank configured label matches no issue.
+- `tracker.required_any_labels` is optional. When set, an issue must have at
+  least one configured label in addition to every `required_labels` entry. This
+  supports queues whose mutually exclusive labels represent different workflow
+  stages, such as specification and delivery.
 - Safer Codex defaults are used when policy fields are omitted:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
   - `codex.thread_sandbox` defaults to `workspace-write`
@@ -264,11 +272,15 @@ codex:
 
 ### Jira Cloud adapter
 
-- Config: use `tracker.kind: jira` with provider `base_url`, `email`, `api_token`, and required
-  `project_key`; the first three default to `JIRA_BASE_URL`, `JIRA_EMAIL`, and `JIRA_API_TOKEN`
-  and accept `$VAR`. Set explicit Jira-native `active_states` and `terminal_states`.
-- Issues and reads: candidate reads and ID refreshes stay scoped to the configured project and
-  requested statuses; `issue.id` is Jira's immutable ID and `issue.identifier` is the issue key.
+- Config: use `tracker.kind: jira` with provider `base_url`, `email`, and `api_token`; these
+  default to `JIRA_BASE_URL`, `JIRA_EMAIL`, and `JIRA_API_TOKEN` and accept `$VAR`. Optionally set
+  one `project_key`, multiple `project_keys`, or direct-parent `epic_keys`. Set tracker `assignee`
+  to `currentUser()` (or `me`) for Jira's authenticated user, or to an explicit account value.
+  Set explicit Jira-native `active_states` and `terminal_states`.
+- Issues and reads: candidate JQL combines only configured project, parent, assignee, and status
+  clauses. Omitting project and parent scope supports cross-project queues; ID refreshes honor the
+  same optional project scope. `issue.id` is Jira's immutable ID and `issue.identifier` is the
+  issue key.
 - Blockers: inward `Blocks` links populate `blocked_by`; issues in Jira's `new` status category
   wait until blockers reach configured terminal states, while in-progress categories keep running.
 - Tool: `jira_rest` sends relative `/rest/api/3/` requests host-side with configured Basic auth,
