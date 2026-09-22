@@ -27,6 +27,21 @@ defmodule SymphonyElixir.Factory.ControlServer do
   @spec status(GenServer.server()) :: map()
   def status(server \\ __MODULE__), do: GenServer.call(server, :status)
 
+  @doc "Persists the visible controller Codex task identity."
+  @spec record_controller_task(String.t(), String.t() | nil, map(), GenServer.server()) :: map()
+  def record_controller_task(thread_id, turn_id, route \\ %{}, server \\ __MODULE__),
+    do: GenServer.call(server, {:record_controller_task, thread_id, turn_id, route})
+
+  @doc "Records an active-writer conflict for the current controller task."
+  @spec record_controller_writer_conflict(String.t(), GenServer.server()) :: map()
+  def record_controller_writer_conflict(thread_id, server \\ __MODULE__),
+    do: GenServer.call(server, {:record_controller_writer_conflict, thread_id})
+
+  @doc "Clears active-writer conflict state after a successful controller resume."
+  @spec clear_controller_writer_conflict(String.t(), GenServer.server()) :: map()
+  def clear_controller_writer_conflict(thread_id, server \\ __MODULE__),
+    do: GenServer.call(server, {:clear_controller_writer_conflict, thread_id})
+
   @doc """
   Activates the supplied dispatcher if no live tick lease exists.
   """
@@ -45,6 +60,11 @@ defmodule SymphonyElixir.Factory.ControlServer do
   @spec acquire_tick(String.t(), GenServer.server()) :: map()
   def acquire_tick(dispatcher_id, server \\ __MODULE__),
     do: GenServer.call(server, {:acquire_tick, dispatcher_id})
+
+  @doc "Renews the exact tick held by the supplied dispatcher."
+  @spec renew_tick(String.t(), String.t(), GenServer.server()) :: map()
+  def renew_tick(dispatcher_id, tick_id, server \\ __MODULE__),
+    do: GenServer.call(server, {:renew_tick, dispatcher_id, tick_id})
 
   @doc """
   Releases the exact tick held by the supplied dispatcher.
@@ -73,6 +93,18 @@ defmodule SymphonyElixir.Factory.ControlServer do
     {:reply, Control.status(state.store, state.config.scope), state}
   end
 
+  def handle_call({:record_controller_task, thread_id, turn_id, route}, _from, state) do
+    {:reply, Control.record_controller_task(state.store, state.config, thread_id, turn_id, route), state}
+  end
+
+  def handle_call({:record_controller_writer_conflict, thread_id}, _from, state) do
+    {:reply, Control.record_controller_writer_conflict(state.store, state.config, thread_id), state}
+  end
+
+  def handle_call({:clear_controller_writer_conflict, thread_id}, _from, state) do
+    {:reply, Control.clear_controller_writer_conflict(state.store, state.config, thread_id), state}
+  end
+
   def handle_call({:activate, dispatcher_id}, _from, state) do
     {:reply, Control.activate(state.store, state.config, dispatcher_id), state}
   end
@@ -83,6 +115,10 @@ defmodule SymphonyElixir.Factory.ControlServer do
 
   def handle_call({:acquire_tick, dispatcher_id}, _from, state) do
     {:reply, Control.acquire_tick(state.store, state.config, dispatcher_id), state}
+  end
+
+  def handle_call({:renew_tick, dispatcher_id, tick_id}, _from, state) do
+    {:reply, Control.renew_tick(state.store, state.config, dispatcher_id, tick_id), state}
   end
 
   def handle_call({:release_tick, dispatcher_id, tick_id}, _from, state) do

@@ -19,6 +19,32 @@ defmodule SymphonyElixir.Factory.Admin do
     end)
   end
 
+  @doc "Returns local control, run, and reopenable Codex-task state for diagnostics."
+  @spec overview(struct() | map()) :: {:ok, map()} | {:error, term()}
+  def overview(factory) do
+    with_store(factory, fn connection, config ->
+      runs = rows(connection, "SELECT * FROM runs ORDER BY updated_at DESC LIMIT 100")
+
+      tasks =
+        rows(
+          connection,
+          """
+          SELECT task_key, run_id, stage, role, status, thread_id, turn_id, codex_project_id,
+                 model, reasoning_effort, failure_code, updated_at
+          FROM factory_tasks
+          ORDER BY updated_at DESC LIMIT 200
+          """
+        )
+
+      {:ok,
+       %{
+         control: Control.status(connection, config.scope),
+         runs: runs,
+         tasks: tasks
+       }}
+    end)
+  end
+
   @doc """
   Activates a dispatcher using the configured identity unless overridden.
   """
@@ -74,4 +100,9 @@ defmodule SymphonyElixir.Factory.Admin do
 
   defp present_string?(value) when is_binary(value), do: String.trim(value) != ""
   defp present_string?(_value), do: false
+
+  defp rows(connection, statement) do
+    result = Store.query!(connection, statement)
+    Enum.map(result.rows, &Map.new(Enum.zip(result.columns, &1)))
+  end
 end

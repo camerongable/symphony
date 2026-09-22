@@ -307,11 +307,23 @@ defmodule SymphonyElixir.Config.Schema do
       field(:database, :string)
       field(:scope, :string, default: "assigned-jira-work")
       field(:dispatcher_id, :string)
+      field(:controller_codex_project_id, :string)
+      field(:branch_prefix, :string, default: "ai")
       field(:lease_seconds, :integer, default: 240)
+      field(:controller_required_mcp_servers, {:array, :string}, default: [])
+      field(:controller_mcp_startup_timeout_ms, :integer, default: 60_000)
       field(:maximum_specifiers, :integer, default: 2)
       field(:maximum_writers, :integer, default: 2)
       field(:maximum_validators, :integer, default: 2)
-      field(:writer_disk_gb, :integer, default: 15)
+      field(:writer_disk_gb, :integer, default: 20)
+      field(:maximum_implementation_iterations, :integer, default: 8)
+      field(:maximum_code_repair_rounds, :integer, default: 2)
+      field(:maximum_validation_repair_rounds, :integer, default: 2)
+      field(:stale_task_minutes, :integer, default: 90)
+      field(:queue, :map, default: %{})
+      field(:cleanup, :map, default: %{})
+      field(:hibernation, :map, default: %{})
+      field(:manual_validation, :map, default: %{})
       field(:models, :map, default: %{})
       field(:repositories, :map, default: %{})
     end
@@ -326,27 +338,55 @@ defmodule SymphonyElixir.Config.Schema do
           :database,
           :scope,
           :dispatcher_id,
+          :controller_codex_project_id,
+          :branch_prefix,
           :lease_seconds,
+          :controller_required_mcp_servers,
+          :controller_mcp_startup_timeout_ms,
           :maximum_specifiers,
           :maximum_writers,
           :maximum_validators,
           :writer_disk_gb,
+          :maximum_implementation_iterations,
+          :maximum_code_repair_rounds,
+          :maximum_validation_repair_rounds,
+          :stale_task_minutes,
+          :queue,
+          :cleanup,
+          :hibernation,
+          :manual_validation,
           :models,
           :repositories
         ],
         empty_values: []
       )
+      |> update_change(:controller_required_mcp_servers, fn servers ->
+        servers
+        |> Enum.map(&String.trim/1)
+        |> Enum.reject(&(&1 == ""))
+        |> Enum.uniq()
+      end)
       |> validate_number(:lease_seconds, greater_than: 0)
+      |> validate_number(:controller_mcp_startup_timeout_ms, greater_than: 0)
       |> validate_number(:maximum_specifiers, greater_than: 0)
       |> validate_number(:maximum_writers, greater_than: 0)
       |> validate_number(:maximum_validators, greater_than: 0)
       |> validate_number(:writer_disk_gb, greater_than: 0)
+      |> validate_number(:maximum_implementation_iterations, greater_than: 0)
+      |> validate_number(:maximum_code_repair_rounds, greater_than_or_equal_to: 0)
+      |> validate_number(:maximum_validation_repair_rounds, greater_than_or_equal_to: 0)
+      |> validate_number(:stale_task_minutes, greater_than: 0)
       |> validate_factory_required_fields()
     end
 
     defp validate_factory_required_fields(changeset) do
       if get_field(changeset, :enabled) do
-        validate_required(changeset, [:database, :scope, :dispatcher_id])
+        validate_required(changeset, [
+          :database,
+          :scope,
+          :dispatcher_id,
+          :controller_codex_project_id
+        ])
       else
         changeset
       end
@@ -530,7 +570,11 @@ defmodule SymphonyElixir.Config.Schema do
       settings.factory
       | database: resolve_optional_path_value(settings.factory.database),
         models: normalize_keys(settings.factory.models),
-        repositories: normalize_keys(settings.factory.repositories)
+        repositories: normalize_keys(settings.factory.repositories),
+        queue: normalize_keys(settings.factory.queue),
+        cleanup: normalize_keys(settings.factory.cleanup),
+        hibernation: normalize_keys(settings.factory.hibernation),
+        manual_validation: normalize_keys(settings.factory.manual_validation)
     }
 
     %{settings | tracker: tracker, workspace: workspace, codex: codex, factory: factory}

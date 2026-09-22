@@ -45,6 +45,117 @@ defmodule SymphonyElixir.Factory.Control do
   @spec status(Store.connection(), String.t()) :: result() | nil
   def status(connection, scope), do: Store.one!(connection, "SELECT * FROM control WHERE scope = ?", [scope])
 
+  @doc "Persists the visible controller Codex task identity after launch."
+  @spec record_controller_task(Store.connection(), config(), String.t(), String.t() | nil, map()) :: result()
+  def record_controller_task(connection, config, thread_id, turn_id, route \\ %{})
+      when is_binary(thread_id) and is_map(route) do
+    Store.query!(
+      connection,
+      """
+      UPDATE control
+      SET controller_thread_id = ?, controller_turn_id = ?,
+          controller_codex_project_id = ?,
+          controller_codex_section_id = ?,
+          controller_model_role = ?, controller_model_provider = ?,
+          controller_model_class = ?, controller_model = ?,
+          controller_reasoning_effort = ?, controller_routing_reason = ?,
+          updated_at = ?
+      WHERE scope = ?
+      """,
+      [
+        thread_id,
+        turn_id,
+        value(route, :project_id),
+        value(route, :section_id),
+        value(route, :resolved_role),
+        value(route, :provider),
+        value(route, :model_class),
+        value(route, :model),
+        value(route, :reasoning_effort),
+        value(route, :routing_reason),
+        iso(DateTime.utc_now()),
+        config.scope
+      ]
+    )
+
+    %{result: "CONTROLLER_TASK_RECORDED", control: fetch!(connection, config.scope)}
+  end
+
+  @doc "Records a resume conflict for the current controller without changing its identity."
+  @spec record_controller_writer_conflict(
+          Store.connection(),
+          config(),
+          String.t(),
+          keyword()
+        ) :: result()
+  def record_controller_writer_conflict(connection, config, thread_id, opts \\ [])
+      when is_binary(thread_id) do
+    Store.transaction!(connection, fn transaction ->
+      row = fetch!(transaction, config.scope)
+
+      if row["controller_thread_id"] == thread_id do
+        current_time = iso(now(opts))
+
+        Store.query!(
+          transaction,
+          """
+          UPDATE control
+          SET controller_writer_conflict_since =
+                COALESCE(controller_writer_conflict_since, ?),
+              controller_writer_conflict_count = controller_writer_conflict_count + 1,
+              updated_at = ?
+          WHERE scope = ?
+          """,
+          [current_time, current_time, config.scope]
+        )
+
+        %{
+          result: "CONTROLLER_WRITER_CONFLICT_RECORDED",
+          control: fetch!(transaction, config.scope)
+        }
+      else
+        %{result: "STALE_CONTROLLER", control: row}
+      end
+    end)
+  end
+
+  @doc "Clears the resume-conflict window after the current controller is usable again."
+  @spec clear_controller_writer_conflict(
+          Store.connection(),
+          config(),
+          String.t(),
+          keyword()
+        ) :: result()
+  def clear_controller_writer_conflict(connection, config, thread_id, opts \\ [])
+      when is_binary(thread_id) do
+    Store.transaction!(connection, fn transaction ->
+      row = fetch!(transaction, config.scope)
+
+      if row["controller_thread_id"] == thread_id do
+        Store.query!(
+          transaction,
+          """
+          UPDATE control
+          SET controller_writer_conflict_since = NULL,
+              controller_writer_conflict_count = 0,
+              updated_at = ?
+          WHERE scope = ?
+          """,
+          [iso(now(opts)), config.scope]
+        )
+
+        %{
+          result: "CONTROLLER_WRITER_CONFLICT_CLEARED",
+          control: fetch!(transaction, config.scope)
+        }
+      else
+        %{result: "STALE_CONTROLLER", control: row}
+      end
+    end)
+  end
+
+  defp value(map, key), do: Map.get(map, key, Map.get(map, to_string(key)))
+
   @doc """
   Activates a dispatcher when no unexpired tick lease is held.
   """
@@ -134,6 +245,47 @@ defmodule SymphonyElixir.Factory.Control do
         %{result: "RELEASED", tick_id: tick_id, generation: generation}
       else
         %{result: "LEASE_MISMATCH", control: row}
+      end
+    end)
+  end
+
+  @doc """
+  Extends the lease held by the exact dispatcher and tick identity.
+
+  Renewal is deliberately identity-bound. A stale scheduler can never renew a
+  lease after another tick has replaced it.
+  """
+  @spec renew_tick(Store.connection(), config(), String.t(), String.t(), keyword()) :: result()
+  def renew_tick(connection, config, dispatcher_id, tick_id, opts \\ []) do
+    Store.transaction!(connection, fn transaction ->
+      row = fetch!(transaction, config.scope)
+      current_time = now(opts)
+
+      cond do
+        row["status"] != "ACTIVE" ->
+          %{result: "PAUSED", control: row}
+
+        row["dispatcher_id"] != dispatcher_id or row["tick_id"] != tick_id ->
+          %{result: "LEASE_MISMATCH", control: row}
+
+        true ->
+          expires_at = DateTime.add(current_time, Map.get(config, :lease_seconds, 240), :second)
+
+          Store.query!(
+            transaction,
+            """
+            UPDATE control
+            SET lease_expires_at = ?, updated_at = ?
+            WHERE scope = ?
+            """,
+            [iso(expires_at), iso(current_time), config.scope]
+          )
+
+          %{
+            result: "LEASE_RENEWED",
+            tick_id: tick_id,
+            lease_expires_at: iso(expires_at)
+          }
       end
     end)
   end

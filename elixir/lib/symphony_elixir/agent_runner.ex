@@ -92,7 +92,12 @@ defmodule SymphonyElixir.AgentRunner do
     with {:ok, session} <-
            AppServer.start_session(workspace,
              worker_host: worker_host,
-             thread_name: codex_thread_name(issue)
+             thread_name: Keyword.get(opts, :thread_name, codex_thread_name(issue)),
+             resume_thread_id: Keyword.get(opts, :resume_thread_id),
+             model: Keyword.get(opts, :model),
+             reasoning_effort: Keyword.get(opts, :reasoning_effort),
+             service_name: Keyword.get(opts, :service_name, "symphony-orchestrator"),
+             thread_source: Keyword.get(opts, :thread_source, "symphony")
            ) do
       try do
         do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)

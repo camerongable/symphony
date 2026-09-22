@@ -1,0 +1,17 @@
+#!/bin/zsh
+set -euo pipefail
+
+script_dir="${0:A:h}"
+elixir_dir="${script_dir:h}"
+workflow_path="${1:-${elixir_dir}/WORKFLOW.local.md}"
+logs_root="${SYMPHONY_FACTORY_LOGS_ROOT:-${HOME}/Library/Logs/ai-factory}"
+
+export PATH="/opt/homebrew/bin:/Applications/ChatGPT.localized/ChatGPT.app/Contents/Resources:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+cd "${elixir_dir}"
+
+exec /opt/homebrew/bin/mise exec -- \
+  mix run --no-start -e 'SymphonyElixir.CLI.main(System.argv())' -- \
+  --i-understand-that-this-will-be-running-without-the-usual-guardrails \
+  --logs-root "${logs_root}" \
+  "${workflow_path}"

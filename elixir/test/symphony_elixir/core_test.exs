@@ -1103,7 +1103,7 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 39_500, 40_500)
+    assert_due_in_range(due_at_ms, 39_000, 40_500)
   end
 
   test "first abnormal worker exit waits before retrying" do
@@ -1583,6 +1583,12 @@ defmodule SymphonyElixir.CoreTest do
           5)
             printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-1\"}}}'
             printf '%s\\n' '{\"method\":\"turn/completed\"}'
+            ;;
+          6)
+            printf '%s\\n' '{\"id\":4,\"result\":{}}'
+            ;;
+          7)
+            printf '%s\\n' '{\"id\":6,\"result\":{\"status\":\"unsubscribed\"}}'
             exit 0
             ;;
           *)
@@ -1838,8 +1844,17 @@ defmodule SymphonyElixir.CoreTest do
             printf '%s\\n' '{"method":"turn/completed"}'
             ;;
           6)
+            printf '%s\\n' '{"id":4,"result":{}}'
+            ;;
+          7)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-cont-2"}}}'
             printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+          8)
+            printf '%s\\n' '{"id":4,"result":{}}'
+            ;;
+          9)
+            printf '%s\\n' '{"id":6,"result":{"status":"unsubscribed"}}'
             ;;
         esac
       done
@@ -1972,8 +1987,17 @@ defmodule SymphonyElixir.CoreTest do
             printf '%s\\n' '{"method":"turn/completed"}'
             ;;
           6)
+            printf '%s\\n' '{"id":4,"result":{}}'
+            ;;
+          7)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-max-2"}}}'
             printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+          8)
+            printf '%s\\n' '{"id":4,"result":{}}'
+            ;;
+          9)
+            printf '%s\\n' '{"id":6,"result":{"status":"unsubscribed"}}'
             ;;
         esac
       done

@@ -24,6 +24,18 @@ defmodule SymphonyElixir.Factory.Store do
       generation INTEGER NOT NULL DEFAULT 0,
       tick_id TEXT,
       lease_expires_at TEXT,
+      controller_thread_id TEXT,
+      controller_turn_id TEXT,
+      controller_codex_project_id TEXT,
+      controller_codex_section_id TEXT,
+      controller_model_role TEXT,
+      controller_model_provider TEXT,
+      controller_model_class TEXT,
+      controller_model TEXT,
+      controller_reasoning_effort TEXT,
+      controller_routing_reason TEXT,
+      controller_writer_conflict_since TEXT,
+      controller_writer_conflict_count INTEGER NOT NULL DEFAULT 0,
       updated_at TEXT NOT NULL
     )
     """,
@@ -55,6 +67,8 @@ defmodule SymphonyElixir.Factory.Store do
       cleanup_authorized INTEGER NOT NULL DEFAULT 0 CHECK(cleanup_authorized IN (0, 1)),
       cleanup_authorized_at TEXT,
       cleaned_at TEXT,
+      workspace_state TEXT NOT NULL DEFAULT 'UNMATERIALIZED',
+      hibernated_at TEXT,
       failure_code TEXT,
       runtime TEXT,
       model_role TEXT,
@@ -63,14 +77,41 @@ defmodule SymphonyElixir.Factory.Store do
       model TEXT,
       reasoning_effort TEXT,
       model_routing_reason TEXT,
+      parent_run_id TEXT,
+      snapshot_json TEXT,
+      contract_markdown TEXT,
+      plan_markdown TEXT,
+      repair_findings_json TEXT,
+      manual_validation_required INTEGER,
+      implementation_iteration INTEGER NOT NULL DEFAULT 0,
+      code_repair_round INTEGER NOT NULL DEFAULT 0,
+      validation_repair_round INTEGER NOT NULL DEFAULT 0,
+      verifier_round INTEGER NOT NULL DEFAULT 0,
+      spec_comment_id TEXT,
+      confirmation_comment_id TEXT,
+      mr_iid INTEGER,
+      last_error TEXT,
+      risk TEXT,
+      risk_signals_json TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     )
     """,
     """
-    CREATE UNIQUE INDEX IF NOT EXISTS one_active_run_per_issue_kind
+    DROP INDEX IF EXISTS one_active_run_per_issue_kind
+    """,
+    """
+    CREATE UNIQUE INDEX one_active_run_per_issue_kind
     ON runs(issue_key, kind)
-    WHERE state NOT IN ('READY_FOR_REVIEW', 'DELIVERED', 'CANCELLED', 'FAILED')
+    WHERE state NOT IN ('READY_FOR_REVIEW', 'DELIVERED', 'AWAITING_VALIDATION', 'CANCELLED', 'FAILED')
+    """,
+    """
+    DROP INDEX IF EXISTS one_active_factory_run_per_issue
+    """,
+    """
+    CREATE UNIQUE INDEX one_active_factory_run_per_issue
+    ON runs(issue_key)
+    WHERE state NOT IN ('READY_FOR_REVIEW', 'DELIVERED', 'AWAITING_VALIDATION', 'CANCELLED', 'FAILED')
     """,
     """
     CREATE TABLE IF NOT EXISTS events (
@@ -102,6 +143,34 @@ defmodule SymphonyElixir.Factory.Store do
     """
     CREATE INDEX IF NOT EXISTS model_routes_by_run
     ON model_routes(run_id, occurred_at)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS factory_tasks (
+      task_key TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      stage TEXT NOT NULL,
+      role TEXT NOT NULL,
+      status TEXT NOT NULL,
+      thread_id TEXT,
+      turn_id TEXT,
+      model_provider TEXT NOT NULL,
+      model_class TEXT NOT NULL,
+      model TEXT NOT NULL,
+      reasoning_effort TEXT NOT NULL,
+      routing_reason TEXT NOT NULL,
+      codex_project_id TEXT,
+      codex_section_id TEXT,
+      prompt_sha256 TEXT NOT NULL,
+      output_json TEXT,
+      failure_code TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(run_id) REFERENCES runs(run_id)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS factory_tasks_by_run
+    ON factory_tasks(run_id, created_at)
     """
   ]
 
@@ -112,7 +181,45 @@ defmodule SymphonyElixir.Factory.Store do
     "model_class" => "TEXT",
     "model" => "TEXT",
     "reasoning_effort" => "TEXT",
-    "model_routing_reason" => "TEXT"
+    "model_routing_reason" => "TEXT",
+    "parent_run_id" => "TEXT",
+    "snapshot_json" => "TEXT",
+    "contract_markdown" => "TEXT",
+    "plan_markdown" => "TEXT",
+    "repair_findings_json" => "TEXT",
+    "manual_validation_required" => "INTEGER",
+    "implementation_iteration" => "INTEGER NOT NULL DEFAULT 0",
+    "code_repair_round" => "INTEGER NOT NULL DEFAULT 0",
+    "validation_repair_round" => "INTEGER NOT NULL DEFAULT 0",
+    "verifier_round" => "INTEGER NOT NULL DEFAULT 0",
+    "spec_comment_id" => "TEXT",
+    "confirmation_comment_id" => "TEXT",
+    "mr_iid" => "INTEGER",
+    "last_error" => "TEXT",
+    "risk" => "TEXT",
+    "risk_signals_json" => "TEXT",
+    "workspace_state" => "TEXT NOT NULL DEFAULT 'UNMATERIALIZED'",
+    "hibernated_at" => "TEXT"
+  }
+
+  @control_columns %{
+    "controller_thread_id" => "TEXT",
+    "controller_turn_id" => "TEXT",
+    "controller_codex_project_id" => "TEXT",
+    "controller_codex_section_id" => "TEXT",
+    "controller_model_role" => "TEXT",
+    "controller_model_provider" => "TEXT",
+    "controller_model_class" => "TEXT",
+    "controller_model" => "TEXT",
+    "controller_reasoning_effort" => "TEXT",
+    "controller_routing_reason" => "TEXT",
+    "controller_writer_conflict_since" => "TEXT",
+    "controller_writer_conflict_count" => "INTEGER NOT NULL DEFAULT 0"
+  }
+
+  @task_columns %{
+    "codex_project_id" => "TEXT",
+    "codex_section_id" => "TEXT"
   }
 
   @type connection :: DBConnection.conn()
@@ -168,11 +275,13 @@ defmodule SymphonyElixir.Factory.Store do
   def initialize(connection) do
     Enum.each(@schema_statements, &query!(connection, &1))
     ensure_columns(connection, "runs", @model_run_columns)
+    ensure_columns(connection, "control", @control_columns)
+    ensure_columns(connection, "factory_tasks", @task_columns)
 
     query!(
       connection,
-      "INSERT OR IGNORE INTO factory_schema_migrations(version, applied_at) VALUES (1, ?), (2, ?)",
-      [iso_now(), iso_now()]
+      "INSERT OR IGNORE INTO factory_schema_migrations(version, applied_at) VALUES (1, ?), (2, ?), (3, ?), (4, ?), (5, ?), (6, ?)",
+      [iso_now(), iso_now(), iso_now(), iso_now(), iso_now(), iso_now()]
     )
 
     :ok

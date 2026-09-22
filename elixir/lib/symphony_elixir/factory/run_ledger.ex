@@ -9,8 +9,13 @@ defmodule SymphonyElixir.Factory.RunLedger do
     run_id issue_key kind state dispatcher_id spec_revision contract_sha256
     repo_key repo_path base_branch worktree branch candidate_sha
     candidate_handoff attempt validation_attempt slack_claim_ts
-    last_input_marker task_id runtime model_role model_provider model_class
+    last_input_marker task_id mr_url jira_status mr_state runtime model_role model_provider model_class
     model reasoning_effort model_routing_reason factory_owned created_at updated_at
+    parent_run_id snapshot_json contract_markdown plan_markdown
+    repair_findings_json manual_validation_required implementation_iteration
+    code_repair_round validation_repair_round verifier_round spec_comment_id
+    confirmation_comment_id mr_iid last_error risk risk_signals_json
+    workspace_state hibernated_at
   )
 
   @updatable_columns ~w(
@@ -18,7 +23,12 @@ defmodule SymphonyElixir.Factory.RunLedger do
     candidate_sha candidate_handoff attempt validation_attempt slack_claim_ts
     last_input_marker task_id mr_url jira_status mr_state failure_code runtime
     model_role model_provider model_class model reasoning_effort
-    model_routing_reason
+    model_routing_reason parent_run_id snapshot_json contract_markdown
+    plan_markdown repair_findings_json manual_validation_required
+    implementation_iteration code_repair_round validation_repair_round
+    verifier_round spec_comment_id confirmation_comment_id mr_iid last_error
+    risk risk_signals_json
+    workspace_state hibernated_at
   )
 
   @doc """
@@ -35,7 +45,12 @@ defmodule SymphonyElixir.Factory.RunLedger do
         |> stringify_keys()
         |> Map.put_new("attempt", 1)
         |> Map.put_new("validation_attempt", 0)
+        |> Map.put_new("implementation_iteration", 0)
+        |> Map.put_new("code_repair_round", 0)
+        |> Map.put_new("validation_repair_round", 0)
+        |> Map.put_new("verifier_round", 0)
         |> Map.put_new("factory_owned", true)
+        |> Map.put_new("workspace_state", "UNMATERIALIZED")
         |> Map.put("created_at", now)
         |> Map.put("updated_at", now)
 

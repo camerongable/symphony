@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.cgable.symphony-factory</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__SYMPHONY_ELIXIR_DIR__/scripts/run-local-factory</string>
+    <string>__SYMPHONY_ELIXIR_DIR__/WORKFLOW.local.md</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__SYMPHONY_ELIXIR_DIR__</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>__USER_HOME__/Library/Logs/ai-factory/symphony-factory.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>__USER_HOME__/Library/Logs/ai-factory/symphony-factory.stderr.log</string>
+</dict>
+</plist>

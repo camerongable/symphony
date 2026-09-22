@@ -33,9 +33,17 @@ Linear serves `linear_graphql`, GitHub Issues serves `github_api`, Jira Cloud se
 tools with configured host-side auth and removes declared tracker-token environment variables from
 the Codex child, so the agent does not need a second tracker login.
 
-This fork also contains an opt-in, SQLite-backed local factory control-plane
-foundation. Its current capabilities and intentionally incomplete stage-graph
-boundary are documented in [Local factory control plane](../docs/factory-control-plane.md).
+This fork also contains an opt-in, SQLite-backed local factory control plane
+for a durable Jira-to-GitLab workflow. It runs specification, incremental
+delivery, independent verification, and optional Slack-coordinated manual
+validation as named, persistent Codex tasks while the controller retains exact
+Jira, Git push, and draft-MR ownership. Configuration, safety boundaries,
+recovery, and cutover are documented in
+[Local factory control plane](../docs/factory-control-plane.md).
+
+Install the persistent local scheduler with
+`./scripts/install-local-factory-launchd`. Codex remains the operator UI; the
+launchd process only supplies durable scheduling and recovery.
 
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.

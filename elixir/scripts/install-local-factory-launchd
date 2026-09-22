@@ -1,0 +1,36 @@
+#!/bin/zsh
+set -euo pipefail
+
+label="com.cgable.symphony-factory"
+script_dir="${0:A:h}"
+elixir_dir="${script_dir:h}"
+template_path="${elixir_dir}/launchd/${label}.plist.example"
+launch_agents_dir="${HOME}/Library/LaunchAgents"
+target_path="${launch_agents_dir}/${label}.plist"
+logs_root="${HOME}/Library/Logs/ai-factory"
+domain="gui/${UID}"
+
+escape_replacement() {
+  printf '%s' "$1" | sed 's/[&|]/\\&/g'
+}
+
+mkdir -p "${launch_agents_dir}" "${logs_root}"
+temporary_path="$(mktemp "${target_path}.XXXXXX")"
+trap 'rm -f "${temporary_path}"' EXIT
+
+escaped_elixir_dir="$(escape_replacement "${elixir_dir}")"
+escaped_home="$(escape_replacement "${HOME}")"
+
+sed \
+  -e "s|__SYMPHONY_ELIXIR_DIR__|${escaped_elixir_dir}|g" \
+  -e "s|__USER_HOME__|${escaped_home}|g" \
+  "${template_path}" > "${temporary_path}"
+
+plutil -lint "${temporary_path}" >/dev/null
+launchctl bootout "${domain}" "${target_path}" 2>/dev/null || true
+install -m 0644 "${temporary_path}" "${target_path}"
+launchctl bootstrap "${domain}" "${target_path}"
+launchctl enable "${domain}/${label}"
+
+printf 'Installed and started %s from %s\n' "${label}" "${target_path}"
+printf 'Inspect with: launchctl print %s/%s\n' "${domain}" "${label}"

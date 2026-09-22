@@ -39,6 +39,19 @@ defmodule SymphonyElixir.AppServerTest do
           *'"method":"thread/name/set"'*)
             printf '%s\\n' '{"id":4,"result":{}}'
             ;;
+          *'"method":"thread/metadata/update"'*)
+            printf '%s\\n' '{"id":7,"result":{"thread":{"id":"thread-visible","projectId":"project-grail"}}}'
+            ;;
+          *'"method":"thread/section/move"'*)
+            printf '%s\\n' '{"id":8,"result":{"thread":{"id":"thread-visible","section":{"id":"section-factory"}}}}'
+            ;;
+          *'"method":"turn/start"'*)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-visible"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+          *'"method":"thread/unsubscribe"'*)
+            printf '%s\\n' '{"id":6,"result":{"status":"unsubscribed"}}'
+            ;;
         esac
       done
       """)
@@ -54,6 +67,8 @@ defmodule SymphonyElixir.AppServerTest do
                AppServer.start_session(workspace,
                  thread_name: " PPL-123: Durable Codex task ",
                  model: "gpt-5.6-terra",
+                 project_id: "project-grail",
+                 section_id: "section-factory",
                  reasoning_effort: "high",
                  service_name: "symphony-factory",
                  thread_source: "symphonyFactory"
@@ -61,8 +76,24 @@ defmodule SymphonyElixir.AppServerTest do
 
       assert started_session.thread_id == "thread-visible"
       assert started_session.thread_name == "PPL-123: Durable Codex task"
+      assert started_session.project_id == "project-grail"
+      assert started_session.section_id == "section-factory"
       assert started_session.model == "gpt-5.6-terra"
       assert started_session.reasoning_effort == "high"
+
+      issue = %Issue{
+        id: "issue-visible",
+        identifier: "PPL-123",
+        title: "Keep durable task name",
+        description: "Ensure Codex title generation cannot replace the configured task name",
+        state: "In Progress",
+        url: "https://example.org/issues/PPL-123",
+        labels: ["backend"]
+      }
+
+      assert {:ok, %{thread_id: "thread-visible", turn_id: "turn-visible"}} =
+               AppServer.run_turn(started_session, "Run one bounded pass", issue)
+
       assert :ok = AppServer.stop_session(started_session)
 
       assert {:ok, resumed_session} =
@@ -70,6 +101,8 @@ defmodule SymphonyElixir.AppServerTest do
                  resume_thread_id: "thread-visible",
                  thread_name: "PPL-123: Durable Codex task",
                  model: "gpt-5.6-sol",
+                 project_id: "project-grail",
+                 section_id: "section-factory",
                  reasoning_effort: "xhigh"
                )
 
@@ -91,18 +124,439 @@ defmodule SymphonyElixir.AppServerTest do
       assert get_in(start_payload, ["params", "serviceName"]) == "symphony-factory"
       assert get_in(start_payload, ["params", "threadSource"]) == "symphonyFactory"
       assert get_in(start_payload, ["params", "model"]) == "gpt-5.6-terra"
+      assert get_in(start_payload, ["params", "projectId"]) == "project-grail"
 
       assert resume_payload = Enum.find(payloads, &(&1["method"] == "thread/resume"))
       assert get_in(resume_payload, ["params", "threadId"]) == "thread-visible"
       assert get_in(resume_payload, ["params", "model"]) == "gpt-5.6-sol"
+      assert get_in(resume_payload, ["params", "excludeTurns"]) == true
 
       name_payloads = Enum.filter(payloads, &(&1["method"] == "thread/name/set"))
-      assert length(name_payloads) == 2
+      assert length(name_payloads) == 3
 
       assert Enum.all?(name_payloads, fn payload ->
                get_in(payload, ["params", "threadId"]) == "thread-visible" &&
                  get_in(payload, ["params", "name"]) == "PPL-123: Durable Codex task"
              end)
+
+      project_payloads = Enum.filter(payloads, &(&1["method"] == "thread/metadata/update"))
+      assert length(project_payloads) == 2
+
+      assert Enum.all?(project_payloads, fn payload ->
+               get_in(payload, ["params", "threadId"]) == "thread-visible" &&
+                 get_in(payload, ["params", "projectId"]) == "project-grail"
+             end)
+
+      section_payloads = Enum.filter(payloads, &(&1["method"] == "thread/section/move"))
+      assert length(section_payloads) == 2
+
+      assert Enum.all?(section_payloads, fn payload ->
+               get_in(payload, ["params", "threadId"]) == "thread-visible" &&
+                 get_in(payload, ["params", "sectionId"]) == "section-factory"
+             end)
+
+      assert payloads |> Enum.filter(&(&1["method"] == "thread/unsubscribe")) |> length() == 2
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "controller sessions fork durable history when a stale writer blocks resume" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-writer-recovery-#{System.unique_integer([:positive])}"
+      )
+
+    previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
+    on_exit(fn -> restore_env("SYMP_TEST_CODEx_TRACE", previous_trace) end)
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "FACTORY-CONTROLLER")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-writer-recovery.trace")
+
+      File.mkdir_p!(workspace)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="\${SYMP_TEST_CODEx_TRACE:-/tmp/codex-writer-recovery.trace}"
+      while IFS= read -r line; do
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$line" in
+          *'"method":"initialize"'*)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          *'"method":"thread/resume"'*)
+            printf '%s\\n' '{"id":2,"error":{"code":-32600,"message":"thread old-thread already has an active writer"}}'
+            ;;
+          *'"method":"thread/read"'*)
+            printf '%s\\n' '{"id":9,"result":{"thread":{"id":"old-thread","status":{"type":"idle"}}}}'
+            ;;
+          *'"method":"thread/fork"'*)
+            printf '%s\\n' '{"id":5,"result":{"thread":{"id":"recovered-thread"}}}'
+            ;;
+          *'"method":"thread/name/set"'*)
+            printf '%s\\n' '{"id":4,"result":{}}'
+            ;;
+          *'"method":"thread/metadata/update"'*)
+            printf '%s\\n' '{"id":7,"result":{"thread":{"id":"recovered-thread","projectId":"project-grail"}}}'
+            ;;
+          *'"method":"thread/section/move"'*)
+            printf '%s\\n' '{"id":8,"result":{"thread":{"id":"recovered-thread","section":{"id":"section-factory"}}}}'
+            ;;
+          *'"method":"thread/archive"'*)
+            printf '%s\\n' '{"id":10,"result":{}}'
+            ;;
+          *'"method":"thread/unsubscribe"'*)
+            printf '%s\\n' '{"id":6,"result":{"status":"unsubscribed"}}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      assert {:ok, session} =
+               AppServer.start_session(workspace,
+                 resume_thread_id: "old-thread",
+                 fork_on_active_writer: true,
+                 project_id: "project-grail",
+                 section_id: "section-factory",
+                 thread_name: "Software Factory Orchestrator"
+               )
+
+      assert session.thread_id == "recovered-thread"
+      assert session.forked_from_thread_id == "old-thread"
+      assert :ok = AppServer.archive_thread(session, session.forked_from_thread_id)
+      assert :ok = AppServer.stop_session(session)
+
+      payloads =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.filter(&String.starts_with?(&1, "JSON:"))
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+
+      assert fork_payload = Enum.find(payloads, &(&1["method"] == "thread/fork"))
+      assert read_payload = Enum.find(payloads, &(&1["method"] == "thread/read"))
+      assert get_in(read_payload, ["params", "threadId"]) == "old-thread"
+      assert get_in(read_payload, ["params", "includeTurns"]) == false
+      assert get_in(fork_payload, ["params", "threadId"]) == "old-thread"
+      assert get_in(fork_payload, ["params", "ephemeral"]) == false
+      assert get_in(fork_payload, ["params", "excludeTurns"]) == true
+      assert get_in(fork_payload, ["params", "deferGoalContinuation"]) == true
+
+      assert project_payload = Enum.find(payloads, &(&1["method"] == "thread/metadata/update"))
+      assert get_in(project_payload, ["params", "threadId"]) == "recovered-thread"
+      assert get_in(project_payload, ["params", "projectId"]) == "project-grail"
+
+      assert section_payload = Enum.find(payloads, &(&1["method"] == "thread/section/move"))
+      assert get_in(section_payload, ["params", "threadId"]) == "recovered-thread"
+      assert get_in(section_payload, ["params", "sectionId"]) == "section-factory"
+
+      assert archive_payload = Enum.find(payloads, &(&1["method"] == "thread/archive"))
+      assert get_in(archive_payload, ["params", "threadId"]) == "old-thread"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "controller sessions do not fork while the conflicting task is still active" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-active-writer-#{System.unique_integer([:positive])}"
+      )
+
+    previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
+    on_exit(fn -> restore_env("SYMP_TEST_CODEx_TRACE", previous_trace) end)
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "FACTORY-CONTROLLER")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-active-writer.trace")
+
+      File.mkdir_p!(workspace)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="\${SYMP_TEST_CODEx_TRACE:-/tmp/codex-active-writer.trace}"
+      while IFS= read -r line; do
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$line" in
+          *'"method":"initialize"'*)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          *'"method":"thread/resume"'*)
+            printf '%s\\n' '{"id":2,"error":{"code":-32600,"message":"thread old-thread already has an active writer"}}'
+            ;;
+          *'"method":"thread/read"'*)
+            printf '%s\\n' '{"id":9,"result":{"thread":{"id":"old-thread","status":{"type":"active","activeFlags":[]}}}}'
+            ;;
+          *'"method":"thread/fork"'*)
+            printf '%s\\n' '{"id":5,"result":{"thread":{"id":"unexpected-fork"}}}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      assert {:error, {:response_error, %{"message" => message}}} =
+               AppServer.start_session(workspace,
+                 resume_thread_id: "old-thread",
+                 fork_on_active_writer: true
+               )
+
+      assert message =~ "active writer"
+
+      payloads =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.filter(&String.starts_with?(&1, "JSON:"))
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+
+      assert Enum.any?(payloads, &(&1["method"] == "thread/read"))
+      refute Enum.any?(payloads, &(&1["method"] == "thread/fork"))
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server waits for every required MCP server before returning a controller session" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-mcp-ready-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "FACTORY-CONTROLLER")
+      codex_binary = Path.join(test_root, "fake-codex")
+
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      while IFS= read -r line; do
+        case "$line" in
+          *'"method":"initialize"'*)
+            printf '%s\n' '{"method":"mcpServer/startupStatus/updated","params":{"name":"Jira","status":"starting"}}'
+            printf '%s\n' '{"id":1,"result":{}}'
+            ;;
+          *'"method":"thread/start"'*)
+            printf '%s\n' '{"method":"mcpServer/startupStatus/updated","params":{"name":"GitLab","status":"ready"}}'
+            printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-mcp-ready"}}}'
+            ;;
+          *'"method":"thread/name/set"'*)
+            printf '%s\n' '{"id":4,"result":{}}'
+            sleep 0.05
+            printf '%s\n' '{"method":"mcpServer/startupStatus/updated","params":{"name":"Jira","status":"ready"}}'
+            ;;
+          *'"method":"thread/unsubscribe"'*)
+            printf '%s\n' '{"id":6,"result":{"status":"unsubscribed"}}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      assert {:ok, session} =
+               AppServer.start_session(workspace,
+                 thread_name: "Software Factory Orchestrator",
+                 required_mcp_servers: ["Jira", "GitLab"],
+                 mcp_startup_timeout_ms: 1_000
+               )
+
+      assert session.thread_id == "thread-mcp-ready"
+      assert :ok = AppServer.stop_session(session)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server fails closed when a required MCP server fails to start" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-mcp-failed-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "FACTORY-CONTROLLER")
+      codex_binary = Path.join(test_root, "fake-codex")
+
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      while IFS= read -r line; do
+        case "$line" in
+          *'"method":"initialize"'*)
+            printf '%s\n' '{"id":1,"result":{}}'
+            ;;
+          *'"method":"thread/start"'*)
+            printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-mcp-failed"}}}'
+            printf '%s\n' '{"method":"mcpServer/startupStatus/updated","params":{"name":"Jira","status":"failed","failureReason":"authentication failed"}}'
+            ;;
+          *'"method":"thread/unsubscribe"'*)
+            printf '%s\n' '{"id":6,"result":{"status":"unsubscribed"}}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      assert {:error,
+              {:required_mcp_server_failed, "Jira",
+               %{
+                 "status" => "failed",
+                 "error" => nil,
+                 "failure_reason" => "authentication failed"
+               }}} =
+               AppServer.start_session(workspace,
+                 required_mcp_servers: ["Jira"],
+                 mcp_startup_timeout_ms: 1_000
+               )
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server requires an installed callable app before returning a session" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-app-ready-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "FACTORY-CONTROLLER")
+      codex_binary = Path.join(test_root, "fake-codex")
+
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      while IFS= read -r line; do
+        case "$line" in
+          *'"method":"initialize"'*)
+            printf '%s\n' '{"id":1,"result":{}}'
+            ;;
+          *'"method":"thread/start"'*)
+            printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-app-ready"}}}'
+            ;;
+          *'"method":"app/installed"'*)
+            printf '%s\n' '{"id":11,"result":{"apps":[{"id":"polaris-app","runtimeName":"Polaris","enabled":true,"callable":true}]}}'
+            ;;
+          *'"method":"thread/unsubscribe"'*)
+            printf '%s\n' '{"id":6,"result":{"status":"unsubscribed"}}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      assert {:ok, session} =
+               AppServer.start_session(workspace,
+                 required_apps: ["Polaris"]
+               )
+
+      assert session.thread_id == "thread-app-ready"
+      assert :ok = AppServer.stop_session(session)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server fails closed when a required app is not callable" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-app-unavailable-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "FACTORY-CONTROLLER")
+      codex_binary = Path.join(test_root, "fake-codex")
+
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      while IFS= read -r line; do
+        case "$line" in
+          *'"method":"initialize"'*)
+            printf '%s\n' '{"id":1,"result":{}}'
+            ;;
+          *'"method":"thread/start"'*)
+            printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-app-unavailable"}}}'
+            ;;
+          *'"method":"app/installed"'*)
+            printf '%s\n' '{"id":11,"result":{"apps":[{"id":"polaris-app","runtimeName":"Polaris","enabled":true,"callable":false}]}}'
+            ;;
+          *'"method":"thread/unsubscribe"'*)
+            printf '%s\n' '{"id":6,"result":{"status":"unsubscribed"}}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      assert {:error,
+              {:required_app_unavailable, "Polaris",
+               %{
+                 "id" => "polaris-app",
+                 "runtimeName" => "Polaris",
+                 "enabled" => true,
+                 "callable" => false
+               }}} = AppServer.start_session(workspace, required_apps: ["Polaris"])
     after
       File.rm_rf(test_root)
     end

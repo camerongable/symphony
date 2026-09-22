@@ -119,11 +119,7 @@ defmodule SymphonyElixir.Orchestrator do
   def handle_info(:run_poll_cycle, state) do
     state = refresh_runtime_config(state)
 
-    state =
-      case TickLease.run(Config.settings!().factory, fn -> maybe_dispatch(state) end) do
-        {:ran, updated_state} -> updated_state
-        {:skipped, _reason} -> state
-      end
+    state = maybe_run_standard_poll(state, Config.settings!().factory)
 
     state = schedule_tick(state, state.poll_interval_ms)
     state = %{state | poll_check_in_progress: false}
@@ -210,6 +206,15 @@ defmodule SymphonyElixir.Orchestrator do
   def handle_info(msg, state) do
     Logger.debug("Orchestrator ignored message: #{inspect(msg)}")
     {:noreply, state}
+  end
+
+  defp maybe_run_standard_poll(state, %{enabled: true}), do: state
+
+  defp maybe_run_standard_poll(state, factory) do
+    case TickLease.run(factory, fn -> maybe_dispatch(state) end) do
+      {:ran, updated_state} -> updated_state
+      {:skipped, _reason} -> state
+    end
   end
 
   defp handle_agent_down(:normal, state, issue_id, running_entry, session_id) do

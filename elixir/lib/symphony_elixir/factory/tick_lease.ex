@@ -28,7 +28,7 @@ defmodule SymphonyElixir.Factory.TickLease do
     case call_control(fn -> ControlServer.acquire_tick(dispatcher_id, control_server) end) do
       %{result: "ACQUIRED", tick_id: tick_id} ->
         try do
-          {:ran, fun.()}
+          run_with_renewal(factory, fun, control_server, dispatcher_id, tick_id, opts)
         after
           release_tick(control_server, dispatcher_id, tick_id)
         end
@@ -43,6 +43,92 @@ defmodule SymphonyElixir.Factory.TickLease do
       unexpected ->
         Logger.error("Factory tick acquisition returned an unexpected result: #{inspect(unexpected)}")
         {:skipped, "CONTROL_UNAVAILABLE"}
+    end
+  end
+
+  defp run_with_renewal(factory, fun, control_server, dispatcher_id, tick_id, opts) do
+    caller = self()
+    result_ref = make_ref()
+
+    {pid, monitor_ref} =
+      spawn_monitor(fn ->
+        outcome =
+          try do
+            {:returned, fun.()}
+          catch
+            kind, reason -> {:raised, kind, reason, __STACKTRACE__}
+          end
+
+        send(caller, {result_ref, outcome})
+      end)
+
+    lease_seconds = Map.get(factory, :lease_seconds, 240)
+
+    renewal_interval_ms =
+      Keyword.get(opts, :renewal_interval_ms, max(div(lease_seconds * 1_000, 3), 100))
+
+    await_result(
+      pid,
+      monitor_ref,
+      result_ref,
+      renewal_interval_ms,
+      control_server,
+      dispatcher_id,
+      tick_id
+    )
+  end
+
+  defp await_result(
+         pid,
+         monitor_ref,
+         result_ref,
+         renewal_interval_ms,
+         control_server,
+         dispatcher_id,
+         tick_id
+       ) do
+    receive do
+      {^result_ref, {:returned, result}} ->
+        Process.demonitor(monitor_ref, [:flush])
+        {:ran, result}
+
+      {^result_ref, {:raised, kind, reason, stacktrace}} ->
+        Process.demonitor(monitor_ref, [:flush])
+        :erlang.raise(kind, reason, stacktrace)
+
+      {:DOWN, ^monitor_ref, :process, ^pid, reason} ->
+        exit(reason)
+    after
+      renewal_interval_ms ->
+        case renew_tick(control_server, dispatcher_id, tick_id) do
+          %{result: "LEASE_RENEWED"} ->
+            await_result(
+              pid,
+              monitor_ref,
+              result_ref,
+              renewal_interval_ms,
+              control_server,
+              dispatcher_id,
+              tick_id
+            )
+
+          reason ->
+            Process.exit(pid, :kill)
+            await_down(monitor_ref, pid)
+            {:ran, {:error, {:tick_lease_lost, reason}}}
+        end
+    end
+  end
+
+  defp renew_tick(control_server, dispatcher_id, tick_id) do
+    call_control(fn -> ControlServer.renew_tick(dispatcher_id, tick_id, control_server) end)
+  end
+
+  defp await_down(monitor_ref, pid) do
+    receive do
+      {:DOWN, ^monitor_ref, :process, ^pid, _reason} -> :ok
+    after
+      1_000 -> Process.demonitor(monitor_ref, [:flush])
     end
   end
 

@@ -23,6 +23,7 @@ defmodule Mix.Tasks.Factory do
 
   @impl Mix.Task
   def run(args) do
+    ensure_runtime_dependencies!()
     {opts, actions, invalid} = OptionParser.parse(args, strict: @switches, aliases: [h: :help])
 
     cond do
@@ -49,11 +50,18 @@ defmodule Mix.Tasks.Factory do
     end
   end
 
-  defp run_action!("status", factory, _dispatcher_id), do: unwrap!(Admin.status(factory))
+  defp run_action!("status", factory, _dispatcher_id), do: unwrap!(Admin.overview(factory))
   defp run_action!("activate", factory, dispatcher_id), do: unwrap!(Admin.activate(factory, dispatcher_id))
   defp run_action!("pause", factory, dispatcher_id), do: unwrap!(Admin.pause(factory, dispatcher_id))
   defp run_action!(action, _factory, _dispatcher_id), do: Mix.raise("Unknown factory action: #{action}")
 
   defp unwrap!({:ok, result}), do: result
   defp unwrap!({:error, reason}), do: Mix.raise("Factory operation failed: #{inspect(reason)}")
+
+  defp ensure_runtime_dependencies! do
+    case Application.ensure_all_started(:exqlite) do
+      {:ok, _applications} -> :ok
+      {:error, reason} -> Mix.raise("Unable to start factory runtime dependencies: #{inspect(reason)}")
+    end
+  end
 end

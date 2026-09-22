@@ -4,7 +4,8 @@ defmodule SymphonyElixir.FactoryAdminTest do
   alias SymphonyElixir.Factory.Admin
 
   test "controls a factory through short-lived local database connections" do
-    database = Path.join(System.tmp_dir!(), "symphony-admin-#{System.unique_integer([:positive])}.sqlite")
+    token = "#{System.system_time(:nanosecond)}-#{System.unique_integer([:positive])}"
+    database = Path.join(System.tmp_dir!(), "symphony-admin-#{token}.sqlite")
 
     factory = %{
       enabled: true,
@@ -17,6 +18,10 @@ defmodule SymphonyElixir.FactoryAdminTest do
     assert {:ok, %{"status" => "PAUSED"}} = Admin.status(factory)
     assert {:ok, %{result: "ACTIVE"}} = Admin.activate(factory)
     assert {:ok, %{"status" => "ACTIVE"}} = Admin.status(factory)
+
+    assert {:ok, %{control: %{"status" => "ACTIVE"}, runs: [], tasks: []}} =
+             Admin.overview(factory)
+
     assert {:ok, %{result: "PAUSED"}} = Admin.pause(factory)
 
     on_exit(fn -> File.rm(database) end)

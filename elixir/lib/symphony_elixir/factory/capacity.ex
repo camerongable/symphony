@@ -9,7 +9,7 @@ defmodule SymphonyElixir.Factory.Capacity do
 
   alias SymphonyElixir.Factory.Store
 
-  @active_specifier_states ~w(SPECIFYING SPEC_DRAFTING AWAITING_JIRA_READBACK SPEC_REVIEW CRITIQUING)
+  @active_specifier_states ~w(SPECIFYING SPEC_DRAFTING SPEC_WRITING AWAITING_JIRA_READBACK SPEC_REVIEW CRITIQUING SPEC_READY_WRITE)
   @active_writer_states ~w(WRITING VERIFYING REPAIRING DELIVERING)
   @active_validator_states ~w(TESTING)
 
@@ -26,11 +26,12 @@ defmodule SymphonyElixir.Factory.Capacity do
       bytes_per_writer = trunc(writer_disk_gb * 1_000_000_000)
       disk_writer_slots = div(free_bytes, bytes_per_writer)
 
-      local_writer_keys = active_issue_keys(connection, "DELIVERY", @active_writer_states)
+      local_writer_keys = active_issue_keys(connection, nil, @active_writer_states)
 
       writer_keys =
         local_writer_keys
         |> MapSet.union(external_issue_keys(opts, :external_writer_issue_keys))
+        |> maybe_exclude(Keyword.get(opts, :exclude_writer_issue_key))
 
       specifier_keys =
         connection
@@ -99,7 +100,7 @@ defmodule SymphonyElixir.Factory.Capacity do
     end
   end
 
-  defp active_issue_keys(connection, kind, states) do
+  defp active_issue_keys(connection, kind, states) when not is_nil(kind) do
     placeholders = Enum.map_join(states, ", ", fn _state -> "?" end)
 
     result =
@@ -114,12 +115,30 @@ defmodule SymphonyElixir.Factory.Capacity do
     |> MapSet.new()
   end
 
+  defp active_issue_keys(connection, nil, states) do
+    placeholders = Enum.map_join(states, ", ", fn _state -> "?" end)
+
+    result =
+      Store.query!(
+        connection,
+        "SELECT DISTINCT issue_key FROM runs WHERE state IN (#{placeholders})",
+        states
+      )
+
+    result.rows
+    |> Enum.map(fn [issue_key] -> issue_key end)
+    |> MapSet.new()
+  end
+
   defp external_issue_keys(opts, key) do
     opts
     |> Keyword.get(key, [])
     |> Enum.map(&to_string/1)
     |> MapSet.new()
   end
+
+  defp maybe_exclude(keys, nil), do: keys
+  defp maybe_exclude(keys, issue_key), do: MapSet.delete(keys, to_string(issue_key))
 
   defp parse_df_free_bytes(output) do
     case output |> String.split("\n", trim: true) |> List.last() |> String.split(~r/\s+/, trim: true) do

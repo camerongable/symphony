@@ -10,8 +10,17 @@ defmodule SymphonyElixir.Codex.AppServer do
   @thread_start_id 2
   @turn_start_id 3
   @thread_name_set_id 4
+  @thread_fork_id 5
+  @thread_unsubscribe_id 6
+  @thread_metadata_update_id 7
+  @thread_section_move_id 8
+  @thread_read_id 9
+  @thread_archive_id 10
+  @apps_installed_id 11
+  @thread_unsubscribe_timeout_ms 1_000
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
+  @mcp_startup_statuses_key {__MODULE__, :mcp_startup_statuses}
   @type session :: %{
           port: port(),
           metadata: map(),
@@ -20,7 +29,10 @@ defmodule SymphonyElixir.Codex.AppServer do
           thread_sandbox: String.t(),
           turn_sandbox_policy: map(),
           thread_id: String.t(),
+          forked_from_thread_id: String.t() | nil,
           thread_name: String.t() | nil,
+          project_id: String.t() | nil,
+          section_id: String.t() | nil,
           model: String.t() | nil,
           reasoning_effort: String.t() | nil,
           workspace: Path.t(),
@@ -44,50 +56,65 @@ defmodule SymphonyElixir.Codex.AppServer do
     worker_host = Keyword.get(opts, :worker_host)
 
     thread_options = %{
+      mcp_startup_timeout_ms: Keyword.get(opts, :mcp_startup_timeout_ms, 60_000),
+      fork_on_active_writer: Keyword.get(opts, :fork_on_active_writer, false),
       model: Keyword.get(opts, :model),
       name: normalize_thread_name(Keyword.get(opts, :thread_name)),
+      project_id: normalize_project_id(Keyword.get(opts, :project_id)),
+      section_id: normalize_section_id(Keyword.get(opts, :section_id)),
       reasoning_effort: Keyword.get(opts, :reasoning_effort),
+      required_apps: normalize_required_apps(Keyword.get(opts, :required_apps, [])),
+      required_mcp_servers: normalize_required_mcp_servers(Keyword.get(opts, :required_mcp_servers, [])),
       resume_thread_id: Keyword.get(opts, :resume_thread_id),
       service_name: Keyword.get(opts, :service_name, "symphony-orchestrator"),
       thread_source: Keyword.get(opts, :thread_source, "symphony")
     }
 
-    dynamic_tool_binding = DynamicTool.bind()
+    Process.put(@mcp_startup_statuses_key, %{})
 
-    with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
-         {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
-      metadata = port_metadata(port, worker_host)
+    try do
+      dynamic_tool_binding = DynamicTool.bind()
 
-      with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
-           {:ok, thread_id} <-
-             do_start_session(
-               port,
-               expanded_workspace,
-               session_policies,
-               dynamic_tool_binding,
-               thread_options
-             ) do
-        {:ok,
-         %{
-           port: port,
-           metadata: metadata,
-           approval_policy: session_policies.approval_policy,
-           auto_approve_requests: session_policies.approval_policy == "never",
-           thread_sandbox: session_policies.thread_sandbox,
-           turn_sandbox_policy: session_policies.turn_sandbox_policy,
-           thread_id: thread_id,
-           thread_name: thread_options.name,
-           model: thread_options.model,
-           reasoning_effort: thread_options.reasoning_effort,
-           workspace: expanded_workspace,
-           worker_host: worker_host,
-           dynamic_tool_binding: dynamic_tool_binding
-         }}
-      else
-        {:error, reason} ->
-          stop_port(port)
-          {:error, reason}
+      with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
+           {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
+        metadata = port_metadata(port, worker_host)
+
+        with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
+             {:ok, thread_ref} <-
+               do_start_session(
+                 port,
+                 expanded_workspace,
+                 session_policies,
+                 dynamic_tool_binding,
+                 thread_options
+               ) do
+          {:ok,
+           %{
+             port: port,
+             metadata: metadata,
+             approval_policy: session_policies.approval_policy,
+             auto_approve_requests: session_policies.approval_policy == "never",
+             thread_sandbox: session_policies.thread_sandbox,
+             turn_sandbox_policy: session_policies.turn_sandbox_policy,
+             thread_id: thread_ref.thread_id,
+             forked_from_thread_id: thread_ref.forked_from_thread_id,
+             thread_name: thread_options.name,
+             project_id: thread_options.project_id,
+             section_id: thread_options.section_id,
+             model: thread_options.model,
+             reasoning_effort: thread_options.reasoning_effort,
+             workspace: expanded_workspace,
+             worker_host: worker_host,
+             dynamic_tool_binding: dynamic_tool_binding
+           }}
+        else
+          {:error, reason} ->
+            stop_port(port)
+            {:error, reason}
+        end
       end
+    after
+      Process.delete(@mcp_startup_statuses_key)
     end
   end
 
@@ -102,6 +129,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           thread_id: thread_id,
           model: model,
           reasoning_effort: reasoning_effort,
+          thread_name: thread_name,
           workspace: workspace,
           dynamic_tool_binding: dynamic_tool_binding
         },
@@ -126,7 +154,8 @@ defmodule SymphonyElixir.Codex.AppServer do
              approval_policy: approval_policy,
              sandbox_policy: turn_sandbox_policy,
              model: model,
-             reasoning_effort: reasoning_effort
+             reasoning_effort: reasoning_effort,
+             output_schema: Keyword.get(opts, :output_schema)
            }
          ) do
       {:ok, turn_id} ->
@@ -146,6 +175,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
         case await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
           {:ok, result} ->
+            reassert_thread_name(port, thread_id, thread_name)
             Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
 
             {:ok,
@@ -157,6 +187,7 @@ defmodule SymphonyElixir.Codex.AppServer do
              }}
 
           {:error, reason} ->
+            reassert_thread_name(port, thread_id, thread_name)
             Logger.warning("Codex session ended with error for #{issue_context(issue)} session_id=#{session_id}: #{inspect(reason)}")
 
             emit_message(
@@ -180,8 +211,29 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   @spec stop_session(session()) :: :ok
-  def stop_session(%{port: port}) when is_port(port) do
-    stop_port(port)
+  def stop_session(%{port: port, thread_id: thread_id}) when is_port(port) do
+    Process.unlink(port)
+
+    try do
+      unsubscribe_thread(port, thread_id)
+    after
+      stop_port(port)
+    end
+  end
+
+  @doc "Archives a superseded durable task through the active app-server session."
+  @spec archive_thread(session(), String.t()) :: :ok | {:error, term()}
+  def archive_thread(%{port: port}, thread_id) when is_port(port) and is_binary(thread_id) do
+    send_message(port, %{
+      "method" => "thread/archive",
+      "id" => @thread_archive_id,
+      "params" => %{"threadId" => thread_id}
+    })
+
+    case await_response(port, @thread_archive_id) do
+      {:ok, _response} -> :ok
+      other -> other
+    end
   end
 
   defp validate_workspace_cwd(workspace, nil) when is_binary(workspace) do
@@ -349,16 +401,39 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp open_thread(port, workspace, session_policies, dynamic_tool_binding, thread_options) do
-    with {:ok, thread_id} <-
-           start_or_resume_thread(
+    case start_or_resume_thread(
+           port,
+           workspace,
+           session_policies,
+           dynamic_tool_binding,
+           thread_options
+         ) do
+      {:ok, thread_ref} ->
+        finish_open_thread(port, thread_ref, thread_options)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp finish_open_thread(port, thread_ref, thread_options) do
+    thread_id = thread_ref.thread_id
+
+    with :ok <- set_thread_name(port, thread_id, thread_options.name),
+         :ok <- set_thread_project(port, thread_id, thread_options.project_id),
+         :ok <- move_thread_to_section(port, thread_id, thread_options.section_id),
+         :ok <-
+           await_required_mcp_servers(
              port,
-             workspace,
-             session_policies,
-             dynamic_tool_binding,
-             thread_options
+             thread_options.required_mcp_servers,
+             thread_options.mcp_startup_timeout_ms
            ),
-         :ok <- set_thread_name(port, thread_id, thread_options.name) do
-      {:ok, thread_id}
+         :ok <- ensure_required_apps(port, thread_options.required_apps, thread_id) do
+      {:ok, thread_ref}
+    else
+      {:error, _reason} = error ->
+        unsubscribe_thread(port, thread_id)
+        error
     end
   end
 
@@ -401,6 +476,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         "threadSource" => thread_options.thread_source
       }
       |> put_if_present("model", thread_options.model)
+      |> put_if_present("projectId", thread_options.project_id)
 
     send_message(port, %{
       "method" => "thread/start",
@@ -411,8 +487,11 @@ defmodule SymphonyElixir.Codex.AppServer do
     case await_response(port, @thread_start_id) do
       {:ok, %{"thread" => thread_payload}} ->
         case thread_payload do
-          %{"id" => thread_id} -> {:ok, thread_id}
-          _ -> {:error, {:invalid_thread_payload, thread_payload}}
+          %{"id" => thread_id} ->
+            {:ok, %{thread_id: thread_id, forked_from_thread_id: nil}}
+
+          _ ->
+            {:error, {:invalid_thread_payload, thread_payload}}
         end
 
       other ->
@@ -423,7 +502,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp resume_thread(
          port,
          workspace,
-         %{approval_policy: approval_policy, thread_sandbox: thread_sandbox},
+         %{approval_policy: approval_policy, thread_sandbox: thread_sandbox} = session_policies,
          thread_options
        ) do
     params =
@@ -431,6 +510,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         "threadId" => thread_options.resume_thread_id,
         "approvalPolicy" => approval_policy,
         "sandbox" => thread_sandbox,
+        "excludeTurns" => true,
         "cwd" => workspace
       }
       |> put_if_present("model", thread_options.model)
@@ -442,9 +522,104 @@ defmodule SymphonyElixir.Codex.AppServer do
     })
 
     case await_response(port, @thread_start_id) do
-      {:ok, %{"thread" => %{"id" => thread_id}}} -> {:ok, thread_id}
-      {:ok, payload} -> {:error, {:invalid_thread_payload, payload}}
-      other -> other
+      {:ok, %{"thread" => %{"id" => thread_id}}} ->
+        {:ok, %{thread_id: thread_id, forked_from_thread_id: nil}}
+
+      {:ok, payload} ->
+        {:error, {:invalid_thread_payload, payload}}
+
+      {:error, {:response_error, error}} ->
+        maybe_fork_active_writer(port, workspace, session_policies, thread_options, error)
+
+      other ->
+        other
+    end
+  end
+
+  defp maybe_fork_active_writer(
+         port,
+         workspace,
+         session_policies,
+         %{fork_on_active_writer: true} = thread_options,
+         %{"code" => -32_600, "message" => message} = error
+       )
+       when is_binary(message) do
+    if String.contains?(String.downcase(message), "active writer") do
+      case read_thread_status(port, thread_options.resume_thread_id) do
+        {:ok, status} when status in ["idle", "notLoaded", "systemError"] ->
+          fork_thread(port, workspace, session_policies, thread_options)
+
+        {:ok, _active_status} ->
+          {:error, {:response_error, error}}
+
+        {:error, _reason} = read_error ->
+          read_error
+      end
+    else
+      {:error, {:response_error, %{"code" => -32_600, "message" => message}}}
+    end
+  end
+
+  defp maybe_fork_active_writer(_port, _workspace, _session_policies, _thread_options, error),
+    do: {:error, {:response_error, error}}
+
+  defp fork_thread(
+         port,
+         workspace,
+         %{approval_policy: approval_policy, thread_sandbox: thread_sandbox},
+         thread_options
+       ) do
+    params =
+      %{
+        "threadId" => thread_options.resume_thread_id,
+        "approvalPolicy" => approval_policy,
+        "sandbox" => thread_sandbox,
+        "ephemeral" => false,
+        "excludeTurns" => true,
+        "deferGoalContinuation" => true,
+        "cwd" => workspace,
+        "threadSource" => thread_options.thread_source
+      }
+      |> put_if_present("model", thread_options.model)
+
+    send_message(port, %{
+      "method" => "thread/fork",
+      "id" => @thread_fork_id,
+      "params" => params
+    })
+
+    case await_response(port, @thread_fork_id) do
+      {:ok, %{"thread" => %{"id" => thread_id}}} ->
+        {:ok,
+         %{
+           thread_id: thread_id,
+           forked_from_thread_id: thread_options.resume_thread_id
+         }}
+
+      {:ok, payload} ->
+        {:error, {:invalid_thread_payload, payload}}
+
+      other ->
+        other
+    end
+  end
+
+  defp read_thread_status(port, thread_id) do
+    send_message(port, %{
+      "method" => "thread/read",
+      "id" => @thread_read_id,
+      "params" => %{"threadId" => thread_id, "includeTurns" => false}
+    })
+
+    case await_response(port, @thread_read_id) do
+      {:ok, %{"thread" => %{"status" => %{"type" => status}}}} when is_binary(status) ->
+        {:ok, status}
+
+      {:ok, payload} ->
+        {:error, {:invalid_thread_read_payload, payload}}
+
+      other ->
+        other
     end
   end
 
@@ -463,6 +638,97 @@ defmodule SymphonyElixir.Codex.AppServer do
     case await_response(port, @thread_name_set_id) do
       {:ok, _response} -> :ok
       other -> other
+    end
+  end
+
+  defp reassert_thread_name(port, thread_id, thread_name) do
+    case set_thread_name(port, thread_id, thread_name) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("Failed to restore configured Codex task name for thread_id=#{thread_id}: #{inspect(reason)}")
+    end
+  end
+
+  defp set_thread_project(_port, _thread_id, nil), do: :ok
+
+  defp set_thread_project(port, thread_id, project_id) do
+    send_message(port, %{
+      "method" => "thread/metadata/update",
+      "id" => @thread_metadata_update_id,
+      "params" => %{
+        "threadId" => thread_id,
+        "projectId" => project_id
+      }
+    })
+
+    case await_response(port, @thread_metadata_update_id) do
+      {:ok, _response} -> :ok
+      other -> other
+    end
+  end
+
+  defp move_thread_to_section(_port, _thread_id, nil), do: :ok
+
+  defp move_thread_to_section(port, thread_id, section_id) do
+    send_message(port, %{
+      "method" => "thread/section/move",
+      "id" => @thread_section_move_id,
+      "params" => %{
+        "threadId" => thread_id,
+        "sectionId" => section_id
+      }
+    })
+
+    case await_response(port, @thread_section_move_id) do
+      {:ok, _response} -> :ok
+      other -> other
+    end
+  end
+
+  defp unsubscribe_thread(port, thread_id) do
+    case :erlang.port_info(port) do
+      :undefined ->
+        :ok
+
+      _port_info ->
+        case send_unsubscribe(port, thread_id) do
+          :sent -> confirm_thread_unsubscribe(port)
+          :closed -> :ok
+        end
+    end
+  end
+
+  defp send_unsubscribe(port, thread_id) do
+    message = %{
+      "method" => "thread/unsubscribe",
+      "id" => @thread_unsubscribe_id,
+      "params" => %{"threadId" => thread_id}
+    }
+
+    try do
+      send_message(port, message)
+      :sent
+    rescue
+      ArgumentError -> :closed
+    catch
+      :exit, _reason -> :closed
+    end
+  end
+
+  defp confirm_thread_unsubscribe(port) do
+    case with_timeout_response(port, @thread_unsubscribe_id, @thread_unsubscribe_timeout_ms, "") do
+      {:ok, %{"status" => status}} when status in ["unsubscribed", "notSubscribed", "notLoaded"] ->
+        :ok
+
+      {:ok, result} ->
+        Logger.warning("Unexpected Codex thread unsubscribe response: #{inspect(result)}")
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("Unable to confirm Codex thread unsubscribe: #{inspect(reason)}")
+        :ok
     end
   end
 
@@ -489,6 +755,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       }
       |> put_if_present("model", turn_options.model)
       |> put_if_present("effort", turn_options.reasoning_effort)
+      |> put_if_present("outputSchema", turn_options.output_schema)
 
     send_message(port, %{
       "method" => "turn/start",
@@ -510,6 +777,24 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp normalize_thread_name(_name), do: nil
+
+  defp normalize_project_id(project_id) when is_binary(project_id) do
+    case String.trim(project_id) do
+      "" -> nil
+      normalized -> normalized
+    end
+  end
+
+  defp normalize_project_id(_project_id), do: nil
+
+  defp normalize_section_id(section_id) when is_binary(section_id) do
+    case String.trim(section_id) do
+      "" -> nil
+      normalized -> normalized
+    end
+  end
+
+  defp normalize_section_id(_section_id), do: nil
 
   defp put_if_present(map, _key, nil), do: map
   defp put_if_present(map, key, value), do: Map.put(map, key, value)
@@ -1076,6 +1361,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:response_error, response_payload}}
 
       {:ok, %{} = other} ->
+        record_mcp_startup_status(other)
         Logger.debug("Ignoring message while waiting for response: #{inspect(other)}")
         with_timeout_response(port, request_id, timeout_ms, "")
 
@@ -1083,6 +1369,180 @@ defmodule SymphonyElixir.Codex.AppServer do
         log_non_json_stream_line(payload, "response stream")
         with_timeout_response(port, request_id, timeout_ms, "")
     end
+  end
+
+  defp await_required_mcp_servers(_port, [], _timeout_ms), do: :ok
+
+  defp await_required_mcp_servers(port, required_servers, timeout_ms) do
+    deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
+    await_required_mcp_servers(port, required_servers, deadline_ms, "")
+  end
+
+  defp await_required_mcp_servers(port, required_servers, deadline_ms, pending_line) do
+    statuses = Process.get(@mcp_startup_statuses_key, %{})
+
+    case required_mcp_servers_state(required_servers, statuses) do
+      :ready ->
+        :ok
+
+      {:failed, server, details} ->
+        {:error, {:required_mcp_server_failed, server, details}}
+
+      {:waiting, waiting_servers} ->
+        receive_required_mcp_status(port, required_servers, waiting_servers, deadline_ms, pending_line)
+    end
+  end
+
+  defp receive_required_mcp_status(port, required_servers, waiting_servers, deadline_ms, pending_line) do
+    remaining_ms = max(deadline_ms - System.monotonic_time(:millisecond), 0)
+
+    receive do
+      {^port, {:data, {:eol, chunk}}} ->
+        payload = pending_line <> to_string(chunk)
+        record_mcp_status_line(payload)
+        await_required_mcp_servers(port, required_servers, deadline_ms, "")
+
+      {^port, {:data, {:noeol, chunk}}} ->
+        await_required_mcp_servers(
+          port,
+          required_servers,
+          deadline_ms,
+          pending_line <> to_string(chunk)
+        )
+
+      {^port, {:exit_status, status}} ->
+        {:error, {:port_exit, status}}
+    after
+      remaining_ms ->
+        {:error, {:required_mcp_servers_unavailable, waiting_servers}}
+    end
+  end
+
+  defp record_mcp_status_line(payload) do
+    case Jason.decode(payload) do
+      {:ok, %{} = message} -> record_mcp_startup_status(message)
+      {:error, _reason} -> log_non_json_stream_line(payload, "MCP startup stream")
+    end
+  end
+
+  defp record_mcp_startup_status(%{
+         "method" => "mcpServer/startupStatus/updated",
+         "params" => %{"name" => name, "status" => status} = params
+       })
+       when is_binary(name) and is_binary(status) do
+    case Process.get(@mcp_startup_statuses_key) do
+      %{} = statuses ->
+        Process.put(
+          @mcp_startup_statuses_key,
+          Map.put(statuses, name, %{
+            "status" => String.downcase(status),
+            "error" => params["error"],
+            "failure_reason" => params["failureReason"]
+          })
+        )
+
+      _not_tracking ->
+        :ok
+    end
+
+    :ok
+  end
+
+  defp record_mcp_startup_status(_message), do: :ok
+
+  defp required_mcp_servers_state(required_servers, statuses) do
+    Enum.reduce_while(required_servers, :ready, fn server, result ->
+      case Map.get(statuses, server) do
+        %{"status" => "ready"} ->
+          {:cont, result}
+
+        %{"status" => status} = details when status in ["failed", "error", "cancelled"] ->
+          {:halt, {:failed, server, details}}
+
+        _other ->
+          {:cont, add_waiting_mcp_server(result, server)}
+      end
+    end)
+    |> case do
+      {:waiting, servers} -> {:waiting, Enum.reverse(servers)}
+      other -> other
+    end
+  end
+
+  defp add_waiting_mcp_server(:ready, server), do: {:waiting, [server]}
+  defp add_waiting_mcp_server({:waiting, servers}, server), do: {:waiting, [server | servers]}
+
+  defp normalize_required_mcp_servers(servers) when is_list(servers) do
+    servers
+    |> Enum.filter(&is_binary/1)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq()
+  end
+
+  defp normalize_required_mcp_servers(_servers), do: []
+
+  defp ensure_required_apps(_port, [], _thread_id), do: :ok
+
+  defp ensure_required_apps(port, required_apps, thread_id) do
+    send_message(port, %{
+      "id" => @apps_installed_id,
+      "method" => "app/installed",
+      "params" => %{"forceRefresh" => true, "threadId" => thread_id}
+    })
+
+    case await_response(port, @apps_installed_id) do
+      {:ok, %{"apps" => apps}} when is_list(apps) ->
+        required_apps_state(required_apps, apps)
+
+      {:ok, response} ->
+        {:error, {:required_apps_invalid_response, response}}
+
+      {:error, reason} ->
+        {:error, {:required_apps_unavailable, required_apps, reason}}
+    end
+  end
+
+  defp required_apps_state(required_apps, installed_apps) do
+    Enum.reduce_while(required_apps, :ok, fn required_app, :ok ->
+      case Enum.find(installed_apps, &app_matches?(&1, required_app)) do
+        %{"enabled" => true, "callable" => true} ->
+          {:cont, :ok}
+
+        %{} = app ->
+          details = Map.take(app, ["id", "runtimeName", "enabled", "callable"])
+          {:halt, {:error, {:required_app_unavailable, required_app, details}}}
+
+        nil ->
+          {:halt, {:error, {:required_app_missing, required_app}}}
+      end
+    end)
+  end
+
+  defp app_matches?(app, required_app) when is_map(app) do
+    required = normalize_app_identifier(required_app)
+
+    [app["id"], app["runtimeName"]]
+    |> Enum.filter(&is_binary/1)
+    |> Enum.any?(&(normalize_app_identifier(&1) == required))
+  end
+
+  defp app_matches?(_app, _required_app), do: false
+
+  defp normalize_required_apps(apps) when is_list(apps) do
+    apps
+    |> Enum.filter(&is_binary/1)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq()
+  end
+
+  defp normalize_required_apps(_apps), do: []
+
+  defp normalize_app_identifier(value) do
+    value
+    |> String.trim()
+    |> String.downcase()
   end
 
   defp log_non_json_stream_line(data, stream_label) do

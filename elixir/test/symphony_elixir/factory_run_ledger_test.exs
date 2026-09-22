@@ -6,7 +6,8 @@ defmodule SymphonyElixir.FactoryRunLedgerTest do
   @now ~U[2026-09-21 21:00:00Z]
 
   setup do
-    database = Path.join(System.tmp_dir!(), "symphony-ledger-#{System.unique_integer([:positive])}.sqlite")
+    token = "#{System.system_time(:nanosecond)}-#{System.unique_integer([:positive])}"
+    database = Path.join(System.tmp_dir!(), "symphony-ledger-#{token}.sqlite")
     connection = start_supervised!({Store, database: database})
     on_exit(fn -> File.rm(database) end)
     %{connection: connection}

@@ -4,7 +4,7 @@ defmodule SymphonyElixir.FactoryTickLeaseTest do
   alias SymphonyElixir.Factory.{Control, ControlServer, Store, TickLease}
 
   setup do
-    suffix = System.unique_integer([:positive])
+    suffix = "#{System.system_time(:nanosecond)}-#{System.unique_integer([:positive])}"
     database = Path.join(System.tmp_dir!(), "symphony-tick-#{suffix}.sqlite")
     store = start_supervised!({Store, database: database})
     control_name = Module.concat(__MODULE__, "Control#{suffix}")
@@ -48,5 +48,33 @@ defmodule SymphonyElixir.FactoryTickLeaseTest do
     end
 
     assert %{"tick_id" => nil} = Control.status(context.store, context.factory.scope)
+  end
+
+  test "a long tick renews its lease before it expires", context do
+    assert {:ok, _active} = ControlServer.activate("dispatcher-a", context.control_name)
+    parent = self()
+
+    task =
+      Task.async(fn ->
+        TickLease.run(
+          context.factory,
+          fn ->
+            send(parent, :long_tick_started)
+            Process.sleep(250)
+            :completed
+          end,
+          control_server: context.control_name,
+          renewal_interval_ms: 50
+        )
+      end)
+
+    assert_receive :long_tick_started
+    Process.sleep(120)
+
+    assert %{result: "LEASE_HELD"} =
+             ControlServer.acquire_tick("dispatcher-a", context.control_name)
+
+    assert {:ran, :completed} = Task.await(task)
+    assert ControlServer.status(context.control_name)["tick_id"] == nil
   end
 end

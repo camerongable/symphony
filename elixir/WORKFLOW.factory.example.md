@@ -7,7 +7,7 @@ tracker:
     api_token: $JIRA_API_TOKEN
   assignee: currentUser()
   required_any_labels:
-    - ai-spec-needed
+    - spec-needed
     - ai-ready
     - ai-running
     - ai-testing
@@ -27,6 +27,7 @@ agent:
   max_turns: 20
 codex:
   command: codex app-server
+  read_timeout_ms: 60000
   approval_policy: never
   thread_sandbox: workspace-write
   turn_sandbox_policy:
@@ -37,15 +38,79 @@ factory:
   database: ~/Library/Application Support/symphony/factory.sqlite
   scope: assigned-jira-work
   dispatcher_id: replace-with-a-stable-uuid
+  controller_codex_project_id: replace-with-a-codex-project-id
+  branch_prefix: your-gitlab-username
   lease_seconds: 240
+  controller_required_mcp_servers:
+    - Jira
+    - GitLab
+  controller_mcp_startup_timeout_ms: 60000
   maximum_specifiers: 2
   maximum_writers: 2
   maximum_validators: 2
-  writer_disk_gb: 15
+  writer_disk_gb: 20
+  maximum_implementation_iterations: 8
+  maximum_code_repair_rounds: 2
+  maximum_validation_repair_rounds: 2
+  stale_task_minutes: 90
+  queue:
+    assignee: currentUser()
+    projects: []
+    epics: []
+    statuses:
+      - READY
+      - TO DO
+    factory_labels:
+      - spec-needed
+      - needs-decision
+      - ai-ready
+      - ai-running
+      - ai-verifying
+      - ai-testing
+      - ai-review
+      - ai-blocked
+  cleanup:
+    enabled: true
+    authorization_max_age_minutes: 60
+    allowed_jira_statuses:
+      - DONE
+      - IN TESTING
+      - TESTING
+    allowed_mr_states:
+      - merged
+    allowed_run_states:
+      - READY_FOR_REVIEW
+      - DELIVERED
+    allowed_worktree_roots:
+      - ~/code/symphony-workspaces
+  hibernation:
+    enabled: true
+    allowed_run_states:
+      - AWAITING_VALIDATION
+      - READY_FOR_REVIEW
+      - TESTING
+    reclaim_script: /absolute/path/to/reclaim-disk-space/scripts/reclaim.py
+  manual_validation:
+    enabled: true
+    required_apps:
+      - replace-with-slack-provider-app-id
+    required_mcp_servers: []
+    startup_timeout_ms: 60000
+    allowed_environments:
+      - cpp-dev
+      - cpp-sandbox
+      - cpp-test
+    require_slack_coordination: true
+    allow_production: false
+    allow_database_ddl: false
   repositories:
     example:
+      codex_project_id: replace-with-a-codex-project-id
       path: /absolute/path/to/repository
       base_branch: main
+      gitlab_project: group/repository
+      route_labels:
+        - repo-example
   models:
     default_provider: codex
     providers:
@@ -54,6 +119,10 @@ factory:
         standard: gpt-5.6-terra
         strong: gpt-5.6-sol
     roles:
+      orchestrator:
+        provider: codex
+        model_class: standard
+        reasoning_effort: medium
       specification-author:
         provider: codex
         model_class: standard
@@ -62,11 +131,15 @@ factory:
         provider: codex
         model_class: strong
         reasoning_effort: high
+      feature-planner:
+        provider: codex
+        model_class: strong
+        reasoning_effort: high
       feature-writer:
         provider: codex
         model_class: standard
         reasoning_effort: high
-      high-risk-feature-writer:
+      feature-writer-high-risk:
         provider: codex
         model_class: strong
         reasoning_effort: xhigh
@@ -88,7 +161,7 @@ factory:
         reasoning_effort: medium
     delivery_routing:
       default_role: feature-writer
-      high_risk_role: high-risk-feature-writer
+      high_risk_role: feature-writer-high-risk
       unknown_risk_is_high: true
       high_risk_values:
         - high
