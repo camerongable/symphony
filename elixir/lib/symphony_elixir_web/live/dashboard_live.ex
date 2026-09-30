@@ -403,7 +403,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
       |> assign(:factory, factory)
       |> assign(:shared_capacity, List.first(factory[:capacity] || []))
       |> assign(:repository_keys, repository_keys(factory[:capacity] || []))
-      |> assign(:current_runs, current_runs(factory[:runs] || []))
+      |> assign(:current_runs, current_runs(factory[:current_runs] || factory[:runs] || []))
 
     ~H"""
     <section class="factory-workspace">

@@ -33,6 +33,12 @@ defmodule SymphonyElixir.Factory.RunLedger do
     workspace_state hibernated_at
   )
 
+  @active_child_specification_states ~w(
+    SPECIFYING SPEC_DRAFTING CONTRACT_DISCUSSING SPEC_WRITING
+    AWAITING_JIRA_READBACK SPEC_REVIEW CRITIQUING SPEC_READY_WRITE
+    AWAITING_CONFIRMATION AWAITING_SPEC_INPUT AWAITING_CONTRACT_INPUT
+  )
+
   @doc """
   Registers a new factory run and its initial event.
   """
@@ -465,6 +471,45 @@ defmodule SymphonyElixir.Factory.RunLedger do
   @spec list_recent(Store.connection(), pos_integer()) :: [map()]
   def list_recent(connection, limit \\ 50) when is_integer(limit) and limit > 0 do
     result = Store.query!(connection, "SELECT * FROM runs ORDER BY created_at DESC, rowid DESC LIMIT ?", [limit])
+    Enum.map(result.rows, &Map.new(Enum.zip(result.columns, &1)))
+  end
+
+  @doc "Lists each issue's effective run, retaining active child work over its parent."
+  @spec list_current(Store.connection(), pos_integer()) :: [map()]
+  def list_current(connection, limit \\ 50) when is_integer(limit) and limit > 0 do
+    active_states = Enum.map_join(@active_child_specification_states, ", ", fn _state -> "?" end)
+
+    result =
+      Store.query!(
+        connection,
+        """
+        WITH ranked AS (
+          SELECT run.rowid AS run_rowid,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY run.issue_key
+                   ORDER BY
+                     CASE
+                       WHEN run.parent_run_id IS NULL THEN 1
+                       WHEN run.state = 'FAILED' AND parent.state NOT IN ('READY_FOR_REVIEW', 'DELIVERED') THEN 1
+                       WHEN run.kind = 'SPECIFICATION' AND run.state IN (#{active_states}) THEN 1
+                       WHEN run.kind = 'VALIDATION' AND run.state NOT IN
+                         ('READY_FOR_REVIEW', 'DELIVERED', 'AWAITING_VALIDATION', 'CANCELLED', 'FAILED') THEN 1
+                       ELSE 0
+                     END DESC,
+                     run.created_at DESC, run.rowid DESC
+                 ) AS issue_rank
+          FROM runs AS run
+          LEFT JOIN runs AS parent ON parent.run_id = run.parent_run_id
+        )
+        SELECT runs.* FROM runs
+        JOIN ranked ON ranked.run_rowid = runs.rowid
+        WHERE ranked.issue_rank = 1
+        ORDER BY runs.created_at DESC, runs.rowid DESC
+        LIMIT ?
+        """,
+        @active_child_specification_states ++ [limit]
+      )
+
     Enum.map(result.rows, &Map.new(Enum.zip(result.columns, &1)))
   end
 

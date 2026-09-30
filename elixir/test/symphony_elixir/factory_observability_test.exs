@@ -344,6 +344,139 @@ defmodule SymphonyElixir.FactoryObservabilityTest do
     assert [%{local_state: "READY_FOR_REVIEW"}] = snapshot.intake.issues
   end
 
+  test "an active child specification is current until it completes, then its parent delivery is current", context do
+    issue_key = "PPL-415"
+
+    assert {:ok, _old} =
+             RunLedger.register(
+               context.store,
+               %{run_id: "old-spec", issue_key: issue_key, kind: "SPECIFICATION", state: "FAILED"},
+               now: ~U[2026-09-29 09:00:00Z]
+             )
+
+    assert {:ok, _parent} =
+             RunLedger.register(
+               context.store,
+               %{run_id: "delivery-parent", issue_key: issue_key, kind: "DELIVERY", state: "FAILED"},
+               now: ~U[2026-09-29 10:00:00Z]
+             )
+
+    assert {:ok, _child} =
+             RunLedger.register(
+               context.store,
+               %{
+                 run_id: "contract-child",
+                 issue_key: issue_key,
+                 kind: "SPECIFICATION",
+                 state: "CONTRACT_DISCUSSING",
+                 parent_run_id: "delivery-parent"
+               },
+               now: ~U[2026-09-29 11:00:00Z]
+             )
+
+    assert {:ok, _intake} =
+             IntakeLedger.replace(context.store, context.factory.scope, [
+               jira_snapshot(issue_key, ["repo-symphony", "ai-running"])
+             ])
+
+    active =
+      Observability.snapshot(
+        settings: %{factory: context.factory},
+        store: context.store,
+        control_server: context.control_server,
+        run_limit: 1,
+        capacity_opts: [free_bytes: 45_000_000_000]
+      )
+
+    assert [%{run_id: "contract-child"}] = active.current_runs
+    assert active.overview.by_issue == %{issue_key => "ACTIVE"}
+
+    assert {:ok, _child} =
+             RunLedger.update(context.store, "contract-child", %{state: "DELIVERED"}, now: ~U[2026-09-29 12:00:00Z])
+
+    assert {:ok, _parent} =
+             RunLedger.update(
+               context.store,
+               "delivery-parent",
+               %{state: "READY_FOR_REVIEW"},
+               now: ~U[2026-09-29 12:01:00Z]
+             )
+
+    assert {:ok, _old} =
+             RunLedger.update(context.store, "old-spec", %{workspace_state: "CLEANED"}, now: ~U[2026-09-29 13:00:00Z])
+
+    assert {:ok, _intake} =
+             IntakeLedger.replace(context.store, context.factory.scope, [
+               jira_snapshot(issue_key, ["repo-symphony", "ai-review"])
+             ])
+
+    review =
+      Observability.snapshot(
+        settings: %{factory: context.factory},
+        store: context.store,
+        control_server: context.control_server,
+        run_limit: 1,
+        capacity_opts: [free_bytes: 45_000_000_000]
+      )
+
+    assert [%{run_id: "delivery-parent", state: "READY_FOR_REVIEW"}] = review.current_runs
+    assert review.counts.review_ready == 1
+    assert review.counts.blocked == 0
+    assert review.overview.by_issue == %{issue_key => "REVIEW_READY"}
+    assert [%{local_state: "READY_FOR_REVIEW"}] = review.intake.issues
+  end
+
+  test "a failed child remains visible until its parent reaches review", context do
+    issue_key = "PPL-416"
+
+    assert {:ok, _parent} =
+             RunLedger.register(
+               context.store,
+               %{run_id: "validation-parent", issue_key: issue_key, kind: "DELIVERY", state: "AWAITING_VALIDATION"},
+               now: ~U[2026-09-29 10:00:00Z]
+             )
+
+    assert {:ok, _child} =
+             RunLedger.register(
+               context.store,
+               %{
+                 run_id: "validation-child",
+                 issue_key: issue_key,
+                 kind: "VALIDATION",
+                 state: "FAILED",
+                 parent_run_id: "validation-parent",
+                 last_error: "validation failed"
+               },
+               now: ~U[2026-09-29 11:00:00Z]
+             )
+
+    blocked =
+      Observability.snapshot(
+        settings: %{factory: context.factory},
+        store: context.store,
+        control_server: context.control_server,
+        capacity_opts: [free_bytes: 45_000_000_000]
+      )
+
+    assert [%{run_id: "validation-child"}] = blocked.current_runs
+    assert blocked.counts.blocked == 1
+    assert blocked.overview.by_issue == %{issue_key => "NEEDS_ATTENTION"}
+
+    assert {:ok, _parent} =
+             RunLedger.update(context.store, "validation-parent", %{state: "READY_FOR_REVIEW"})
+
+    recovered =
+      Observability.snapshot(
+        settings: %{factory: context.factory},
+        store: context.store,
+        control_server: context.control_server,
+        capacity_opts: [free_bytes: 45_000_000_000]
+      )
+
+    assert [%{run_id: "validation-parent"}] = recovered.current_runs
+    assert recovered.overview.by_issue == %{issue_key => "REVIEW_READY"}
+  end
+
   test "overview partitions each current ticket into one lifecycle bucket", context do
     intake = [
       jira_snapshot("PPL-401", ["repo-symphony", "spec-needed"]),

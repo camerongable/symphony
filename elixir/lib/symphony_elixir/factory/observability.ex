@@ -48,42 +48,49 @@ defmodule SymphonyElixir.Factory.Observability do
     task_limit = Keyword.get(opts, :task_limit, 100)
 
     all_runs = RunLedger.list_recent(store, run_limit)
+    current_runs = RunLedger.list_current(store, run_limit)
     runs = Enum.reject(all_runs, &hidden_from_dashboard?/1)
+    current_runs = Enum.reject(current_runs, &hidden_from_dashboard?/1)
     tasks = TaskLedger.list_recent(store, task_limit)
     tasks_by_run = Enum.group_by(tasks, & &1["run_id"])
-    issue_by_run = Map.new(all_runs, &{&1["run_id"], &1["issue_key"]})
+    issue_by_run = Map.new(all_runs ++ current_runs, &{&1["run_id"], &1["issue_key"]})
 
-    projected_runs =
-      Enum.map(runs, fn run ->
-        run
-        |> project_run()
-        |> Map.put(
-          :tasks,
-          tasks_by_run
-          |> Map.get(run["run_id"], [])
-          |> Enum.map(&project_task(&1, issue_by_run))
-        )
-      end)
+    projected_runs = project_runs(runs, tasks_by_run, issue_by_run)
+    projected_current_runs = project_runs(current_runs, tasks_by_run, issue_by_run)
 
     projected_tasks = Enum.map(tasks, &project_task(&1, issue_by_run))
-    intake = project_intake(IntakeLedger.get(store, value(factory, :scope, "default")), factory, all_runs)
+    intake = project_intake(IntakeLedger.get(store, value(factory, :scope, "default")), factory, current_runs)
     control = project_control(ControlServer.status(control_server))
     intake = Map.put(intake, :stale, control.status == "PAUSED")
-    stalled_run_ids = stalled_native_run_ids(store, runs, control)
+    stalled_run_ids = stalled_native_run_ids(store, current_runs, control)
 
     %{
       enabled: true,
       available: true,
       control: control,
       broker: project_broker(store, factory),
-      counts: counts(runs, tasks),
-      overview: overview(projected_runs, projected_tasks, intake, stalled_run_ids),
+      counts: counts(current_runs, tasks),
+      overview: overview(projected_current_runs, projected_tasks, intake, stalled_run_ids),
       intake: intake,
       capacity: capacities(store, factory, opts),
+      current_runs: projected_current_runs,
       runs: projected_runs,
       tasks: projected_tasks,
       recent_events: Enum.map(RunLedger.recent_events(store, event_limit), &project_event/1)
     }
+  end
+
+  defp project_runs(runs, tasks_by_run, issue_by_run) do
+    Enum.map(runs, fn run ->
+      run
+      |> project_run()
+      |> Map.put(
+        :tasks,
+        tasks_by_run
+        |> Map.get(run["run_id"], [])
+        |> Enum.map(&project_task(&1, issue_by_run))
+      )
+    end)
   end
 
   defp project_control(control) do
@@ -465,6 +472,7 @@ defmodule SymphonyElixir.Factory.Observability do
       overview: empty_overview(),
       intake: %{available: false, observed_at: nil, count: 0, issues: [], error: nil},
       capacity: [],
+      current_runs: [],
       runs: [],
       tasks: [],
       recent_events: []
