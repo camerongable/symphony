@@ -461,10 +461,10 @@ defmodule SymphonyElixir.Factory.RunLedger do
     Enum.map(result.rows, &Map.new(Enum.zip(result.columns, &1)))
   end
 
-  @doc "Lists the most recently updated runs with a bounded result size."
+  @doc "Lists the newest runs by creation with a bounded result size."
   @spec list_recent(Store.connection(), pos_integer()) :: [map()]
   def list_recent(connection, limit \\ 50) when is_integer(limit) and limit > 0 do
-    result = Store.query!(connection, "SELECT * FROM runs ORDER BY updated_at DESC LIMIT ?", [limit])
+    result = Store.query!(connection, "SELECT * FROM runs ORDER BY created_at DESC, rowid DESC LIMIT ?", [limit])
     Enum.map(result.rows, &Map.new(Enum.zip(result.columns, &1)))
   end
 

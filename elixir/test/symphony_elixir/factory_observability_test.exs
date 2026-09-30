@@ -287,6 +287,63 @@ defmodule SymphonyElixir.FactoryObservabilityTest do
     assert snapshot.counts.by_state == %{"SPEC_DRAFTING" => 1}
   end
 
+  test "housekeeping on an old failed specification does not replace the current delivery", context do
+    issue_key = "PPL-414"
+
+    assert {:ok, _old} =
+             RunLedger.register(
+               context.store,
+               %{
+                 run_id: "run-old-specification",
+                 issue_key: issue_key,
+                 kind: "SPECIFICATION",
+                 state: "FAILED",
+                 last_error: "old specification failed"
+               },
+               now: ~U[2026-09-29 10:00:00Z]
+             )
+
+    assert {:ok, _current} =
+             RunLedger.register(
+               context.store,
+               %{
+                 run_id: "run-current-delivery",
+                 issue_key: issue_key,
+                 kind: "DELIVERY",
+                 state: "READY_FOR_REVIEW"
+               },
+               now: ~U[2026-09-29 11:00:00Z]
+             )
+
+    assert {:ok, _old} =
+             RunLedger.update(
+               context.store,
+               "run-old-specification",
+               %{workspace_state: "CLEANED"},
+               now: ~U[2026-09-29 12:00:00Z]
+             )
+
+    assert {:ok, _intake} =
+             IntakeLedger.replace(context.store, context.factory.scope, [
+               jira_snapshot(issue_key, ["repo-symphony", "ai-review"])
+             ])
+
+    snapshot =
+      Observability.snapshot(
+        settings: %{factory: context.factory},
+        store: context.store,
+        control_server: context.control_server,
+        run_limit: 1,
+        capacity_opts: [free_bytes: 45_000_000_000]
+      )
+
+    assert [%{run_id: "run-current-delivery"}] = snapshot.runs
+    assert snapshot.counts.by_state == %{"READY_FOR_REVIEW" => 1}
+    assert snapshot.counts.blocked == 0
+    assert snapshot.overview.by_issue == %{issue_key => "REVIEW_READY"}
+    assert [%{local_state: "READY_FOR_REVIEW"}] = snapshot.intake.issues
+  end
+
   test "overview partitions each current ticket into one lifecycle bucket", context do
     intake = [
       jira_snapshot("PPL-401", ["repo-symphony", "spec-needed"]),

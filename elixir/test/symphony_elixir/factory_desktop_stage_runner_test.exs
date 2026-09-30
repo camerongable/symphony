@@ -723,7 +723,9 @@ defmodule SymphonyElixir.FactoryDesktopStageRunnerTest do
                output: %{"result" => %{"status" => "WORKSPACE_READY"}, "completed_tool_calls" => []}
              })
 
-    assert {:ok, %{"action" => "FOLLOWUP", "cwd" => ^canonical_checkout}} = wait_request(store, request_key)
+    assert {:ok, %{"action" => "FOLLOWUP", "cwd" => ^canonical_checkout}} =
+             wait_request_from_runner(store, request_key, runner)
+
     assert String.trim(git!(checkout, ["branch", "--show-current"])) == branch
 
     changed_prompt = "Implement updated Jira snapshot"
@@ -932,6 +934,40 @@ defmodule SymphonyElixir.FactoryDesktopStageRunnerTest do
       {:error, :unknown_request} ->
         Process.sleep(5)
         wait_request(store, request_key, tries - 1)
+    end
+  end
+
+  defp wait_request_from_runner(store, request_key, runner) do
+    deadline = System.monotonic_time(:millisecond) + 5_000
+    wait_request_from_runner(store, request_key, runner, deadline)
+  end
+
+  defp wait_request_from_runner(store, request_key, runner, deadline) do
+    case DesktopRequest.get(store, request_key) do
+      {:ok, request} ->
+        {:ok, request}
+
+      {:error, :unknown_request} ->
+        wait_request_from_runner_pending(store, request_key, runner, deadline)
+    end
+  end
+
+  defp wait_request_from_runner_pending(store, request_key, runner, deadline) do
+    case Task.yield(runner, 0) do
+      {:ok, result} ->
+        {:error, {:runner_finished_before_request, result}}
+
+      nil ->
+        retry_wait_for_runner_request(store, request_key, runner, deadline)
+    end
+  end
+
+  defp retry_wait_for_runner_request(store, request_key, runner, deadline) do
+    if System.monotonic_time(:millisecond) >= deadline do
+      {:error, :runner_did_not_enqueue_request}
+    else
+      Process.sleep(5)
+      wait_request_from_runner(store, request_key, runner, deadline)
     end
   end
 
