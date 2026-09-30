@@ -85,12 +85,23 @@ defmodule SymphonyElixir.Factory.ControlServer do
     }
 
     Control.initialize(store, config)
-    {:ok, %{store: store, config: config}}
+
+    {:ok,
+     %{
+       store: store,
+       config: config,
+       runtime_identity: %{
+         process_started_at: DateTime.utc_now() |> DateTime.to_iso8601(),
+         factory_beam_fingerprint: factory_beam_fingerprint(),
+         factory_beam_module_count: factory_beam_modules() |> length()
+       }
+     }}
   end
 
   @impl true
   def handle_call(:status, _from, state) do
-    {:reply, Control.status(state.store, state.config.scope), state}
+    status = Control.status(state.store, state.config.scope) |> Map.put("runtime_identity", state.runtime_identity)
+    {:reply, status, state}
   end
 
   def handle_call({:record_controller_task, thread_id, turn_id, route}, _from, state) do
@@ -123,5 +134,28 @@ defmodule SymphonyElixir.Factory.ControlServer do
 
   def handle_call({:release_tick, dispatcher_id, tick_id}, _from, state) do
     {:reply, Control.release_tick(state.store, state.config, dispatcher_id, tick_id), state}
+  end
+
+  defp factory_beam_modules do
+    :code.all_loaded()
+    |> Enum.map(&elem(&1, 0))
+    |> Enum.filter(&String.starts_with?(Atom.to_string(&1), "Elixir.SymphonyElixir.Factory."))
+    |> Enum.sort()
+  end
+
+  defp factory_beam_fingerprint do
+    module_digests =
+      Enum.map(factory_beam_modules(), fn module ->
+        digest =
+          case :code.get_object_code(module) do
+            {^module, binary, _path} -> :crypto.hash(:sha256, binary)
+            _other -> <<>>
+          end
+
+        {Atom.to_string(module), digest}
+      end)
+
+    :crypto.hash(:sha256, :erlang.term_to_binary(module_digests))
+    |> Base.encode16(case: :lower)
   end
 end

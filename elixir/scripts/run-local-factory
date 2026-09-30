@@ -6,7 +6,13 @@ elixir_dir="${script_dir:h}"
 workflow_path="${1:-${elixir_dir}/WORKFLOW.local.md}"
 logs_root="${SYMPHONY_FACTORY_LOGS_ROOT:-${HOME}/Library/Logs/ai-factory}"
 
-export PATH="/opt/homebrew/bin:/Applications/ChatGPT.localized/ChatGPT.app/Contents/Resources:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+codex_resources="/Applications/ChatGPT.localized/ChatGPT.app/Contents/Resources"
+export PATH="${codex_resources}/codex-cli/CodexCLI.app/Contents/MacOS:${codex_resources}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+if ! command -v codex >/dev/null 2>&1; then
+  print -u2 "Factory startup requires the Codex CLI in the app bundle or PATH"
+  exit 127
+fi
 
 cd "${elixir_dir}"
 

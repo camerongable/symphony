@@ -40,6 +40,36 @@ defmodule SymphonyElixir.Factory.Worktree do
     "#{prefix}/#{suffix}"
   end
 
+  @doc "Keeps a later run off a local issue branch left by an earlier run."
+  @spec branch_for_run(map(), String.t(), String.t()) :: {:ok, String.t()} | {:error, term()}
+  def branch_for_run(route, branch, run_id) when is_binary(branch) and is_binary(run_id) do
+    repo = route |> Map.fetch!("path") |> Path.expand()
+
+    with :ok <- validate_native_branch(repo, branch) do
+      choose_branch_for_run(repo, branch, run_id)
+    end
+  end
+
+  def branch_for_run(_route, _branch, _run_id), do: {:error, :invalid_factory_branch_identity}
+
+  defp choose_branch_for_run(repo, branch, run_id) do
+    if branch_exists?(repo, branch), do: suffixed_branch(repo, branch, run_id), else: {:ok, branch}
+  end
+
+  defp suffixed_branch(repo, branch, run_id) do
+    candidate = "#{branch}-#{String.slice(run_id, 0, 8)}"
+
+    case validate_native_branch(repo, candidate) do
+      :ok ->
+        if branch_exists?(repo, candidate),
+          do: {:error, {:factory_branch_collision, candidate}},
+          else: {:ok, candidate}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
   @doc "Creates or validates the sole source-writing worktree for a run."
   @spec ensure_writer(map(), String.t(), String.t()) :: {:ok, map()} | {:error, term()}
   def ensure_writer(route, issue_key, run_id) do
@@ -82,6 +112,198 @@ defmodule SymphonyElixir.Factory.Worktree do
       {:ok, path}
     end
   end
+
+  @doc "Reuses a clean specification-critic checkout at its original SHA after the remote base advances."
+  @spec create_detached_pinned(map(), String.t(), String.t(), String.t(), String.t()) ::
+          {:ok, Path.t()} | {:error, term()}
+  def create_detached_pinned(route, issue_key, run_id, stage, sha) do
+    with true <- String.match?(stage, ~r/^specification-critic-\d+$/) or {:error, :pinned_detached_stage_not_allowed},
+         repo = Path.expand(Map.fetch!(route, "path")),
+         path = stage_path(route, issue_key, run_id, stage),
+         :ok <- validate_repository(repo),
+         :ok <- validate_stage_path(path, route) do
+      reuse_or_create_pinned(route, issue_key, run_id, stage, sha, path)
+    end
+  end
+
+  defp reuse_or_create_pinned(route, issue_key, run_id, stage, sha, path) do
+    if File.dir?(path) do
+      case validate_detached(route, path) do
+        {:ok, _pinned} -> {:ok, path}
+        {:error, _reason} = error -> error
+      end
+    else
+      create_detached(route, issue_key, run_id, stage, sha)
+    end
+  end
+
+  @doc "Validates a recorded factory detached checkout before a task resumes in it."
+  @spec validate_detached(map(), Path.t()) :: {:ok, %{path: Path.t(), sha: String.t()}} | {:error, term()}
+  def validate_detached(route, path) do
+    repo = Path.expand(Map.fetch!(route, "path"))
+
+    with :ok <- validate_repository(repo),
+         :ok <- validate_stage_path(path, route),
+         :ok <- require_registered(repo, path),
+         :ok <- require_clean(path),
+         {:ok, ""} <- trimmed_git(path, ["branch", "--show-current"]),
+         {:ok, sha} <- rev_parse(path, "HEAD"),
+         :ok <- object_exists(repo, sha) do
+      {:ok, %{path: path, sha: sha}}
+    else
+      {:ok, _other} -> {:error, :detached_worktree_mismatch}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  @doc "Validates a Codex-managed worktree from this repository before adopting it for a task."
+  @spec validate_native(map(), Path.t()) ::
+          {:ok, %{path: Path.t(), sha: String.t()}} | {:error, term()}
+  def validate_native(route, path), do: validate_native(route, path, [])
+
+  @spec validate_native(map(), Path.t(), keyword()) ::
+          {:ok, %{path: Path.t(), sha: String.t()}} | {:error, term()}
+  def validate_native(_route, path, _opts) when not is_binary(path), do: {:error, :native_worktree_invalid_path}
+
+  def validate_native(route, path, opts) do
+    repo = route |> Map.fetch!("path") |> Path.expand()
+    expanded = Path.expand(path)
+
+    with :ok <- validate_repository(repo),
+         :ok <- require_existing_directory(expanded),
+         {:ok, canonical_path} <- PathSafety.canonicalize(expanded),
+         :ok <- require_nonprimary(repo, canonical_path),
+         :ok <- require_worktree_root(canonical_path),
+         :ok <- require_registered(repo, canonical_path),
+         :ok <- require_shared_git_common_dir(repo, canonical_path),
+         :ok <- maybe_require_clean(canonical_path, Keyword.get(opts, :clean, true)),
+         :ok <- maybe_require_detached(canonical_path, Keyword.get(opts, :detached, true)),
+         :ok <- require_expected_branch(canonical_path, Keyword.get(opts, :expected_branch)),
+         {:ok, sha} <- rev_parse(canonical_path, "HEAD"),
+         :ok <- require_expected_sha(sha, Keyword.get(opts, :expected_sha)),
+         :ok <- object_exists(repo, sha) do
+      {:ok, %{path: canonical_path, sha: sha}}
+    end
+  end
+
+  @doc "Attaches a clean, pinned native worktree to its exact factory branch."
+  @spec attach_native_branch(map(), Path.t(), String.t(), String.t()) ::
+          {:ok, %{path: Path.t(), sha: String.t()}} | {:error, term()}
+  def attach_native_branch(route, path, branch, expected_sha) do
+    repo = route |> Map.fetch!("path") |> Path.expand()
+
+    with :ok <- validate_native_branch(repo, branch),
+         :ok <- validate_native_expected_sha(expected_sha),
+         {:ok, %{path: canonical_path}} <-
+           validate_native(route, path, detached: false, expected_sha: expected_sha),
+         {:ok, current_branch} <- trimmed_git(canonical_path, ["branch", "--show-current"]),
+         :ok <- attach_native_branch_at_head(repo, canonical_path, current_branch, branch, expected_sha) do
+      validate_native(route, canonical_path,
+        detached: false,
+        expected_branch: branch,
+        expected_sha: expected_sha
+      )
+    end
+  end
+
+  @doc "Commits one declared native writer slice, or adopts its exact prior commit after a restart."
+  @spec commit_native_slice(map(), Path.t(), String.t(), String.t(), [String.t()], String.t()) ::
+          {:ok, %{sha: String.t()}} | {:error, term()}
+  def commit_native_slice(route, path, branch, parent_sha, paths, message) do
+    with :ok <- validate_native_branch(Map.fetch!(route, "path"), branch),
+         :ok <- validate_native_expected_sha(parent_sha),
+         :ok <- validate_slice_intent(paths, message),
+         {:ok, workspace} <- validate_native(route, path, clean: false, detached: false, expected_branch: branch) do
+      if workspace.sha == parent_sha do
+        commit_new_native_slice(workspace.path, parent_sha, paths, message)
+      else
+        adopt_native_slice(workspace.path, workspace.sha, parent_sha, paths, message)
+      end
+    end
+  end
+
+  defp validate_slice_intent(paths, message) when is_list(paths) and is_binary(message) do
+    valid_message? =
+      byte_size(message) <= 120 and
+        String.match?(message, ~r/\A(?:feat|fix|chore|refactor|test|docs|perf)\([A-Z]+-\d+\): [^\r\n\x00]+\z/)
+
+    if valid_slice_paths?(paths) and valid_message?, do: :ok, else: {:error, :native_slice_intent_invalid}
+  end
+
+  defp validate_slice_intent(_paths, _message), do: {:error, :native_slice_intent_invalid}
+
+  defp valid_slice_paths?(paths) do
+    paths != [] and Enum.uniq(paths) == paths and Enum.all?(paths, &valid_slice_path?/1)
+  end
+
+  defp valid_slice_path?(path) when is_binary(path) do
+    path != "" and not String.starts_with?(path, "/") and
+      not String.contains?(path, ["\n", "\r", "\0"]) and
+      Enum.all?(Path.split(path), &(&1 not in ["", ".", "..", ".git"]))
+  end
+
+  defp valid_slice_path?(_path), do: false
+
+  defp commit_new_native_slice(path, parent_sha, paths, message) do
+    with {:ok, staged} <- git_paths(path, ["diff", "--cached", "--name-only", "-z", "--no-renames"]),
+         {:ok, unstaged} <- git_paths(path, ["diff", "--name-only", "-z", "--no-renames"]),
+         {:ok, untracked} <- git_paths(path, ["ls-files", "--others", "--exclude-standard", "-z"]),
+         :ok <- validate_native_slice_changes(staged, unstaged, untracked, paths),
+         :ok <- maybe_stage_native_slice(path, staged, paths),
+         {:ok, staged_after} <- git_paths(path, ["diff", "--cached", "--name-only", "-z", "--no-renames"]),
+         true <- sorted_paths(staged_after) == sorted_paths(paths) or {:error, :native_slice_stage_mismatch},
+         {:ok, _output} <- git(path, ["commit", "--no-verify", "-m", message]),
+         {:ok, sha} <- rev_parse(path, "HEAD") do
+      adopt_native_slice(path, sha, parent_sha, paths, message)
+    end
+  end
+
+  defp validate_native_slice_changes([], unstaged, untracked, paths) do
+    if sorted_paths(unstaged ++ untracked) == sorted_paths(paths),
+      do: :ok,
+      else: {:error, :native_slice_paths_mismatch}
+  end
+
+  defp validate_native_slice_changes(staged, [], [], paths) do
+    if sorted_paths(staged) == sorted_paths(paths),
+      do: :ok,
+      else: {:error, :native_slice_pre_staged_changes}
+  end
+
+  defp validate_native_slice_changes(_staged, _unstaged, _untracked, _paths),
+    do: {:error, :native_slice_pre_staged_changes}
+
+  defp maybe_stage_native_slice(_path, [_ | _], _paths), do: :ok
+
+  defp maybe_stage_native_slice(path, [], paths) do
+    literal_paths = Enum.map(paths, &(":(literal)" <> &1))
+
+    case git(path, ["add", "--" | literal_paths]) do
+      {:ok, _output} -> :ok
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp adopt_native_slice(path, sha, parent_sha, paths, message) do
+    with {:ok, actual_parent} <- rev_parse(path, "HEAD^"),
+         true <- actual_parent == parent_sha or {:error, :native_slice_parent_mismatch},
+         {:ok, actual_paths} <- git_paths(path, ["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "--no-renames", "HEAD"]),
+         true <- sorted_paths(actual_paths) == sorted_paths(paths) or {:error, :native_slice_paths_mismatch},
+         {:ok, actual_message} <- trimmed_git(path, ["show", "-s", "--format=%s", "HEAD"]),
+         true <- actual_message == message or {:error, :native_slice_message_mismatch},
+         :ok <- require_clean(path) do
+      {:ok, %{sha: sha}}
+    end
+  end
+
+  defp git_paths(path, args) do
+    case git(path, args) do
+      {:ok, output} -> {:ok, String.split(output, "\0", trim: true)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp sorted_paths(paths), do: Enum.sort(paths)
 
   @doc "Removes a clean detached factory worktree and prunes Git metadata."
   @spec remove_detached(map(), Path.t()) :: :ok | {:error, term()}
@@ -320,6 +542,145 @@ defmodule SymphonyElixir.Factory.Worktree do
       {:ok, output} -> if String.trim(output) == "", do: :ok, else: {:error, :worktree_dirty}
       {:error, _reason} = error -> error
     end
+  end
+
+  defp require_existing_directory(path) do
+    if File.dir?(path), do: :ok, else: {:error, :native_worktree_missing}
+  end
+
+  defp require_nonprimary(repo, path) do
+    if canonical(repo) == path, do: {:error, :native_worktree_primary_checkout}, else: :ok
+  end
+
+  defp require_worktree_root(path) do
+    case trimmed_git(path, ["rev-parse", "--show-toplevel"]) do
+      {:ok, toplevel} ->
+        if canonical(toplevel) == path, do: :ok, else: {:error, :native_worktree_root_mismatch}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp require_shared_git_common_dir(repo, path) do
+    with {:ok, repo_common_dir} <- git_common_dir(repo),
+         {:ok, path_common_dir} <- git_common_dir(path) do
+      if repo_common_dir == path_common_dir,
+        do: :ok,
+        else: {:error, :native_git_common_dir_mismatch}
+    end
+  end
+
+  defp git_common_dir(path) do
+    with {:ok, common_dir} <- trimmed_git(path, ["rev-parse", "--git-common-dir"]) do
+      PathSafety.canonicalize(Path.expand(common_dir, path))
+    end
+  end
+
+  defp maybe_require_clean(path, true), do: require_clean(path)
+  defp maybe_require_clean(_path, false), do: :ok
+
+  defp maybe_require_detached(path, true) do
+    case trimmed_git(path, ["symbolic-ref", "--quiet", "HEAD"]) do
+      {:ok, _branch} -> {:error, :native_worktree_not_detached}
+      {:error, {:git_failed, 1, _args, _output}} -> :ok
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp maybe_require_detached(_path, false), do: :ok
+
+  defp require_expected_branch(_path, nil), do: :ok
+
+  defp require_expected_branch(path, expected_branch) do
+    case trimmed_git(path, ["branch", "--show-current"]) do
+      {:ok, ^expected_branch} -> :ok
+      {:ok, actual_branch} -> {:error, {:native_worktree_branch_mismatch, expected_branch, actual_branch}}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp require_expected_sha(_sha, nil), do: :ok
+  defp require_expected_sha(sha, sha), do: :ok
+
+  defp require_expected_sha(actual_sha, expected_sha) do
+    {:error, {:native_worktree_sha_mismatch, expected_sha, actual_sha}}
+  end
+
+  defp validate_native_branch(_repo, branch) when not is_binary(branch), do: {:error, :native_branch_invalid}
+  defp validate_native_branch(_repo, branch) when branch in ["main", "master"], do: {:error, :native_branch_protected}
+
+  defp validate_native_branch(repo, branch) do
+    case git(repo, ["check-ref-format", "--branch", branch]) do
+      {:ok, output} -> if(String.trim(output) == branch, do: :ok, else: {:error, :native_branch_invalid})
+      {:error, _reason} -> {:error, :native_branch_invalid}
+    end
+  end
+
+  defp validate_native_expected_sha(sha) when is_binary(sha) do
+    if String.match?(sha, ~r/\A(?:[0-9a-f]{40}|[0-9a-f]{64})\z/),
+      do: :ok,
+      else: {:error, :native_worktree_invalid_expected_sha}
+  end
+
+  defp validate_native_expected_sha(_sha), do: {:error, :native_worktree_invalid_expected_sha}
+
+  defp attach_native_branch_at_head(_repo, _path, branch, branch, _sha), do: :ok
+
+  defp attach_native_branch_at_head(repo, path, "", branch, sha) do
+    with {:ok, existing_branch?} <- require_native_branch_sha(repo, branch, sha),
+         :ok <- require_native_branch_available(repo, path, branch),
+         args <- if(existing_branch?, do: ["switch", "--no-guess", branch], else: ["switch", "-c", branch]),
+         {:ok, _output} <- git(path, args) do
+      :ok
+    end
+  end
+
+  defp attach_native_branch_at_head(_repo, _path, actual_branch, expected_branch, _sha) do
+    {:error, {:native_worktree_branch_mismatch, expected_branch, actual_branch}}
+  end
+
+  defp require_native_branch_sha(repo, branch, expected_sha) do
+    if branch_exists?(repo, branch) do
+      case rev_parse(repo, "refs/heads/#{branch}") do
+        {:ok, ^expected_sha} -> {:ok, true}
+        {:ok, actual_sha} -> {:error, {:native_branch_sha_mismatch, branch, expected_sha, actual_sha}}
+        {:error, _reason} = error -> error
+      end
+    else
+      {:ok, false}
+    end
+  end
+
+  defp require_native_branch_available(repo, path, branch) do
+    case git(repo, ["worktree", "list", "--porcelain"]) do
+      {:ok, output} ->
+        occupied_path =
+          output
+          |> String.split("\n\n", trim: true)
+          |> Enum.find_value(&branch_checkout_path(&1, branch, path))
+
+        if occupied_path,
+          do: {:error, {:native_branch_checked_out_elsewhere, branch, occupied_path}},
+          else: :ok
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp branch_checkout_path(entry, branch, path) do
+    lines = String.split(entry, "\n", trim: true)
+
+    registered_path =
+      Enum.find_value(lines, fn
+        "worktree " <> registered_path -> registered_path
+        _line -> nil
+      end)
+
+    if "branch refs/heads/#{branch}" in lines and is_binary(registered_path) and
+         canonical(registered_path) != path,
+       do: canonical(registered_path)
   end
 
   defp require_registered(repo, path) do

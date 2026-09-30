@@ -84,7 +84,8 @@ defmodule SymphonyElixir.Factory.Controller do
   def handle_info({:factory_task_finished, task_key, result}, state) do
     Logger.info("Factory task finished task_key=#{task_key} result=#{result_label(result)}")
     state = drop_active_task(state, task_key)
-    {:noreply, schedule(state, 0)}
+    delay = if writer_conflict?(result), do: state.poll_interval_ms, else: 0
+    {:noreply, schedule(state, delay)}
   end
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, %State{tick_ref: ref} = state) do
@@ -177,4 +178,7 @@ defmodule SymphonyElixir.Factory.Controller do
 
   defp result_label({:ok, _result}), do: "ok"
   defp result_label({:error, reason}), do: "error:#{inspect(reason)}"
+
+  defp writer_conflict?({:error, reason}), do: Factory.TaskLauncher.retryable_writer_conflict?(reason)
+  defp writer_conflict?(_result), do: false
 end

@@ -152,31 +152,160 @@ defmodule SymphonyElixir.Factory.Cleanup do
   @spec apply(Store.connection(), map(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
   def apply(connection, policy, run_id, opts \\ []) do
     with {:ok, run} <- RunLedger.get(connection, run_id),
-         %{eligible: true} = check <- preflight(connection, policy, run, opts),
-         {:ok, _output} <- git(run["repo_path"], ["worktree", "remove", check.worktree]),
-         {:ok, _output} <- git(run["repo_path"], ["worktree", "prune"]),
-         {:ok, reclaim} <- reclaim_bazel(policy, check.worktree, run["repo_path"], opts) do
-      now = DateTime.utc_now() |> DateTime.to_iso8601()
-
-      Store.query!(
-        connection,
-        """
-        UPDATE runs
-        SET cleanup_authorized = 0, cleaned_at = ?, updated_at = ?
-        WHERE run_id = ?
-        """,
-        [now, now, run_id]
-      )
-
-      record_event(connection, run_id, "WORKTREE_CLEANED", %{
-        worktree: check.worktree,
-        reclaim: reclaim
-      })
-
+         :ok <- already_cleaned(run),
+         %{eligible: true} = check <- resumable_preflight(connection, policy, run, opts),
+         :ok <- remove_worktree(connection, run, check, opts),
+         :ok <- prune_worktrees(connection, run, check, opts),
+         {:ok, reclaim} <- reclaim_bazel_resumably(connection, policy, run, check, opts),
+         :ok <- checkpoint(opts, :before_ledger_update),
+         :ok <- mark_cleaned(connection, run, check, reclaim, opts) do
       {:ok, %{result: "CLEANED", run_id: run_id, worktree: check.worktree, reclaim: reclaim}}
     else
       %{eligible: false} = check -> {:error, {:cleanup_blocked, check}}
       {:error, _reason} = error -> error
+    end
+  end
+
+  defp already_cleaned(%{"cleaned_at" => value}) when is_binary(value), do: {:error, :already_cleaned}
+  defp already_cleaned(_run), do: :ok
+
+  defp resumable_preflight(connection, policy, run, opts) do
+    check = preflight(connection, policy, run, opts)
+
+    if check.eligible or recovery_readback?(connection, run, check.worktree) do
+      if check.eligible, do: check, else: preflight_after_removal(connection, policy, run, check, opts)
+    else
+      check
+    end
+  end
+
+  defp preflight_after_removal(connection, policy, run, check, opts) do
+    cleanup = value(policy, "cleanup", %{})
+    now = Keyword.get_lazy(opts, :now, &DateTime.utc_now/0)
+
+    reasons =
+      []
+      |> require_flag(run["cleanup_authorized"] == 1, "cleanup is not authorized")
+      |> require_flag(fresh?(run["cleanup_authorized_at"], now, value(cleanup, "authorization_max_age_minutes", 60)), "cleanup authorization is stale")
+      |> require_flag(run["state"] in value(cleanup, "allowed_run_states", []), "run is active, blocked, or not cleanup-eligible")
+      |> require_flag(run["factory_owned"] == 1, "worktree is not factory-owned")
+      |> require_flag(not active_task?(connection, run["run_id"]), "run still has an active task")
+      |> require_flag(not live_workspace?(check.worktree, opts), "worktree is the live workspace")
+      |> require_flag(allowed_root?(check.worktree, cleanup), "worktree is outside configured roots")
+      |> require_flag(not File.exists?(check.worktree) and not registered?(run["repo_path"], check.worktree), "removed worktree readback is unsafe")
+      |> require_flag(remote_identity_exact?(run), "candidate is not remotely recoverable")
+      |> require_flag(recovery_readback?(connection, run, check.worktree), "no matching removal checkpoint")
+
+    %{check | eligible: reasons == [], reasons: reasons}
+  end
+
+  defp remove_worktree(connection, run, check, opts) do
+    if event?(connection, run, "WORKTREE_REMOVAL_STARTED", check.worktree) do
+      remove_started_worktree(connection, run, check, opts)
+    else
+      with :ok <- checkpoint(opts, :before_worktree_removal_event),
+           :ok <- record_event(connection, run["run_id"], "WORKTREE_REMOVAL_STARTED", identity_payload(run, check)) do
+        remove_started_worktree(connection, run, check, opts)
+      end
+    end
+  end
+
+  defp remove_started_worktree(connection, run, check, opts) do
+    if File.exists?(check.worktree) do
+      with :ok <- checkpoint(opts, :before_worktree_remove),
+           {:ok, _} <- git(run["repo_path"], ["worktree", "remove", check.worktree]),
+           :ok <- checkpoint(opts, :after_worktree_remove) do
+        record_event(connection, run["run_id"], "WORKTREE_REMOVED", %{worktree: check.worktree})
+      end
+    else
+      :ok
+    end
+  end
+
+  defp prune_worktrees(connection, run, check, opts) do
+    if event?(connection, run, "WORKTREE_PRUNED", check.worktree) do
+      :ok
+    else
+      with :ok <- checkpoint(opts, :before_worktree_prune),
+           {:ok, _} <- git(run["repo_path"], ["worktree", "prune"]),
+           :ok <- checkpoint(opts, :after_worktree_prune) do
+        record_event(connection, run["run_id"], "WORKTREE_PRUNED", %{worktree: check.worktree})
+      end
+    end
+  end
+
+  defp reclaim_bazel_resumably(connection, policy, run, check, opts) do
+    case latest_event_payload(connection, run["run_id"], "BAZEL_RECLAIMED", check.worktree) do
+      %{"reclaim" => reclaim} ->
+        {:ok, reclaim}
+
+      _ ->
+        with :ok <- ensure_event(connection, run, "BAZEL_RECLAIM_STARTED", check),
+             :ok <- checkpoint(opts, :before_bazel_reclaim),
+             {:ok, reclaim} <- reclaim_bazel(policy, check.worktree, run["repo_path"], opts),
+             :ok <- checkpoint(opts, :after_bazel_reclaim),
+             :ok <- record_event(connection, run["run_id"], "BAZEL_RECLAIMED", %{worktree: check.worktree, reclaim: reclaim}) do
+          {:ok, reclaim}
+        end
+    end
+  end
+
+  defp mark_cleaned(connection, run, check, reclaim, opts) do
+    now = DateTime.utc_now() |> DateTime.to_iso8601()
+
+    with :ok <- checkpoint(opts, :before_ledger_update) do
+      Store.query!(connection, "UPDATE runs SET cleanup_authorized = 0, cleaned_at = ?, updated_at = ? WHERE run_id = ?", [now, now, run["run_id"]])
+      checkpoint(opts, :after_ledger_update)
+      record_event(connection, run["run_id"], "WORKTREE_CLEANED", %{worktree: check.worktree, reclaim: reclaim})
+      :ok
+    end
+  end
+
+  defp ensure_event(connection, run, type, check) do
+    if event?(connection, run, type, check.worktree),
+      do: :ok,
+      else: record_event(connection, run["run_id"], type, identity_payload(run, check))
+  end
+
+  defp identity_payload(run, check), do: %{worktree: check.worktree, branch: run["branch"], candidate_sha: run["candidate_sha"], repo_path: expanded(run["repo_path"])}
+
+  defp event?(connection, run, type, worktree), do: latest_event_payload(connection, run["run_id"], type, worktree) != nil
+
+  defp latest_event_payload(connection, run_id, type, worktree) do
+    RunLedger.events(connection, run_id)
+    |> Enum.reverse()
+    |> Enum.find_value(&matching_event_payload(&1, type, worktree))
+  end
+
+  defp matching_event_payload(%{"event_type" => type, "payload_json" => json}, type, worktree) do
+    case Jason.decode(json) do
+      {:ok, %{"worktree" => ^worktree} = payload} -> payload
+      _ -> nil
+    end
+  end
+
+  defp matching_event_payload(_event, _type, _worktree), do: nil
+
+  defp recovery_readback?(connection, run, worktree) do
+    case latest_event_payload(connection, run["run_id"], "WORKTREE_REMOVAL_STARTED", worktree) do
+      %{"branch" => branch, "candidate_sha" => sha, "repo_path" => repo} ->
+        branch == run["branch"] and sha == run["candidate_sha"] and repo == expanded(run["repo_path"])
+
+      _ ->
+        false
+    end
+  end
+
+  defp remote_identity_exact?(run) do
+    remote_branch_exact?(expanded(run["repo_path"]), run["branch"], run["candidate_sha"]) or
+      (String.downcase(run["mr_state"] || "") == "merged" and present?(run["base_branch"]) and
+         match?({:ok, _}, git(expanded(run["repo_path"]), ["merge-base", "--is-ancestor", run["candidate_sha"], "refs/remotes/origin/#{run["base_branch"]}"])))
+  end
+
+  defp checkpoint(opts, boundary) do
+    case Keyword.get(opts, :failure_injector) do
+      fun when is_function(fun, 1) -> fun.(boundary)
+      _ -> :ok
     end
   end
 
@@ -507,6 +636,8 @@ defmodule SymphonyElixir.Factory.Cleanup do
       "INSERT INTO events(occurred_at, event_type, run_id, payload_json) VALUES (?, ?, ?, ?)",
       [DateTime.utc_now() |> DateTime.to_iso8601(), event_type, run_id, Jason.encode!(payload)]
     )
+
+    :ok
   end
 
   defp trimmed_git(path, args) do

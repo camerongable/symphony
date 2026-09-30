@@ -11,6 +11,7 @@ defmodule SymphonyElixirWeb.Layouts do
       assigns
       |> assign(:csrf_token, Plug.CSRFProtection.get_csrf_token())
       |> assign(:dashboard_css_url, SymphonyElixirWeb.StaticAssets.dashboard_css_url())
+      |> assign(:dashboard_js_url, SymphonyElixirWeb.StaticAssets.dashboard_js_url())
       |> assign(:favicon_url, SymphonyElixirWeb.StaticAssets.favicon_url())
 
     ~H"""
@@ -25,6 +26,7 @@ defmodule SymphonyElixirWeb.Layouts do
         <script defer src="/vendor/phoenix_html/phoenix_html.js"></script>
         <script defer src="/vendor/phoenix/phoenix.js"></script>
         <script defer src="/vendor/phoenix_live_view/phoenix_live_view.js"></script>
+        <script defer src={@dashboard_js_url}></script>
         <script>
           window.addEventListener("DOMContentLoaded", function () {
             var csrfToken = document
@@ -34,7 +36,8 @@ defmodule SymphonyElixirWeb.Layouts do
             if (!window.Phoenix || !window.LiveView) return;
 
             var liveSocket = new window.LiveView.LiveSocket("/live", window.Phoenix.Socket, {
-              params: {_csrf_token: csrfToken}
+              params: {_csrf_token: csrfToken},
+              hooks: window.SymphonyHooks || {}
             });
 
             liveSocket.connect();

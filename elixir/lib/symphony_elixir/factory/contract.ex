@@ -2,8 +2,8 @@ defmodule SymphonyElixir.Factory.Contract do
   @moduledoc """
   Exact Jira markers and digest binding for self-contained delivery contracts.
 
-  The controller computes every digest. Agent-supplied hashes never authorize
-  implementation.
+  Authorization markers are accepted only when their digest matches the exact
+  contract payload read back from Jira.
   """
 
   @begin_marker "AI FACTORY CONTRACT BEGIN"
@@ -24,8 +24,7 @@ defmodule SymphonyElixir.Factory.Contract do
     normalized = String.trim(markdown)
     sha256 = digest(normalized)
 
-    marker =
-      "<!-- #{@begin_marker} issue=#{issue_key} revision=#{revision} sha256=#{sha256} -->"
+    marker = "#{@begin_marker} issue-hex=#{issue_hex(issue_key)} revision=#{revision} sha256=#{sha256}"
 
     %{
       issue_key: issue_key,
@@ -39,10 +38,17 @@ defmodule SymphonyElixir.Factory.Contract do
   @doc "Returns a Jira comment containing the exact digest-bound draft contract."
   @spec draft_comment(bound_contract()) :: String.t()
   def draft_comment(contract) do
+    literal =
+      contract.markdown
+      |> String.split("\n", trim: false)
+      |> Enum.map_join("\n", &"| #{&1}")
+
     """
     #{contract.marker}
-    #{contract.markdown}
-    <!-- #{@end_marker} issue=#{contract.issue_key} revision=#{contract.revision} sha256=#{contract.sha256} -->
+    ```
+    #{literal}
+    ```
+    #{@end_marker} issue-hex=#{issue_hex(contract.issue_key)} revision=#{contract.revision} sha256=#{contract.sha256}
     """
     |> String.trim()
   end
@@ -50,7 +56,7 @@ defmodule SymphonyElixir.Factory.Contract do
   @doc "Returns the exact marker announcing a critic-approved contract for confirmation."
   @spec ready_marker(bound_contract()) :: String.t()
   def ready_marker(contract) do
-    "AI FACTORY SPEC READY issue=#{contract.issue_key} revision=#{contract.revision} sha256=#{contract.sha256}"
+    "AI FACTORY SPEC READY issue-hex=#{issue_hex(contract.issue_key)} revision=#{contract.revision} sha256=#{contract.sha256}"
   end
 
   @doc "Returns the human confirmation text required before `ai-ready`."
@@ -60,8 +66,50 @@ defmodule SymphonyElixir.Factory.Contract do
   @doc "Returns the immutable authorization record written after human confirmation."
   @spec authorization_marker(bound_contract(), String.t()) :: String.t()
   def authorization_marker(contract, confirmation_comment_id) do
-    "AI FACTORY AUTHORIZED issue=#{contract.issue_key} revision=#{contract.revision} " <>
-      "sha256=#{contract.sha256} confirmation_comment_id=#{confirmation_comment_id}"
+    "AI FACTORY AUTHORIZED issue-hex=#{issue_hex(contract.issue_key)} revision=#{contract.revision} " <>
+      "sha256=#{contract.sha256} confirmation-comment-id=#{confirmation_comment_id}"
+  end
+
+  @doc "Returns the audit marker for authorization by an independent critic PASS."
+  @spec automatic_authorization_marker(bound_contract(), String.t(), String.t()) :: String.t()
+  def automatic_authorization_marker(contract, critic_task_key, critic_output_sha256) do
+    "AI FACTORY AUTHORIZED issue-hex=#{issue_hex(contract.issue_key)} revision=#{contract.revision} " <>
+      "sha256=#{contract.sha256} mode=automatic critic-task-key=#{critic_task_key} " <>
+      "critic-output-sha256=#{critic_output_sha256}"
+  end
+
+  @doc "Returns the authorization marker for a contract written by the interactive specify-work skill."
+  @spec specification_skill_authorization_marker(bound_contract()) :: String.t()
+  def specification_skill_authorization_marker(contract) do
+    "AI FACTORY AUTHORIZED issue-hex=#{issue_hex(contract.issue_key)} revision=#{contract.revision} " <>
+      "sha256=#{contract.sha256} mode=specify-work"
+  end
+
+  @doc "Extracts the unique automatic-authorization critic proof for this exact contract."
+  @spec automatic_authorization_proof(map(), bound_contract()) :: {:ok, map()} | :none | {:error, atom()}
+  def automatic_authorization_proof(snapshot, contract) do
+    prefix =
+      "AI FACTORY AUTHORIZED issue-hex=#{issue_hex(contract.issue_key)} revision=#{contract.revision} " <>
+        "sha256=#{contract.sha256} mode=automatic critic-task-key="
+
+    pattern = ~r/\A#{Regex.escape(prefix)}([A-Za-z0-9:._-]+) critic-output-sha256=([0-9a-f]{64})\z/
+
+    proofs =
+      snapshot
+      |> comments()
+      |> Enum.flat_map(fn comment ->
+        case Regex.run(pattern, String.trim(comment_text(comment))) do
+          [_marker, task_key, digest] -> [%{critic_task_key: task_key, critic_output_sha256: digest}]
+          _other -> []
+        end
+      end)
+      |> Enum.uniq()
+
+    case proofs do
+      [] -> :none
+      [proof] -> {:ok, proof}
+      _many -> {:error, :ambiguous_automatic_authorization}
+    end
   end
 
   @doc "Returns the stable digest for a set of unanswered specification questions."
@@ -76,7 +124,38 @@ defmodule SymphonyElixir.Factory.Contract do
   @doc "Returns the exact prefix a human uses to answer specification questions."
   @spec input_marker(String.t(), String.t()) :: String.t()
   def input_marker(issue_key, questions_sha256) do
-    "AI FACTORY SPEC INPUT issue=#{issue_key} questions_sha256=#{questions_sha256}"
+    "AI FACTORY SPEC INPUT issue-hex=#{issue_hex(issue_key)} questions-sha256=#{questions_sha256}"
+  end
+
+  @doc "Formats a digest-bound question request without Jira-autolinkable issue keys."
+  @spec input_request_comment(String.t(), [String.t()]) :: String.t()
+  def input_request_comment(issue_key, questions) when is_binary(issue_key) and is_list(questions) do
+    digest = questions_digest(questions)
+
+    literal =
+      questions
+      |> Enum.with_index(1)
+      |> Enum.map_join("\n", fn {question, index} -> "| #{index}. #{question}" end)
+
+    """
+    AI FACTORY SPEC INPUT REQUIRED issue-hex=#{issue_hex(issue_key)} questions-sha256=#{digest}
+    ```
+    #{literal}
+    ```
+    Reply in one Jira comment beginning with this exact first line, followed by your answers:
+    #{input_marker(issue_key, digest)}
+    """
+    |> String.trim()
+  end
+
+  @doc "Proves the same exact questions despite Jira's blank-line fence formatting."
+  @spec input_request_comment_equivalent?(String.t(), String.t(), String.t()) :: boolean()
+  def input_request_comment_equivalent?(expected, actual, issue_key)
+      when is_binary(expected) and is_binary(actual) and is_binary(issue_key) do
+    case parse_input_request(expected, issue_key) do
+      nil -> expected == actual
+      request -> parse_input_request(actual, issue_key) == request
+    end
   end
 
   @doc "Finds a non-empty human answer bound to the exact specification questions."
@@ -93,11 +172,20 @@ defmodule SymphonyElixir.Factory.Contract do
     end
   end
 
-  @doc "Checks that Jira read-back contains the exact bound contract comment."
+  @doc "Checks that Jira read-back contains the exact digest-bound contract payload."
   @spec draft_read_back?(map(), bound_contract()) :: boolean()
   def draft_read_back?(snapshot, contract) do
-    exact = draft_comment(contract)
-    Enum.any?(comments(snapshot), &(comment_text(&1) == exact))
+    Enum.any?(comments(snapshot), &(parse_draft(comment_text(&1), contract.issue_key) == contract))
+  end
+
+  @doc "Allows Jira to reformat the draft wrapper without changing the contract payload."
+  @spec draft_comment_equivalent?(String.t(), String.t(), String.t()) :: boolean()
+  def draft_comment_equivalent?(expected, actual, issue_key)
+      when is_binary(expected) and is_binary(actual) and is_binary(issue_key) do
+    case parse_draft(expected, issue_key) do
+      nil -> expected == actual
+      contract -> parse_draft(actual, issue_key) == contract
+    end
   end
 
   @doc "Finds an exact human confirmation comment for the bound digest."
@@ -111,17 +199,31 @@ defmodule SymphonyElixir.Factory.Contract do
     end
   end
 
-  @doc "Checks that Jira contains the exact immutable authorization record."
+  @doc "Checks that Jira still contains and authorizes the latest exact contract."
   @spec authorized?(map(), bound_contract()) :: boolean()
   def authorized?(snapshot, contract) do
     prefix =
-      "AI FACTORY AUTHORIZED issue=#{contract.issue_key} revision=#{contract.revision} " <>
-        "sha256=#{contract.sha256} confirmation_comment_id="
+      "AI FACTORY AUTHORIZED issue-hex=#{issue_hex(contract.issue_key)} revision=#{contract.revision} " <>
+        "sha256=#{contract.sha256} "
 
-    Enum.any?(comments(snapshot), &String.starts_with?(String.trim(comment_text(&1)), prefix))
+    human_marker = ~r/\A#{Regex.escape(prefix)}confirmation[-_]comment[-_]id=[A-Za-z0-9-]+\z/
+
+    automatic_marker =
+      ~r/\A#{Regex.escape(prefix)}mode=automatic critic-task-key=[A-Za-z0-9:._-]+ critic-output-sha256=[0-9a-f]{64}\z/
+
+    specification_skill_marker = ~r/\A#{Regex.escape(prefix)}mode=specify-work\z/
+
+    draft_read_back?(snapshot, contract) and next_revision(snapshot) == contract.revision + 1 and
+      unique_revision_digest?(snapshot, contract) and
+      Enum.any?(comments(snapshot), fn comment ->
+        text = String.trim(comment_text(comment))
+
+        Regex.match?(human_marker, text) or Regex.match?(automatic_marker, text) or
+          Regex.match?(specification_skill_marker, text)
+      end)
   end
 
-  @doc "Extracts the newest exact contract that also has an authorization record."
+  @doc "Extracts the latest exact contract only when its authorization is current."
   @spec authorized_from_snapshot(map(), String.t()) :: {:ok, bound_contract()} | {:error, term()}
   def authorized_from_snapshot(snapshot, issue_key) do
     snapshot
@@ -138,31 +240,53 @@ defmodule SymphonyElixir.Factory.Contract do
   @doc "Reads the required yes/no value from the contract's Manual Validation section."
   @spec manual_validation_required(String.t()) :: {:ok, boolean()} | {:error, term()}
   def manual_validation_required(markdown) do
-    case Regex.run(
-           ~r/^## Manual Validation\s*$.*?^- Required:\s*(yes|no)\s*$/ims,
-           markdown
-         ) do
-      [_match, value] -> {:ok, String.downcase(value) == "yes"}
-      _other -> {:error, :manual_validation_contract_missing}
+    with {:ok, section} <- manual_validation_section(markdown) do
+      case Regex.scan(~r/^- Required:[ \t]*(.*)$/im, section) do
+        [[_match, value]] -> manual_validation_decision(value)
+        [] -> {:error, :manual_validation_contract_missing}
+        _many -> {:error, :ambiguous_manual_validation_decision}
+      end
     end
   end
 
   @doc "Reads the fixed manual-validation environment when validation is required."
   @spec manual_validation_environment(String.t()) :: {:ok, String.t() | nil} | {:error, term()}
   def manual_validation_environment(markdown) do
-    with {:ok, required?} <- manual_validation_required(markdown) do
-      if required? do
-        extract_manual_validation_environment(markdown)
-      else
+    case manual_validation_required(markdown) do
+      {:ok, true} ->
+        with {:ok, section} <- manual_validation_section(markdown) do
+          extract_manual_validation_environment(section)
+        end
+
+      {:ok, false} ->
         {:ok, nil}
-      end
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
-  defp extract_manual_validation_environment(markdown) do
-    case Regex.run(~r/^## Manual Validation\s*$.*?^- Environment:\s*([^\n]+)\s*$/ims, markdown) do
-      [_match, environment] -> nonblank_environment(environment)
-      _other -> {:error, :manual_validation_environment_missing}
+  defp manual_validation_section(markdown) when is_binary(markdown) do
+    case Regex.scan(~r/^## Manual Validation[ \t]*\r?$\r?\n?(.*?)(?=^#+[ \t]+\S|\z)/ims, markdown) do
+      [[_match, section]] -> {:ok, section}
+      [] -> {:error, :manual_validation_contract_missing}
+      _many -> {:error, :ambiguous_manual_validation_section}
+    end
+  end
+
+  defp manual_validation_decision(value) do
+    case value |> String.trim() |> String.downcase() do
+      "yes" -> {:ok, true}
+      "no" -> {:ok, false}
+      _other -> {:error, :manual_validation_contract_missing}
+    end
+  end
+
+  defp extract_manual_validation_environment(section) do
+    case Regex.scan(~r/^- Environment:[ \t]*(.*)$/im, section) do
+      [[_match, environment]] -> nonblank_environment(environment)
+      [] -> {:error, :manual_validation_environment_missing}
+      _many -> {:error, :ambiguous_manual_validation_environment}
     end
   end
 
@@ -173,17 +297,69 @@ defmodule SymphonyElixir.Factory.Contract do
     end
   end
 
-  @doc "Returns the next revision after all exact factory contract markers in a snapshot."
+  @doc "Returns the next revision after the description and exact factory contract markers."
   @spec next_revision(map()) :: pos_integer()
   def next_revision(snapshot) do
-    maximum =
+    issue_key = Map.get(snapshot, "key") || Map.get(snapshot, :key)
+
+    marker_revisions =
       snapshot
       |> comments()
       |> Enum.map(&comment_text/1)
-      |> Enum.flat_map(&marker_revisions/1)
-      |> Enum.max(fn -> 0 end)
+      |> Enum.flat_map(&comment_revisions(&1, issue_key))
+
+    description = Map.get(snapshot, "description") || Map.get(snapshot, :description) || ""
+    revisions = marker_revisions ++ declared_revisions(description)
+    maximum = Enum.max(revisions, fn -> 0 end)
 
     maximum + 1
+  end
+
+  @doc "Reads a unique declared specification revision from Markdown."
+  @spec declared_revision(String.t()) :: {:ok, pos_integer()} | :missing | {:error, atom()}
+  def declared_revision(markdown) when is_binary(markdown) do
+    case Enum.uniq(declared_revisions(markdown)) do
+      [] -> :missing
+      [revision] -> {:ok, revision}
+      _many -> {:error, :ambiguous_spec_revision}
+    end
+  end
+
+  @doc "Canonicalizes a single carried-forward revision header before binding a new draft."
+  @spec normalize_draft_revision(String.t(), pos_integer()) :: {:ok, String.t()} | {:error, atom()}
+  def normalize_draft_revision(markdown, target_revision) when is_binary(markdown) and target_revision > 0 do
+    declarations = Regex.scan(~r/Spec revision:\*{0,2}[ \t]*(\d+)/i, markdown)
+
+    case declarations do
+      [] ->
+        {:ok, markdown}
+
+      [[_match, revision]] ->
+        normalize_single_revision(markdown, revision, target_revision)
+
+      _other ->
+        {:error, :contract_revision_mismatch}
+    end
+  end
+
+  defp normalize_single_revision(markdown, revision, target_revision) do
+    if revision == Integer.to_string(target_revision),
+      do: {:ok, markdown},
+      else: normalize_previous_revision_header(markdown, revision, target_revision)
+  end
+
+  defp normalize_previous_revision_header(markdown, revision, target_revision) do
+    header = ~r/^([ \t]*(?:\*\*)?Spec revision:\*{0,2}[ \t]*)(\d+)([ \t]*)$/im
+
+    if revision == Integer.to_string(target_revision - 1) and
+         match?([[_line, _prefix, ^revision, _suffix]], Regex.scan(header, markdown)) do
+      {:ok,
+       Regex.replace(header, markdown, fn _line, prefix, _old, suffix ->
+         "#{prefix}#{target_revision}#{suffix}"
+       end)}
+    else
+      {:error, :contract_revision_mismatch}
+    end
   end
 
   @doc "Computes a lowercase SHA-256 digest for exact normalized contract bytes."
@@ -196,7 +372,7 @@ defmodule SymphonyElixir.Factory.Contract do
   end
 
   defp marker_revisions(text) do
-    Regex.scan(~r/#{@begin_marker} issue=\S+ revision=(\d+) sha256=[0-9a-f]{64}/, text)
+    Regex.scan(~r/#{@begin_marker} (?:issue-hex=[0-9A-F]+|issue=\S+) revision=(\d+) sha256=[0-9a-f]{64}/, text)
     |> Enum.flat_map(fn
       [_match, revision] ->
         case Integer.parse(revision) do
@@ -209,7 +385,117 @@ defmodule SymphonyElixir.Factory.Contract do
     end)
   end
 
+  defp comment_revisions(text, issue_key) when is_binary(issue_key) and issue_key != "" do
+    case parse_draft(text, issue_key) do
+      %{revision: revision} -> [revision]
+      nil -> []
+    end
+  end
+
+  defp comment_revisions(text, _issue_key), do: marker_revisions(text)
+
+  defp declared_revisions(markdown) when is_binary(markdown) do
+    Regex.scan(~r/Spec revision:\*{0,2}\s*(\d+)/i, markdown)
+    |> Enum.map(fn [_match, revision] -> String.to_integer(revision) end)
+    |> Enum.filter(&(&1 > 0))
+  end
+
+  defp unique_revision_digest?(snapshot, contract) do
+    issue = Regex.escape(contract.issue_key)
+    hex = issue_hex(contract.issue_key)
+
+    markers = [
+      ~r/#{@begin_marker} issue-hex=#{hex} revision=#{contract.revision} sha256=([0-9a-f]{64})/,
+      ~r/#{@begin_marker} issue=#{issue} revision=#{contract.revision} sha256=([0-9a-f]{64})/
+    ]
+
+    digests =
+      snapshot
+      |> comments()
+      |> Enum.flat_map(fn comment -> Enum.flat_map(markers, &Regex.scan(&1, comment_text(comment))) end)
+      |> Enum.map(fn [_match, digest] -> digest end)
+      |> Enum.uniq()
+
+    digests == [contract.sha256]
+  end
+
   defp parse_draft(text, issue_key) do
+    hex = issue_hex(issue_key)
+
+    regex =
+      ~r/\A#{@begin_marker} issue-hex=#{hex} revision=(\d+) sha256=([0-9a-f]{64})\n(?:[ \t]*\n)*```\n(.*?)\n```\n(?:[ \t]*\n)*#{@end_marker} issue-hex=#{hex} revision=\1 sha256=\2\z/ms
+
+    case Regex.run(regex, text) do
+      [_match, revision_text, sha256, literal] ->
+        with {revision, ""} <- Integer.parse(revision_text),
+             {:ok, normalized} <- decode_literal(literal),
+             true <- digest(normalized) == sha256 do
+          %{
+            issue_key: issue_key,
+            revision: revision,
+            sha256: sha256,
+            markdown: normalized,
+            marker: "#{@begin_marker} issue-hex=#{hex} revision=#{revision} sha256=#{sha256}"
+          }
+        else
+          _other -> nil
+        end
+
+      _other ->
+        parse_legacy_draft(text, issue_key)
+    end
+  end
+
+  defp decode_literal(literal) do
+    lines = String.split(literal, "\n", trim: false)
+
+    if Enum.all?(lines, &String.starts_with?(&1, "| ")) do
+      {:ok, lines |> Enum.map_join("\n", &String.replace_prefix(&1, "| ", "")) |> String.trim()}
+    else
+      {:error, :invalid_contract_literal}
+    end
+  end
+
+  defp parse_input_request(text, issue_key) do
+    hex = issue_hex(issue_key)
+
+    regex =
+      ~r/\AAI FACTORY SPEC INPUT REQUIRED issue-hex=#{hex} questions-sha256=([0-9a-f]{64})\n(?:[ \t]*\n)*```\n(.*?)\n```\n(?:[ \t]*\n)*Reply in one Jira comment beginning with this exact first line, followed by your answers:\n(?:[ \t]*\n)*AI FACTORY SPEC INPUT issue-hex=#{hex} questions-sha256=\1\z/ms
+
+    case Regex.run(regex, text) do
+      [_match, digest, literal] ->
+        with {:ok, numbered} <- decode_literal(literal),
+             {:ok, questions} <- decode_numbered_questions(numbered),
+             true <- questions_digest(questions) == digest do
+          %{digest: digest, questions: questions}
+        else
+          _other -> nil
+        end
+
+      _other ->
+        nil
+    end
+  end
+
+  defp decode_numbered_questions(numbered) do
+    questions = String.split(numbered, "\n")
+
+    parsed =
+      questions
+      |> Enum.with_index(1)
+      |> Enum.map(fn {line, index} -> parse_numbered_question(line, index) end)
+
+    if parsed != [] and Enum.all?(parsed, &is_binary/1), do: {:ok, parsed}, else: {:error, :invalid_questions}
+  end
+
+  defp parse_numbered_question(line, index) do
+    case Regex.run(~r/^(\d+)\. (.+)$/, line) do
+      [_match, number_text, question] -> if(number_text == Integer.to_string(index), do: question)
+      _other -> nil
+    end
+  end
+
+  defp parse_legacy_draft(text, issue_key) do
     escaped_issue = Regex.escape(issue_key)
 
     regex =
@@ -245,4 +531,6 @@ defmodule SymphonyElixir.Factory.Contract do
   end
 
   defp comment_text(_comment), do: ""
+
+  defp issue_hex(issue_key), do: Base.encode16(issue_key, case: :upper)
 end

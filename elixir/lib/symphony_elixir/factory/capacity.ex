@@ -9,7 +9,7 @@ defmodule SymphonyElixir.Factory.Capacity do
 
   alias SymphonyElixir.Factory.Store
 
-  @active_specifier_states ~w(SPECIFYING SPEC_DRAFTING SPEC_WRITING AWAITING_JIRA_READBACK SPEC_REVIEW CRITIQUING SPEC_READY_WRITE)
+  @active_specifier_states ~w(SPECIFYING SPEC_DRAFTING CONTRACT_DISCUSSING SPEC_WRITING AWAITING_JIRA_READBACK SPEC_REVIEW CRITIQUING SPEC_READY_WRITE)
   @active_writer_states ~w(WRITING VERIFYING REPAIRING DELIVERING)
   @active_validator_states ~w(TESTING)
 

@@ -1,6 +1,163 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
+  test "thread lookup finds one exact named task across source kinds and archived pages" do
+    with_thread_listing_server(
+      "exact-thread",
+      """
+      case "$line" in
+        *'"method":"thread/list"'*)
+          case "$line" in
+            *'"archived":false'*)
+              printf '%s\\n' '{"id":13,"result":{"data":[{"id":"active-decoy","name":"FACTORY PROBE · Grail · Native Readback - old","projectId":"project-grail","cwd":"/other"}],"nextCursor":null}}'
+              ;;
+            *'"cursor":"second-archived"'*)
+              printf '%s\\n' '{"id":13,"result":{"data":[{"id":"matching-thread","name":"FACTORY PROBE · Grail · Native Readback","projectId":"project-grail","cwd":"/worktree/grail"}],"nextCursor":null}}'
+              ;;
+            *)
+              printf '%s\\n' '{"id":13,"result":{"data":[{"id":"archived-decoy","name":"Other task","projectId":"project-grail","cwd":"/other"}],"nextCursor":"second-archived"}}'
+              ;;
+          esac
+          ;;
+      esac
+      """,
+      fn workspace, trace_file ->
+        assert {:ok,
+                %{
+                  id: "matching-thread",
+                  project_id: "project-grail",
+                  cwd: "/worktree/grail",
+                  archived: true
+                }} =
+                 AppServer.find_thread_by_title("FACTORY PROBE · Grail · Native Readback", "project-grail", workspace: workspace)
+
+        requests = listing_requests(trace_file)
+        assert length(requests) == 3
+        assert Enum.map(requests, &get_in(&1, ["params", "archived"])) == [false, true, true]
+        assert Enum.at(requests, 2)["params"]["cursor"] == "second-archived"
+
+        assert Enum.all?(requests, fn request ->
+                 get_in(request, ["params", "searchTerm"]) == "FACTORY PROBE · Grail · Native Readback" and
+                   get_in(request, ["params", "sourceKinds"]) ==
+                     ~w(cli vscode exec appServer subAgent subAgentReview subAgentCompact subAgentThreadSpawn subAgentOther unknown)
+               end)
+      end
+    )
+  end
+
+  test "thread lookup rejects a project mismatch without creating a task" do
+    with_thread_listing_server(
+      "project-mismatch",
+      """
+      case "$line" in
+        *'"method":"thread/list"'*)
+          case "$line" in
+            *'"archived":false'*)
+              printf '%s\\n' '{"id":13,"result":{"data":[{"id":"wrong-project","name":"PPL-9723 · Specification Author","projectId":"project-other","cwd":"/worktree/other"}],"nextCursor":null}}'
+              ;;
+            *)
+              printf '%s\\n' '{"id":13,"result":{"data":[],"nextCursor":null}}'
+              ;;
+          esac
+          ;;
+      esac
+      """,
+      fn workspace, trace_file ->
+        assert {:error, {:thread_project_mismatch, "project-grail", "project-other"}} =
+                 AppServer.find_thread_by_title("PPL-9723 · Specification Author", "project-grail", workspace: workspace)
+
+        refute File.read!(trace_file) =~ ~s("method":"thread/start")
+      end
+    )
+  end
+
+  test "thread lookup exposes an unassigned candidate for independent project readback" do
+    with_thread_listing_server(
+      "project-unassigned",
+      """
+      case "$line" in
+        *'"method":"thread/list"'*)
+          case "$line" in
+            *'"archived":false'*)
+              printf '%s\\n' '{"id":13,"result":{"data":[{"id":"unassigned-thread","name":"PPL-9723 · Specification Author","projectId":null,"cwd":"/worktree/grail"}],"nextCursor":null}}'
+              ;;
+            *)
+              printf '%s\\n' '{"id":13,"result":{"data":[],"nextCursor":null}}'
+              ;;
+          esac
+          ;;
+      esac
+      """,
+      fn workspace, _trace_file ->
+        assert {:candidate, %{id: "unassigned-thread", project_id: nil, cwd: "/worktree/grail", archived: false}} =
+                 AppServer.find_thread_by_title("PPL-9723 · Specification Author", "project-grail", workspace: workspace)
+      end
+    )
+  end
+
+  test "thread lookup rejects duplicate exact names rather than selecting an arbitrary task" do
+    with_thread_listing_server(
+      "duplicate-thread",
+      """
+      case "$line" in
+        *'"method":"thread/list"'*)
+          case "$line" in
+            *'"archived":false'*)
+              printf '%s\\n' '{"id":13,"result":{"data":[{"id":"thread-1","name":"PPL-9723 · Specification Author","projectId":"project-grail","cwd":"/worktree/one"}],"nextCursor":null}}'
+              ;;
+            *)
+              printf '%s\\n' '{"id":13,"result":{"data":[{"id":"thread-2","name":"PPL-9723 · Specification Author","projectId":"project-grail","cwd":"/worktree/two"}],"nextCursor":null}}'
+              ;;
+          esac
+          ;;
+      esac
+      """,
+      fn workspace, _trace_file ->
+        assert {:error, {:thread_name_ambiguous, ["thread-1", "thread-2"]}} =
+                 AppServer.find_thread_by_title("PPL-9723 · Specification Author", "project-grail", workspace: workspace)
+      end
+    )
+  end
+
+  test "thread lookup reports not found only after checking active and archived tasks" do
+    with_thread_listing_server(
+      "not-found",
+      """
+      case "$line" in
+        *'"method":"thread/list"'*)
+          printf '%s\\n' '{"id":13,"result":{"data":[],"nextCursor":null}}'
+          ;;
+      esac
+      """,
+      fn workspace, trace_file ->
+        assert {:error, :thread_not_found} =
+                 AppServer.find_thread_by_title("PPL-9723 · Specification Author", "project-grail", workspace: workspace)
+
+        assert listing_requests(trace_file)
+               |> Enum.map(&get_in(&1, ["params", "archived"])) == [false, true]
+      end
+    )
+  end
+
+  test "thread lookup fails closed on a repeated pagination cursor" do
+    with_thread_listing_server(
+      "repeated-cursor",
+      """
+      case "$line" in
+        *'"method":"thread/list"'*)
+          printf '%s\\n' '{"id":13,"result":{"data":[],"nextCursor":"repeated"}}'
+          ;;
+      esac
+      """,
+      fn workspace, trace_file ->
+        assert {:error, :thread_list_cursor_repeated} =
+                 AppServer.find_thread_by_title("PPL-9723 · Specification Author", "project-grail", workspace: workspace)
+
+        assert length(listing_requests(trace_file)) == 2
+      end
+    )
+  end
+
   test "app server creates named durable threads and resumes the same thread with its model route" do
     test_root =
       Path.join(
@@ -103,10 +260,12 @@ defmodule SymphonyElixir.AppServerTest do
                  model: "gpt-5.6-sol",
                  project_id: "project-grail",
                  section_id: "section-factory",
-                 reasoning_effort: "xhigh"
+                 reasoning_effort: "xhigh",
+                 on_thread_created: fn thread_id -> send(self(), {:resumed_thread, thread_id}) end
                )
 
       assert resumed_session.thread_id == "thread-visible"
+      assert_received {:resumed_thread, "thread-visible"}
       assert resumed_session.model == "gpt-5.6-sol"
       assert resumed_session.reasoning_effort == "xhigh"
       assert :ok = AppServer.stop_session(resumed_session)
@@ -124,7 +283,7 @@ defmodule SymphonyElixir.AppServerTest do
       assert get_in(start_payload, ["params", "serviceName"]) == "symphony-factory"
       assert get_in(start_payload, ["params", "threadSource"]) == "symphonyFactory"
       assert get_in(start_payload, ["params", "model"]) == "gpt-5.6-terra"
-      assert get_in(start_payload, ["params", "projectId"]) == "project-grail"
+      refute Map.has_key?(start_payload["params"], "projectId")
 
       assert resume_payload = Enum.find(payloads, &(&1["method"] == "thread/resume"))
       assert get_in(resume_payload, ["params", "threadId"]) == "thread-visible"
@@ -156,6 +315,227 @@ defmodule SymphonyElixir.AppServerTest do
              end)
 
       assert payloads |> Enum.filter(&(&1["method"] == "thread/unsubscribe")) |> length() == 2
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server fails when a requested project cannot be bound" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-project-not-found-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "PPL-123")
+      codex_binary = Path.join(test_root, "fake-codex")
+
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      while IFS= read -r line; do
+        case "$line" in
+          *'"method":"initialize"'*)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          *'"method":"thread/start"'*)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"unbound-thread"}}}'
+            ;;
+          *'"method":"thread/metadata/update"'*)
+            printf '%s\\n' '{"id":7,"error":{"code":-32600,"message":"project not found: missing-project"}}'
+            ;;
+          *'"method":"thread/unsubscribe"'*)
+            printf '%s\\n' '{"id":6,"result":{"status":"unsubscribed"}}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      assert {:error, {:project_binding_failed, "missing-project", _reason}} =
+               AppServer.start_session(workspace, project_id: "missing-project")
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server refuses to substitute a different project for the requested desktop project" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-project-root-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "PPL-123")
+      repository_root = Path.join(test_root, "grail")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "requests.jsonl")
+
+      File.mkdir_p!(workspace)
+      File.mkdir_p!(repository_root)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      while IFS= read -r line; do
+        printf '%s\\n' "$line" >> "#{trace_file}"
+        case "$line" in
+          *'"method":"initialize"'*)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          *'"method":"project/list"'*)
+            printf '%s\\n' '{"id":12,"result":{"data":[{"id":"secondary-project","roots":[{"path":"#{test_root}/other"},{"path":"#{repository_root}"}]},{"id":"local-grail-project","roots":[{"path":"#{repository_root}"}]}],"nextCursor":null}}'
+            ;;
+          *'"method":"thread/start"'*)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"bound-thread"}}}'
+            ;;
+          *'"method":"thread/metadata/update"'*)
+            case "$line" in
+              *'"projectId":"local-grail-project"'*)
+                printf '%s\\n' '{"id":7,"result":{"thread":{"id":"bound-thread","projectId":"local-grail-project"}}}'
+                ;;
+              *)
+                printf '%s\\n' '{"id":7,"error":{"code":-32600,"message":"incorrect project binding"}}'
+                ;;
+            esac
+            ;;
+          *'"method":"thread/unsubscribe"'*)
+            printf '%s\\n' '{"id":6,"result":{"status":"unsubscribed"}}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      assert {:error, {:project_id_mismatch, "desktop-grail-project", "local-grail-project"}} =
+               AppServer.start_session(workspace,
+                 project_id: "desktop-grail-project",
+                 project_root: repository_root
+               )
+
+      refute File.read!(trace_file) =~ ~s("method":"thread/start")
+
+      assert {:ok, session} =
+               AppServer.start_session(workspace,
+                 project_id: "local-grail-project",
+                 project_root: repository_root
+               )
+
+      assert session.project_id == "local-grail-project"
+      assert :ok = AppServer.stop_session(session)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server does not start a worker for a secondary-only project root" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-secondary-root-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "PPL-123")
+      repository_root = Path.join(test_root, "grail")
+      codex_binary = Path.join(test_root, "fake-codex")
+
+      File.mkdir_p!(workspace)
+      File.mkdir_p!(repository_root)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      while IFS= read -r line; do
+        case "$line" in
+          *'"method":"initialize"'*)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          *'"method":"project/list"'*)
+            printf '%s\\n' '{"id":12,"result":{"data":[{"id":"other-project","roots":[{"path":"#{test_root}/other"},{"path":"#{repository_root}"}]}],"nextCursor":null}}'
+            ;;
+          *'"method":"thread/start"'*)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"wrong-thread"}}}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      assert {:error, {:project_root_not_found, _root}} =
+               AppServer.start_session(workspace,
+                 project_id: "desktop-grail-project",
+                 project_root: repository_root
+               )
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "resume cannot replace the persisted controller task identity" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-resume-mismatch-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "FACTORY-CONTROLLER")
+      codex_binary = Path.join(test_root, "fake-codex")
+
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      while IFS= read -r line; do
+        case "$line" in
+          *'"method":"initialize"'*)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          *'"method":"thread/resume"'*)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"unexpected-thread"}}}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      assert {:error, {:resumed_thread_id_mismatch, "existing-thread", "unexpected-thread"}} =
+               AppServer.start_session(workspace,
+                 resume_thread_id: "existing-thread",
+                 on_thread_created: fn thread_id -> send(self(), {:durable_thread_created, thread_id}) end
+               )
+
+      refute_received {:durable_thread_created, _thread_id}
     after
       File.rm_rf(test_root)
     end
@@ -448,8 +828,11 @@ defmodule SymphonyElixir.AppServerTest do
                }}} =
                AppServer.start_session(workspace,
                  required_mcp_servers: ["Jira"],
-                 mcp_startup_timeout_ms: 1_000
+                 mcp_startup_timeout_ms: 1_000,
+                 on_thread_created: fn thread_id -> send(self(), {:durable_thread_created, thread_id}) end
                )
+
+      assert_received {:durable_thread_created, "thread-mcp-failed"}
     after
       File.rm_rf(test_root)
     end
@@ -1040,7 +1423,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
-  test "app server auto-approves command execution approval requests when approval policy is never" do
+  test "app server rejects command execution approval requests when approval policy is never" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -1115,7 +1498,8 @@ defmodule SymphonyElixir.AppServerTest do
         labels: ["backend"]
       }
 
-      assert {:ok, _result} = AppServer.run(workspace, "Handle approval request", issue)
+      assert {:error, {:approval_required, %{"method" => "item/commandExecution/requestApproval"}}} =
+               AppServer.run(workspace, "Handle approval request", issue)
 
       trace = File.read!(trace_file)
       lines = String.split(trace, "\n", trim: true)
@@ -1160,7 +1544,7 @@ defmodule SymphonyElixir.AppServerTest do
                end
              end)
 
-      assert Enum.any?(lines, fn line ->
+      refute Enum.any?(lines, fn line ->
                if String.starts_with?(line, "JSON:") do
                  payload =
                    line
@@ -1177,7 +1561,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
-  test "app server auto-approves MCP tool approval prompts when approval policy is never" do
+  test "app server rejects MCP tool approval prompts when approval policy is never" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -1252,12 +1636,13 @@ defmodule SymphonyElixir.AppServerTest do
         labels: ["backend"]
       }
 
-      assert {:ok, _result} = AppServer.run(workspace, "Handle tool approval prompt", issue)
+      assert {:error, {:turn_input_required, %{"method" => "item/tool/requestUserInput"}}} =
+               AppServer.run(workspace, "Handle tool approval prompt", issue)
 
       trace = File.read!(trace_file)
       lines = String.split(trace, "\n", trim: true)
 
-      assert Enum.any?(lines, fn line ->
+      refute Enum.any?(lines, fn line ->
                if String.starts_with?(line, "JSON:") do
                  payload =
                    line
@@ -1274,6 +1659,181 @@ defmodule SymphonyElixir.AppServerTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  test "scoped Jira comment approval requires matching started tool, issue, body, and host question" do
+    question = %{
+      "header" => "Approve app tool call?",
+      "id" => "mcp_tool_call_approval_call-720",
+      "isOther" => false,
+      "isSecret" => false,
+      "options" => [
+        %{"label" => "Approve Once"},
+        %{"label" => "Approve this Session"},
+        %{"label" => "Deny"},
+        %{"label" => "Cancel"}
+      ],
+      "question" => "The Jira MCP server wants to run the tool \"jira_add_comment\", which may modify or delete data. Allow this action?"
+    }
+
+    request = %{
+      "id" => 110,
+      "method" => "item/tool/requestUserInput",
+      "params" => %{"itemId" => "call-720", "questions" => [question]}
+    }
+
+    item = %{
+      "id" => "call-720",
+      "type" => "mcpToolCall",
+      "server" => "Jira",
+      "tool" => "jira_add_comment",
+      "arguments" => %{"issue_key" => "MT-720", "body" => "Approved marker-720"}
+    }
+
+    assert {{:ok, _result}, approved_payloads} = run_scoped_approval_fixture(item, request)
+
+    assert Enum.any?(approved_payloads, fn payload ->
+             get_in(payload, ["params", "approvalPolicy"]) == "on-request"
+           end)
+
+    assert Enum.any?(approved_payloads, fn payload ->
+             get_in(payload, ["result", "answers", question["id"], "answers"]) == ["Approve Once"]
+           end)
+
+    denied_items = [
+      %{item | "server" => "GitLab"},
+      %{item | "tool" => "jira_update_issue"},
+      %{item | "arguments" => %{"issue_key" => "MT-721", "body" => "Approved marker-720"}},
+      %{item | "arguments" => %{"issue_key" => "MT-720", "body" => "Approved marker-720 plus unapproved text"}},
+      %{item | "arguments" => %{"issue_key" => "MT-720", "body" => "Approved marker-720", "visibility" => "public"}},
+      nil
+    ]
+
+    for denied_item <- denied_items do
+      assert {{:error, {:turn_input_required, %{"method" => "item/tool/requestUserInput"}}}, denied_payloads} =
+               run_scoped_approval_fixture(denied_item, request)
+
+      refute Enum.any?(denied_payloads, &(&1["id"] == 110 and is_map(&1["result"])))
+    end
+
+    altered_request = put_in(request, ["params", "questions", Access.at(0), "question"], "Approve Jira, please?")
+
+    assert {{:error, {:turn_input_required, %{"method" => "item/tool/requestUserInput"}}}, _payloads} =
+             run_scoped_approval_fixture(item, altered_request)
+
+    command_request = %{"id" => 110, "method" => "item/commandExecution/requestApproval", "params" => %{}}
+
+    assert {{:error, {:approval_required, %{"method" => "item/commandExecution/requestApproval"}}}, payloads} =
+             run_scoped_approval_fixture(item, command_request)
+
+    refute Enum.any?(payloads, &(&1["id"] == 110 and is_map(&1["result"])))
+
+    file_request = %{"id" => 110, "method" => "item/fileChange/requestApproval", "params" => %{}}
+
+    assert {{:error, {:approval_required, %{"method" => "item/fileChange/requestApproval"}}}, payloads} =
+             run_scoped_approval_fixture(item, file_request)
+
+    refute Enum.any?(payloads, &(&1["id"] == 110 and is_map(&1["result"])))
+
+    assert {{:error, {:turn_input_required, %{"method" => "item/tool/requestUserInput"}}}, replay_payloads} =
+             run_scoped_approval_fixture(item, request, replay: true)
+
+    assert Enum.any?(replay_payloads, &(&1["id"] == 110 and is_map(&1["result"])))
+    refute Enum.any?(replay_payloads, &(&1["id"] == 111 and is_map(&1["result"])))
+  end
+
+  test "scoped Jira label approval accepts only exact labels on the expected issue" do
+    question = %{
+      "header" => "Approve app tool call?",
+      "id" => "mcp_tool_call_approval_call-720",
+      "isOther" => false,
+      "isSecret" => false,
+      "options" => [
+        %{"label" => "Approve Once"},
+        %{"label" => "Approve this Session"},
+        %{"label" => "Deny"},
+        %{"label" => "Cancel"}
+      ],
+      "question" => "The Jira MCP server wants to run the tool \"jira_update_issue\", which may modify or delete data. Allow this action?"
+    }
+
+    request = %{
+      "id" => 110,
+      "method" => "item/tool/requestUserInput",
+      "params" => %{"itemId" => "call-720", "questions" => [question]}
+    }
+
+    item = %{
+      "id" => "call-720",
+      "type" => "mcpToolCall",
+      "server" => "Jira",
+      "tool" => "jira_update_issue",
+      "arguments" => %{"issue_key" => "MT-720", "fields" => Jason.encode!(%{"labels" => ["ai-ready", "repo-grail"]})}
+    }
+
+    approval = %{server: "Jira", tool: "jira_update_issue", issue_key: "MT-720", labels_equals: ["ai-ready", "repo-grail"]}
+
+    assert {{:ok, _result}, approved_payloads} = run_scoped_approval_fixture(item, request, approvals: [approval])
+
+    assert Enum.any?(approved_payloads, fn payload ->
+             get_in(payload, ["result", "answers", question["id"], "answers"]) == ["Approve Once"]
+           end)
+
+    denied_items = [
+      %{item | "arguments" => %{"issue_key" => "MT-721", "fields" => Jason.encode!(%{"labels" => ["ai-ready", "repo-grail"]})}},
+      %{item | "arguments" => %{"issue_key" => "MT-720", "fields" => Jason.encode!(%{"labels" => ["ai-ready"]})}},
+      %{item | "arguments" => %{"issue_key" => "MT-720", "fields" => Jason.encode!(%{"labels" => ["ai-ready", "repo-grail"], "summary" => "Unapproved"})}},
+      %{item | "arguments" => %{"issue_key" => "MT-720"}},
+      %{item | "arguments" => Map.put(item["arguments"], "attachments", "/tmp/unapproved")},
+      %{item | "tool" => "jira_add_comment"}
+    ]
+
+    for denied_item <- denied_items do
+      assert {{:error, {:turn_input_required, %{"method" => "item/tool/requestUserInput"}}}, payloads} =
+               run_scoped_approval_fixture(denied_item, request, approvals: [approval])
+
+      refute Enum.any?(payloads, &(&1["id"] == 110 and is_map(&1["result"])))
+    end
+
+    comment_approval = %{
+      server: "Jira",
+      tool: "jira_add_comment",
+      issue_key: "MT-720",
+      body_equals: "Approved marker-720"
+    }
+
+    second_item = %{
+      item
+      | "id" => "call-721",
+        "tool" => "jira_add_comment",
+        "arguments" => %{"issue_key" => "MT-720", "body" => "Approved marker-720"}
+    }
+
+    second_request = %{
+      request
+      | "id" => 111,
+        "params" => %{
+          "itemId" => "call-721",
+          "questions" => [
+            %{
+              question
+              | "id" => "mcp_tool_call_approval_call-721",
+                "question" => "The Jira MCP server wants to run the tool \"jira_add_comment\", which may modify or delete data. Allow this action?"
+            }
+          ]
+        }
+    }
+
+    assert {{:ok, _result}, dual_payloads} =
+             run_scoped_approval_fixture(item, request,
+               approvals: [comment_approval, approval],
+               replay: true,
+               second_item: second_item,
+               second_request: second_request
+             )
+
+    assert Enum.any?(dual_payloads, &(&1["id"] == 110 and is_map(&1["result"])))
+    assert Enum.any?(dual_payloads, &(&1["id"] == 111 and is_map(&1["result"])))
   end
 
   test "app server blocks freeform tool input prompts" do
@@ -2186,6 +2746,165 @@ defmodule SymphonyElixir.AppServerTest do
                end
              end)
     after
+      File.rm_rf(test_root)
+    end
+  end
+
+  defp with_thread_listing_server(test_name, list_handler, callback) do
+    test_root =
+      Path.join(System.tmp_dir!(), "symphony-thread-lookup-#{test_name}-#{System.unique_integer([:positive])}")
+
+    previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "lookup")
+    trace_file = Path.join(test_root, "lookup.trace")
+    codex_binary = Path.join(test_root, "fake-codex")
+
+    try do
+      File.mkdir_p!(workspace)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/symphony-thread-lookup.trace}"
+      while IFS= read -r line; do
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$line" in
+          *'"method":"initialize"'*) printf '%s\\n' '{"id":1,"result":{}}' ;;
+        esac
+        #{list_handler}
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      callback.(workspace, trace_file)
+    after
+      restore_env("SYMP_TEST_CODEx_TRACE", previous_trace)
+      File.rm_rf(test_root)
+    end
+  end
+
+  defp listing_requests(trace_file) do
+    trace_file
+    |> File.read!()
+    |> String.split("\n", trim: true)
+    |> Enum.map(&String.trim_leading(&1, "JSON:"))
+    |> Enum.map(&Jason.decode!/1)
+    |> Enum.filter(&(&1["method"] == "thread/list"))
+  end
+
+  defp run_scoped_approval_fixture(item, request, opts \\ []) do
+    test_root =
+      Path.join(System.tmp_dir!(), "symphony-scoped-approval-#{System.unique_integer([:positive])}")
+
+    previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
+    trace_file = Path.join(test_root, "codex.trace")
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "MT-720")
+    codex_binary = Path.join(test_root, "fake-codex")
+
+    try do
+      File.mkdir_p!(workspace)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      started =
+        if is_map(item) do
+          Jason.encode!(%{"method" => "item/started", "params" => %{"item" => item}})
+        else
+          ""
+        end
+
+      replay_started =
+        if Keyword.get(opts, :replay, false) do
+          second_item = Keyword.get(opts, :second_item, %{item | "id" => "call-721"})
+
+          Jason.encode!(%{
+            "method" => "item/started",
+            "params" => %{"item" => second_item}
+          })
+        else
+          ""
+        end
+
+      replay_request =
+        if Keyword.get(opts, :replay, false) do
+          Keyword.get(
+            opts,
+            :second_request,
+            request
+            |> Map.put("id", 111)
+            |> put_in(["params", "itemId"], "call-721")
+            |> put_in(["params", "questions", Access.at(0), "id"], "mcp_tool_call_approval_call-721")
+          )
+          |> Jason.encode!()
+        else
+          ""
+        end
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-scoped-approval.trace}"
+      while IFS= read -r line; do
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$line" in
+          *'"method":"initialize"'*) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          *'"method":"thread/start"'*) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-720"}}}' ;;
+          *'"method":"turn/start"'*)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-720"}}}'
+            if [ -n '#{started}' ]; then printf '%s\\n' '#{started}'; fi
+            printf '%s\\n' '#{Jason.encode!(request)}'
+            ;;
+          *'"id":110'*)
+            if [ -n '#{replay_started}' ]; then
+              printf '%s\\n' '#{replay_started}'
+              printf '%s\\n' '#{replay_request}'
+            else
+              printf '%s\\n' '{"method":"turn/completed"}'
+            fi
+            ;;
+          *'"id":111'*) printf '%s\\n' '{"method":"turn/completed"}' ;;
+          *'"method":"thread/unsubscribe"'*) printf '%s\\n' '{"id":6,"result":{"status":"unsubscribed"}}' ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_approval_policy: "never"
+      )
+
+      issue = %Issue{id: "issue-720", identifier: "MT-720", title: "Scoped approval"}
+
+      approvals =
+        Keyword.get(opts, :approvals, [
+          %{server: "Jira", tool: "jira_add_comment", issue_key: "MT-720", body_equals: "Approved marker-720"}
+        ])
+
+      result =
+        AppServer.run(workspace, "Post one exact Jira comment", issue,
+          approval_policy: "on-request",
+          allowed_mcp_tool_approvals: approvals
+        )
+
+      payloads =
+        trace_file
+        |> then(fn path -> if File.exists?(path), do: File.read!(path), else: "" end)
+        |> String.split("\n", trim: true)
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+
+      {result, payloads}
+    after
+      restore_env("SYMP_TEST_CODEx_TRACE", previous_trace)
       File.rm_rf(test_root)
     end
   end

@@ -6,7 +6,7 @@ defmodule SymphonyElixir.Factory.Policy do
   alias SymphonyElixir.Factory.{ModelRouter, Queue}
 
   @explicit_roles ~w(
-    orchestrator specification-author specification-critic feature-planner
+    orchestrator orchestrator-intake specification-author specification-critic feature-planner
     change-verifier manual-validator explorer failure-triager
   )
 
@@ -14,6 +14,7 @@ defmodule SymphonyElixir.Factory.Policy do
   @spec validate(struct() | map()) :: :ok | {:error, term()}
   def validate(factory) do
     with {:ok, _jql} <- Queue.jql(value(factory, "queue", %{})),
+         :ok <- validate_specification_authorization(value(factory, "specification_authorization_mode", "auto_after_critic")),
          :ok <- validate_branch_prefix(value(factory, "branch_prefix", "ai")),
          :ok <- validate_repositories(value(factory, "repositories", %{})),
          :ok <- validate_models(value(factory, "models", %{})),
@@ -22,6 +23,9 @@ defmodule SymphonyElixir.Factory.Policy do
       validate_manual_validation(value(factory, "manual_validation", %{}))
     end
   end
+
+  defp validate_specification_authorization(mode) when mode in ["auto_after_critic", "human_confirmation"], do: :ok
+  defp validate_specification_authorization(_mode), do: {:error, :invalid_specification_authorization_mode}
 
   defp validate_branch_prefix(prefix) when is_binary(prefix) do
     if Regex.match?(~r/^[A-Za-z0-9._-]+$/, prefix), do: :ok, else: {:error, :invalid_branch_prefix}
@@ -43,6 +47,9 @@ defmodule SymphonyElixir.Factory.Policy do
 
         not is_list(route_labels) or route_labels == [] or not Enum.all?(route_labels, &present?/1) ->
           {:halt, {:error, {:repository_route_labels_required, to_string(repo_key)}}}
+
+        value(route, "ci_preflight") not in [nil, "draft_mr"] ->
+          {:halt, {:error, {:invalid_ci_preflight_route, to_string(repo_key)}}}
 
         not File.dir?(Path.expand(value(route, "path"))) ->
           {:halt, {:error, {:repository_path_missing, to_string(repo_key), value(route, "path")}}}

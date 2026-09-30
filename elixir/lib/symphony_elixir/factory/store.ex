@@ -55,6 +55,11 @@ defmodule SymphonyElixir.Factory.Store do
       branch TEXT,
       candidate_sha TEXT,
       candidate_handoff TEXT,
+      ci_preflight_sha TEXT,
+      ci_pipeline_id INTEGER,
+      ci_pipeline_url TEXT,
+      ci_evidence_json TEXT,
+      ci_last_checked_at TEXT,
       attempt INTEGER NOT NULL DEFAULT 1,
       validation_attempt INTEGER NOT NULL DEFAULT 0,
       slack_claim_ts TEXT,
@@ -160,6 +165,8 @@ defmodule SymphonyElixir.Factory.Store do
       routing_reason TEXT NOT NULL,
       codex_project_id TEXT,
       codex_section_id TEXT,
+      workspace TEXT,
+      workspace_sha TEXT,
       prompt_sha256 TEXT NOT NULL,
       output_json TEXT,
       failure_code TEXT,
@@ -171,6 +178,98 @@ defmodule SymphonyElixir.Factory.Store do
     """
     CREATE INDEX IF NOT EXISTS factory_tasks_by_run
     ON factory_tasks(run_id, created_at)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS intake_snapshots (
+      scope TEXT PRIMARY KEY,
+      observed_at TEXT NOT NULL,
+      snapshot_json TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS contract_chats (
+      run_id TEXT PRIMARY KEY REFERENCES runs(run_id),
+      task_key TEXT NOT NULL REFERENCES factory_tasks(task_key),
+      status TEXT NOT NULL CHECK(status IN ('WAITING', 'ANSWERED', 'CONSUMED')),
+      source_sha256 TEXT NOT NULL,
+      question_turn_id TEXT NOT NULL,
+      question_sha256 TEXT NOT NULL,
+      user_turn_id TEXT,
+      user_message_id TEXT,
+      user_text TEXT,
+      reply_evidence_json TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS contract_chats_by_task
+    ON contract_chats(task_key)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS desktop_requests (
+      request_key TEXT PRIMARY KEY,
+      target_kind TEXT NOT NULL CHECK(target_kind IN ('TASK', 'CONTROLLER')),
+      target_key TEXT NOT NULL,
+      action TEXT NOT NULL CHECK(action IN ('CREATE', 'FOLLOWUP')),
+      status TEXT NOT NULL CHECK(status IN (
+        'PENDING', 'CREATE_UNCERTAIN', 'FOLLOWUP_UNCERTAIN',
+        'THREAD_RECORDED', 'RECONCILE_REQUIRED', 'SUCCEEDED', 'FAILED'
+      )),
+      payload_sha256 TEXT NOT NULL,
+      codex_project_id TEXT NOT NULL,
+      model TEXT NOT NULL,
+      reasoning_effort TEXT NOT NULL,
+      existing_thread_id TEXT,
+      thread_id TEXT,
+      verified_project_id TEXT,
+      verified_cwd TEXT,
+      verified_head_sha TEXT,
+      turn_id TEXT,
+      title TEXT NOT NULL,
+      prompt TEXT NOT NULL,
+      schema_json TEXT NOT NULL,
+      cwd TEXT NOT NULL,
+      branch TEXT,
+      base_branch TEXT,
+      metadata_json TEXT NOT NULL,
+      output_json TEXT,
+      failure_code TEXT,
+      rejected_tool_call_id TEXT,
+      claimed_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS one_unresolved_desktop_request_per_target
+    ON desktop_requests(target_kind, target_key)
+    WHERE status IN (
+      'PENDING', 'CREATE_UNCERTAIN', 'FOLLOWUP_UNCERTAIN',
+      'THREAD_RECORDED', 'RECONCILE_REQUIRED'
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS planner_format_repairs (
+      request_key TEXT PRIMARY KEY REFERENCES desktop_requests(request_key),
+      completed_turn_id TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('AUTHORIZED', 'CLAIMED')),
+      authorized_at TEXT NOT NULL,
+      claimed_at TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS controller_format_repairs (
+      request_key TEXT PRIMARY KEY REFERENCES desktop_requests(request_key),
+      completed_turn_id TEXT NOT NULL,
+      request_payload_sha256 TEXT NOT NULL,
+      thread_id TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('AUTHORIZED', 'CLAIMED', 'SUCCEEDED')),
+      authorized_at TEXT NOT NULL,
+      claimed_at TEXT,
+      repair_turn_id TEXT,
+      repair_output_sha256 TEXT
+    )
     """
   ]
 
@@ -199,7 +298,12 @@ defmodule SymphonyElixir.Factory.Store do
     "risk" => "TEXT",
     "risk_signals_json" => "TEXT",
     "workspace_state" => "TEXT NOT NULL DEFAULT 'UNMATERIALIZED'",
-    "hibernated_at" => "TEXT"
+    "hibernated_at" => "TEXT",
+    "ci_preflight_sha" => "TEXT",
+    "ci_pipeline_id" => "INTEGER",
+    "ci_pipeline_url" => "TEXT",
+    "ci_evidence_json" => "TEXT",
+    "ci_last_checked_at" => "TEXT"
   }
 
   @control_columns %{
@@ -219,7 +323,21 @@ defmodule SymphonyElixir.Factory.Store do
 
   @task_columns %{
     "codex_project_id" => "TEXT",
-    "codex_section_id" => "TEXT"
+    "codex_section_id" => "TEXT",
+    "workspace" => "TEXT",
+    "workspace_sha" => "TEXT"
+  }
+
+  @desktop_request_columns %{
+    "verified_project_id" => "TEXT",
+    "verified_cwd" => "TEXT",
+    "verified_head_sha" => "TEXT",
+    "rejected_tool_call_id" => "TEXT",
+    "claimed_at" => "TEXT"
+  }
+
+  @contract_chat_columns %{
+    "reply_evidence_json" => "TEXT"
   }
 
   @type connection :: DBConnection.conn()
@@ -277,11 +395,16 @@ defmodule SymphonyElixir.Factory.Store do
     ensure_columns(connection, "runs", @model_run_columns)
     ensure_columns(connection, "control", @control_columns)
     ensure_columns(connection, "factory_tasks", @task_columns)
+    ensure_columns(connection, "desktop_requests", @desktop_request_columns)
+    ensure_columns(connection, "contract_chats", @contract_chat_columns)
 
     query!(
       connection,
-      "INSERT OR IGNORE INTO factory_schema_migrations(version, applied_at) VALUES (1, ?), (2, ?), (3, ?), (4, ?), (5, ?), (6, ?)",
-      [iso_now(), iso_now(), iso_now(), iso_now(), iso_now(), iso_now()]
+      """
+      INSERT OR IGNORE INTO factory_schema_migrations(version, applied_at)
+      VALUES (1, ?), (2, ?), (3, ?), (4, ?), (5, ?), (6, ?), (7, ?), (8, ?), (9, ?), (10, ?), (11, ?), (12, ?), (13, ?)
+      """,
+      List.duplicate(iso_now(), 13)
     )
 
     :ok

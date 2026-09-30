@@ -308,17 +308,21 @@ defmodule SymphonyElixir.Config.Schema do
       field(:scope, :string, default: "assigned-jira-work")
       field(:dispatcher_id, :string)
       field(:controller_codex_project_id, :string)
+      field(:task_transport, :string, default: "app_server")
+      field(:native_session_discovery_enabled, :boolean, default: false)
       field(:branch_prefix, :string, default: "ai")
       field(:lease_seconds, :integer, default: 240)
       field(:controller_required_mcp_servers, {:array, :string}, default: [])
       field(:controller_mcp_startup_timeout_ms, :integer, default: 60_000)
       field(:maximum_specifiers, :integer, default: 2)
+      field(:specification_authorization_mode, :string, default: "auto_after_critic")
       field(:maximum_writers, :integer, default: 2)
       field(:maximum_validators, :integer, default: 2)
       field(:writer_disk_gb, :integer, default: 20)
       field(:maximum_implementation_iterations, :integer, default: 8)
       field(:maximum_code_repair_rounds, :integer, default: 2)
       field(:maximum_validation_repair_rounds, :integer, default: 2)
+      field(:controller_writer_stale_minutes, :integer, default: 15)
       field(:stale_task_minutes, :integer, default: 90)
       field(:queue, :map, default: %{})
       field(:cleanup, :map, default: %{})
@@ -339,17 +343,21 @@ defmodule SymphonyElixir.Config.Schema do
           :scope,
           :dispatcher_id,
           :controller_codex_project_id,
+          :task_transport,
+          :native_session_discovery_enabled,
           :branch_prefix,
           :lease_seconds,
           :controller_required_mcp_servers,
           :controller_mcp_startup_timeout_ms,
           :maximum_specifiers,
+          :specification_authorization_mode,
           :maximum_writers,
           :maximum_validators,
           :writer_disk_gb,
           :maximum_implementation_iterations,
           :maximum_code_repair_rounds,
           :maximum_validation_repair_rounds,
+          :controller_writer_stale_minutes,
           :stale_task_minutes,
           :queue,
           :cleanup,
@@ -369,13 +377,16 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:lease_seconds, greater_than: 0)
       |> validate_number(:controller_mcp_startup_timeout_ms, greater_than: 0)
       |> validate_number(:maximum_specifiers, greater_than: 0)
+      |> validate_inclusion(:specification_authorization_mode, ["auto_after_critic", "human_confirmation"])
       |> validate_number(:maximum_writers, greater_than: 0)
       |> validate_number(:maximum_validators, greater_than: 0)
       |> validate_number(:writer_disk_gb, greater_than: 0)
       |> validate_number(:maximum_implementation_iterations, greater_than: 0)
       |> validate_number(:maximum_code_repair_rounds, greater_than_or_equal_to: 0)
       |> validate_number(:maximum_validation_repair_rounds, greater_than_or_equal_to: 0)
+      |> validate_number(:controller_writer_stale_minutes, greater_than: 0)
       |> validate_number(:stale_task_minutes, greater_than: 0)
+      |> validate_inclusion(:task_transport, ["app_server", "desktop_broker"])
       |> validate_factory_required_fields()
     end
 

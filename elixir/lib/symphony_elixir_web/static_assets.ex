@@ -2,12 +2,14 @@ defmodule SymphonyElixirWeb.StaticAssets do
   @moduledoc false
 
   @dashboard_css_path Path.expand("../../priv/static/dashboard.css", __DIR__)
+  @dashboard_js_path Path.expand("../../priv/static/dashboard.js", __DIR__)
   @favicon_path Path.expand("../../priv/static/favicon.png", __DIR__)
   @phoenix_html_js_path Application.app_dir(:phoenix_html, "priv/static/phoenix_html.js")
   @phoenix_js_path Application.app_dir(:phoenix, "priv/static/phoenix.js")
   @phoenix_live_view_js_path Application.app_dir(:phoenix_live_view, "priv/static/phoenix_live_view.js")
 
   @external_resource @dashboard_css_path
+  @external_resource @dashboard_js_path
   @external_resource @favicon_path
   @external_resource @phoenix_html_js_path
   @external_resource @phoenix_js_path
@@ -22,11 +24,16 @@ defmodule SymphonyElixirWeb.StaticAssets do
                   |> Base.encode16(case: :lower)
                   |> binary_part(0, 12)
   @phoenix_html_js File.read!(@phoenix_html_js_path)
+  @dashboard_js File.read!(@dashboard_js_path)
+  @dashboard_js_digest :crypto.hash(:sha256, @dashboard_js)
+                       |> Base.encode16(case: :lower)
+                       |> binary_part(0, 12)
   @phoenix_js File.read!(@phoenix_js_path)
   @phoenix_live_view_js File.read!(@phoenix_live_view_js_path)
 
   @assets %{
     "/dashboard.css" => {"text/css", @dashboard_css},
+    "/dashboard.js" => {"application/javascript", @dashboard_js},
     "/favicon.png" => {"image/png", @favicon},
     "/vendor/phoenix_html/phoenix_html.js" => {"application/javascript", @phoenix_html_js},
     "/vendor/phoenix/phoenix.js" => {"application/javascript", @phoenix_js},
@@ -35,6 +42,9 @@ defmodule SymphonyElixirWeb.StaticAssets do
 
   @spec dashboard_css_url() :: String.t()
   def dashboard_css_url, do: "/dashboard.css?v=#{@dashboard_css_digest}"
+
+  @spec dashboard_js_url() :: String.t()
+  def dashboard_js_url, do: "/dashboard.js?v=#{@dashboard_js_digest}"
 
   @spec favicon_url() :: String.t()
   def favicon_url, do: "/favicon.png?v=#{@favicon_digest}"

@@ -6,11 +6,12 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   use Phoenix.Controller, formats: [:json]
 
   alias Plug.Conn
+  alias SymphonyElixir.Factory.Observability, as: FactoryObservability
   alias SymphonyElixirWeb.{Endpoint, Presenter}
 
   @spec state(Conn.t(), map()) :: Conn.t()
   def state(conn, _params) do
-    json(conn, Presenter.state_payload(orchestrator(), snapshot_timeout_ms()))
+    json(conn, Presenter.state_payload(orchestrator(), snapshot_timeout_ms(), factory_observability()))
   end
 
   @spec issue(Conn.t(), map()) :: Conn.t()
@@ -59,5 +60,9 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
 
   defp snapshot_timeout_ms do
     Endpoint.config(:snapshot_timeout_ms) || 15_000
+  end
+
+  defp factory_observability do
+    Endpoint.config(:factory_observability) || (&FactoryObservability.snapshot/0)
   end
 end

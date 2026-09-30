@@ -17,15 +17,23 @@ defmodule SymphonyElixir.Codex.AppServer do
   @thread_read_id 9
   @thread_archive_id 10
   @apps_installed_id 11
+  @project_list_id 12
+  @thread_list_id 13
+  @mcp_tool_call_id 14
+  @thread_list_page_size 100
+  @thread_list_max_records 10_000
+  @thread_list_source_kinds ~w(cli vscode exec appServer subAgent subAgentReview subAgentCompact subAgentThreadSpawn subAgentOther unknown)
   @thread_unsubscribe_timeout_ms 1_000
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @mcp_startup_statuses_key {__MODULE__, :mcp_startup_statuses}
+  @mcp_approval_state_key {__MODULE__, :mcp_approval_state}
   @type session :: %{
           port: port(),
           metadata: map(),
           approval_policy: String.t() | map(),
           auto_approve_requests: boolean(),
+          allowed_mcp_tool_approvals: list(),
           thread_sandbox: String.t(),
           turn_sandbox_policy: map(),
           thread_id: String.t(),
@@ -51,16 +59,53 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
+  @doc "Calls one configured MCP tool from an ephemeral app-server thread without accepting interactive approvals."
+  @spec call_mcp_tool(Path.t(), String.t(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
+  def call_mcp_tool(workspace, server, tool, arguments, opts \\ [])
+      when is_binary(server) and is_binary(tool) and is_map(arguments) do
+    with {:ok, session} <-
+           start_session(workspace,
+             ephemeral: true,
+             required_mcp_servers: [server],
+             mcp_startup_timeout_ms: Keyword.get(opts, :mcp_startup_timeout_ms, 60_000),
+             service_name: "symphony-factory-connector",
+             thread_source: "symphonyFactoryConnector"
+           ) do
+      try do
+        send_message(session.port, %{
+          "method" => "mcpServer/tool/call",
+          "id" => @mcp_tool_call_id,
+          "params" => %{
+            "server" => server,
+            "tool" => tool,
+            "arguments" => arguments,
+            "threadId" => session.thread_id
+          }
+        })
+
+        deadline_ms = System.monotonic_time(:millisecond) + Config.settings!().codex.read_timeout_ms
+        await_mcp_tool_response(session.port, deadline_ms, "")
+      after
+        stop_session(session)
+      end
+    end
+  end
+
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
 
     thread_options = %{
       mcp_startup_timeout_ms: Keyword.get(opts, :mcp_startup_timeout_ms, 60_000),
+      approval_policy: Keyword.get(opts, :approval_policy),
+      allowed_mcp_tool_approvals: Keyword.get(opts, :allowed_mcp_tool_approvals, []),
       fork_on_active_writer: Keyword.get(opts, :fork_on_active_writer, false),
+      ephemeral: Keyword.get(opts, :ephemeral, false),
       model: Keyword.get(opts, :model),
       name: normalize_thread_name(Keyword.get(opts, :thread_name)),
+      on_thread_created: Keyword.get(opts, :on_thread_created),
       project_id: normalize_project_id(Keyword.get(opts, :project_id)),
+      project_root: normalize_project_root(Keyword.get(opts, :project_root)),
       section_id: normalize_section_id(Keyword.get(opts, :section_id)),
       reasoning_effort: Keyword.get(opts, :reasoning_effort),
       required_apps: normalize_required_apps(Keyword.get(opts, :required_apps, [])),
@@ -79,7 +124,8 @@ defmodule SymphonyElixir.Codex.AppServer do
            {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
         metadata = port_metadata(port, worker_host)
 
-        with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
+        with {:ok, configured_policies} <- session_policies(expanded_workspace, worker_host),
+             {:ok, session_policies} <- scoped_session_policies(configured_policies, thread_options),
              {:ok, thread_ref} <-
                do_start_session(
                  port,
@@ -93,13 +139,14 @@ defmodule SymphonyElixir.Codex.AppServer do
              port: port,
              metadata: metadata,
              approval_policy: session_policies.approval_policy,
-             auto_approve_requests: session_policies.approval_policy == "never",
+             auto_approve_requests: false,
+             allowed_mcp_tool_approvals: thread_options.allowed_mcp_tool_approvals,
              thread_sandbox: session_policies.thread_sandbox,
              turn_sandbox_policy: session_policies.turn_sandbox_policy,
              thread_id: thread_ref.thread_id,
              forked_from_thread_id: thread_ref.forked_from_thread_id,
              thread_name: thread_options.name,
-             project_id: thread_options.project_id,
+             project_id: thread_ref.project_id,
              section_id: thread_options.section_id,
              model: thread_options.model,
              reasoning_effort: thread_options.reasoning_effort,
@@ -125,6 +172,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata: metadata,
           approval_policy: approval_policy,
           auto_approve_requests: auto_approve_requests,
+          allowed_mcp_tool_approvals: allowed_mcp_tool_approvals,
           turn_sandbox_policy: turn_sandbox_policy,
           thread_id: thread_id,
           model: model,
@@ -144,69 +192,79 @@ defmodule SymphonyElixir.Codex.AppServer do
         DynamicTool.execute(tool, arguments, dynamic_tool_binding, issue: issue)
       end)
 
-    case start_turn(
-           port,
-           thread_id,
-           prompt,
-           issue,
-           %{
-             workspace: workspace,
-             approval_policy: approval_policy,
-             sandbox_policy: turn_sandbox_policy,
-             model: model,
-             reasoning_effort: reasoning_effort,
-             output_schema: Keyword.get(opts, :output_schema)
-           }
-         ) do
-      {:ok, turn_id} ->
-        session_id = "#{thread_id}-#{turn_id}"
-        Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id}")
+    Process.put(@mcp_approval_state_key, %{
+      items: %{},
+      allowed: allowed_mcp_tool_approvals,
+      expected_issue_key: Map.get(issue, :identifier)
+    })
 
-        emit_message(
-          on_message,
-          :session_started,
-          %{
-            session_id: session_id,
-            thread_id: thread_id,
-            turn_id: turn_id
-          },
-          metadata
-        )
-
-        case await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
-          {:ok, result} ->
-            reassert_thread_name(port, thread_id, thread_name)
-            Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
-
-            {:ok,
+    try do
+      case start_turn(
+             port,
+             thread_id,
+             prompt,
+             issue,
              %{
-               result: result,
-               session_id: session_id,
-               thread_id: thread_id,
-               turn_id: turn_id
-             }}
+               workspace: workspace,
+               approval_policy: approval_policy,
+               sandbox_policy: turn_sandbox_policy,
+               model: model,
+               reasoning_effort: reasoning_effort,
+               output_schema: Keyword.get(opts, :output_schema)
+             }
+           ) do
+        {:ok, turn_id} ->
+          session_id = "#{thread_id}-#{turn_id}"
+          Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id}")
 
-          {:error, reason} ->
-            reassert_thread_name(port, thread_id, thread_name)
-            Logger.warning("Codex session ended with error for #{issue_context(issue)} session_id=#{session_id}: #{inspect(reason)}")
+          emit_message(
+            on_message,
+            :session_started,
+            %{
+              session_id: session_id,
+              thread_id: thread_id,
+              turn_id: turn_id
+            },
+            metadata
+          )
 
-            emit_message(
-              on_message,
-              :turn_ended_with_error,
-              %{
-                session_id: session_id,
-                reason: reason
-              },
-              metadata
-            )
+          case await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
+            {:ok, result} ->
+              reassert_thread_name(port, thread_id, thread_name)
+              Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
 
-            {:error, reason}
-        end
+              {:ok,
+               %{
+                 result: result,
+                 session_id: session_id,
+                 thread_id: thread_id,
+                 turn_id: turn_id
+               }}
 
-      {:error, reason} ->
-        Logger.error("Codex session failed for #{issue_context(issue)}: #{inspect(reason)}")
-        emit_message(on_message, :startup_failed, %{reason: reason}, metadata)
-        {:error, reason}
+            {:error, reason} ->
+              reassert_thread_name(port, thread_id, thread_name)
+              Logger.warning("Codex session ended with error for #{issue_context(issue)} session_id=#{session_id}: #{inspect(reason)}")
+
+              emit_message(
+                on_message,
+                :turn_ended_with_error,
+                %{
+                  session_id: session_id,
+                  reason: reason
+                },
+                metadata
+              )
+
+              {:error, reason}
+          end
+
+        {:error, reason} ->
+          Logger.error("Codex session failed for #{issue_context(issue)}: #{inspect(reason)}")
+          emit_message(on_message, :startup_failed, %{reason: reason}, metadata)
+          {:error, reason}
+      end
+    after
+      Process.delete(@mcp_approval_state_key)
     end
   end
 
@@ -235,6 +293,122 @@ defmodule SymphonyElixir.Codex.AppServer do
       other -> other
     end
   end
+
+  @doc "Finds one stored task by exact title and project without resuming it; an unassigned match needs external project readback."
+  @spec find_thread_by_title(String.t(), String.t(), keyword()) ::
+          {:ok, map()} | {:candidate, map()} | {:error, term()}
+  def find_thread_by_title(title, project_id, opts \\ []) do
+    with name when is_binary(name) <- normalize_thread_name(title),
+         project when is_binary(project) <- normalize_project_id(project_id) do
+      workspace = Keyword.get(opts, :workspace, File.cwd!())
+      worker_host = Keyword.get(opts, :worker_host)
+      dynamic_tool_binding = DynamicTool.bind()
+
+      with {:ok, port} <- start_port(workspace, worker_host, dynamic_tool_binding) do
+        Process.unlink(port)
+
+        try do
+          with :ok <- send_initialize(port),
+               {:ok, active} <- list_threads_by_title(port, name, false),
+               {:ok, archived} <- list_threads_by_title(port, name, true) do
+            resolve_exact_thread(active ++ archived, project)
+          end
+        after
+          stop_port(port)
+        end
+      end
+    else
+      nil -> {:error, :invalid_thread_lookup}
+    end
+  end
+
+  defp list_threads_by_title(port, title, archived) do
+    list_threads_by_title(port, title, archived, nil, [], [], 0)
+  end
+
+  defp list_threads_by_title(_port, _title, _archived, _cursor, _seen, _matches, scanned)
+       when scanned > @thread_list_max_records,
+       do: {:error, :thread_list_limit_exceeded}
+
+  defp list_threads_by_title(port, title, archived, cursor, seen, matches, scanned) do
+    params = %{
+      "archived" => archived,
+      "limit" => @thread_list_page_size,
+      "searchTerm" => title,
+      "sourceKinds" => @thread_list_source_kinds,
+      "useStateDbOnly" => false
+    }
+
+    params = if is_nil(cursor), do: params, else: Map.put(params, "cursor", cursor)
+    send_message(port, %{"method" => "thread/list", "id" => @thread_list_id, "params" => params})
+
+    case await_response(port, @thread_list_id) do
+      {:ok, %{"data" => page} = response} when is_list(page) ->
+        updated_scanned = scanned + length(page)
+
+        cond do
+          updated_scanned > @thread_list_max_records ->
+            {:error, :thread_list_limit_exceeded}
+
+          not Enum.all?(page, &is_map/1) ->
+            {:error, :invalid_thread_list_page}
+
+          true ->
+            exact_matches =
+              page
+              |> Enum.filter(&(Map.get(&1, "name") == title))
+              |> Enum.map(&Map.put(&1, "archived", archived))
+
+            continue_thread_list(
+              port,
+              title,
+              archived,
+              Map.get(response, "nextCursor"),
+              seen,
+              matches ++ exact_matches,
+              updated_scanned
+            )
+        end
+
+      other ->
+        {:error, {:thread_lookup_failed, other}}
+    end
+  end
+
+  defp continue_thread_list(_port, _title, _archived, nil, _seen, matches, _scanned),
+    do: {:ok, matches}
+
+  defp continue_thread_list(port, title, archived, cursor, seen, matches, scanned)
+       when is_binary(cursor) and cursor != "" do
+    if cursor in seen do
+      {:error, :thread_list_cursor_repeated}
+    else
+      list_threads_by_title(port, title, archived, cursor, [cursor | seen], matches, scanned)
+    end
+  end
+
+  defp continue_thread_list(_port, _title, _archived, _cursor, _seen, _matches, _scanned),
+    do: {:error, :invalid_thread_list_cursor}
+
+  defp resolve_exact_thread([], _project_id), do: {:error, :thread_not_found}
+
+  defp resolve_exact_thread([%{"id" => id, "projectId" => project_id, "cwd" => cwd, "archived" => archived}], expected_project_id)
+       when is_binary(id) and id != "" and is_binary(cwd) and cwd != "" and
+              is_boolean(archived) do
+    result = %{id: id, project_id: project_id, cwd: cwd, archived: archived}
+
+    case project_id do
+      ^expected_project_id -> {:ok, result}
+      nil -> {:candidate, result}
+      _ -> {:error, {:thread_project_mismatch, expected_project_id, project_id}}
+    end
+  end
+
+  defp resolve_exact_thread([record], _project_id),
+    do: {:error, {:invalid_thread_list_entry, Map.get(record, "id")}}
+
+  defp resolve_exact_thread(records, _project_id),
+    do: {:error, {:thread_name_ambiguous, Enum.map(records, &Map.get(&1, "id"))}}
 
   defp validate_workspace_cwd(workspace, nil) when is_binary(workspace) do
     expanded_workspace = Path.expand(workspace)
@@ -393,10 +567,48 @@ defmodule SymphonyElixir.Codex.AppServer do
     Config.codex_runtime_settings(workspace, remote: true)
   end
 
+  defp scoped_session_policies(policies, %{approval_policy: nil, allowed_mcp_tool_approvals: []}),
+    do: {:ok, policies}
+
+  defp scoped_session_policies(
+         policies,
+         %{approval_policy: "on-request", allowed_mcp_tool_approvals: allowed}
+       )
+       when is_list(allowed) do
+    if allowed != [] and length(allowed) <= 2 and
+         Enum.all?(allowed, &valid_scoped_jira_approval?/1) and
+         Enum.uniq_by(allowed, & &1.tool) == allowed and
+         length(Enum.uniq(Enum.map(allowed, & &1.issue_key))) == 1 do
+      {:ok, %{policies | approval_policy: "on-request"}}
+    else
+      {:error, :invalid_scoped_mcp_approval}
+    end
+  end
+
+  defp scoped_session_policies(_policies, _options), do: {:error, :invalid_scoped_mcp_approval}
+
+  defp valid_scoped_jira_approval?(%{server: "Jira", tool: "jira_add_comment", issue_key: issue_key, body_equals: body})
+       when is_binary(issue_key) and is_binary(body),
+       do: issue_key != "" and body != ""
+
+  defp valid_scoped_jira_approval?(%{server: "Jira", tool: "jira_update_issue", issue_key: issue_key, labels_equals: labels})
+       when is_binary(issue_key) and is_list(labels),
+       do: issue_key != "" and labels != [] and Enum.all?(labels, &(is_binary(&1) and &1 != "")) and Enum.uniq(labels) == labels
+
+  defp valid_scoped_jira_approval?(_approval), do: false
+
   defp do_start_session(port, workspace, session_policies, dynamic_tool_binding, thread_options) do
-    case send_initialize(port) do
-      :ok -> open_thread(port, workspace, session_policies, dynamic_tool_binding, thread_options)
-      {:error, reason} -> {:error, reason}
+    with :ok <- send_initialize(port),
+         {:ok, project_id} <- resolve_project_id(port, thread_options.project_id, thread_options.project_root),
+         {:ok, thread_ref} <-
+           open_thread(
+             port,
+             workspace,
+             session_policies,
+             dynamic_tool_binding,
+             %{thread_options | project_id: project_id}
+           ) do
+      {:ok, Map.put(thread_ref, :project_id, project_id)}
     end
   end
 
@@ -419,7 +631,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp finish_open_thread(port, thread_ref, thread_options) do
     thread_id = thread_ref.thread_id
 
-    with :ok <- set_thread_name(port, thread_id, thread_options.name),
+    with :ok <- notify_thread_created(thread_options, thread_id),
+         :ok <- set_thread_name(port, thread_id, thread_options.name),
          :ok <- set_thread_project(port, thread_id, thread_options.project_id),
          :ok <- move_thread_to_section(port, thread_id, thread_options.section_id),
          :ok <-
@@ -436,6 +649,13 @@ defmodule SymphonyElixir.Codex.AppServer do
         error
     end
   end
+
+  defp notify_thread_created(%{on_thread_created: callback}, thread_id) when is_function(callback, 1) do
+    callback.(thread_id)
+    :ok
+  end
+
+  defp notify_thread_created(_thread_options, _thread_id), do: :ok
 
   defp start_or_resume_thread(
          port,
@@ -471,12 +691,11 @@ defmodule SymphonyElixir.Codex.AppServer do
         "sandbox" => thread_sandbox,
         "cwd" => workspace,
         "dynamicTools" => dynamic_tool_binding.tool_specs,
-        "ephemeral" => false,
+        "ephemeral" => thread_options.ephemeral,
         "serviceName" => thread_options.service_name,
         "threadSource" => thread_options.thread_source
       }
       |> put_if_present("model", thread_options.model)
-      |> put_if_present("projectId", thread_options.project_id)
 
     send_message(port, %{
       "method" => "thread/start",
@@ -522,8 +741,11 @@ defmodule SymphonyElixir.Codex.AppServer do
     })
 
     case await_response(port, @thread_start_id) do
-      {:ok, %{"thread" => %{"id" => thread_id}}} ->
+      {:ok, %{"thread" => %{"id" => thread_id}}} when thread_id == thread_options.resume_thread_id ->
         {:ok, %{thread_id: thread_id, forked_from_thread_id: nil}}
+
+      {:ok, %{"thread" => %{"id" => thread_id}}} ->
+        {:error, {:resumed_thread_id_mismatch, thread_options.resume_thread_id, thread_id}}
 
       {:ok, payload} ->
         {:error, {:invalid_thread_payload, payload}}
@@ -664,10 +886,74 @@ defmodule SymphonyElixir.Codex.AppServer do
     })
 
     case await_response(port, @thread_metadata_update_id) do
-      {:ok, _response} -> :ok
-      other -> other
+      {:ok, %{"thread" => %{"id" => ^thread_id, "projectId" => ^project_id}}} ->
+        :ok
+
+      other ->
+        {:error, {:project_binding_failed, project_id, other}}
     end
   end
+
+  defp resolve_project_id(_port, nil, nil), do: {:ok, nil}
+  defp resolve_project_id(_port, project_id, nil), do: {:ok, project_id}
+
+  defp resolve_project_id(port, requested_id, project_root) do
+    with {:ok, canonical_root} <- PathSafety.canonicalize(project_root),
+         true <- File.dir?(canonical_root) || {:error, {:project_root_unavailable, project_root}},
+         {:ok, projects} <- list_projects(port, nil, [], []) do
+      matching_projects =
+        Enum.filter(projects, &primary_project_root?(&1, canonical_root))
+
+      case matching_projects do
+        [%{"id" => id}] when is_binary(requested_id) and requested_id != id ->
+          {:error, {:project_id_mismatch, requested_id, id}}
+
+        [%{"id" => id}] when is_binary(id) and id != "" ->
+          {:ok, id}
+
+        [] ->
+          {:error, {:project_root_not_found, canonical_root}}
+
+        _ ->
+          {:error, {:project_root_ambiguous, canonical_root}}
+      end
+    end
+  end
+
+  defp primary_project_root?(%{"roots" => [%{"path" => primary_root} | _]}, canonical_root)
+       when is_binary(primary_root),
+       do: PathSafety.canonicalize(primary_root) == {:ok, canonical_root}
+
+  defp primary_project_root?(_project, _canonical_root), do: false
+
+  defp list_projects(_port, _cursor, _seen, projects) when length(projects) > 1_000,
+    do: {:error, :project_list_limit_exceeded}
+
+  defp list_projects(port, cursor, seen, projects) do
+    params = if is_nil(cursor), do: %{}, else: %{"cursor" => cursor}
+    send_message(port, %{"method" => "project/list", "id" => @project_list_id, "params" => params})
+
+    case await_response(port, @project_list_id) do
+      {:ok, %{"data" => page} = response} when is_list(page) ->
+        continue_project_list(port, Map.get(response, "nextCursor"), seen, projects ++ page)
+
+      other ->
+        {:error, {:project_lookup_failed, other}}
+    end
+  end
+
+  defp continue_project_list(_port, nil, _seen, projects), do: {:ok, projects}
+
+  defp continue_project_list(port, next_cursor, seen, projects)
+       when is_binary(next_cursor) and next_cursor != "" do
+    if next_cursor in seen do
+      {:error, :project_list_cursor_repeated}
+    else
+      list_projects(port, next_cursor, [next_cursor | seen], projects)
+    end
+  end
+
+  defp continue_project_list(_port, _cursor, _seen, _projects), do: {:error, :invalid_project_list_cursor}
 
   defp move_thread_to_section(_port, _thread_id, nil), do: :ok
 
@@ -786,6 +1072,15 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp normalize_project_id(_project_id), do: nil
+
+  defp normalize_project_root(project_root) when is_binary(project_root) do
+    case String.trim(project_root) do
+      "" -> nil
+      path -> Path.expand(path)
+    end
+  end
+
+  defp normalize_project_root(_project_root), do: nil
 
   defp normalize_section_id(section_id) when is_binary(section_id) do
     case String.trim(section_id) do
@@ -935,6 +1230,7 @@ defmodule SymphonyElixir.Codex.AppServer do
          auto_approve_requests
        ) do
     metadata = metadata_from_message(port, payload)
+    record_mcp_approval_item(method, payload)
 
     case maybe_handle_approval_request(
            port,
@@ -1193,28 +1489,6 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp approve_or_require(
-         port,
-         id,
-         decision,
-         payload,
-         payload_string,
-         on_message,
-         metadata,
-         true
-       ) do
-    send_message(port, %{"id" => id, "result" => %{"decision" => decision}})
-
-    emit_message(
-      on_message,
-      :approval_auto_approved,
-      %{payload: payload, raw: payload_string, decision: decision},
-      metadata
-    )
-
-    :approved
-  end
-
-  defp approve_or_require(
          _port,
          _id,
          _decision,
@@ -1222,7 +1496,7 @@ defmodule SymphonyElixir.Codex.AppServer do
          _payload_string,
          _on_message,
          _metadata,
-         false
+         _auto_approve_requests
        ) do
     :approval_required
   end
@@ -1235,16 +1509,19 @@ defmodule SymphonyElixir.Codex.AppServer do
          payload_string,
          on_message,
          metadata,
-         true
+         _auto_approve_requests
        ) do
-    case tool_request_user_input_approval_answers(params) do
-      {:ok, answers, decision} ->
-        send_message(port, %{"id" => id, "result" => %{"answers" => answers}})
+    case scoped_mcp_approval_answer(params) do
+      {:ok, question_id} ->
+        send_message(port, %{
+          "id" => id,
+          "result" => %{"answers" => %{question_id => %{"answers" => ["Approve Once"]}}}
+        })
 
         emit_message(
           on_message,
           :approval_auto_approved,
-          %{payload: payload, raw: payload_string, decision: decision},
+          %{payload: payload, raw: payload_string, decision: "Approve Once"},
           metadata
         )
 
@@ -1255,80 +1532,156 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp maybe_auto_answer_tool_request_user_input(
-         _port,
-         _id,
-         _params,
-         _payload,
-         _payload_string,
-         _on_message,
-         _metadata,
-         false
-       ),
-       do: :input_required
-
-  defp tool_request_user_input_approval_answers(%{"questions" => questions}) when is_list(questions) do
-    answers =
-      Enum.reduce_while(questions, %{}, fn question, acc ->
-        case tool_request_user_input_approval_answer(question) do
-          {:ok, question_id, answer_label} ->
-            {:cont, Map.put(acc, question_id, %{"answers" => [answer_label]})}
-
-          :error ->
-            {:halt, :error}
-        end
-      end)
-
-    case answers do
-      :error -> :error
-      answer_map when map_size(answer_map) > 0 -> {:ok, answer_map, "Approve this Session"}
-      _ -> :error
+  defp record_mcp_approval_item("item/started", %{"params" => %{"item" => %{"id" => item_id} = item}})
+       when is_binary(item_id) do
+    case Process.get(@mcp_approval_state_key) do
+      %{items: items} = state -> Process.put(@mcp_approval_state_key, %{state | items: Map.put(items, item_id, item)})
+      _other -> :ok
     end
   end
 
-  defp tool_request_user_input_approval_answers(_params), do: :error
+  defp record_mcp_approval_item(_method, _payload), do: :ok
 
-  defp tool_request_user_input_approval_answer(%{"id" => question_id, "options" => options})
-       when is_binary(question_id) and is_list(options) do
-    if String.starts_with?(question_id, "mcp_tool_call_approval_") do
-      case tool_request_user_input_approval_option_label(options) do
-        nil -> :error
-        answer_label -> {:ok, question_id, answer_label}
-      end
+  defp scoped_mcp_approval_answer(%{"itemId" => item_id, "questions" => [question]})
+       when is_binary(item_id) do
+    with %{items: items, allowed: allowed, expected_issue_key: expected_issue_key} = state <-
+           Process.get(@mcp_approval_state_key),
+         %{} = item <- Map.get(items, item_id),
+         %{} = approval <-
+           Enum.find(allowed, &scoped_approval_matches_item?(&1, item)),
+         ^expected_issue_key <- approval.issue_key,
+         true <- scoped_approval_arguments?(approval, approval_item_arguments(item)),
+         {:ok, question_id} <- scoped_approval_question(question, item_id, approval.tool) do
+      Process.put(@mcp_approval_state_key, %{
+        state
+        | items: Map.delete(items, item_id),
+          allowed: List.delete(allowed, approval)
+      })
+
+      {:ok, question_id}
+    else
+      _other -> :error
+    end
+  end
+
+  defp scoped_mcp_approval_answer(_params), do: :error
+
+  defp scoped_approval_matches_item?(%{server: server, tool: tool}, item) do
+    item["type"] in ["mcpToolCall", "mcp_tool_call"] and
+      item["server"] == server and item["tool"] == tool
+  end
+
+  defp scoped_approval_matches_item?(_approval, _item), do: false
+
+  defp approval_item_arguments(%{"arguments" => arguments}) when is_map(arguments), do: arguments
+
+  defp approval_item_arguments(%{"arguments" => json}) when is_binary(json) do
+    case Jason.decode(json) do
+      {:ok, %{} = arguments} -> arguments
+      _other -> %{}
+    end
+  end
+
+  defp approval_item_arguments(_item), do: %{}
+
+  defp scoped_approval_arguments?(%{tool: "jira_add_comment", issue_key: issue_key, body_equals: body}, arguments) do
+    Enum.sort(Map.keys(arguments)) == ["body", "issue_key"] and
+      arguments == %{"issue_key" => issue_key, "body" => body}
+  end
+
+  defp scoped_approval_arguments?(%{tool: "jira_update_issue", issue_key: issue_key, labels_equals: labels}, arguments) do
+    with ["fields", "issue_key"] <- Enum.sort(Map.keys(arguments)),
+         ^issue_key <- arguments["issue_key"],
+         fields_json when is_binary(fields_json) <- arguments["fields"],
+         {:ok, %{"labels" => actual_labels} = fields} <- Jason.decode(fields_json),
+         true <- Map.keys(fields) == ["labels"],
+         true <- is_list(actual_labels),
+         true <- Enum.uniq(actual_labels) == actual_labels do
+      MapSet.new(actual_labels) == MapSet.new(labels)
+    else
+      _other -> false
+    end
+  end
+
+  defp scoped_approval_arguments?(_approval, _arguments), do: false
+
+  defp scoped_approval_question(
+         %{
+           "header" => "Approve app tool call?",
+           "id" => question_id,
+           "isOther" => false,
+           "isSecret" => false,
+           "options" => options,
+           "question" => question_text
+         },
+         item_id,
+         tool
+       )
+       when is_list(options) and tool in ["jira_add_comment", "jira_update_issue"] do
+    labels =
+      Enum.map(options, fn
+        %{"label" => label} -> label
+        _option -> nil
+      end)
+
+    if question_id == "mcp_tool_call_approval_#{item_id}" and
+         question_text == "The Jira MCP server wants to run the tool \"#{tool}\", which may modify or delete data. Allow this action?" and
+         labels == ["Approve Once", "Approve this Session", "Deny", "Cancel"] do
+      {:ok, question_id}
     else
       :error
     end
   end
 
-  defp tool_request_user_input_approval_answer(_question), do: :error
-
-  defp tool_request_user_input_approval_option_label(options) do
-    options
-    |> Enum.map(&tool_request_user_input_option_label/1)
-    |> Enum.reject(&is_nil/1)
-    |> case do
-      labels ->
-        Enum.find(labels, &(&1 == "Approve this Session")) ||
-          Enum.find(labels, &(&1 == "Approve Once")) ||
-          Enum.find(labels, &approval_option_label?/1)
-    end
-  end
-
-  defp tool_request_user_input_option_label(%{"label" => label}) when is_binary(label), do: label
-  defp tool_request_user_input_option_label(_option), do: nil
-
-  defp approval_option_label?(label) when is_binary(label) do
-    normalized_label =
-      label
-      |> String.trim()
-      |> String.downcase()
-
-    String.starts_with?(normalized_label, "approve") or String.starts_with?(normalized_label, "allow")
-  end
+  defp scoped_approval_question(_question, _item_id, _tool), do: :error
 
   defp await_response(port, request_id) do
     with_timeout_response(port, request_id, Config.settings!().codex.read_timeout_ms, "")
   end
+
+  defp await_mcp_tool_response(port, deadline_ms, pending_line) do
+    remaining_ms = max(deadline_ms - System.monotonic_time(:millisecond), 0)
+
+    receive do
+      {^port, {:data, {:eol, chunk}}} ->
+        case Jason.decode(pending_line <> to_string(chunk)) do
+          {:ok, payload} -> handle_mcp_tool_payload(port, deadline_ms, payload)
+          {:error, _reason} -> {:error, :mcp_tool_protocol_invalid}
+        end
+
+      {^port, {:data, {:noeol, chunk}}} ->
+        if byte_size(pending_line) + byte_size(chunk) > @port_line_bytes,
+          do: {:error, :mcp_tool_result_too_large},
+          else: await_mcp_tool_response(port, deadline_ms, pending_line <> to_string(chunk))
+
+      {^port, {:exit_status, status}} ->
+        {:error, {:port_exit, status}}
+    after
+      remaining_ms -> {:error, :mcp_tool_response_timeout}
+    end
+  end
+
+  defp handle_mcp_tool_payload(_port, _deadline_ms, %{"id" => @mcp_tool_call_id, "result" => %{"isError" => true}}),
+    do: {:error, :mcp_tool_error}
+
+  defp handle_mcp_tool_payload(_port, _deadline_ms, %{"id" => @mcp_tool_call_id, "result" => %{} = result}),
+    do: {:ok, result}
+
+  defp handle_mcp_tool_payload(_port, _deadline_ms, %{"id" => @mcp_tool_call_id, "error" => _error}),
+    do: {:error, :mcp_tool_call_rejected}
+
+  defp handle_mcp_tool_payload(_port, _deadline_ms, %{"id" => _other_id}), do: {:error, :mcp_tool_approval_required}
+
+  defp handle_mcp_tool_payload(port, deadline_ms, %{"method" => method} = payload) do
+    if needs_input?(method, payload) or String.contains?(String.downcase(method), "approval") or
+         String.ends_with?(method, "requestUserInput") do
+      {:error, :mcp_tool_approval_required}
+    else
+      await_mcp_tool_response(port, deadline_ms, "")
+    end
+  end
+
+  defp handle_mcp_tool_payload(_port, _deadline_ms, _payload), do: {:error, :mcp_tool_protocol_invalid}
 
   defp with_timeout_response(port, request_id, timeout_ms, pending_line) do
     receive do

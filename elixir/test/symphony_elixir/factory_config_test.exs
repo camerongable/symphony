@@ -13,6 +13,10 @@ defmodule SymphonyElixir.FactoryConfigTest do
     assert settings.factory.hibernation == %{}
     assert settings.factory.controller_required_mcp_servers == []
     assert settings.factory.controller_mcp_startup_timeout_ms == 60_000
+    assert settings.factory.controller_writer_stale_minutes == 15
+    assert settings.factory.task_transport == "app_server"
+    assert settings.factory.specification_authorization_mode == "auto_after_critic"
+    refute settings.factory.native_session_discovery_enabled
     assert is_nil(settings.factory.controller_codex_project_id)
   end
 
@@ -39,6 +43,44 @@ defmodule SymphonyElixir.FactoryConfigTest do
     assert message =~ "factory.database"
     assert message =~ "factory.dispatcher_id"
     assert message =~ "factory.controller_codex_project_id"
+  end
+
+  test "factory transport accepts only the explicit desktop broker opt-in" do
+    assert {:ok, settings} =
+             Schema.parse(%{"tracker" => %{"kind" => "memory"}, "factory" => %{"task_transport" => "desktop_broker"}})
+
+    assert settings.factory.task_transport == "desktop_broker"
+
+    assert {:error, {:invalid_workflow_config, message}} =
+             Schema.parse(%{"tracker" => %{"kind" => "memory"}, "factory" => %{"task_transport" => "unknown"}})
+
+    assert message =~ "factory.task_transport"
+
+    assert {:ok, opted_in} =
+             Schema.parse(%{
+               "tracker" => %{"kind" => "memory"},
+               "factory" => %{"native_session_discovery_enabled" => true}
+             })
+
+    assert opted_in.factory.native_session_discovery_enabled
+  end
+
+  test "specification authorization mode is explicit and validated" do
+    assert {:ok, settings} =
+             Schema.parse(%{
+               "tracker" => %{"kind" => "memory"},
+               "factory" => %{"specification_authorization_mode" => "human_confirmation"}
+             })
+
+    assert settings.factory.specification_authorization_mode == "human_confirmation"
+
+    assert {:error, {:invalid_workflow_config, message}} =
+             Schema.parse(%{
+               "tracker" => %{"kind" => "memory"},
+               "factory" => %{"specification_authorization_mode" => "unreviewed"}
+             })
+
+    assert message =~ "factory.specification_authorization_mode"
   end
 
   test "enabled configuration starts a compatible durable store" do
@@ -90,6 +132,21 @@ defmodule SymphonyElixir.FactoryConfigTest do
     assert %{"version" => 6} =
              Store.one!(Supervisor.store_name(), "SELECT version FROM factory_schema_migrations WHERE version = 6")
 
+    assert %{"version" => 7} =
+             Store.one!(Supervisor.store_name(), "SELECT version FROM factory_schema_migrations WHERE version = 7")
+
+    assert %{"version" => 9} =
+             Store.one!(Supervisor.store_name(), "SELECT version FROM factory_schema_migrations WHERE version = 9")
+
+    assert %{"version" => 11} =
+             Store.one!(Supervisor.store_name(), "SELECT version FROM factory_schema_migrations WHERE version = 11")
+
+    assert %{"name" => "intake_snapshots"} =
+             Store.one!(
+               Supervisor.store_name(),
+               "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'intake_snapshots'"
+             )
+
     assert %{"status" => "PAUSED", "dispatcher_id" => "dispatcher-a"} =
              ControlServer.status(Supervisor.control_name())
 
@@ -139,7 +196,7 @@ defmodule SymphonyElixir.FactoryConfigTest do
   defp model_policy do
     roles =
       ~w(
-        orchestrator specification-author specification-critic feature-planner
+        orchestrator orchestrator-intake specification-author specification-critic feature-planner
         feature-writer feature-writer-high-risk change-verifier manual-validator
         explorer failure-triager
       )

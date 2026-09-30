@@ -17,6 +17,21 @@ defmodule SymphonyElixir.FactoryQueueTest do
     assert jql =~ ~s|status IN ("READY", "TO DO")|
     refute jql =~ "project IN"
     refute jql =~ "parent IN"
+    refute jql =~ "key IN"
+  end
+
+  test "limits a pilot queue to exact Jira issue keys without changing the assignee scope" do
+    queue = %{
+      "assignee" => "currentUser()",
+      "statuses" => ["READY", "TO DO"],
+      "factory_labels" => ["spec-needed", "ai-ready"],
+      "issue_keys" => ["PPL-9723"]
+    }
+
+    assert {:ok, jql} = Queue.jql(queue)
+    assert jql =~ "assignee = currentUser()"
+    assert jql =~ ~s|key IN ("PPL-9723")|
+    assert {:error, :invalid_issue_keys} = Queue.jql(%{queue | "issue_keys" => ["PPL-9723\" OR key IS NOT EMPTY"]})
   end
 
   test "classifies work and rejects conflicting authorization labels" do

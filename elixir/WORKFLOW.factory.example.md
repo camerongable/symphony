@@ -33,12 +33,19 @@ codex:
   turn_sandbox_policy:
     type: workspaceWrite
     networkAccess: true
+server:
+  host: 127.0.0.1
+  port: 4000
+observability:
+  dashboard_enabled: true
 factory:
   enabled: true
   database: ~/Library/Application Support/symphony/factory.sqlite
   scope: assigned-jira-work
   dispatcher_id: replace-with-a-stable-uuid
-  controller_codex_project_id: replace-with-a-codex-project-id
+  controller_codex_project_id: replace-with-a-codex-project-id # use projectless for a prebound Desktop controller
+  task_transport: app_server # desktop_broker routes workers and a prebound controller through the Desktop broker
+  native_session_discovery_enabled: false # opt in only after approving local Codex session metadata scanning
   branch_prefix: your-gitlab-username
   lease_seconds: 240
   controller_required_mcp_servers:
@@ -46,17 +53,20 @@ factory:
     - GitLab
   controller_mcp_startup_timeout_ms: 60000
   maximum_specifiers: 2
+  specification_authorization_mode: auto_after_critic # independent critic PASS authorizes complete contracts
   maximum_writers: 2
   maximum_validators: 2
   writer_disk_gb: 20
   maximum_implementation_iterations: 8
   maximum_code_repair_rounds: 2
   maximum_validation_repair_rounds: 2
+  controller_writer_stale_minutes: 15
   stale_task_minutes: 90
   queue:
     assignee: currentUser()
     projects: []
     epics: []
+    issue_keys: [] # optional exact-key allowlist for a bounded pilot
     statuses:
       - READY
       - TO DO
@@ -76,6 +86,7 @@ factory:
       - DONE
       - IN TESTING
       - TESTING
+      - IN REVIEW
     allowed_mr_states:
       - merged
     allowed_run_states:
@@ -115,17 +126,21 @@ factory:
     default_provider: codex
     providers:
       codex:
-        fast: gpt-5.6-luna
-        standard: gpt-5.6-terra
-        strong: gpt-5.6-sol
+        fast: gpt-6-luna
+        standard: gpt-6.1-sol
+        strong: gpt-6.1-sol
     roles:
       orchestrator:
         provider: codex
         model_class: standard
         reasoning_effort: medium
+      orchestrator-intake:
+        provider: codex
+        model_class: fast
+        reasoning_effort: medium
       specification-author:
         provider: codex
-        model_class: standard
+        model_class: fast
         reasoning_effort: high
       specification-critic:
         provider: codex
@@ -133,12 +148,12 @@ factory:
         reasoning_effort: high
       feature-planner:
         provider: codex
-        model_class: strong
+        model_class: fast
         reasoning_effort: high
       feature-writer:
         provider: codex
         model_class: standard
-        reasoning_effort: high
+        reasoning_effort: medium
       feature-writer-high-risk:
         provider: codex
         model_class: strong

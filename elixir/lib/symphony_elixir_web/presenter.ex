@@ -4,32 +4,43 @@ defmodule SymphonyElixirWeb.Presenter do
   """
 
   alias SymphonyElixir.{Config, Orchestrator, StatusDashboard, Workspace}
+  alias SymphonyElixir.Factory.Observability, as: FactoryObservability
 
-  @spec state_payload(GenServer.name(), timeout()) :: map()
-  def state_payload(orchestrator, snapshot_timeout_ms) do
+  @spec state_payload(GenServer.name(), timeout(), (-> map() | nil)) :: map()
+  def state_payload(
+        orchestrator,
+        snapshot_timeout_ms,
+        factory_observability \\ &FactoryObservability.snapshot/0
+      ) do
     generated_at = DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()
 
-    case Orchestrator.snapshot(orchestrator, snapshot_timeout_ms) do
-      %{} = snapshot ->
-        %{
-          generated_at: generated_at,
-          counts: %{
-            running: length(snapshot.running),
-            retrying: length(snapshot.retrying),
-            blocked: length(Map.get(snapshot, :blocked, []))
-          },
-          running: Enum.map(snapshot.running, &running_entry_payload/1),
-          retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
-          blocked: Enum.map(Map.get(snapshot, :blocked, []), &blocked_entry_payload/1),
-          codex_totals: snapshot.codex_totals,
-          rate_limits: snapshot.rate_limits
-        }
+    payload =
+      case Orchestrator.snapshot(orchestrator, snapshot_timeout_ms) do
+        %{} = snapshot ->
+          %{
+            generated_at: generated_at,
+            counts: %{
+              running: length(snapshot.running),
+              retrying: length(snapshot.retrying),
+              blocked: length(Map.get(snapshot, :blocked, []))
+            },
+            running: Enum.map(snapshot.running, &running_entry_payload/1),
+            retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
+            blocked: Enum.map(Map.get(snapshot, :blocked, []), &blocked_entry_payload/1),
+            codex_totals: snapshot.codex_totals,
+            rate_limits: snapshot.rate_limits
+          }
 
-      :timeout ->
-        %{generated_at: generated_at, error: %{code: "snapshot_timeout", message: "Snapshot timed out"}}
+        :timeout ->
+          %{generated_at: generated_at, error: %{code: "snapshot_timeout", message: "Snapshot timed out"}}
 
-      :unavailable ->
-        %{generated_at: generated_at, error: %{code: "snapshot_unavailable", message: "Snapshot unavailable"}}
+        :unavailable ->
+          %{generated_at: generated_at, error: %{code: "snapshot_unavailable", message: "Snapshot unavailable"}}
+      end
+
+    case factory_observability.() do
+      nil -> payload
+      factory -> Map.put(payload, :factory, factory)
     end
   end
 

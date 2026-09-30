@@ -459,10 +459,16 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     dashboard_css = response(get(build_conn(), "/dashboard.css"), 200)
     assert dashboard_css =~ ":root {"
-    assert dashboard_css =~ ".status-badge-live"
-    assert dashboard_css =~ "[data-phx-main].phx-connected .status-badge-live"
+    assert dashboard_css =~ ".status-badge-connected"
+    assert dashboard_css =~ "[data-phx-main].phx-connected .status-badge-connected"
     assert dashboard_css =~ "[data-phx-main].phx-connected .status-badge-offline"
-    assert dashboard_css =~ "text-decoration-thickness: 1px"
+    assert dashboard_css =~ "font-family: -apple-system"
+    assert dashboard_css =~ ".responsive-table td::before"
+    refute dashboard_css =~ "Sohne"
+
+    dashboard_js = response(get(build_conn(), "/dashboard.js"), 200)
+    assert dashboard_js =~ "PersistentDisclosure"
+    assert dashboard_js =~ "this.el.open = this.wasOpen"
 
     favicon_conn = get(build_conn(), "/favicon.png")
     assert response(favicon_conn, 200) == File.read!("priv/static/favicon.png")
@@ -499,7 +505,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
 
     {:ok, view, html} = live(build_conn(), "/")
-    assert html =~ "Operations Dashboard"
+    assert html =~ "Software factory"
     assert html =~ "MT-HTTP"
     assert html =~ "MT-RETRY"
     assert html =~ "MT-BLOCKED"
@@ -511,14 +517,14 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "turn blocked: waiting for user input"
     assert html =~ "Runtime"
     assert html =~ "Live"
-    assert html =~ "Offline"
+    assert html =~ "Reconnecting"
     assert html =~ "Copy ID"
     assert html =~ "Codex update"
     refute html =~ "data-runtime-clock="
     refute html =~ "setInterval(refreshRuntimeClocks"
     refute html =~ "Refresh now"
     refute html =~ "Transport"
-    assert html =~ "status-badge-live"
+    assert html =~ "status-badge-connected"
     assert html =~ "status-badge-offline"
 
     updated_snapshot =
@@ -563,6 +569,643 @@ defmodule SymphonyElixir.ExtensionsTest do
     end)
 
     refute render(view) =~ "javascript:alert"
+  end
+
+  test "dashboard and state api expose the factory control plane" do
+    orchestrator_name = Module.concat(__MODULE__, :FactoryDashboardOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        refresh: :unavailable
+      )
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50,
+      factory_observability: &factory_dashboard_snapshot/0
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/")
+    assert html =~ "From Jira to review"
+    assert html =~ "Scheduler needs attention"
+    assert html =~ "Jira intake"
+    assert html =~ "last successful Jira poll"
+    assert html =~ "1 tracked"
+    assert html =~ "PPL-9723"
+    assert html =~ "Detect visually hidden text"
+    assert html =~ "Specification"
+    assert html =~ "repo-grail"
+    assert html =~ "PPL-123"
+    assert html =~ "cgable/PPL-123-dashboard"
+    assert html =~ "Change Verifier"
+    refute html =~ "Open orchestrator"
+    assert html =~ "45.0 GB"
+    assert html =~ "Workspace hibernated"
+    assert html =~ "WORKTREE_HIBERNATED"
+    assert html =~ "1 visible worker tasks"
+
+    document = Floki.parse_document!(html)
+    capacity = Floki.find(document, ".capacity-card")
+    assert length(Floki.find(capacity, "tbody tr")) == 1
+    assert Floki.text(capacity, sep: " ") =~ "All repositories"
+    assert Floki.text(capacity, sep: " ") =~ "grail"
+    assert Floki.text(capacity, sep: " ") =~ "polaris"
+    assert Floki.text(Floki.find(document, ".status-cluster"), sep: " ") =~ "Writer capacity available"
+    assert Floki.find(document, ~s(.dashboard-shell[data-factory-operability="stopped"])) != []
+
+    workflows = Floki.find(document, ".runs-section")
+    assert length(Floki.find(workflows, "tbody tr")) == 1
+    refute Floki.text(workflows, sep: " ") =~ "stale failure from a previous attempt"
+    assert Floki.find(workflows, ~s(td[data-label="Progress"] .state-badge)) == []
+    assert Floki.text(Floki.find(workflows, ~s(td[data-label="Workspace"])), sep: " ") =~ "Worktree hibernated"
+
+    task_history = Floki.find(document, ".factory-task-history")
+
+    assert Floki.find(task_history, ~s(th)) |> Enum.map(&Floki.text/1) ==
+             ["Issue", "Role", "Status", "Model", "Failure", "Codex task", "Updated"]
+
+    state = json_response(get(build_conn(), "/api/v1/state"), 200)
+    assert state["factory"]["control"]["status"] == "ACTIVE"
+    assert state["factory"]["control"]["controller_writer_conflict_count"] == 2
+    assert state["factory"]["intake"]["count"] == 1
+    assert state["factory"]["counts"]["hibernated"] == 1
+    assert hd(state["factory"]["tasks"])["thread_id"] == "thread-verifier"
+  end
+
+  test "paused dashboard identifies Jira intake as a saved snapshot" do
+    orchestrator_name = Module.concat(__MODULE__, :PausedFactoryDashboardOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        refresh: :unavailable
+      )
+
+    factory_snapshot =
+      factory_dashboard_snapshot()
+      |> put_in([:control, :status], "PAUSED")
+      |> put_in([:intake, :stale], true)
+      |> put_in([:control, :controller_writer_conflict_count], 0)
+      |> put_in([:control, :controller_writer_conflict_since], nil)
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50,
+      factory_observability: fn -> factory_snapshot end
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/")
+
+    assert html =~ "Dashboard connected"
+    assert html =~ "Stale snapshot: polling is paused, so this saved intake may no longer match Jira."
+    assert html =~ "Factory BEAM fingerprint"
+
+    document = Floki.parse_document!(html)
+    intake = Floki.find(document, ".intake-section")
+    intent = Floki.find(intake, ~s(td[data-label="Intent"]))
+    routing = Floki.find(intake, ~s(td[data-label="Routing"]))
+
+    assert Floki.text(Floki.find(document, ".status-cluster .state-badge-danger")) =~ "Scheduler paused"
+    assert Floki.text(Floki.find(document, ".status-cluster .state-badge-active")) =~ "Writer capacity available"
+
+    assert document
+           |> Floki.find(".factory-controller .section-header > .state-badge-danger")
+           |> Floki.text()
+           |> String.trim() == "Paused"
+
+    assert Floki.find(document, ~s(.dashboard-shell[data-factory-operability="stopped"])) != []
+    assert Floki.find(intake, ".section-header > .state-badge-active") == []
+    assert Floki.find(intake, ".snapshot-note time") != []
+    assert Floki.find(intent, ".state-badge") == []
+    assert Floki.find(routing, ".state-badge") == []
+    assert Floki.find(intent, ".table-value") != []
+    assert Floki.find(routing, ".table-value") != []
+    refute html =~ ~r|</time>\s*\.|s
+
+    dashboard_css = response(get(build_conn(), "/dashboard.css"), 200)
+    assert dashboard_css =~ ".status-badge-connected"
+    assert dashboard_css =~ ".status-badge-connected .status-badge-dot {\n  background: var(--accent);"
+    assert dashboard_css =~ ".status-badge-offline .status-badge-dot {\n  background: var(--muted);"
+
+    [_, connected_badge] = Regex.run(~r/\.status-badge-connected\s*\{([^}]*)\}/s, dashboard_css)
+    refute connected_badge =~ "background:"
+    refute connected_badge =~ "color:"
+    assert dashboard_css =~ ~s(data-factory-operability="ready")
+    assert dashboard_css =~ ~s(data-factory-operability="stopped")
+  end
+
+  test "dashboard distinguishes writer capacity, workspace, and failed task details" do
+    orchestrator_name = Module.concat(__MODULE__, :LimitedFactoryDashboardOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        refresh: :unavailable
+      )
+
+    factory_snapshot =
+      factory_dashboard_snapshot()
+      |> put_in([:control, :controller_writer_conflict_count], 0)
+      |> put_in([:control, :controller_writer_conflict_since], nil)
+      |> put_in([:capacity, Access.at(0), :result], "INSUFFICIENT_WRITER_CAPACITY")
+      |> put_in([:runs, Access.at(0), :workspace_state], "MATERIALIZED")
+      |> put_in([:tasks, Access.at(0), :status], "FAILED")
+      |> put_in([:tasks, Access.at(0), :failure_code], "factory_stage_output_invalid_json")
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50,
+      factory_observability: fn -> factory_snapshot end
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/")
+    document = Floki.parse_document!(html)
+
+    assert Floki.find(document, ~s(.dashboard-shell[data-factory-operability="limited"])) != []
+    assert Floki.text(Floki.find(document, ".status-cluster .state-badge-active")) =~ "Scheduler active"
+    assert Floki.text(Floki.find(document, ".status-cluster .state-badge-warning")) =~ "Writer capacity limited"
+    assert Floki.text(Floki.find(document, ".capacity-card .state-badge-warning")) =~ "Limited"
+
+    assert Floki.text(Floki.find(document, ~s(.runs-section td[data-label="Workspace"])), sep: " ") =~
+             "Worktree present"
+
+    task_history = Floki.find(document, ".factory-task-history")
+    assert Floki.text(Floki.find(task_history, ~s(td[data-label="Status"]))) =~ "Failed"
+
+    assert Floki.text(Floki.find(task_history, ~s(td[data-label="Model"])), sep: " ") =~
+             "gpt-5.6-sol high effort"
+
+    assert Floki.text(Floki.find(task_history, ~s(td[data-label="Failure"]))) =~
+             "Worker returned text instead of the required structured result."
+  end
+
+  test "dashboard uses ready tint only when scheduling and writer capacity are available" do
+    orchestrator_name = Module.concat(__MODULE__, :ReadyFactoryDashboardOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        refresh: :unavailable
+      )
+
+    factory_snapshot =
+      factory_dashboard_snapshot()
+      |> put_in([:control, :controller_writer_conflict_count], 0)
+      |> put_in([:control, :controller_writer_conflict_since], nil)
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50,
+      factory_observability: fn -> factory_snapshot end
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/")
+    assert Floki.find(Floki.parse_document!(html), ~s(.dashboard-shell[data-factory-operability="ready"])) != []
+  end
+
+  test "dashboard reports Desktop Broker request state separately from scheduler health" do
+    orchestrator_name = Module.concat(__MODULE__, :BrokerFactoryDashboardOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        refresh: :unavailable
+      )
+
+    factory_snapshot =
+      factory_dashboard_snapshot()
+      |> put_in([:control, :controller_writer_conflict_count], 0)
+      |> put_in([:control, :controller_writer_conflict_since], nil)
+      |> Map.put(:broker, %{
+        pending: 2,
+        claimed_unverified: 0,
+        needs_reconciliation: 0,
+        last_completed_at: "2026-09-24T12:00:00Z"
+      })
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50,
+      factory_observability: fn -> factory_snapshot end
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/")
+    document = Floki.parse_document!(html)
+
+    assert Floki.text(Floki.find(document, ".status-cluster"), sep: " ") =~ "Scheduler active"
+    assert Floki.text(Floki.find(document, ".status-cluster"), sep: " ") =~ "Broker requests pending"
+    assert Floki.find(document, ".status-cluster .state-badge-active") |> Floki.text() =~ "Scheduler active"
+    assert Floki.find(document, ".status-cluster .state-badge-danger") == []
+
+    broker = Floki.find(document, ".broker-card")
+    assert Floki.text(broker, sep: " ") =~ "Desktop Broker"
+    assert Floki.text(broker, sep: " ") =~ "Automation heartbeat is not measured here"
+    assert Floki.text(broker, sep: " ") =~ "Pending 2"
+    assert Floki.text(broker, sep: " ") =~ "Claimed 0"
+    assert Floki.text(broker, sep: " ") =~ "Needs reconciliation 0"
+    assert Floki.find(document, ".control-grid-with-broker .capacity-card") != []
+    assert Floki.find(document, ~s(.dashboard-shell[data-factory-operability="ready"])) != []
+
+    state = json_response(get(build_conn(), "/api/v1/state"), 200)
+    assert state["factory"]["broker"]["pending"] == 2
+  end
+
+  test "dashboard does not mark an unverified Desktop Broker heartbeat healthy" do
+    orchestrator_name = Module.concat(__MODULE__, :UnknownBrokerFactoryDashboardOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        refresh: :unavailable
+      )
+
+    factory_snapshot =
+      factory_dashboard_snapshot()
+      |> put_in([:control, :controller_writer_conflict_count], 0)
+      |> put_in([:control, :controller_writer_conflict_since], nil)
+      |> Map.put(:broker, %{
+        pending: 0,
+        claimed_unverified: 0,
+        needs_reconciliation: 0,
+        last_completed_at: nil
+      })
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50,
+      factory_observability: fn -> factory_snapshot end
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/")
+    document = Floki.parse_document!(html)
+
+    assert Floki.text(Floki.find(document, ".broker-card .section-header > .state-badge")) =~ "Unknown"
+    assert Floki.find(document, ".broker-card .section-header > .state-badge-active") == []
+    assert Floki.text(Floki.find(document, ".status-cluster"), sep: " ") =~ "Broker status unknown"
+    assert Floki.find(document, ~s(.dashboard-shell[data-factory-operability="unknown"])) != []
+  end
+
+  test "dashboard treats one claimed Desktop request as neutral in-flight work" do
+    orchestrator_name = Module.concat(__MODULE__, :ClaimedBrokerFactoryDashboardOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        refresh: :unavailable
+      )
+
+    factory_snapshot =
+      factory_dashboard_snapshot()
+      |> put_in([:control, :controller_writer_conflict_count], 0)
+      |> put_in([:control, :controller_writer_conflict_since], nil)
+      |> Map.put(:broker, %{
+        pending: 0,
+        claimed_unverified: 1,
+        needs_reconciliation: 0,
+        last_completed_at: nil
+      })
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50,
+      factory_observability: fn -> factory_snapshot end
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/")
+    document = Floki.parse_document!(html)
+
+    assert Floki.text(Floki.find(document, ".status-cluster .state-badge"), sep: " ") =~
+             "Broker request claimed"
+
+    assert Floki.find(document, ".status-cluster .state-badge-warning") == []
+    assert Floki.find(document, ".broker-card .section-header > .state-badge-warning") == []
+
+    assert Floki.find(document, ~s(.dashboard-shell[data-factory-operability="ready"])) != []
+  end
+
+  test "dashboard flags Desktop requests requiring reconciliation independently of a running scheduler" do
+    orchestrator_name = Module.concat(__MODULE__, :ReconcileBrokerFactoryDashboardOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        refresh: :unavailable
+      )
+
+    factory_snapshot =
+      factory_dashboard_snapshot()
+      |> put_in([:control, :controller_writer_conflict_count], 0)
+      |> put_in([:control, :controller_writer_conflict_since], nil)
+      |> Map.put(:broker, %{
+        pending: 1,
+        claimed_unverified: 1,
+        needs_reconciliation: 1,
+        last_completed_at: nil
+      })
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50,
+      factory_observability: fn -> factory_snapshot end
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/")
+    document = Floki.parse_document!(html)
+
+    assert Floki.text(Floki.find(document, ".status-cluster"), sep: " ") =~ "Scheduler active"
+
+    assert Floki.text(Floki.find(document, ".status-cluster .state-badge-danger")) =~
+             "Broker needs attention"
+
+    assert Floki.text(Floki.find(document, ".broker-card .section-header > .state-badge-danger")) =~
+             "Needs attention"
+
+    assert Floki.find(document, ~s(.dashboard-shell[data-factory-operability="stopped"])) != []
+  end
+
+  test "dashboard summary does not count a queued ticket as active without a running task" do
+    orchestrator_name = Module.concat(__MODULE__, :FactorySummaryOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: Map.put(static_snapshot(), :running, []),
+        refresh: :unavailable
+      )
+
+    factory_snapshot =
+      factory_dashboard_snapshot()
+      |> put_in([:counts, :in_progress], 1)
+      |> put_in([:counts, :review_ready], 0)
+      |> put_in([:overview], %{
+        active: 0,
+        queued: 1,
+        review_ready: 0,
+        needs_attention: 0,
+        by_issue: %{"PPL-9723" => "QUEUED"}
+      })
+      |> put_in([:runs, Access.at(0), :issue_key], "PPL-9723")
+      |> put_in([:runs, Access.at(0), :state], "SPEC_DRAFTING")
+      |> put_in([:tasks, Access.at(0), :issue_key], "PPL-9723")
+      |> put_in([:tasks, Access.at(0), :status], "FAILED")
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50,
+      factory_observability: fn -> factory_snapshot end
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/")
+
+    summary_cards =
+      html
+      |> Floki.parse_document!()
+      |> Floki.find(".metric-card")
+
+    active_text =
+      summary_cards
+      |> Enum.find(&(Floki.text(&1, sep: " ") =~ "Active work"))
+      |> Floki.text(sep: " ")
+
+    queue_text =
+      summary_cards
+      |> Enum.find(&(Floki.text(&1, sep: " ") =~ "Jira queue"))
+      |> Floki.text(sep: " ")
+
+    assert active_text =~ "Active work 0"
+    assert active_text =~ "0 active tickets"
+    assert queue_text =~ "Jira queue 1"
+
+    workflow =
+      html
+      |> Floki.parse_document!()
+      |> Floki.find(".runs-section")
+      |> Floki.text(sep: " ")
+
+    assert workflow =~ "Queued"
+    assert workflow =~ "Spec drafting · Delivery · grail"
+  end
+
+  test "dashboard summary uses the exclusive factory needs-attention bucket" do
+    orchestrator_name = Module.concat(__MODULE__, :FactoryBlockedSummaryOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        refresh: :unavailable
+      )
+
+    factory_snapshot =
+      put_in(factory_dashboard_snapshot().overview, %{
+        active: 0,
+        queued: 0,
+        review_ready: 0,
+        needs_attention: 1,
+        by_issue: %{"PPL-123" => "NEEDS_ATTENTION"}
+      })
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50,
+      factory_observability: fn -> factory_snapshot end
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/")
+
+    attention_card =
+      html
+      |> Floki.parse_document!()
+      |> Floki.find(".metric-card")
+      |> Enum.find(&(Floki.text(&1, sep: " ") =~ "Needs attention"))
+
+    attention_text = Floki.text(attention_card, sep: " ")
+    assert attention_text =~ "Needs attention 1"
+    assert attention_text =~ "1 ticket needs attention"
+  end
+
+  test "active ticket workflow links to its current Codex task" do
+    orchestrator_name = Module.concat(__MODULE__, :ActiveFactoryTaskOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: Map.put(static_snapshot(), :running, []),
+        refresh: :unavailable
+      )
+
+    active_task = %{
+      (factory_dashboard_snapshot().tasks
+       |> hd())
+      | issue_key: "PPL-123",
+        status: "RUNNING",
+        thread_id: "thread-active"
+    }
+
+    factory_snapshot =
+      factory_dashboard_snapshot()
+      |> put_in([:tasks], [active_task])
+      |> put_in([:runs, Access.at(0), :tasks], [active_task])
+      |> put_in([:runs, Access.at(0), :state], "SPEC_DRAFTING")
+      |> put_in([:overview], %{
+        active: 1,
+        queued: 1,
+        review_ready: 0,
+        needs_attention: 0,
+        by_issue: %{"PPL-123" => "ACTIVE", "PPL-9723" => "QUEUED"}
+      })
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50,
+      factory_observability: fn -> factory_snapshot end
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/")
+
+    assert html =~ "Open active task"
+    assert html =~ ~s(href="codex://threads/thread-active")
+
+    workflow =
+      html
+      |> Floki.parse_document!()
+      |> Floki.find(".runs-section")
+      |> Floki.text(sep: " ")
+
+    assert workflow =~ "Active"
+    assert workflow =~ "Spec drafting · Delivery · grail"
+  end
+
+  test "failed factory tasks explain the failure and are not shown as pending" do
+    orchestrator_name = Module.concat(__MODULE__, :FailedFactoryTaskOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        refresh: :unavailable
+      )
+
+    failed_task = %{
+      (factory_dashboard_snapshot().tasks
+       |> hd())
+      | status: "FAILED",
+        thread_id: nil,
+        failure_code: "project not found: project-grail"
+    }
+
+    factory_snapshot = put_in(factory_dashboard_snapshot().tasks, [failed_task])
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50,
+      factory_observability: fn -> factory_snapshot end
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/")
+
+    task_history =
+      html
+      |> Floki.parse_document!()
+      |> Floki.find(".factory-task-history")
+      |> Floki.text(sep: " ")
+
+    assert task_history =~ "project not found: project-grail"
+    assert task_history =~ "Not created"
+    refute task_history =~ "Pending"
+  end
+
+  test "factory task failures translate structured-output errors for operators" do
+    orchestrator_name = Module.concat(__MODULE__, :InvalidFactoryOutputOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        refresh: :unavailable
+      )
+
+    failed_task = %{
+      (factory_dashboard_snapshot().tasks
+       |> hd())
+      | status: "FAILED",
+        failure_code: ~s({:factory_stage_output_invalid_json, %Jason.DecodeError{position: 0, data: "plain text"}})
+    }
+
+    factory_snapshot =
+      factory_dashboard_snapshot()
+      |> put_in([:tasks], [failed_task])
+      |> put_in([:runs, Access.at(0), :last_error], failed_task.failure_code)
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50,
+      factory_observability: fn -> factory_snapshot end
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/")
+
+    task_history =
+      html
+      |> Floki.parse_document!()
+      |> Floki.find(".factory-task-history")
+      |> Floki.text(sep: " ")
+
+    assert task_history =~ "Worker returned text instead of the required structured result."
+    refute task_history =~ "Jason.DecodeError"
+
+    workflow =
+      html
+      |> Floki.parse_document!()
+      |> Floki.find(".runs-section")
+      |> Floki.text(sep: " ")
+
+    assert workflow =~ "Worker returned text instead of the required structured result."
+    refute workflow =~ "Jason.DecodeError"
+  end
+
+  test "controller lease distinguishes an expired tick from a live held lease" do
+    orchestrator_name = Module.concat(__MODULE__, :ExpiredFactoryLeaseOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        refresh: :unavailable
+      )
+
+    expired_at = DateTime.utc_now() |> DateTime.add(-60, :second) |> DateTime.to_iso8601()
+
+    factory_snapshot =
+      factory_dashboard_snapshot()
+      |> put_in([:control, :tick_id], "expired-tick")
+      |> put_in([:control, :lease_expires_at], expired_at)
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50,
+      factory_observability: fn -> factory_snapshot end
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/")
+
+    controller_text =
+      html
+      |> Floki.parse_document!()
+      |> Floki.find(".factory-controller")
+      |> Floki.text(sep: " ")
+
+    assert controller_text =~ "Lease Expired"
+    refute controller_text =~ "Lease Held"
   end
 
   test "dashboard liveview renders an unavailable state without crashing" do
@@ -704,6 +1347,173 @@ defmodule SymphonyElixir.ExtensionsTest do
       ],
       codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},
       rate_limits: %{"primary" => %{"remaining" => 11}}
+    }
+  end
+
+  defp factory_dashboard_snapshot do
+    %{
+      enabled: true,
+      available: true,
+      control: %{
+        status: "ACTIVE",
+        scope: "assigned-jira-work",
+        dispatcher_id: "dispatcher",
+        generation: 12,
+        tick_id: nil,
+        lease_expires_at: nil,
+        updated_at: "2026-09-22T20:00:00Z",
+        controller_thread_id: "thread-controller",
+        controller_turn_id: "turn-controller",
+        controller_codex_project_id: "project-factory",
+        controller_model: "gpt-5.6-terra",
+        controller_reasoning_effort: "medium",
+        controller_writer_conflict_since: "2026-09-22T20:00:00Z",
+        controller_writer_conflict_count: 2,
+        runtime_identity: %{
+          process_started_at: "2026-09-22T20:00:00Z",
+          factory_beam_fingerprint: String.duplicate("a", 64),
+          factory_beam_module_count: 12
+        }
+      },
+      counts: %{
+        total_runs: 1,
+        in_progress: 0,
+        review_ready: 1,
+        blocked: 0,
+        hibernated: 1,
+        visible_tasks: 1,
+        by_state: %{"READY_FOR_REVIEW" => 1}
+      },
+      overview: %{
+        active: 0,
+        queued: 1,
+        review_ready: 1,
+        needs_attention: 0,
+        by_issue: %{
+          "PPL-9723" => "QUEUED",
+          "PPL-123" => "REVIEW_READY"
+        }
+      },
+      intake: %{
+        available: true,
+        stale: false,
+        observed_at: "2026-09-22T20:01:00Z",
+        count: 1,
+        error: nil,
+        issues: [
+          %{
+            issue_key: "PPL-9723",
+            issue_url: "https://jira.example/PPL-9723",
+            summary: "Detect visually hidden text in PDFs for indirect injection",
+            status: "To Do",
+            labels: ["repo-grail", "spec-needed"],
+            project_key: "PPL",
+            updated_at: "2026-09-22T19:59:00Z",
+            classification: "SPECIFICATION",
+            routing_status: "ROUTED",
+            repo_key: "repo-grail",
+            local_state: "QUEUED"
+          }
+        ]
+      },
+      capacity: [
+        %{
+          repo_key: "grail",
+          free_gb: 45.0,
+          available_writer_slots: 2,
+          maximum_writers: 2,
+          available_specifier_slots: 2,
+          maximum_specifiers: 2,
+          available_validator_slots: 2,
+          maximum_validators: 2,
+          result: "PASS"
+        },
+        %{
+          repo_key: "polaris",
+          free_gb: 45.0,
+          available_writer_slots: 2,
+          maximum_writers: 2,
+          available_specifier_slots: 2,
+          maximum_specifiers: 2,
+          available_validator_slots: 2,
+          maximum_validators: 2,
+          result: "PASS"
+        }
+      ],
+      runs: [
+        %{
+          run_id: "run-1",
+          issue_key: "PPL-123",
+          issue_url: "https://jira.example/PPL-123",
+          kind: "DELIVERY",
+          state: "READY_FOR_REVIEW",
+          repo_key: "grail",
+          branch: "cgable/PPL-123-dashboard",
+          worktree: "/tmp/PPL-123",
+          workspace_state: "HIBERNATED",
+          hibernated_at: "2026-09-22T19:59:00Z",
+          candidate_sha: String.duplicate("a", 40),
+          mr_url: "https://gitlab.example/merge_requests/123",
+          mr_iid: 123,
+          model: "gpt-5.6-sol",
+          reasoning_effort: "high",
+          implementation_iteration: 2,
+          code_repair_round: 0,
+          validation_repair_round: 0,
+          last_error: nil,
+          updated_at: "2026-09-22T20:00:00Z",
+          tasks: []
+        },
+        %{
+          run_id: "run-old",
+          issue_key: "PPL-123",
+          issue_url: "https://jira.example/PPL-123",
+          kind: "DELIVERY",
+          state: "FAILED",
+          repo_key: "grail",
+          branch: "cgable/PPL-123-dashboard",
+          worktree: nil,
+          workspace_state: "HIBERNATED",
+          hibernated_at: "2026-09-22T18:59:00Z",
+          candidate_sha: nil,
+          mr_url: nil,
+          mr_iid: nil,
+          model: "gpt-5.6-sol",
+          reasoning_effort: "high",
+          implementation_iteration: 1,
+          code_repair_round: 0,
+          validation_repair_round: 0,
+          last_error: "stale failure from a previous attempt",
+          updated_at: "2026-09-22T19:00:00Z",
+          tasks: []
+        }
+      ],
+      tasks: [
+        %{
+          task_key: "run-1:change-verifier:1",
+          run_id: "run-1",
+          issue_key: "PPL-123",
+          stage: "VERIFYING",
+          role: "Change Verifier",
+          status: "COMPLETED",
+          thread_id: "thread-verifier",
+          turn_id: "turn-verifier",
+          codex_project_id: "project-grail",
+          model: "gpt-5.6-sol",
+          reasoning_effort: "high",
+          failure_code: nil,
+          updated_at: "2026-09-22T19:58:00Z"
+        }
+      ],
+      recent_events: [
+        %{
+          id: 1,
+          occurred_at: "2026-09-22T19:59:00Z",
+          event_type: "WORKTREE_HIBERNATED",
+          run_id: "run-1",
+          issue_key: "PPL-123"
+        }
+      ]
     }
   end
 

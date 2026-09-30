@@ -165,6 +165,89 @@ defmodule SymphonyElixir.FactoryCleanupTest do
     assert "worktree is dirty or has untracked files" in reasons
   end
 
+  test "Jira In Review can authorize a clean published candidate when explicitly configured", context do
+    policy =
+      put_in(context.policy, ["cleanup", "allowed_jira_statuses"], ["IN REVIEW", "IN TESTING", "DONE"])
+
+    assert {:error, :external_state_not_terminal} =
+             Cleanup.authorize(context.store, policy, "run-cleanup", "In Dev", "opened")
+
+    assert {:error, :external_state_not_terminal} =
+             Cleanup.authorize(context.store, policy, "run-cleanup", "ai-review", "opened")
+
+    assert {:ok, authorized} =
+             Cleanup.authorize(context.store, policy, "run-cleanup", "In Review", "opened")
+
+    assert %{eligible: true} = Cleanup.preflight(context.store, policy, authorized)
+  end
+
+  test "resumes after worktree removal without attempting removal again", context do
+    assert {:ok, _} = Cleanup.authorize(context.store, context.policy, "run-cleanup", "DONE", "opened")
+
+    fail = fn
+      :after_worktree_remove -> {:error, :injected_crash}
+      _boundary -> :ok
+    end
+
+    assert {:error, :injected_crash} =
+             Cleanup.apply(context.store, context.policy, "run-cleanup",
+               command_runner: fn _executable, _args, _opts ->
+                 {Jason.encode!(%{"reclaimed_bytes" => 0}), 0}
+               end,
+               failure_injector: fail,
+               active_workspace: context.workspace_root
+             )
+
+    refute File.exists?(context.writer.path)
+
+    assert {:ok, %{result: "CLEANED"}} =
+             Cleanup.apply(context.store, context.policy, "run-cleanup",
+               command_runner: fn _executable, _args, _opts ->
+                 {Jason.encode!(%{"reclaimed_bytes" => 0}), 0}
+               end,
+               active_workspace: context.workspace_root
+             )
+
+    assert {:ok, run} = RunLedger.get(context.store, "run-cleanup")
+    assert run["cleaned_at"]
+  end
+
+  test "resumes after Bazel reclamation and before the ledger update", context do
+    assert {:ok, _} = Cleanup.authorize(context.store, context.policy, "run-cleanup", "DONE", "opened")
+    parent = self()
+
+    runner = fn _executable, args, _opts ->
+      send(parent, {:reclaim, args})
+      {Jason.encode!(%{"reclaimed_bytes" => 123}), 0}
+    end
+
+    fail = fn
+      :before_ledger_update -> {:error, :injected_ledger_failure}
+      _boundary -> :ok
+    end
+
+    assert {:error, :injected_ledger_failure} =
+             Cleanup.apply(context.store, context.policy, "run-cleanup",
+               command_runner: runner,
+               failure_injector: fail,
+               active_workspace: context.workspace_root
+             )
+
+    assert_received {:reclaim, _args}
+    assert {:ok, run} = RunLedger.get(context.store, "run-cleanup")
+    assert is_nil(run["cleaned_at"])
+
+    assert {:ok, %{result: "CLEANED"}} =
+             Cleanup.apply(context.store, context.policy, "run-cleanup",
+               command_runner: runner,
+               active_workspace: context.workspace_root
+             )
+
+    refute_received {:reclaim, _args}
+    assert {:ok, run} = RunLedger.get(context.store, "run-cleanup")
+    assert run["cleaned_at"]
+  end
+
   test "lists only complete terminal identities for fresh external authorization", context do
     assert [candidate] = Cleanup.authorization_candidates(context.store, context.policy, "grail")
     assert candidate["run_id"] == "run-cleanup"

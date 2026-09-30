@@ -34,16 +34,210 @@ tools with configured host-side auth and removes declared tracker-token environm
 the Codex child, so the agent does not need a second tracker login.
 
 This fork also contains an opt-in, SQLite-backed local factory control plane
-for a durable Jira-to-GitLab workflow. It runs specification, incremental
-delivery, independent verification, and optional Slack-coordinated manual
-validation as named, persistent Codex tasks while the controller retains exact
-Jira, Git push, and draft-MR ownership. Configuration, safety boundaries,
-recovery, and cutover are documented in
+for a durable Jira-to-GitLab workflow. A manually invoked `specify-work` writes
+and reads back the exact authorized contract before adding `ai-ready`; delivery
+then starts one writer directly, with short inline code-grounding, independent
+verification, and optional Slack-coordinated manual validation as visible
+Codex tasks. The controller retains Git push and draft-MR ownership.
+Configuration, safety boundaries, recovery, and cutover are documented in
 [Local factory control plane](../docs/factory-control-plane.md).
+Manual-validation results are bound to the confirmed contract's named
+non-production environment as well as its exact candidate SHA. The safety
+policy is rechecked before a validator starts and before its result is used.
 
 Install the persistent local scheduler with
 `./scripts/install-local-factory-launchd`. Codex remains the operator UI; the
 launchd process only supplies durable scheduling and recovery.
+The launcher puts the Codex app's bundled CLI directory on `PATH` and fails
+startup if `codex` is absent; an outdated bundle path otherwise makes every
+Jira intake tick fail before any active ticket can advance.
+
+The optional `desktop_broker` transport routes worker tasks and a prebound,
+projectless controller task through durable Desktop requests. The broker must
+read back the same task, turn, schema result, and required tool calls. Desktop
+follow-ups cannot convey the app-server's issue-scoped Jira tool approvals.
+The `specify-work` skill writes its manually authored, authorized contract
+through the user's Jira connection; the controller validates its exact marker
+before delivery. Scheduler-owned Jira reads and writes use a separate ephemeral
+app-server MCP connection. Intake stores exact Jira description and
+comment bytes without model reserialization. Writes check the issue, status,
+and labels, skip an exact comment already present, and read the issue back.
+Digest-bound factory contracts use a transport-safe literal comment envelope;
+the controller rejects Jira Markdown rewrites instead of treating them as an
+equivalent specification.
+Automatic specification repair is bounded separately from human input: a
+read-backed answer to the exact question marker resets the automatic repair
+budget and resumes the existing author task, even if earlier drafts exhausted
+that budget. Legacy feature-planner results receive one same-task JSON-format
+repair turn; new deliveries skip the planner task, and malformed legacy output
+never authorizes a second planner task.
+For a pre-fix planner request with no repair budget, pause the factory and
+prove its exact completed turn and task route before
+`mix factory authorize-planner-repair REQUEST_KEY COMPLETED_TURN --workflow
+WORKFLOW.local.md`. This records a one-shot grant without changing the request
+payload. The Desktop broker claims that grant after activation and sends one
+tool-free format repair to the same planner task; an uncertain claim is
+reconciled, never resent.
+An approval or elicitation prompt is not answered automatically; the write
+fails closed for reconciliation. The visible Desktop controller task remains
+the audit and GitLab-delivery interface, not the Jira data transport.
+
+If a Desktop controller permanently lacks a required connector, pause the
+factory and broker first. After proving a replacement projectless task can
+complete the connector read, and proving the old request made no required
+external call, migrate the binding with `mise exec -- mix factory
+replace-controller OLD_THREAD NEW_THREAD NEW_TURN FAILED_REQUEST_KEY --workflow
+WORKFLOW.local.md`. This retires only the exact failed controller request and
+keeps ticket worker tasks and their history intact. Archive the old controller
+only after the new binding is read back.
+
+A broker readback outage keeps future native stages in `WAITING_FOR_BROKER` so
+the same completed turn can be reconciled. For a legacy run already marked
+`FAILED` solely because a completed native author turn was hidden from Desktop
+task history, pause both loops, prove the exact turn and request marker, then
+run `mise exec -- mix factory recover-spec-readback REQUEST_KEY COMPLETED_TURN
+--workflow WORKFLOW.local.md`. This reopens the same run and author for broker
+completion; it does not generate a new turn or change Jira.
+
+If a completed author draft was rejected only because it carried forward the
+previous specification revision, pause dispatch and verify the latest Jira
+description and exact completed Desktop turn. `mise exec -- mix factory
+adopt-spec-revision REQUEST_KEY COMPLETED_TURN --workflow WORKFLOW.local.md`
+binds only a unique prior-revision header to the recorded next revision and
+continues with draft write/read-back and independent critique. It does not
+send another author turn or write Jira itself.
+
+Native factory writers edit and check source in their Codex worktree, then
+return exact changed paths and a conventional commit message as raw structured
+output. The controller validates the bound branch, parent SHA, complete path
+set, and clean read-back before committing with `--no-verify`; workers do not
+write protected shared Git metadata. After an approval-blocked writer turn has
+ended with no edits, pause dispatch, verify that exact task and clean pinned
+checkout, then use `mise exec -- mix factory recover-native-writer REQUEST_KEY
+COMPLETED_TURN --workflow WORKFLOW.local.md`. This attaches the recorded branch
+and reuses the same task for its next pass; a mismatched or dirty checkout fails
+closed.
+
+For a failed `REPAIRING` slice whose controller commit succeeded before the
+ledger update, pause dispatch and verify the current Jira labels, completed
+turn, and clean checkout. `mise exec -- mix factory adopt-repair-slice
+REQUEST_KEY COMPLETED_TURN --workflow WORKFLOW.local.md` proves the commit's
+parent, paths, message, branch, and SHA, then reopens the same run for
+idempotent adoption and fresh verification. These recovery commands do not
+change Jira labels; if a prior block write added `ai-blocked`, the controller
+must restore and read back the authorized labels before activation.
+
+If a native writer turn is interrupted, read back that exact interrupted turn
+and request marker. With dispatch paused and no live lease, `mise exec -- mix
+factory resume-interrupted-writer REQUEST_KEY INTERRUPTED_TURN --workflow
+WORKFLOW.local.md` closes only that unresolved request and re-arms the same
+task. It accepts any implementation iteration only while the run is still
+writing, has no MR, and its candidate SHA is absent or equals the bound
+worktree HEAD. It also verifies the task/project/worktree/branch binding and
+refuses another unresolved request or moved HEAD/branch. The operator must
+independently verify the interrupted turn ID; the command does not attest
+Codex history by itself.
+
+When a writer returns `BLOCKED` on a failing contract check with partial
+source edits, the controller does not discard them or silently reinterpret the
+contract. After proving the exact completed turn, one latest failed delivery
+run, unchanged branch/HEAD, and an `ai-running` snapshot, pause dispatch and
+run `mise exec -- mix factory investigate-blocked-writer REQUEST_KEY
+BLOCKED_TURN --workflow WORKFLOW.local.md`. This permits one bounded
+investigation in the same task and dirty checkout. It does not commit the
+failed slice or override a genuine product decision.
+
+If a completed repair writer correctly refuses controller-owned push/MR work,
+pause dispatch and use `mise exec -- mix factory resume-controller-delivery
+RUN_ID CANDIDATE_SHA --workflow WORKFLOW.local.md`. Recovery requires the exact
+latest run and completed broker result, a clean bound branch at that SHA, an
+existing draft-MR binding, and the configured CI-preflight route. It returns
+the same run to controller-owned CI push, MR read-back, and fresh verification;
+it neither relaunches the writer nor edits the MR itself. Record any missing
+contract-required MR evidence before reactivation.
+
+If Codex rejects a verifier CREATE with `invalid arguments` before returning
+any task or client ID, leave it in reconciliation. After reading back that
+exact failed tool call, pause dispatch and run `mise exec -- mix factory
+resume-rejected-create REQUEST_KEY REJECTED_TOOL_CALL_ID --workflow
+WORKFLOW.local.md`. This requeues only the unbound, failed request for one
+corrected broker claim; an ambiguous or accepted CREATE is never retried.
+
+The scheduler also polls the exact issue key of a failed delivery, even when
+Jira has moved it to In Dev and it is absent from the normal intake query. A
+changed Jira description or human comment starts one visible `Contract Update`
+task in the repository Project. New contract-only chats use the Project's local
+context without creating a worktree; already-bound chats retain their checkout.
+A question in that task pauses only that
+ticket; the Desktop broker reads back the user's reply and the scheduler
+continues the same chat. The reply is input, not authorization: the controller
+still writes and reads back the new contract and passes independent review
+before rearming the original writer worktree. An unchanged failed contract
+does not create another task. The dashboard links to the waiting chat.
+
+The factory creates a fresh detached Codex worktree before launching each
+change verifier. The verifier runs `verify-feature-delivery` in reviewer mode
+inside that checkout; it must not create another worktree or delegate again.
+The Desktop broker may submit that skill's detailed verdict JSON unchanged.
+Symphony checks its issue, contract revision and digest, candidate SHA, review
+checkout, acceptance results, and checks before reducing it to the factory's
+stage result. A `REPAIR` verdict carries its exact required repairs into the
+same writer's next pass.
+If a verifier turn fails authentication before producing a verdict, prove the
+failed Codex turn, exact request, Project, and clean detached candidate checkout.
+With dispatch paused and unleased, run `mise exec -- mix factory
+resume-auth-failed-verifier REQUEST_KEY FAILED_TURN --workflow
+WORKFLOW.local.md`. This closes only that request and rearms the same verifier
+task without counting a code-repair round. It does not repair credentials or
+attest the failed turn by itself.
+
+If a verifier CREATE was uncertain but its exact bootstrap later completed, use
+`mise exec -- mix factory recover-native-verifier-create REQUEST_KEY
+BOOTSTRAP_TURN --workflow WORKFLOW.local.md` while dispatch is paused and
+unleased. Recovery requires the same latest failed run, a completed bootstrap
+bound to the verifier's existing thread, Project, detached clean checkout, and
+candidate SHA, with no unresolved sibling request. It rearms that existing
+verifier task; it never retries CREATE or changes the candidate/MR.
+
+Native worktree creation can return a temporary client ID before its real task
+ID is available. The optional `native_session_discovery_enabled` gate defaults
+to `false`. When explicitly enabled, `mix factory.desktop find-thread
+REQUEST_KEY --source-thread-id BROKER_THREAD_ID --workflow WORKFLOW.local.md`
+scans a bounded portion of recent local and archived Codex session metadata
+and returns only a candidate task ID. The broker must still verify the candidate's Project,
+checkout, and completed turn through Codex before binding it. A missing or
+ambiguous candidate never authorizes another create.
+
+Worker task launch checks the route's primary repository root against the
+local Codex app-server Project list. It refuses to substitute that registry's
+ID when it differs from the configured desktop Project ID, before creating a
+task. The two registries currently have different IDs on this host, so this
+guard prevents new projectless factory tasks while the desktop-backed launch
+handoff is being built. Existing task IDs and titles remain reopenable, but
+their desktop sidebar grouping is unchanged.
+
+After fixing an infrastructure failure, request one local retry of the exact
+latest failed specification with `mise exec -- mix factory retry-spec PPL-1234
+--workflow WORKFLOW.local.md`. This preserves the failed run and its task
+history, does not edit Jira, and cannot repeat without another explicit
+request. The factory refuses the command while a scheduler tick holds its
+lease, or while the author task or a Desktop request is still active. When the
+issue, repository, Codex Project, and checkout still match, the next
+specification attempt reopens the failed run and resumes the previous author
+task instead of creating a new visible task. A substantive Jira clarification
+does the same without requiring `retry-spec`. A missing checkout or changed
+route stops that issue for reconciliation rather than creating a replacement.
+An active-writer refusal leaves that task waiting and retries the same ID after
+a bounded delay; it never forks to work around ownership.
+This does not bypass the desktop/app-server Project mismatch above.
+
+For the app-server task transport, Jira mutation approval is one-shot and
+issue-bound: comments require the exact body, and label changes require
+`jira_update_issue` with only the exact label set computed from the current
+intake snapshot. Mixed comment-and-label steps carry separate approvals. For
+Desktop transport, the direct MCP writer sends only those same scoped arguments
+and checks the fresh preimage and post-write read-back. An agent's PASS text
+alone is never proof of a write.
 
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
@@ -328,6 +522,21 @@ The observability UI now runs on a minimal Phoenix stack:
 - Bandit as the HTTP server
 - Phoenix dependency static assets for the LiveView client bootstrap
 - Tracker issue identifiers link to the tracker-provided URL when it uses `http` or `https`
+- When `factory.enabled` is true, the same dashboard shows controller leases, bounded capacity,
+  durable runs, Codex task identities, worktree state, delivery links, and recent ledger events.
+  The overview counts each current ticket once; a paused factory with a Desktop task awaiting
+  broker recovery or its next stage places that ticket under Needs attention rather than Active work.
+  A nonterminal run stays under Active work while controller gates run between worker turns;
+  Jira queue counts only tickets without an in-progress run. Jira intake separately lists all
+  tracked factory-labelled tickets, including those already in progress.
+  The Desktop Broker card counts pending, claimed, and reconciliation-needed task handoffs;
+  it does not measure the Codex automation heartbeat. Ordinary queued or claimed requests do
+  not make the factory unhealthy, while a reconciliation-needed request is flagged in the Broker card.
+  Visible worker titles use `ISSUE · Role` or `ISSUE · R# · Role`; internal request IDs remain
+  in the durable ledger and task prompt rather than the sidebar title.
+
+Bind `server.host` to `127.0.0.1` for a local-only operator surface. The factory example enables the
+dashboard at `http://127.0.0.1:4000`; it does not provide authentication for a network-exposed bind.
 
 ## Project Layout
 

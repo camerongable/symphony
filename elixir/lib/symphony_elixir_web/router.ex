@@ -16,6 +16,7 @@ defmodule SymphonyElixirWeb.Router do
 
   scope "/", SymphonyElixirWeb do
     get("/dashboard.css", StaticAssetController, :dashboard_css)
+    get("/dashboard.js", StaticAssetController, :dashboard_js)
     get("/favicon.png", StaticAssetController, :favicon)
     get("/vendor/phoenix_html/phoenix_html.js", StaticAssetController, :phoenix_html_js)
     get("/vendor/phoenix/phoenix.js", StaticAssetController, :phoenix_js)

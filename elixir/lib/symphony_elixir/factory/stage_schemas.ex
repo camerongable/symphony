@@ -51,6 +51,19 @@ defmodule SymphonyElixir.Factory.StageSchemas do
     })
   end
 
+  def for_stage(:native_feature_writer) do
+    object(~w(status changed_paths commit_message blockers checks), %{
+      "status" => enum(~w(CONTINUE COMPLETE BLOCKED)),
+      "summary" => string(),
+      "changed_paths" => @string_list,
+      "commit_message" => nullable_string(),
+      "remaining_criteria" => @string_list,
+      "next_slice" => string(),
+      "blockers" => @string_list,
+      "checks" => @string_list
+    })
+  end
+
   def for_stage(:change_verifier) do
     object(~w(status candidate_sha findings checks), %{
       "status" => enum(~w(PASS REPAIR BLOCK)),
@@ -85,7 +98,7 @@ defmodule SymphonyElixir.Factory.StageSchemas do
     object(~w(status issue_key snapshot_json), %{
       "status" => enum(~w(PASS BLOCK)),
       "issue_key" => string(),
-      "snapshot_json" => string()
+      "snapshot_json" => %{"type" => ["string", "object", "array"]}
     })
   end
 
@@ -102,7 +115,7 @@ defmodule SymphonyElixir.Factory.StageSchemas do
 
   def for_stage(:gitlab_mr) do
     object(
-      ~w(status mr_url iid source_branch target_branch sha draft reviewers_count state),
+      ~w(status mr_url iid source_branch target_branch sha draft reviewers_count assignee_id state),
       %{
         "status" => enum(~w(PASS BLOCK)),
         "mr_url" => string(),
@@ -112,7 +125,44 @@ defmodule SymphonyElixir.Factory.StageSchemas do
         "sha" => string(),
         "draft" => %{"type" => "boolean"},
         "reviewers_count" => %{"type" => "integer"},
+        "assignee_id" => %{"type" => "integer"},
         "state" => string()
+      }
+    )
+  end
+
+  def for_stage(:gitlab_ci_status) do
+    object(
+      ~w(status mr_url iid source_branch target_branch sha draft reviewers_count assignee_id mr_state
+         pipeline_id pipeline_url pipeline_sha pipeline_ref pipeline_source pipeline_status required_jobs findings),
+      %{
+        "status" => enum(~w(PASS WAIT REPAIR BLOCK)),
+        "mr_url" => string(),
+        "iid" => %{"type" => "integer"},
+        "source_branch" => string(),
+        "target_branch" => string(),
+        "sha" => string(),
+        "draft" => %{"type" => "boolean"},
+        "reviewers_count" => %{"type" => "integer"},
+        "assignee_id" => %{"type" => "integer"},
+        "mr_state" => string(),
+        "pipeline_id" => %{"type" => ["integer", "null"]},
+        "pipeline_url" => nullable_string(),
+        "pipeline_sha" => nullable_string(),
+        "pipeline_ref" => nullable_string(),
+        "pipeline_source" => nullable_string(),
+        "pipeline_status" => string(),
+        "required_jobs" => %{
+          "type" => "array",
+          "items" =>
+            object(~w(id name status web_url), %{
+              "id" => %{"type" => "integer"},
+              "name" => string(),
+              "status" => string(),
+              "web_url" => string()
+            })
+        },
+        "findings" => @string_list
       }
     )
   end
@@ -132,6 +182,59 @@ defmodule SymphonyElixir.Factory.StageSchemas do
       }
     })
   end
+
+  @doc "Checks a decoded stage result against the supported strict JSON-schema subset."
+  @spec validate(map(), map()) :: :ok | {:error, :factory_stage_output_schema_mismatch}
+  def validate(output, schema) when is_map(output) and is_map(schema) do
+    if valid_value?(output, schema), do: :ok, else: {:error, :factory_stage_output_schema_mismatch}
+  end
+
+  defp valid_value?(value, schema) do
+    valid_type?(value, Map.get(schema, "type")) and
+      valid_enum?(value, Map.get(schema, "enum")) and
+      valid_object?(value, schema) and
+      valid_array?(value, schema)
+  end
+
+  defp valid_type?(_value, nil), do: true
+  defp valid_type?(value, types) when is_list(types), do: Enum.any?(types, &valid_type?(value, &1))
+  defp valid_type?(value, "object"), do: is_map(value)
+  defp valid_type?(value, "array"), do: is_list(value)
+  defp valid_type?(value, "string"), do: is_binary(value)
+  defp valid_type?(value, "boolean"), do: is_boolean(value)
+  defp valid_type?(value, "integer"), do: is_integer(value)
+  defp valid_type?(nil, "null"), do: true
+  defp valid_type?(_value, _type), do: false
+
+  defp valid_enum?(_value, nil), do: true
+  defp valid_enum?(value, values) when is_list(values), do: value in values
+  defp valid_enum?(_value, _values), do: false
+
+  defp valid_object?(value, schema) when is_map(value) do
+    required = Map.get(schema, "required", [])
+    properties = Map.get(schema, "properties", %{})
+
+    Enum.all?(required, &Map.has_key?(value, &1)) and
+      (Map.get(schema, "additionalProperties") != false or
+         Enum.all?(Map.keys(value), &Map.has_key?(properties, &1))) and
+      Enum.all?(value, fn {key, field} ->
+        case Map.fetch(properties, key) do
+          {:ok, field_schema} -> valid_value?(field, field_schema)
+          :error -> true
+        end
+      end)
+  end
+
+  defp valid_object?(_value, _schema), do: true
+
+  defp valid_array?(value, schema) when is_list(value) do
+    case Map.get(schema, "items") do
+      nil -> true
+      item_schema -> Enum.all?(value, &valid_value?(&1, item_schema))
+    end
+  end
+
+  defp valid_array?(_value, _schema), do: true
 
   defp object(required, properties) do
     %{

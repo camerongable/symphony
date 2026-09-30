@@ -7,7 +7,8 @@ defmodule SymphonyElixir.Factory.Queue do
   def jql(queue) when is_map(queue) do
     with {:ok, assignee} <- required_string(queue, "assignee"),
          {:ok, statuses} <- required_strings(queue, "statuses"),
-         {:ok, labels} <- required_strings(queue, "factory_labels") do
+         {:ok, labels} <- required_strings(queue, "factory_labels"),
+         {:ok, issue_keys} <- optional_issue_keys(queue) do
       clauses = [
         "assignee = #{assignee}",
         "status IN (#{quoted_list(statuses)})",
@@ -16,6 +17,7 @@ defmodule SymphonyElixir.Factory.Queue do
 
       clauses = optional_in_clause(clauses, "project", value(queue, "projects", []))
       clauses = optional_in_clause(clauses, "parent", value(queue, "epics", []))
+      clauses = optional_in_clause(clauses, "key", issue_keys)
       {:ok, Enum.join(clauses, " AND ") <> " ORDER BY priority DESC, created ASC"}
     end
   end
@@ -126,6 +128,20 @@ defmodule SymphonyElixir.Factory.Queue do
       {:ok, Enum.map(values, &String.trim/1)}
     else
       {:error, {:missing_queue_setting, key}}
+    end
+  end
+
+  defp optional_issue_keys(queue) do
+    case value(queue, "issue_keys", []) do
+      keys when is_list(keys) ->
+        if Enum.all?(keys, &(is_binary(&1) and Regex.match?(~r/\A[A-Za-z][A-Za-z0-9_]*-[0-9]+\z/, &1))) do
+          {:ok, keys}
+        else
+          {:error, :invalid_issue_keys}
+        end
+
+      _other ->
+        {:error, :invalid_issue_keys}
     end
   end
 

@@ -73,10 +73,23 @@ defmodule SymphonyElixir.FactoryPolicyTest do
     assert {:error, :hibernation_states_required} = Policy.validate(incomplete)
   end
 
+  test "requires a separate read-only intake model route" do
+    factory = valid_factory()
+    without_intake = update_in(factory, [:models, "roles"], &Map.delete(&1, "orchestrator-intake"))
+
+    assert {:error, {:model_route_unavailable, "orchestrator-intake", _reason}} =
+             Policy.validate(without_intake)
+  end
+
+  test "rejects an unrecognized specification authorization policy" do
+    factory = valid_factory() |> Map.put(:specification_authorization_mode, "unreviewed")
+    assert {:error, :invalid_specification_authorization_mode} = Policy.validate(factory)
+  end
+
   defp valid_factory do
     roles =
       ~w(
-        orchestrator specification-author specification-critic feature-planner
+        orchestrator orchestrator-intake specification-author specification-critic feature-planner
         feature-writer feature-writer-high-risk change-verifier manual-validator
         explorer failure-triager
       )
