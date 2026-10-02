@@ -1148,18 +1148,8 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, :worker_event_buffer_overflow}
 
       state[:scope] == :exact_turn ->
-        Process.put(@turn_event_state_key, %{state | early: [], bytes: 0})
-
-        result =
-          Enum.reduce_while(Enum.reverse(state.early), :continue, fn payload, _ ->
-            case handle_incoming(port, on_message, Jason.encode!(payload), timeout_ms, tool_executor, auto_approve_requests) do
-              {:ok, :turn_completed} = done -> {:halt, done}
-              {:error, _} = error -> {:halt, error}
-              _ -> {:cont, :continue}
-            end
-          end)
-
-        if result == :continue, do: receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests), else: result
+        Process.put(@turn_event_state_key, %{state | early: Enum.reverse(state.early), bytes: 0})
+        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
 
       true ->
         receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
@@ -1167,13 +1157,35 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
+    if turn_deadline_expired?() do
+      {:error, :turn_timeout}
+    else
+      receive_loop_until_event(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests)
+    end
+  end
+
+  defp receive_loop_until_event(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
+    case pop_early_turn_event() do
+      {:ok, payload} ->
+        dispatch_incoming(port, on_message, Jason.encode!(payload), timeout_ms, tool_executor, auto_approve_requests)
+        |> case do
+          {:continue, :ignored} -> receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+          result -> result
+        end
+
+      :empty ->
+        receive_live_event(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests)
+    end
+  end
+
+  defp receive_live_event(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
     timeout_ms = effective_turn_timeout(timeout_ms)
 
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
 
-        case handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests) do
+        case dispatch_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests) do
           {:continue, :ignored} -> receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
           result -> result
         end
@@ -1189,10 +1201,36 @@ defmodule SymphonyElixir.Codex.AppServer do
         )
 
       {^port, {:exit_status, status}} ->
-        {:error, {:port_exit, status}}
+        if turn_deadline_expired?(), do: {:error, :turn_timeout}, else: {:error, {:port_exit, status}}
     after
       timeout_ms ->
         {:error, :turn_timeout}
+    end
+  end
+
+  defp dispatch_incoming(port, on_message, data, timeout_ms, tool_executor, auto_approve_requests) do
+    if turn_deadline_expired?() do
+      {:error, :turn_timeout}
+    else
+      handle_incoming(port, on_message, data, effective_turn_timeout(timeout_ms), tool_executor, auto_approve_requests)
+    end
+  end
+
+  defp pop_early_turn_event do
+    case Process.get(@turn_event_state_key) do
+      %{scope: :exact_turn, early: [payload | rest]} = state ->
+        Process.put(@turn_event_state_key, %{state | early: rest})
+        {:ok, payload}
+
+      _ ->
+        :empty
+    end
+  end
+
+  defp turn_deadline_expired? do
+    case Process.get(@turn_event_state_key) do
+      %{scope: :exact_turn, deadline: deadline} -> System.monotonic_time(:millisecond) >= deadline
+      _ -> false
     end
   end
 
@@ -1230,6 +1268,25 @@ defmodule SymphonyElixir.Codex.AppServer do
                 emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
                 {:ok, :turn_completed}
             end
+        end
+
+      {:ok, %{"method" => "error", "params" => params} = payload} when is_map(params) ->
+        case exact_error_scope(payload) do
+          :legacy ->
+            handle_turn_method(port, on_message, payload, payload_string, "error", timeout_ms, tool_executor, auto_approve_requests)
+
+          :ignore ->
+            {:continue, :ignored}
+
+          {:error, reason} ->
+            {:error, reason}
+
+          {:retry, true} ->
+            emit_message(on_message, :notification, %{payload: payload, raw: payload_string}, metadata_from_message(port, payload))
+            receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+
+          {:retry, false} ->
+            {:error, {:worker_turn_error, params["error"]}}
         end
 
       {:ok, %{"method" => "turn/failed", "params" => _} = payload} ->
@@ -1327,6 +1384,33 @@ defmodule SymphonyElixir.Codex.AppServer do
         end
 
         receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+    end
+  end
+
+  defp exact_error_scope(payload) do
+    case Process.get(@turn_event_state_key) do
+      %{scope: :exact_turn, identity: {thread_id, turn_id}} ->
+        params = payload["params"]
+
+        cond do
+          not is_binary(params["threadId"]) or not is_binary(params["turnId"]) ->
+            {:error, {:worker_event_identity_missing, "error"}}
+
+          params["threadId"] != thread_id or params["turnId"] != turn_id ->
+            :ignore
+
+          params["willRetry"] == true ->
+            {:retry, true}
+
+          params["willRetry"] == false ->
+            {:retry, false}
+
+          true ->
+            {:error, {:worker_error_notification_invalid, params}}
+        end
+
+      _ ->
+        :legacy
     end
   end
 
@@ -1848,6 +1932,14 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp with_timeout_response(port, request_id, timeout_ms, pending_line) do
     timeout_ms = effective_turn_timeout(timeout_ms)
 
+    if turn_deadline_expired?() do
+      {:error, :turn_timeout}
+    else
+      with_timeout_response_loop(port, request_id, timeout_ms, pending_line)
+    end
+  end
+
+  defp with_timeout_response_loop(port, request_id, timeout_ms, pending_line) do
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
@@ -1865,6 +1957,14 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp handle_response(port, request_id, data, timeout_ms) do
+    if turn_deadline_expired?() do
+      {:error, :turn_timeout}
+    else
+      handle_response_within_deadline(port, request_id, data, timeout_ms)
+    end
+  end
+
+  defp handle_response_within_deadline(port, request_id, data, timeout_ms) do
     payload = to_string(data)
 
     case Jason.decode(payload) do
@@ -1879,9 +1979,14 @@ defmodule SymphonyElixir.Codex.AppServer do
 
       {:ok, %{} = other} ->
         record_mcp_startup_status(other)
-        buffer_early_turn_event(other)
-        Logger.debug("Ignoring message while waiting for response: #{inspect(other)}")
-        with_timeout_response(port, request_id, timeout_ms, "")
+
+        if exact_turn_scope?() and is_binary(other["method"]) and Map.has_key?(other, "id") do
+          {:error, :worker_request_attribution_unsupported}
+        else
+          buffer_early_turn_event(other)
+          Logger.debug("Ignoring message while waiting for response: #{inspect(other)}")
+          with_timeout_response(port, request_id, timeout_ms, "")
+        end
 
       {:error, _} ->
         log_non_json_stream_line(payload, "response stream")
@@ -1889,20 +1994,21 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp buffer_early_turn_event(%{"method" => method} = payload)
-       when method in ["turn/completed", "turn/failed", "turn/cancelled", "item/started", "item/completed"] do
-    case Process.get(@turn_event_state_key) do
-      %{scope: :exact_turn, identity: nil, early: frames, bytes: bytes} = state ->
-        size = byte_size(Jason.encode!(payload))
+  defp buffer_early_turn_event(%{"method" => method} = payload) when is_binary(method) do
+    if String.starts_with?(method, "turn/") or String.starts_with?(method, "item/") or method == "error" do
+      case Process.get(@turn_event_state_key) do
+        %{scope: :exact_turn, identity: nil, early: frames, bytes: bytes} = state ->
+          size = byte_size(Jason.encode!(payload))
 
-        if length(frames) >= 256 or bytes + size > 1_048_576 do
-          Process.put(@turn_event_state_key, %{state | overflow: true})
-        else
-          Process.put(@turn_event_state_key, %{state | early: [payload | frames], bytes: bytes + size})
-        end
+          if length(frames) >= 256 or bytes + size > 1_048_576 do
+            Process.put(@turn_event_state_key, Map.put(state, :overflow, true))
+          else
+            Process.put(@turn_event_state_key, %{state | early: [payload | frames], bytes: bytes + size})
+          end
 
-      _ ->
-        :ok
+        _ ->
+          :ok
+      end
     end
   end
 

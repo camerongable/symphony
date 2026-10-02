@@ -1,5 +1,5 @@
 defmodule SymphonyElixir.FactoryStageRunnerTest do
-  use ExUnit.Case, async: true
+  use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.Factory.{Prompt, StageRunner, StageSchemas}
   alias SymphonyElixir.Tracker.Issue
@@ -206,14 +206,33 @@ defmodule SymphonyElixir.FactoryStageRunnerTest do
     @spec run_turn(map(), String.t(), Issue.t(), keyword()) :: {:ok, map()}
     def run_turn(_session, _prompt, _issue, opts) do
       opts[:on_message].(%{event: :session_started, thread_id: "scoped-thread", turn_id: "scoped-turn"})
+      emit_item(opts, "scoped-thread", "scoped-turn", %{"type" => "agentMessage", "text" => Jason.encode!(%{"status" => "PASS", "findings" => [], "required_questions" => []})})
       emit_item(opts, "foreign-thread", "scoped-turn", %{"type" => "agentMessage", "text" => "{\"status\":\"FAIL\"}"})
       emit_item(opts, "foreign-thread", "scoped-turn", %{"type" => "mcpToolCall", "serverName" => "Jira", "toolName" => "jira_search", "status" => "completed"})
-      emit_item(opts, "scoped-thread", "scoped-turn", %{"type" => "agentMessage", "text" => Jason.encode!(%{"status" => "PASS", "findings" => [], "required_questions" => []})})
       {:ok, %{turn_id: "scoped-turn"}}
     end
 
     defp emit_item(opts, thread_id, turn_id, item) do
       opts[:on_message].(%{payload: %{"method" => "item/completed", "params" => %{"threadId" => thread_id, "turnId" => turn_id, "item" => item}}})
+    end
+
+    @spec stop_session(map()) :: :ok
+    def stop_session(_session), do: :ok
+  end
+
+  defmodule MismatchedScopeAppServer do
+    @spec start_session(Path.t(), keyword()) :: {:ok, map()}
+    def start_session(_workspace, _opts), do: {:ok, %{thread_id: "scoped-thread"}}
+    @spec run_turn(map(), String.t(), Issue.t(), keyword()) :: {:ok, map()}
+    def run_turn(_session, prompt, _issue, opts) do
+      {started_thread, observed_turn, returned_turn} =
+        if prompt == "mismatched-session",
+          do: {"other-thread", "observed-turn", "observed-turn"},
+          else: {"scoped-thread", "observed-turn", "returned-turn"}
+
+      opts[:on_message].(%{event: :session_started, thread_id: started_thread, turn_id: observed_turn})
+      opts[:on_message].(%{payload: %{"method" => "item/completed", "params" => %{"threadId" => started_thread, "turnId" => observed_turn, "item" => %{"type" => "agentMessage", "text" => "{}"}}}})
+      {:ok, %{turn_id: returned_turn}}
     end
 
     @spec stop_session(map()) :: :ok
@@ -280,6 +299,77 @@ defmodule SymphonyElixir.FactoryStageRunnerTest do
                app_server: ScopedAppServer,
                event_scope: :exact_turn,
                required_tool_calls: [%{server: "Jira", tool: "jira_search"}]
+             )
+  end
+
+  test "matching early output and required tool evidence replay before an early completion" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-stage-early-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "PPL-100")
+    codex_binary = Path.join(test_root, "fake-codex")
+    File.mkdir_p!(workspace)
+
+    File.write!(codex_binary, """
+    #!/bin/sh
+    while IFS= read -r line; do
+      case "$line" in
+        *'"method":"initialize"'*) printf '%s\\n' '{"id":1,"result":{}}' ;;
+        *'"method":"thread/start"'*) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"early-thread"}}}' ;;
+        *'"method":"thread/name/set"'*) printf '%s\\n' '{"id":4,"result":{}}' ;;
+        *'"method":"thread/metadata/update"'*) printf '%s\\n' '{"id":7,"result":{"thread":{"id":"early-thread","projectId":"project-grail"}}}' ;;
+        *'"method":"turn/start"'*)
+          printf '%s\\n' '{"method":"item/completed","params":{"threadId":"early-thread","turnId":"early-turn","item":{"type":"agentMessage","phase":"commentary","text":"not final"}}}'
+          printf '%s\\n' '{"method":"item/completed","params":{"threadId":"early-thread","turnId":"early-turn","item":{"type":"agentMessage","text":"{\\"status\\":\\"PASS\\",\\"findings\\":[],\\"required_questions\\":[]}"}}}'
+          printf '%s\\n' '{"method":"item/completed","params":{"threadId":"early-thread","turnId":"early-turn","item":{"type":"mcpToolCall","status":"completed","server":{"name":"Jira"},"toolName":"jira_search","result":{}}}}'
+          printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"early-thread","turn":{"id":"early-turn","status":"completed","items":[]}}}'
+          printf '%s\\n' '{"id":3,"result":{"turn":{"id":"early-turn"}}}'
+          ;;
+        *'"method":"thread/unsubscribe"'*) printf '%s\\n' '{"id":6,"result":{"status":"unsubscribed"}}' ;;
+      esac
+    done
+    """)
+
+    File.chmod!(codex_binary, 0o755)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      codex_command: "#{codex_binary} app-server",
+      codex_turn_timeout_ms: 2_000
+    )
+
+    issue = %Issue{id: "100", identifier: "PPL-100", title: "Factory task"}
+
+    assert {:ok, result} =
+             StageRunner.run(workspace, issue, "Review", StageSchemas.for_stage(:specification_critic),
+               event_scope: :exact_turn,
+               project_id: "project-grail",
+               thread_name: "early fixture",
+               required_tool_calls: [%{server: "Jira", tool: "jira_search"}]
+             )
+
+    assert result == %{
+             thread_id: "early-thread",
+             turn_id: "early-turn",
+             output: %{"status" => "PASS", "findings" => [], "required_questions" => []}
+           }
+
+    File.rm_rf!(test_root)
+  end
+
+  test "exact-turn collection rejects session-thread and returned-turn mismatches" do
+    issue = %Issue{id: "100", identifier: "PPL-100", title: "Factory task"}
+    schema = StageSchemas.for_stage(:specification_critic)
+
+    assert {:error, :factory_stage_session_thread_mismatch} =
+             StageRunner.run("/tmp/workspace", issue, "mismatched-session", schema,
+               app_server: MismatchedScopeAppServer,
+               event_scope: :exact_turn
+             )
+
+    assert {:error, {:factory_stage_turn_identity_mismatch, _, _, _}} =
+             StageRunner.run("/tmp/workspace", issue, "mismatched-turn", schema,
+               app_server: MismatchedScopeAppServer,
+               event_scope: :exact_turn
              )
   end
 

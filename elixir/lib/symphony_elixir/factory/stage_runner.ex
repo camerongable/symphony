@@ -50,8 +50,7 @@ defmodule SymphonyElixir.Factory.StageRunner do
         :service_name,
         :thread_name,
         :thread_source,
-        :worker_host,
-        :event_scope
+        :worker_host
       ])
       |> Keyword.put_new(:service_name, "symphony-factory")
       |> Keyword.put_new(:thread_source, "symphonyFactory")
@@ -59,6 +58,7 @@ defmodule SymphonyElixir.Factory.StageRunner do
 
     case app_server.start_session(workspace, session_opts) do
       {:ok, session} ->
+        Agent.update(collector, &Map.put(&1, :expected_thread_id, session.thread_id))
         run_session(app_server, session, issue, prompt, output_schema, on_message, collector, opts)
 
       {:error, reason} ->
@@ -93,7 +93,7 @@ defmodule SymphonyElixir.Factory.StageRunner do
              output_schema: output_schema,
              event_scope: context.event_scope
            ) do
-      case collector_output(context.collector, context.required_tool_calls, output_schema) do
+      case collector_output(context.collector, context.required_tool_calls, output_schema, {session.thread_id, turn.turn_id}) do
         {:ok, output} ->
           {:ok, turn, output}
 
@@ -139,7 +139,11 @@ defmodule SymphonyElixir.Factory.StageRunner do
   end
 
   defp start_collector(event_scope) do
-    {:ok, collector} = Agent.start_link(fn -> %{output: nil, completed_tool_calls: [], event_scope: event_scope, identity: nil, identity_error: nil} end)
+    {:ok, collector} =
+      Agent.start_link(fn ->
+        %{output: nil, completed_tool_calls: [], event_scope: event_scope, identity: nil, identity_error: nil, expected_thread_id: nil}
+      end)
+
     collector
   end
 
@@ -155,11 +159,24 @@ defmodule SymphonyElixir.Factory.StageRunner do
     end
   end
 
+  defp maybe_collect_output(collector, %{event: :session_started, thread_id: thread_id, turn_id: turn_id}) do
+    Agent.update(collector, fn state ->
+      cond do
+        state.event_scope != :exact_turn -> state
+        thread_id != state.expected_thread_id -> %{state | identity_error: :factory_stage_session_thread_mismatch}
+        not is_binary(turn_id) -> %{state | identity_error: :factory_stage_turn_identity_missing}
+        true -> %{state | identity: {thread_id, turn_id}, identity_error: nil}
+      end
+    end)
+  end
+
   defp maybe_collect_output(collector, %{payload: payload}) when is_map(payload) do
     state = Agent.get(collector, & &1)
 
     if state.event_scope == :exact_turn and not collector_identity_matches?(payload, state.identity) do
-      if is_nil(state.identity), do: Agent.update(collector, &Map.put(&1, :identity_error, :factory_stage_identity_missing))
+      if is_nil(state.identity) and is_nil(state.identity_error),
+        do: Agent.update(collector, &Map.put(&1, :identity_error, :factory_stage_identity_missing))
+
       :ok
     else
       case get_in(payload, ["params", "item"]) do
@@ -181,16 +198,20 @@ defmodule SymphonyElixir.Factory.StageRunner do
     end
   end
 
-  defp maybe_collect_output(collector, %{event: :session_started, thread_id: thread_id, turn_id: turn_id}) do
-    Agent.update(collector, &Map.put(&1, :identity, {thread_id, turn_id}))
-  end
-
   defp maybe_collect_output(_collector, _message), do: :ok
 
-  defp collector_output(collector, required_tool_calls, output_schema) do
+  defp collector_output(collector, required_tool_calls, output_schema, returned_identity) do
     state = Agent.get(collector, & &1)
 
-    with true <- not (state.event_scope == :exact_turn and (is_nil(state.identity) or not is_nil(state.identity_error))) || {:error, state.identity_error || :factory_stage_identity_missing},
+    expected_identity = {state.expected_thread_id, elem(returned_identity, 1)}
+
+    with true <-
+           not (state.event_scope == :exact_turn and
+                  (is_nil(state.identity) or not is_nil(state.identity_error) or state.identity != returned_identity or
+                     state.expected_thread_id != elem(returned_identity, 0))) ||
+             {:error,
+              state.identity_error ||
+                if(is_nil(state.identity), do: :factory_stage_identity_missing, else: {:factory_stage_turn_identity_mismatch, expected_identity, state.identity, returned_identity})},
          :ok <- validate_required_tool_calls(required_tool_calls, state.completed_tool_calls),
          {:ok, output} <- decode_output(state.output),
          :ok <- StageSchemas.validate(output, output_schema) do

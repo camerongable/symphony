@@ -366,6 +366,183 @@ defmodule SymphonyElixir.AppServerTest do
     File.rm_rf!(test_root)
   end
 
+  test "exact-turn mode processes all matching early frames in order before live reads" do
+    with_exact_turn_session(
+      """
+      printf '%s\\n' '{"method":"item/completed","params":{"threadId":"strict-thread","turnId":"strict-turn","item":{"type":"agentMessage","text":"early verdict"}}}'
+      printf '%s\\n' '{"method":"item/completed","params":{"threadId":"strict-thread","turnId":"strict-turn","item":{"type":"mcpToolCall","status":"completed","server":{"name":"Jira"},"toolName":"jira_search","result":{}}}}'
+      printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"strict-thread","turn":{"id":"strict-turn","status":"completed","items":[]}}}'
+      printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"strict-thread","turn":{"id":"strict-turn","status":"completed","items":[]}}}'
+      printf '%s\\n' '{"id":3,"result":{"turn":{"id":"strict-turn"}}}'
+      """,
+      fn session, issue ->
+        parent = self()
+
+        assert {:ok, %{turn_id: "strict-turn"}} =
+                 AppServer.run_turn(session, "Review", issue,
+                   event_scope: :exact_turn,
+                   on_message: fn message -> send(parent, message) end
+                 )
+
+        assert_received %{event: :session_started, thread_id: "strict-thread", turn_id: "strict-turn"}
+        assert_received %{payload: %{"method" => "item/completed", "params" => %{"item" => %{"text" => "early verdict"}}}}
+        assert_received %{payload: %{"method" => "item/completed", "params" => %{"item" => %{"type" => "mcpToolCall"}}}}
+        assert_received %{event: :turn_completed, payload: %{"params" => %{"turn" => %{"status" => "completed"}}}}
+        refute_received %{event: :turn_completed}
+      end
+    )
+  end
+
+  test "strict completion errors override an already observed final-looking output" do
+    for status <- ["failed", "interrupted", "inProgress", "unexpected"] do
+      with_exact_turn_session(
+        """
+        printf '%s\\n' '{"method":"item/completed","params":{"threadId":"strict-thread","turnId":"strict-turn","item":{"type":"agentMessage","text":"{\\"status\\":\\"PASS\\"}"}}}'
+        printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"strict-thread","turn":{"id":"strict-turn","status":"#{status}","items":[]}}}'
+        printf '%s\\n' '{"id":3,"result":{"turn":{"id":"strict-turn"}}}'
+        """,
+        fn session, issue ->
+          result = AppServer.run_turn(session, "Review", issue, event_scope: :exact_turn)
+
+          if status in ["failed", "interrupted"] do
+            assert {:error, {:turn_failed, %{"status" => ^status}}} = result
+          else
+            assert {:error, {:worker_turn_status_invalid, ^status}} = result
+          end
+        end
+      )
+    end
+
+    with_exact_turn_session(
+      """
+      printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"strict-thread","turn":{"id":"strict-turn","items":[]}}}'
+      printf '%s\\n' '{"id":3,"result":{"turn":{"id":"strict-turn"}}}'
+      """,
+      fn session, issue ->
+        assert {:error, {:worker_turn_status_invalid, nil}} = AppServer.run_turn(session, "Review", issue, event_scope: :exact_turn)
+      end
+    )
+  end
+
+  test "strict error notifications honor willRetry without accepting retryable failure as completion" do
+    with_exact_turn_session(
+      """
+      printf '%s\\n' '{"method":"error","params":{"threadId":"strict-thread","turnId":"strict-turn","error":{"message":"retrying"},"willRetry":true}}'
+      printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"strict-thread","turn":{"id":"strict-turn","status":"completed","items":[]}}}'
+      printf '%s\\n' '{"id":3,"result":{"turn":{"id":"strict-turn"}}}'
+      """,
+      fn session, issue ->
+        assert {:ok, %{turn_id: "strict-turn"}} = AppServer.run_turn(session, "Review", issue, event_scope: :exact_turn)
+      end
+    )
+
+    with_exact_turn_session(
+      """
+      printf '%s\\n' '{"method":"error","params":{"threadId":"strict-thread","turnId":"strict-turn","error":{"message":"terminal failure"},"willRetry":false}}'
+      printf '%s\\n' '{"id":3,"result":{"turn":{"id":"strict-turn"}}}'
+      """,
+      fn session, issue ->
+        assert {:error, {:worker_turn_error, %{"message" => "terminal failure"}}} =
+                 AppServer.run_turn(session, "Review", issue, event_scope: :exact_turn)
+      end
+    )
+  end
+
+  test "strict mode refuses unattributable approval requests without executing tools" do
+    with_exact_turn_session(
+      """
+      printf '%s\\n' '{"id":77,"method":"item/commandExecution/requestApproval","params":{"threadId":"foreign-thread","turnId":"foreign-turn","command":"mutate"}}'
+      """,
+      fn session, issue ->
+        parent = self()
+
+        executor = fn _tool, _args ->
+          send(parent, :tool_executed)
+          {:ok, %{}}
+        end
+
+        assert {:error, :worker_request_attribution_unsupported} =
+                 AppServer.run_turn(session, "Review", issue, event_scope: :exact_turn, tool_executor: executor)
+
+        refute_received :tool_executed
+      end
+    )
+  end
+
+  test "strict mode rejects missing identities and clears failed invocation buffers" do
+    with_exact_turn_session(
+      """
+      case "$turn_count" in
+        1)
+          printf '%s\\n' '{"method":"turn/completed","params":{"turn":{"id":"strict-turn","status":"completed","items":[]}}}'
+          printf '%s\\n' '{"id":3,"result":{"turn":{"id":"strict-turn"}}}'
+          ;;
+        *)
+          printf '%s\\n' '{"id":3,"result":{"turn":{"id":"next-turn"}}}'
+          printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"strict-thread","turn":{"id":"next-turn","status":"completed","items":[]}}}'
+          ;;
+      esac
+      """,
+      fn session, issue ->
+        Process.put(:strict_fixture_turn_count, 0)
+        on_exit(fn -> Process.delete(:strict_fixture_turn_count) end)
+
+        assert {:error, {:worker_event_identity_missing, "turn/completed"}} =
+                 AppServer.run_turn(session, "First", issue, event_scope: :exact_turn)
+
+        assert {:ok, %{turn_id: "next-turn"}} = AppServer.run_turn(session, "Second", issue, event_scope: :exact_turn)
+      end,
+      turn_count: true
+    )
+  end
+
+  test "strict early-event frame and byte limits fail with the named overflow error" do
+    for mode <- [:frames, :bytes] do
+      script =
+        case mode do
+          :frames ->
+            "i=0\nwhile [ $i -lt 257 ]; do printf '%s\\n' '{\"method\":\"item/completed\",\"params\":{\"threadId\":\"other\",\"turnId\":\"other\",\"item\":{}}}'; i=$((i+1)); done\nprintf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"strict-turn\"}}}'"
+
+          :bytes ->
+            "blob=$(head -c 600000 /dev/zero | tr '\\000' x)\nprintf '{\"method\":\"item/completed\",\"params\":{\"threadId\":\"other\",\"turnId\":\"other\",\"item\":{\"text\":\"%s\"}}}\\n' \"$blob\"\nprintf '{\"method\":\"item/completed\",\"params\":{\"threadId\":\"other\",\"turnId\":\"other\",\"item\":{\"text\":\"%s\"}}}\\n' \"$blob\"\nprintf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"strict-turn\"}}}'"
+        end
+
+      with_exact_turn_session(script, fn session, issue ->
+        assert {:error, :worker_event_buffer_overflow} = AppServer.run_turn(session, "Review", issue, event_scope: :exact_turn)
+      end)
+    end
+  end
+
+  test "strict absolute deadline expires under continuous unrelated event noise" do
+    with_exact_turn_session(
+      """
+      i=0
+      while [ $i -lt 50000 ]; do
+        printf '%s\\n' '{"method":"unrelated/noise","params":{}}'
+        i=$((i+1))
+      done
+      printf '%s\\n' '{"id":3,"result":{"turn":{"id":"strict-turn"}}}'
+      """,
+      fn session, issue ->
+        assert {:error, :turn_timeout} = AppServer.run_turn(session, "Review", issue, event_scope: :exact_turn)
+      end,
+      timeout_ms: 40
+    )
+  end
+
+  test "strict missing item identity is an error rather than collectable output" do
+    with_exact_turn_session(
+      """
+      printf '%s\\n' '{"method":"item/completed","params":{"item":{"type":"agentMessage","text":"{\\"status\\":\\"PASS\\"}"}}}'
+      printf '%s\\n' '{"id":3,"result":{"turn":{"id":"strict-turn"}}}'
+      """,
+      fn session, issue ->
+        assert {:error, {:worker_event_identity_missing, "item/completed"}} =
+                 AppServer.run_turn(session, "Review", issue, event_scope: :exact_turn)
+      end
+    )
+  end
+
   test "app server fails when a requested project cannot be bound" do
     test_root =
       Path.join(
@@ -3004,6 +3181,56 @@ defmodule SymphonyElixir.AppServerTest do
     after
       restore_env("SYMP_TEST_CODEx_TRACE", previous_trace)
       File.rm_rf(test_root)
+    end
+  end
+
+  defp with_exact_turn_session(turn_script, callback, opts \\ []) do
+    test_root = Path.join(System.tmp_dir!(), "symphony-exact-fixture-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "PPL-123")
+    codex_binary = Path.join(test_root, "fake-codex")
+    File.mkdir_p!(workspace)
+    turn_count_init = if Keyword.get(opts, :turn_count, false), do: "turn_count=0", else: ""
+    turn_count_step = if Keyword.get(opts, :turn_count, false), do: "turn_count=$((turn_count+1))", else: ""
+
+    File.write!(codex_binary, """
+    #!/bin/sh
+    #{turn_count_init}
+    while IFS= read -r line; do
+      case "$line" in
+        *'"method":"initialize"'*) printf '%s\\n' '{"id":1,"result":{}}' ;;
+        *'"method":"thread/start"'*) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"strict-thread","projectId":"project-grail"}}}' ;;
+        *'"method":"thread/name/set"'*) printf '%s\\n' '{"id":4,"result":{}}' ;;
+        *'"method":"thread/metadata/update"'*) printf '%s\\n' '{"id":7,"result":{"thread":{"id":"strict-thread","projectId":"project-grail"}}}' ;;
+        *'"method":"turn/start"'*)
+          #{turn_count_step}
+          #{turn_script}
+          ;;
+        *'"method":"thread/unsubscribe"'*) printf '%s\\n' '{"id":6,"result":{"status":"unsubscribed"}}' ;;
+      esac
+    done
+    """)
+
+    File.chmod!(codex_binary, 0o755)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      codex_command: "#{codex_binary} app-server",
+      codex_turn_timeout_ms: Keyword.get(opts, :timeout_ms, 5_000)
+    )
+
+    issue = %Issue{id: "issue-strict", identifier: "PPL-123", title: "Strict turn"}
+
+    try do
+      assert {:ok, session} = AppServer.start_session(workspace, thread_name: "strict fixture", project_id: "project-grail")
+
+      try do
+        callback.(session, issue)
+      after
+        AppServer.stop_session(session)
+      end
+    after
+      File.rm_rf!(test_root)
     end
   end
 end
