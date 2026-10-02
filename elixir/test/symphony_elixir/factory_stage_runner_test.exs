@@ -200,6 +200,26 @@ defmodule SymphonyElixir.FactoryStageRunnerTest do
     def stop_session(_session), do: :ok
   end
 
+  defmodule ScopedAppServer do
+    @spec start_session(Path.t(), keyword()) :: {:ok, map()}
+    def start_session(_workspace, _opts), do: {:ok, %{thread_id: "scoped-thread"}}
+    @spec run_turn(map(), String.t(), Issue.t(), keyword()) :: {:ok, map()}
+    def run_turn(_session, _prompt, _issue, opts) do
+      opts[:on_message].(%{event: :session_started, thread_id: "scoped-thread", turn_id: "scoped-turn"})
+      emit_item(opts, "foreign-thread", "scoped-turn", %{"type" => "agentMessage", "text" => "{\"status\":\"FAIL\"}"})
+      emit_item(opts, "foreign-thread", "scoped-turn", %{"type" => "mcpToolCall", "serverName" => "Jira", "toolName" => "jira_search", "status" => "completed"})
+      emit_item(opts, "scoped-thread", "scoped-turn", %{"type" => "agentMessage", "text" => Jason.encode!(%{"status" => "PASS", "findings" => [], "required_questions" => []})})
+      {:ok, %{turn_id: "scoped-turn"}}
+    end
+
+    defp emit_item(opts, thread_id, turn_id, item) do
+      opts[:on_message].(%{payload: %{"method" => "item/completed", "params" => %{"threadId" => thread_id, "turnId" => turn_id, "item" => item}}})
+    end
+
+    @spec stop_session(map()) :: :ok
+    def stop_session(_session), do: :ok
+  end
+
   test "runs a named resumable task with a structured response" do
     issue = %Issue{id: "100", identifier: "PPL-100", title: "Factory task"}
     schema = StageSchemas.for_stage(:specification_critic)
@@ -246,6 +266,21 @@ defmodule SymphonyElixir.FactoryStageRunnerTest do
     assert_received {:thread_started, "thread-123"}
     refute_received {:thread_started, "thread-123"}
     assert_received {:run_turn, ^schema}
+  end
+
+  test "exact-turn collection ignores foreign output and foreign tool evidence" do
+    issue = %Issue{id: "100", identifier: "PPL-100", title: "Factory task"}
+    schema = StageSchemas.for_stage(:specification_critic)
+
+    assert {:ok, result} = StageRunner.run("/tmp/workspace", issue, "Review", schema, app_server: ScopedAppServer, event_scope: :exact_turn)
+    assert result.output["status"] == "PASS"
+
+    assert {:error, {:required_tool_calls_missing, _}} =
+             StageRunner.run("/tmp/workspace", issue, "Review", schema,
+               app_server: ScopedAppServer,
+               event_scope: :exact_turn,
+               required_tool_calls: [%{server: "Jira", tool: "jira_search"}]
+             )
   end
 
   test "persists a created thread before MCP startup fails so the next attempt can resume it" do

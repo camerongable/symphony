@@ -27,7 +27,9 @@ defmodule SymphonyElixir.Factory.StageRunner do
   def run(workspace, %Issue{} = issue, prompt, output_schema, opts \\ [])
       when is_binary(workspace) and is_binary(prompt) and is_map(output_schema) do
     app_server = Keyword.get(opts, :app_server, AppServer)
-    collector = start_collector()
+    event_scope = Keyword.get(opts, :event_scope, :legacy)
+    unless event_scope in [:legacy, :exact_turn], do: raise(ArgumentError, "unsupported event_scope: #{inspect(event_scope)}")
+    collector = start_collector(event_scope)
     on_message = message_handler(collector, Keyword.get(opts, :on_message))
 
     session_opts =
@@ -48,7 +50,8 @@ defmodule SymphonyElixir.Factory.StageRunner do
         :service_name,
         :thread_name,
         :thread_source,
-        :worker_host
+        :worker_host,
+        :event_scope
       ])
       |> Keyword.put_new(:service_name, "symphony-factory")
       |> Keyword.put_new(:thread_source, "symphonyFactory")
@@ -69,7 +72,8 @@ defmodule SymphonyElixir.Factory.StageRunner do
       on_message: on_message,
       collector: collector,
       required_tool_calls: Keyword.get(opts, :required_tool_calls, []),
-      format_repair_attempts: Keyword.get(opts, :format_repair_attempts, 0)
+      format_repair_attempts: Keyword.get(opts, :format_repair_attempts, 0),
+      event_scope: Keyword.get(opts, :event_scope, :legacy)
     }
 
     with :ok <- maybe_archive_forked_thread(app_server, session, opts),
@@ -86,7 +90,8 @@ defmodule SymphonyElixir.Factory.StageRunner do
     with {:ok, turn} <-
            app_server.run_turn(session, prompt, issue,
              on_message: context.on_message,
-             output_schema: output_schema
+             output_schema: output_schema,
+             event_scope: context.event_scope
            ) do
       case collector_output(context.collector, context.required_tool_calls, output_schema) do
         {:ok, output} ->
@@ -133,8 +138,8 @@ defmodule SymphonyElixir.Factory.StageRunner do
     """
   end
 
-  defp start_collector do
-    {:ok, collector} = Agent.start_link(fn -> %{output: nil, completed_tool_calls: []} end)
+  defp start_collector(event_scope) do
+    {:ok, collector} = Agent.start_link(fn -> %{output: nil, completed_tool_calls: [], event_scope: event_scope, identity: nil, identity_error: nil} end)
     collector
   end
 
@@ -151,22 +156,33 @@ defmodule SymphonyElixir.Factory.StageRunner do
   end
 
   defp maybe_collect_output(collector, %{payload: payload}) when is_map(payload) do
-    case get_in(payload, ["params", "item"]) do
-      %{"type" => "agentMessage", "phase" => "commentary"} ->
-        :ok
+    state = Agent.get(collector, & &1)
 
-      %{"type" => "agentMessage", "text" => text} when is_binary(text) ->
-        Agent.update(collector, &Map.put(&1, :output, text))
+    if state.event_scope == :exact_turn and not collector_identity_matches?(payload, state.identity) do
+      if is_nil(state.identity), do: Agent.update(collector, &Map.put(&1, :identity_error, :factory_stage_identity_missing))
+      :ok
+    else
+      case get_in(payload, ["params", "item"]) do
+        %{"type" => "agentMessage", "phase" => "commentary"} ->
+          :ok
 
-      %{} = item ->
-        case completed_tool_call(payload, item) do
-          nil -> :ok
-          tool_call -> Agent.update(collector, &Map.update!(&1, :completed_tool_calls, fn calls -> [tool_call | calls] end))
-        end
+        %{"type" => "agentMessage", "text" => text} when is_binary(text) ->
+          Agent.update(collector, &Map.put(&1, :output, text))
 
-      _other ->
-        :ok
+        %{} = item ->
+          case completed_tool_call(payload, item) do
+            nil -> :ok
+            tool_call -> Agent.update(collector, &Map.update!(&1, :completed_tool_calls, fn calls -> [tool_call | calls] end))
+          end
+
+        _other ->
+          :ok
+      end
     end
+  end
+
+  defp maybe_collect_output(collector, %{event: :session_started, thread_id: thread_id, turn_id: turn_id}) do
+    Agent.update(collector, &Map.put(&1, :identity, {thread_id, turn_id}))
   end
 
   defp maybe_collect_output(_collector, _message), do: :ok
@@ -174,11 +190,19 @@ defmodule SymphonyElixir.Factory.StageRunner do
   defp collector_output(collector, required_tool_calls, output_schema) do
     state = Agent.get(collector, & &1)
 
-    with :ok <- validate_required_tool_calls(required_tool_calls, state.completed_tool_calls),
+    with true <- not (state.event_scope == :exact_turn and (is_nil(state.identity) or not is_nil(state.identity_error))) || {:error, state.identity_error || :factory_stage_identity_missing},
+         :ok <- validate_required_tool_calls(required_tool_calls, state.completed_tool_calls),
          {:ok, output} <- decode_output(state.output),
          :ok <- StageSchemas.validate(output, output_schema) do
       {:ok, output}
     end
+  end
+
+  defp collector_identity_matches?(_payload, nil), do: false
+
+  defp collector_identity_matches?(payload, {thread_id, turn_id}) do
+    params = Map.get(payload, "params", %{})
+    Map.get(params, "threadId") == thread_id and Map.get(params, "turnId") == turn_id
   end
 
   defp decode_output(text) do

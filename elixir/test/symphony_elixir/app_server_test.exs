@@ -320,6 +320,52 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "exact-turn mode buffers the matching early output and ignores foreign completion events" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-exact-turn-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "PPL-123")
+    codex_binary = Path.join(test_root, "fake-codex")
+    File.mkdir_p!(workspace)
+
+    File.write!(codex_binary, """
+    #!/bin/sh
+    while IFS= read -r line; do
+      case "$line" in
+        *'"method":"initialize"'*) printf '%s\\n' '{"id":1,"result":{}}' ;;
+        *'"method":"thread/start"'*) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"strict-thread"}}}' ;;
+        *'"method":"thread/name/set"'*) printf '%s\\n' '{"id":4,"result":{}}' ;;
+        *'"method":"thread/subscribe"'*) printf '%s\\n' '{"id":5,"result":{}}' ;;
+        *'"method":"turn/start"'*)
+          printf '%s\\n' '{"method":"item/completed","params":{"threadId":"strict-thread","turnId":"strict-turn","item":{"type":"agentMessage","text":"early output"}}}'
+          printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"foreign-thread","turn":{"id":"foreign-turn","status":"completed","items":[]}}}'
+          printf '%s\\n' '{"id":3,"result":{"turn":{"id":"strict-turn"}}}'
+          printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"strict-thread","turn":{"id":"foreign-turn","status":"completed","items":[]}}}'
+          printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"strict-thread","turn":{"id":"strict-turn","status":"completed","items":[]}}}'
+          ;;
+        *'"method":"thread/unsubscribe"'*) printf '%s\\n' '{"id":6,"result":{"status":"unsubscribed"}}' ;;
+      esac
+    done
+    """)
+
+    File.chmod!(codex_binary, 0o755)
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root, codex_command: "#{codex_binary} app-server")
+    issue = %Issue{id: "issue-visible", identifier: "PPL-123", title: "Exact turn"}
+    messages = self()
+
+    assert {:ok, session} = AppServer.start_session(workspace, thread_name: "strict", on_thread_created: fn _ -> :ok end)
+
+    assert {:ok, %{turn_id: "strict-turn"}} =
+             AppServer.run_turn(session, "Review", issue,
+               event_scope: :exact_turn,
+               on_message: fn message -> send(messages, message) end
+             )
+
+    assert_received %{event: :session_started, thread_id: "strict-thread", turn_id: "strict-turn"}
+    assert_received %{payload: %{"method" => "item/completed", "params" => %{"threadId" => "strict-thread", "turnId" => "strict-turn", "item" => %{"text" => "early output"}}}}
+    assert :ok = AppServer.stop_session(session)
+    File.rm_rf!(test_root)
+  end
+
   test "app server fails when a requested project cannot be bound" do
     test_root =
       Path.join(
