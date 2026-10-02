@@ -2419,4 +2419,42 @@ defmodule SymphonyElixir.CoreTest do
 
     assert configured.factory.ticket_supervisor == %{"enabled" => false, "pilot_issue_keys" => ["PPL-123"]}
   end
+
+  test "ticket supervisor null preservation does not alter legacy nested map normalization" do
+    assert {:ok, settings} =
+             Schema.parse(%{
+               "factory" => %{
+                 "repositories" => %{
+                   "ticket_supervisor" => %{
+                     "path" => System.tmp_dir!(),
+                     "base_branch" => "master",
+                     "gitlab_project" => "example/ticket-supervisor",
+                     "codex_project_id" => "project-ticket-supervisor",
+                     "route_labels" => ["repo-ticket-supervisor"],
+                     "ci_preflight" => nil
+                   }
+                 }
+               },
+               "codex" => %{
+                 "turn_sandbox_policy" => %{
+                   "type" => "workspaceWrite",
+                   "writableRoots" => [System.tmp_dir!()],
+                   "ticket_supervisor" => nil
+                 }
+               }
+             })
+
+    assert settings.factory.repositories["ticket_supervisor"] == %{
+             "path" => System.tmp_dir!(),
+             "base_branch" => "master",
+             "gitlab_project" => "example/ticket-supervisor",
+             "codex_project_id" => "project-ticket-supervisor",
+             "route_labels" => ["repo-ticket-supervisor"]
+           }
+
+    assert settings.codex.turn_sandbox_policy == %{
+             "type" => "workspaceWrite",
+             "writableRoots" => [System.tmp_dir!()]
+           }
+  end
 end
