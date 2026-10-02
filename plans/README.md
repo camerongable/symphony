@@ -9,6 +9,7 @@ the existing safety boundaries, and execute its gates in order.
 | Plan | Title | Priority | Effort | Depends on | Status |
 | --- | --- | --- | --- | --- | --- |
 | [001](001-ticket-supervisor-workers.md) | Introduce one ticket chat with bounded role workers | P1 | L | Offline foundation before runtime acceptance | IN PROGRESS — adversarial review completed; disabled foundation next |
+| [002](002-correlate-worker-turn-events.md) | Preserve and correlate exact worker-turn events | P1 | M | Source/protocol investigation complete | IN PROGRESS — isolated executor next |
 
 Source rollback checkpoint: `bc7c28c5f7d79f37cfaf0d2c3ea873f758147863`
 on `cgable/factory-control-plane`. This commit preserves the current Symphony
@@ -21,6 +22,8 @@ settings, Codex chat history, or canonical skills outside this repository.
   Runtime permissions, worker readback and restart acceptance must pass before
   admitting work or enabling the new route. This avoids requiring a complete
   system before building the primitives needed to test it.
+- Execute bounded plan 002 first for plan 001's offline protocol foundation;
+  its tests cannot satisfy the later real-runtime acceptance gate.
 - The older `elixir/docs/factory-hardening-plan.md` remains the record of completed
   reliability work and unfinished native-cleanup acceptance. Plan 001 proposes a
   different execution boundary; it neither marks native cleanup complete nor

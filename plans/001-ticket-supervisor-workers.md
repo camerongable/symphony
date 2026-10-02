@@ -625,9 +625,6 @@ the existing factory API/status command, then read back recorded pilot mode.
 
 ## STOP conditions and next actions
 
-- Installed tools cannot expose fresh-context spawn or enforced review permissions:
-  stop after step 1; report the failed requirement and the supported headless-worker
-  alternative, not another attachment workaround or repeated native retries.
 - The selected factory-launched runtime cannot enforce the principal matrix or
   expose durable worker readback: stop admission at step 1B, preserve the disabled
   foundation and report that specific gap. Do not replace it with native delegation.
