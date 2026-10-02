@@ -231,7 +231,18 @@ defmodule SymphonyElixir.FactoryStageRunnerTest do
           else: {"scoped-thread", "observed-turn", "returned-turn"}
 
       opts[:on_message].(%{event: :session_started, thread_id: started_thread, turn_id: observed_turn})
-      opts[:on_message].(%{payload: %{"method" => "item/completed", "params" => %{"threadId" => started_thread, "turnId" => observed_turn, "item" => %{"type" => "agentMessage", "text" => "{}"}}}})
+
+      opts[:on_message].(%{
+        payload: %{
+          "method" => "item/completed",
+          "params" => %{
+            "threadId" => started_thread,
+            "turnId" => observed_turn,
+            "item" => %{"type" => "agentMessage", "text" => "{}"}
+          }
+        }
+      })
+
       {:ok, %{turn_id: returned_turn}}
     end
 
@@ -311,6 +322,7 @@ defmodule SymphonyElixir.FactoryStageRunnerTest do
 
     File.write!(codex_binary, """
     #!/bin/sh
+    printf() { command printf "$@" | sed "s/\\\"id\\\":3/\\\"id\\\":\\\"$turn_request_id\\\"/g"; }
     while IFS= read -r line; do
       case "$line" in
         *'"method":"initialize"'*) printf '%s\\n' '{"id":1,"result":{}}' ;;
@@ -318,6 +330,7 @@ defmodule SymphonyElixir.FactoryStageRunnerTest do
         *'"method":"thread/name/set"'*) printf '%s\\n' '{"id":4,"result":{}}' ;;
         *'"method":"thread/metadata/update"'*) printf '%s\\n' '{"id":7,"result":{"thread":{"id":"early-thread","projectId":"project-grail"}}}' ;;
         *'"method":"turn/start"'*)
+          turn_request_id=$(command printf '%s\\n' "$line" | sed -n 's/.*"id":"\\([^\"]*\\)".*/\\1/p')
           printf '%s\\n' '{"method":"item/completed","params":{"threadId":"early-thread","turnId":"early-turn","item":{"type":"agentMessage","phase":"commentary","text":"not final"}}}'
           printf '%s\\n' '{"method":"item/completed","params":{"threadId":"early-thread","turnId":"early-turn","item":{"type":"agentMessage","text":"{\\"status\\":\\"PASS\\",\\"findings\\":[],\\"required_questions\\":[]}"}}}'
           printf '%s\\n' '{"method":"item/completed","params":{"threadId":"early-thread","turnId":"early-turn","item":{"type":"mcpToolCall","status":"completed","server":{"name":"Jira"},"toolName":"jira_search","result":{}}}}'

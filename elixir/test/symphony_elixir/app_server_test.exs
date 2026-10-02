@@ -338,7 +338,8 @@ defmodule SymphonyElixir.AppServerTest do
         *'"method":"turn/start"'*)
           printf '%s\\n' '{"method":"item/completed","params":{"threadId":"strict-thread","turnId":"strict-turn","item":{"type":"agentMessage","text":"early output"}}}'
           printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"foreign-thread","turn":{"id":"foreign-turn","status":"completed","items":[]}}}'
-          printf '%s\\n' '{"id":3,"result":{"turn":{"id":"strict-turn"}}}'
+          turn_request_id=$(printf '%s\\n' "$line" | sed -n 's/.*"id":"\\([^"]*\\)".*/\\1/p')
+          printf '{"id":"%s","result":{"turn":{"id":"strict-turn"}}}\\n' "$turn_request_id"
           printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"strict-thread","turn":{"id":"foreign-turn","status":"completed","items":[]}}}'
           printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"strict-thread","turn":{"id":"strict-turn","status":"completed","items":[]}}}'
           ;;
@@ -419,7 +420,8 @@ defmodule SymphonyElixir.AppServerTest do
       printf '%s\\n' '{"id":3,"result":{"turn":{"id":"strict-turn"}}}'
       """,
       fn session, issue ->
-        assert {:error, {:worker_turn_status_invalid, nil}} = AppServer.run_turn(session, "Review", issue, event_scope: :exact_turn)
+        assert {:error, {:worker_turn_status_invalid, nil}} =
+                 AppServer.run_turn(session, "Review", issue, event_scope: :exact_turn)
       end
     )
   end
@@ -504,13 +506,87 @@ defmodule SymphonyElixir.AppServerTest do
             "i=0\nwhile [ $i -lt 257 ]; do printf '%s\\n' '{\"method\":\"item/completed\",\"params\":{\"threadId\":\"other\",\"turnId\":\"other\",\"item\":{}}}'; i=$((i+1)); done\nprintf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"strict-turn\"}}}'"
 
           :bytes ->
-            "blob=$(head -c 600000 /dev/zero | tr '\\000' x)\nprintf '{\"method\":\"item/completed\",\"params\":{\"threadId\":\"other\",\"turnId\":\"other\",\"item\":{\"text\":\"%s\"}}}\\n' \"$blob\"\nprintf '{\"method\":\"item/completed\",\"params\":{\"threadId\":\"other\",\"turnId\":\"other\",\"item\":{\"text\":\"%s\"}}}\\n' \"$blob\"\nprintf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"strict-turn\"}}}'"
+            """
+            blob=$(head -c 600000 /dev/zero | tr '\\000' x)
+            printf '{"method":"item/completed","params":{"threadId":"other","turnId":"other","item":{"text":"%s"}}}\\n' "$blob"
+            printf '{"method":"item/completed","params":{"threadId":"other","turnId":"other","item":{"text":"%s"}}}\\n' "$blob"
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"strict-turn"}}}'
+            """
         end
 
       with_exact_turn_session(script, fn session, issue ->
-        assert {:error, :worker_event_buffer_overflow} = AppServer.run_turn(session, "Review", issue, event_scope: :exact_turn)
+        assert {:error, :worker_event_buffer_overflow} =
+                 AppServer.run_turn(session, "Review", issue, event_scope: :exact_turn)
       end)
     end
+  end
+
+  test "strict overflow is returned immediately even when turn start never responds" do
+    script =
+      "i=0\nwhile [ $i -lt 257 ]; do printf '%s\\n' '{\"method\":\"item/completed\",\"params\":{\"threadId\":\"other\",\"turnId\":\"other\",\"item\":{}}}'; i=$((i+1)); done"
+
+    with_exact_turn_session(
+      script,
+      fn session, issue ->
+        started_at = System.monotonic_time(:millisecond)
+
+        assert {:error, :worker_event_buffer_overflow} =
+                 AppServer.run_turn(session, "Review", issue, event_scope: :exact_turn)
+
+        assert System.monotonic_time(:millisecond) - started_at < 1_000
+      end,
+      timeout_ms: 5_000
+    )
+  end
+
+  test "strict response read timeout remains below the absolute turn budget" do
+    with_exact_turn_session(
+      "",
+      fn session, issue ->
+        write_workflow_file!(Workflow.workflow_file_path(),
+          workspace_root: Path.dirname(session.workspace),
+          codex_command: Config.settings!().codex.command,
+          codex_turn_timeout_ms: 200,
+          codex_read_timeout_ms: 20
+        )
+
+        started_at = System.monotonic_time(:millisecond)
+        assert {:error, :response_timeout} = AppServer.run_turn(session, "Review", issue, event_scope: :exact_turn)
+        assert System.monotonic_time(:millisecond) - started_at < 100
+      end,
+      timeout_ms: 200
+    )
+  end
+
+  test "late response from a timed-out strict invocation cannot satisfy the next turn" do
+    script =
+      """
+      case "$turn_count" in
+        1)
+          sleep 0.25
+          printf '%s\\n' '{"method":"item/completed","params":{"threadId":"strict-thread","turnId":"old-turn","item":{"type":"agentMessage","text":"{\\"status\\":\\"PASS\\",\\"findings\\":[],\\"required_questions\\":[]}"}}}'
+          printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"strict-thread","turn":{"id":"old-turn","status":"completed","items":[]}}}'
+          printf '%s\\n' '{"id":3,"result":{"turn":{"id":"old-turn"}}}'
+          ;;
+        *)
+          printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"strict-thread","turn":{"id":"new-turn","status":"failed","items":[]}}}'
+          printf '%s\\n' '{"id":3,"result":{"turn":{"id":"new-turn"}}}'
+          ;;
+      esac
+      """
+
+    with_exact_turn_session(
+      script,
+      fn session, issue ->
+        assert {:error, :turn_timeout} = AppServer.run_turn(session, "First", issue, event_scope: :exact_turn)
+
+        assert {:error, {:turn_failed, %{"id" => "new-turn", "status" => "failed"}}} =
+                 AppServer.run_turn(session, "Second", issue, event_scope: :exact_turn)
+      end,
+      timeout_ms: 200,
+      read_timeout_ms: 1_000,
+      turn_count: true
+    )
   end
 
   test "strict absolute deadline expires under continuous unrelated event noise" do
@@ -3196,6 +3272,12 @@ defmodule SymphonyElixir.AppServerTest do
     File.write!(codex_binary, """
     #!/bin/sh
     #{turn_count_init}
+    printf() {
+      case "$*" in
+        *'"id":3'*) command printf "$@" | sed "s/\\\"id\\\":3/\\\"id\\\":\\\"$turn_request_id\\\"/g" ;;
+        *) command printf "$@" ;;
+      esac
+    }
     while IFS= read -r line; do
       case "$line" in
         *'"method":"initialize"'*) printf '%s\\n' '{"id":1,"result":{}}' ;;
@@ -3203,6 +3285,7 @@ defmodule SymphonyElixir.AppServerTest do
         *'"method":"thread/name/set"'*) printf '%s\\n' '{"id":4,"result":{}}' ;;
         *'"method":"thread/metadata/update"'*) printf '%s\\n' '{"id":7,"result":{"thread":{"id":"strict-thread","projectId":"project-grail"}}}' ;;
         *'"method":"turn/start"'*)
+          turn_request_id=$(command printf '%s\\n' "$line" | sed -n 's/.*"id":"\\([^\"]*\\)".*/\\1/p')
           #{turn_count_step}
           #{turn_script}
           ;;
@@ -3216,7 +3299,8 @@ defmodule SymphonyElixir.AppServerTest do
     write_workflow_file!(Workflow.workflow_file_path(),
       workspace_root: workspace_root,
       codex_command: "#{codex_binary} app-server",
-      codex_turn_timeout_ms: Keyword.get(opts, :timeout_ms, 5_000)
+      codex_turn_timeout_ms: Keyword.get(opts, :timeout_ms, 5_000),
+      codex_read_timeout_ms: 5_000
     )
 
     issue = %Issue{id: "issue-strict", identifier: "PPL-123", title: "Strict turn"}

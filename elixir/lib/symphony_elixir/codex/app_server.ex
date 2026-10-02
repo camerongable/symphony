@@ -239,7 +239,8 @@ defmodule SymphonyElixir.Codex.AppServer do
                sandbox_policy: turn_sandbox_policy,
                model: model,
                reasoning_effort: reasoning_effort,
-               output_schema: Keyword.get(opts, :output_schema)
+               output_schema: Keyword.get(opts, :output_schema),
+               request_id: turn_start_request_id(event_scope)
              }
            ) do
         {:ok, turn_id} ->
@@ -299,6 +300,11 @@ defmodule SymphonyElixir.Codex.AppServer do
       Process.delete(@turn_event_state_key)
     end
   end
+
+  defp turn_start_request_id(:exact_turn),
+    do: "turn-start-#{System.unique_integer([:positive, :monotonic])}"
+
+  defp turn_start_request_id(:legacy), do: @turn_start_id
 
   @spec stop_session(session()) :: :ok
   def stop_session(%{port: port, thread_id: thread_id}) when is_port(port) do
@@ -1088,13 +1094,15 @@ defmodule SymphonyElixir.Codex.AppServer do
       |> put_if_present("effort", turn_options.reasoning_effort)
       |> put_if_present("outputSchema", turn_options.output_schema)
 
+    request_id = turn_options.request_id
+
     send_message(port, %{
       "method" => "turn/start",
-      "id" => @turn_start_id,
+      "id" => request_id,
       "params" => params
     })
 
-    case await_response(port, @turn_start_id) do
+    case await_response(port, request_id) do
       {:ok, %{"turn" => %{"id" => turn_id}}} -> {:ok, turn_id}
       other -> other
     end
@@ -1238,179 +1246,154 @@ defmodule SymphonyElixir.Codex.AppServer do
     payload_string = to_string(data)
 
     case Jason.decode(payload_string) do
-      {:ok, %{"method" => "turn/completed"} = payload} ->
-        case exact_event_scope(payload, :terminal) do
-          :ignore ->
-            {:continue, :ignored}
-
-          {:error, reason} ->
-            {:error, reason}
-
-          :match ->
-            turn = get_in(payload, ["params", "turn"])
-
-            strict_completion =
-              if exact_turn_scope?() do
-                case {turn["status"], Map.get(turn, "error")} do
-                  {"completed", nil} -> :ok
-                  {status, _} when status in ["failed", "interrupted"] -> {:error, {:turn_failed, turn}}
-                  {status, _} -> {:error, {:worker_turn_status_invalid, status}}
-                end
-              else
-                :ok
-              end
-
-            case strict_completion do
-              {:error, reason} ->
-                {:error, reason}
-
-              :ok ->
-                emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
-                {:ok, :turn_completed}
-            end
-        end
-
-      {:ok, %{"method" => "error", "params" => params} = payload} when is_map(params) ->
-        case exact_error_scope(payload) do
-          :legacy ->
-            handle_turn_method(port, on_message, payload, payload_string, "error", timeout_ms, tool_executor, auto_approve_requests)
-
-          :ignore ->
-            {:continue, :ignored}
-
-          {:error, reason} ->
-            {:error, reason}
-
-          {:retry, true} ->
-            emit_message(on_message, :notification, %{payload: payload, raw: payload_string}, metadata_from_message(port, payload))
-            receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
-
-          {:retry, false} ->
-            {:error, {:worker_turn_error, params["error"]}}
-        end
-
-      {:ok, %{"method" => "turn/failed", "params" => _} = payload} ->
-        case exact_event_scope(payload, :terminal) do
-          :ignore ->
-            {:continue, :ignored}
-
-          {:error, reason} ->
-            {:error, reason}
-
-          :match ->
-            emit_turn_event(
-              on_message,
-              :turn_failed,
-              payload,
-              payload_string,
-              port,
-              Map.get(payload, "params")
-            )
-
-            {:error, {:turn_failed, Map.get(payload, "params")}}
-        end
-
-      {:ok, %{"method" => "turn/cancelled", "params" => _} = payload} ->
-        case exact_event_scope(payload, :terminal) do
-          :ignore ->
-            {:continue, :ignored}
-
-          {:error, reason} ->
-            {:error, reason}
-
-          :match ->
-            emit_turn_event(
-              on_message,
-              :turn_cancelled,
-              payload,
-              payload_string,
-              port,
-              Map.get(payload, "params")
-            )
-
-            {:error, {:turn_cancelled, Map.get(payload, "params")}}
-        end
-
-      {:ok, %{"method" => method} = payload}
-      when is_binary(method) ->
-        scope_result = if method in ["item/started", "item/completed"], do: exact_event_scope(payload, :item), else: :match
-
-        case scope_result do
-          :ignore ->
-            {:continue, :ignored}
-
-          {:error, reason} ->
-            {:error, reason}
-
-          :match ->
-            handle_turn_method(
-              port,
-              on_message,
-              payload,
-              payload_string,
-              method,
-              timeout_ms,
-              tool_executor,
-              auto_approve_requests
-            )
-        end
+      {:ok, %{"method" => method} = payload} when is_binary(method) ->
+        handle_method_event(port, on_message, payload, payload_string, timeout_ms, tool_executor, auto_approve_requests)
 
       {:ok, payload} ->
-        emit_message(
-          on_message,
-          :other_message,
-          %{
-            payload: payload,
-            raw: payload_string
-          },
-          metadata_from_message(port, payload)
-        )
-
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        emit_other_message(port, on_message, payload, payload_string, timeout_ms, tool_executor, auto_approve_requests)
 
       {:error, _reason} ->
-        log_non_json_stream_line(payload_string, "turn stream")
+        emit_malformed_message(port, on_message, payload_string, timeout_ms, tool_executor, auto_approve_requests)
+    end
+  end
 
-        if protocol_message_candidate?(payload_string) do
-          emit_message(
-            on_message,
-            :malformed,
-            %{
-              payload: payload_string,
-              raw: payload_string
-            },
-            metadata_from_message(port, %{raw: payload_string})
-          )
+  defp handle_method_event(port, on_message, payload, raw, timeout, tool_executor, auto_approve) do
+    case payload["method"] do
+      "turn/completed" -> handle_completed_event(port, on_message, payload, raw)
+      "error" -> handle_error_method_event(port, on_message, payload, raw, timeout, tool_executor, auto_approve)
+      "turn/failed" -> handle_terminal_event(port, on_message, payload, raw, :failed)
+      "turn/cancelled" -> handle_terminal_event(port, on_message, payload, raw, :cancelled)
+      method -> handle_scoped_method(port, on_message, payload, raw, method, timeout, tool_executor, auto_approve)
+    end
+  end
+
+  defp handle_error_method_event(port, on_message, %{"params" => params} = payload, raw, timeout, executor, auto)
+       when is_map(params),
+       do: handle_error_event(port, on_message, payload, raw, timeout, executor, auto)
+
+  defp handle_error_method_event(port, on_message, payload, raw, timeout, executor, auto),
+    do: handle_scoped_method(port, on_message, payload, raw, "error", timeout, executor, auto)
+
+  defp handle_completed_event(port, on_message, payload, raw) do
+    with :match <- exact_event_scope(payload, :terminal),
+         :ok <- validate_completion_status(payload) do
+      emit_turn_event(on_message, :turn_completed, payload, raw, port, payload)
+      {:ok, :turn_completed}
+    else
+      :ignore -> {:continue, :ignored}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp validate_completion_status(payload) do
+    case Process.get(@turn_event_state_key) do
+      %{scope: :exact_turn} ->
+        turn = get_in(payload, ["params", "turn"])
+
+        case {turn["status"], Map.get(turn, "error")} do
+          {"completed", nil} -> :ok
+          {status, _} when status in ["failed", "interrupted"] -> {:error, {:turn_failed, turn}}
+          {status, _} -> {:error, {:worker_turn_status_invalid, status}}
         end
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+      _ ->
+        :ok
     end
+  end
+
+  defp handle_error_event(port, on_message, payload, raw, timeout, tool_executor, auto_approve) do
+    case exact_error_scope(payload) do
+      :legacy ->
+        handle_turn_method(port, on_message, payload, raw, "error", timeout, tool_executor, auto_approve)
+
+      :ignore ->
+        {:continue, :ignored}
+
+      {:error, reason} ->
+        {:error, reason}
+
+      {:retry, true} ->
+        emit_message(on_message, :notification, %{payload: payload, raw: raw}, metadata_from_message(port, payload))
+        receive_loop(port, on_message, timeout, "", tool_executor, auto_approve)
+
+      {:retry, false} ->
+        {:error, {:worker_turn_error, get_in(payload, ["params", "error"])}}
+    end
+  end
+
+  defp handle_terminal_event(port, on_message, payload, raw, kind) do
+    case exact_event_scope(payload, :terminal) do
+      :ignore ->
+        {:continue, :ignored}
+
+      {:error, reason} ->
+        {:error, reason}
+
+      :match ->
+        params = payload["params"]
+        event = if kind == :failed, do: :turn_failed, else: :turn_cancelled
+        emit_turn_event(on_message, event, payload, raw, port, params)
+        reason = if kind == :failed, do: {:turn_failed, params}, else: {:turn_cancelled, params}
+        {:error, reason}
+    end
+  end
+
+  defp handle_scoped_method(port, on_message, payload, raw, method, timeout, tool_executor, auto_approve) do
+    result = if method in ["item/started", "item/completed"], do: exact_event_scope(payload, :item), else: :match
+
+    case result do
+      :ignore -> {:continue, :ignored}
+      {:error, reason} -> {:error, reason}
+      :match -> handle_turn_method(port, on_message, payload, raw, method, timeout, tool_executor, auto_approve)
+    end
+  end
+
+  defp emit_other_message(port, on_message, payload, raw, timeout, tool_executor, auto_approve) do
+    emit_message(on_message, :other_message, %{payload: payload, raw: raw}, metadata_from_message(port, payload))
+    receive_loop(port, on_message, timeout, "", tool_executor, auto_approve)
+  end
+
+  defp emit_malformed_message(port, on_message, raw, timeout, tool_executor, auto_approve) do
+    log_non_json_stream_line(raw, "turn stream")
+
+    if protocol_message_candidate?(raw) do
+      emit_message(on_message, :malformed, %{payload: raw, raw: raw}, metadata_from_message(port, %{raw: raw}))
+    end
+
+    receive_loop(port, on_message, timeout, "", tool_executor, auto_approve)
   end
 
   defp exact_error_scope(payload) do
     case Process.get(@turn_event_state_key) do
       %{scope: :exact_turn, identity: {thread_id, turn_id}} ->
         params = payload["params"]
-
-        cond do
-          not is_binary(params["threadId"]) or not is_binary(params["turnId"]) ->
-            {:error, {:worker_event_identity_missing, "error"}}
-
-          params["threadId"] != thread_id or params["turnId"] != turn_id ->
-            :ignore
-
-          params["willRetry"] == true ->
-            {:retry, true}
-
-          params["willRetry"] == false ->
-            {:retry, false}
-
-          true ->
-            {:error, {:worker_error_notification_invalid, params}}
-        end
+        classify_error_scope(params, thread_id, turn_id)
 
       _ ->
         :legacy
+    end
+  end
+
+  defp classify_error_scope(params, thread_id, turn_id) do
+    case event_identity_scope(params, thread_id, turn_id, "turnId") do
+      :missing -> {:error, {:worker_event_identity_missing, "error"}}
+      :foreign -> :ignore
+      :matching -> classify_retryability(params)
+    end
+  end
+
+  defp classify_retryability(%{"willRetry" => true}), do: {:retry, true}
+  defp classify_retryability(%{"willRetry" => false}), do: {:retry, false}
+  defp classify_retryability(params), do: {:error, {:worker_error_notification_invalid, params}}
+
+  defp event_identity_scope(params, thread_id, turn_id, turn_key) do
+    event_thread = params["threadId"]
+    event_turn = params[turn_key]
+
+    cond do
+      not is_binary(event_thread) or not is_binary(event_turn) -> :missing
+      event_thread == thread_id and event_turn == turn_id -> :matching
+      true -> :foreign
     end
   end
 
@@ -1463,68 +1446,76 @@ defmodule SymphonyElixir.Codex.AppServer do
     if exact_turn_scope?() and Map.has_key?(payload, "id") do
       {:error, :worker_request_attribution_unsupported}
     else
-      metadata = metadata_from_message(port, payload)
-      record_mcp_approval_item(method, payload)
-
-      case maybe_handle_approval_request(
-             port,
-             method,
-             payload,
-             payload_string,
-             on_message,
-             metadata,
-             tool_executor,
-             auto_approve_requests
-           ) do
-        :input_required ->
-          emit_message(
-            on_message,
-            :turn_input_required,
-            %{payload: payload, raw: payload_string},
-            metadata
-          )
-
-          {:error, {:turn_input_required, payload}}
-
-        :approved ->
-          receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
-
-        :approval_required ->
-          emit_message(
-            on_message,
-            :approval_required,
-            %{payload: payload, raw: payload_string},
-            metadata
-          )
-
-          {:error, {:approval_required, payload}}
-
-        :unhandled ->
-          if needs_input?(method, payload) do
-            emit_message(
-              on_message,
-              :turn_input_required,
-              %{payload: payload, raw: payload_string},
-              metadata
-            )
-
-            {:error, {:turn_input_required, payload}}
-          else
-            emit_message(
-              on_message,
-              :notification,
-              %{
-                payload: payload,
-                raw: payload_string
-              },
-              metadata
-            )
-
-            Logger.debug("Codex notification: #{inspect(method)}")
-            receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
-          end
-      end
+      process_turn_method(
+        port,
+        on_message,
+        payload,
+        payload_string,
+        method,
+        timeout_ms,
+        tool_executor,
+        auto_approve_requests
+      )
     end
+  end
+
+  defp process_turn_method(port, on_message, payload, payload_string, method, timeout_ms, tool_executor, auto_approve_requests) do
+    metadata = metadata_from_message(port, payload)
+    record_mcp_approval_item(method, payload)
+
+    result =
+      maybe_handle_approval_request(
+        port,
+        method,
+        payload,
+        payload_string,
+        on_message,
+        metadata,
+        tool_executor,
+        auto_approve_requests
+      )
+
+    context = %{
+      port: port,
+      on_message: on_message,
+      payload: payload,
+      raw: payload_string,
+      method: method,
+      timeout: timeout_ms,
+      executor: tool_executor,
+      auto_approve: auto_approve_requests,
+      metadata: metadata
+    }
+
+    handle_turn_method_result(result, context)
+  end
+
+  defp handle_turn_method_result(:input_required, context) do
+    emit_message(context.on_message, :turn_input_required, %{payload: context.payload, raw: context.raw}, context.metadata)
+    {:error, {:turn_input_required, context.payload}}
+  end
+
+  defp handle_turn_method_result(:approved, context),
+    do: receive_loop(context.port, context.on_message, context.timeout, "", context.executor, context.auto_approve)
+
+  defp handle_turn_method_result(:approval_required, context) do
+    emit_message(context.on_message, :approval_required, %{payload: context.payload, raw: context.raw}, context.metadata)
+    {:error, {:approval_required, context.payload}}
+  end
+
+  defp handle_turn_method_result(:unhandled, context) do
+    if needs_input?(context.method, context.payload) do
+      handle_turn_input_required(context)
+    else
+      emit_message(context.on_message, :notification, %{payload: context.payload, raw: context.raw}, context.metadata)
+      Logger.debug("Codex notification: #{inspect(context.method)}")
+      receive_loop(context.port, context.on_message, context.timeout, "", context.executor, context.auto_approve)
+    end
+  end
+
+  defp handle_turn_input_required(context) do
+    emit_message(context.on_message, :turn_input_required, %{payload: context.payload, raw: context.raw}, context.metadata)
+    {:error, {:turn_input_required, context.payload}}
   end
 
   defp exact_turn_scope? do
@@ -1880,8 +1871,11 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp effective_turn_timeout(timeout_ms) do
     case Process.get(@turn_event_state_key) do
-      %{scope: :exact_turn, deadline: deadline} -> max(deadline - System.monotonic_time(:millisecond), 0)
-      _ -> timeout_ms
+      %{scope: :exact_turn, deadline: deadline} ->
+        min(timeout_ms, max(deadline - System.monotonic_time(:millisecond), 0))
+
+      _ ->
+        timeout_ms
     end
   end
 
@@ -1952,7 +1946,11 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:port_exit, status}}
     after
       timeout_ms ->
-        if exact_turn_scope?(), do: {:error, :turn_timeout}, else: {:error, :response_timeout}
+        if exact_turn_scope?() and turn_deadline_expired?() do
+          {:error, :turn_timeout}
+        else
+          {:error, :response_timeout}
+        end
     end
   end
 
@@ -1968,25 +1966,8 @@ defmodule SymphonyElixir.Codex.AppServer do
     payload = to_string(data)
 
     case Jason.decode(payload) do
-      {:ok, %{"id" => ^request_id, "error" => error}} ->
-        {:error, {:response_error, error}}
-
-      {:ok, %{"id" => ^request_id, "result" => result}} ->
-        {:ok, result}
-
-      {:ok, %{"id" => ^request_id} = response_payload} ->
-        {:error, {:response_error, response_payload}}
-
-      {:ok, %{} = other} ->
-        record_mcp_startup_status(other)
-
-        if exact_turn_scope?() and is_binary(other["method"]) and Map.has_key?(other, "id") do
-          {:error, :worker_request_attribution_unsupported}
-        else
-          buffer_early_turn_event(other)
-          Logger.debug("Ignoring message while waiting for response: #{inspect(other)}")
-          with_timeout_response(port, request_id, timeout_ms, "")
-        end
+      {:ok, response} when is_map(response) ->
+        handle_response_payload(port, request_id, timeout_ms, response)
 
       {:error, _} ->
         log_non_json_stream_line(payload, "response stream")
@@ -1994,25 +1975,70 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp buffer_early_turn_event(%{"method" => method} = payload) when is_binary(method) do
-    if String.starts_with?(method, "turn/") or String.starts_with?(method, "item/") or method == "error" do
-      case Process.get(@turn_event_state_key) do
-        %{scope: :exact_turn, identity: nil, early: frames, bytes: bytes} = state ->
-          size = byte_size(Jason.encode!(payload))
+  defp handle_response_payload(_port, request_id, _timeout, %{"id" => request_id, "error" => error}),
+    do: {:error, {:response_error, error}}
 
-          if length(frames) >= 256 or bytes + size > 1_048_576 do
-            Process.put(@turn_event_state_key, Map.put(state, :overflow, true))
-          else
-            Process.put(@turn_event_state_key, %{state | early: [payload | frames], bytes: bytes + size})
-          end
+  defp handle_response_payload(_port, request_id, _timeout, %{"id" => request_id, "result" => result}),
+    do: {:ok, result}
 
-        _ ->
-          :ok
-      end
+  defp handle_response_payload(_port, request_id, _timeout, %{"id" => request_id} = response),
+    do: {:error, {:response_error, response}}
+
+  defp handle_response_payload(port, request_id, timeout, response) do
+    record_mcp_startup_status(response)
+
+    if unsupported_strict_request?(response) do
+      {:error, :worker_request_attribution_unsupported}
+    else
+      handle_interleaved_response(port, request_id, timeout, response)
     end
   end
 
+  defp unsupported_strict_request?(%{"method" => method} = response) when is_binary(method),
+    do: exact_turn_scope?() and Map.has_key?(response, "id")
+
+  defp unsupported_strict_request?(_response), do: false
+
+  defp handle_interleaved_response(port, request_id, timeout, response) do
+    case buffer_early_turn_event(response) do
+      :overflow ->
+        {:error, :worker_event_buffer_overflow}
+
+      _ ->
+        Logger.debug("Ignoring message while waiting for response: #{inspect(response)}")
+        with_timeout_response(port, request_id, timeout, "")
+    end
+  end
+
+  defp buffer_early_turn_event(%{"method" => method} = payload) when is_binary(method) do
+    if early_turn_event_method?(method), do: enqueue_early_turn_event(payload), else: :ok
+  end
+
   defp buffer_early_turn_event(_payload), do: :ok
+
+  defp early_turn_event_method?(method),
+    do: String.starts_with?(method, "turn/") or String.starts_with?(method, "item/") or method == "error"
+
+  defp enqueue_early_turn_event(payload) do
+    case Process.get(@turn_event_state_key) do
+      %{scope: :exact_turn, identity: nil} = state -> append_early_turn_event(state, payload)
+      _ -> :ok
+    end
+  end
+
+  defp append_early_turn_event(%{overflow: true}, _payload), do: :overflow
+
+  defp append_early_turn_event(%{early: frames, bytes: bytes} = state, payload) do
+    size = byte_size(Jason.encode!(payload))
+
+    if length(frames) >= 256 or bytes + size > 1_048_576 do
+      Process.put(@turn_event_state_key, Map.put(state, :overflow, true))
+      :overflow
+    else
+      Process.put(@turn_event_state_key, %{state | early: [payload | frames], bytes: bytes + size})
+      :ok
+    end
+  end
 
   defp await_required_mcp_servers(_port, [], _timeout_ms), do: :ok
 

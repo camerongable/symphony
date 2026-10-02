@@ -93,7 +93,9 @@ defmodule SymphonyElixir.Factory.StageRunner do
              output_schema: output_schema,
              event_scope: context.event_scope
            ) do
-      case collector_output(context.collector, context.required_tool_calls, output_schema, {session.thread_id, turn.turn_id}) do
+      returned_identity = {session.thread_id, turn.turn_id}
+
+      case collector_output(context.collector, context.required_tool_calls, output_schema, returned_identity) do
         {:ok, output} ->
           {:ok, turn, output}
 
@@ -141,7 +143,14 @@ defmodule SymphonyElixir.Factory.StageRunner do
   defp start_collector(event_scope) do
     {:ok, collector} =
       Agent.start_link(fn ->
-        %{output: nil, completed_tool_calls: [], event_scope: event_scope, identity: nil, identity_error: nil, expected_thread_id: nil}
+        %{
+          output: nil,
+          completed_tool_calls: [],
+          event_scope: event_scope,
+          identity: nil,
+          identity_error: nil,
+          expected_thread_id: nil
+        }
       end)
 
     collector
@@ -173,50 +182,76 @@ defmodule SymphonyElixir.Factory.StageRunner do
   defp maybe_collect_output(collector, %{payload: payload}) when is_map(payload) do
     state = Agent.get(collector, & &1)
 
-    if state.event_scope == :exact_turn and not collector_identity_matches?(payload, state.identity) do
-      if is_nil(state.identity) and is_nil(state.identity_error),
-        do: Agent.update(collector, &Map.put(&1, :identity_error, :factory_stage_identity_missing))
-
-      :ok
-    else
-      case get_in(payload, ["params", "item"]) do
-        %{"type" => "agentMessage", "phase" => "commentary"} ->
-          :ok
-
-        %{"type" => "agentMessage", "text" => text} when is_binary(text) ->
-          Agent.update(collector, &Map.put(&1, :output, text))
-
-        %{} = item ->
-          case completed_tool_call(payload, item) do
-            nil -> :ok
-            tool_call -> Agent.update(collector, &Map.update!(&1, :completed_tool_calls, fn calls -> [tool_call | calls] end))
-          end
-
-        _other ->
-          :ok
-      end
+    case collector_payload_scope(payload, state) do
+      :matching -> collect_item_payload(collector, payload)
+      :missing -> record_missing_collector_identity(collector, state)
+      :foreign -> :ok
     end
   end
 
   defp maybe_collect_output(_collector, _message), do: :ok
 
+  defp collector_payload_scope(_payload, %{event_scope: :legacy}), do: :matching
+  defp collector_payload_scope(_payload, %{identity: nil}), do: :missing
+
+  defp collector_payload_scope(payload, %{identity: identity}) do
+    if collector_identity_matches?(payload, identity), do: :matching, else: :foreign
+  end
+
+  defp record_missing_collector_identity(collector, %{identity_error: nil}),
+    do: Agent.update(collector, &Map.put(&1, :identity_error, :factory_stage_identity_missing))
+
+  defp record_missing_collector_identity(_collector, _state), do: :ok
+
+  defp collect_item_payload(collector, payload) do
+    case get_in(payload, ["params", "item"]) do
+      %{"type" => "agentMessage", "phase" => "commentary"} ->
+        :ok
+
+      %{"type" => "agentMessage", "text" => text} when is_binary(text) ->
+        Agent.update(collector, &Map.put(&1, :output, text))
+
+      %{} = item ->
+        collect_tool_call(collector, payload, item)
+
+      _other ->
+        :ok
+    end
+  end
+
+  defp collect_tool_call(collector, payload, item) do
+    case completed_tool_call(payload, item) do
+      nil -> :ok
+      tool_call -> Agent.update(collector, &Map.update!(&1, :completed_tool_calls, fn calls -> [tool_call | calls] end))
+    end
+  end
+
   defp collector_output(collector, required_tool_calls, output_schema, returned_identity) do
     state = Agent.get(collector, & &1)
 
-    expected_identity = {state.expected_thread_id, elem(returned_identity, 1)}
-
     with true <-
-           not (state.event_scope == :exact_turn and
-                  (is_nil(state.identity) or not is_nil(state.identity_error) or state.identity != returned_identity or
-                     state.expected_thread_id != elem(returned_identity, 0))) ||
-             {:error,
-              state.identity_error ||
-                if(is_nil(state.identity), do: :factory_stage_identity_missing, else: {:factory_stage_turn_identity_mismatch, expected_identity, state.identity, returned_identity})},
+           collector_identity_valid?(state, returned_identity) || collector_identity_error(state, returned_identity),
          :ok <- validate_required_tool_calls(required_tool_calls, state.completed_tool_calls),
          {:ok, output} <- decode_output(state.output),
          :ok <- StageSchemas.validate(output, output_schema) do
       {:ok, output}
     end
+  end
+
+  defp collector_identity_valid?(%{event_scope: :legacy}, _returned_identity), do: true
+
+  defp collector_identity_valid?(state, returned_identity) do
+    state.identity == returned_identity and state.expected_thread_id == elem(returned_identity, 0) and
+      is_nil(state.identity_error)
+  end
+
+  defp collector_identity_error(%{identity_error: reason}, _returned_identity) when not is_nil(reason), do: {:error, reason}
+
+  defp collector_identity_error(%{identity: nil}, _returned_identity), do: {:error, :factory_stage_identity_missing}
+
+  defp collector_identity_error(state, returned_identity) do
+    expected = {state.expected_thread_id, elem(returned_identity, 1)}
+    {:error, {:factory_stage_turn_identity_mismatch, expected, state.identity, returned_identity}}
   end
 
   defp collector_identity_matches?(_payload, nil), do: false
