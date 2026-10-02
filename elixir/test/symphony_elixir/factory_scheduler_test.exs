@@ -369,6 +369,140 @@ defmodule SymphonyElixir.FactorySchedulerTest do
     %{context: context, store: store, root: root}
   end
 
+  test "unsupported stored execution modes fence every tick before feedback, recovery, intake, or cleanup", %{
+    context: context,
+    store: store,
+    root: root
+  } do
+    checkout = Path.join(root, "unsupported-spec-checkout")
+    File.mkdir_p!(checkout)
+    marker_path = Path.join(checkout, "candidate.txt")
+    File.write!(marker_path, "preserve this checkout")
+    workspace_root = Path.join(root, "must-not-be-created")
+
+    assert {:ok, _spec} =
+             RunLedger.register(store, %{
+               run_id: "a-unsupported-spec",
+               issue_key: "PPL-700",
+               kind: "SPECIFICATION",
+               state: "SPEC_WRITING",
+               execution_mode: "TICKET_SUPERVISOR_V1",
+               worktree: checkout,
+               snapshot_json: Jason.encode!(snapshot(["spec-needed", "repo-grail"]))
+             })
+
+    assert {:ok, _delivery} =
+             RunLedger.register(store, %{
+               run_id: "z-unsupported-failed-delivery",
+               issue_key: "PPL-701",
+               kind: "DELIVERY",
+               state: "FAILED",
+               execution_mode: "TICKET_SUPERVISOR_V1",
+               last_input_marker: "old-jira-input",
+               snapshot_json: Jason.encode!(snapshot(["ai-running", "repo-grail"]))
+             })
+
+    assert {:ok, :recorded} =
+             MrFeedbackLedger.record_candidate(store, %{
+               feedback_key: "feedback-pending-mode-fence",
+               run_id: "a-unsupported-spec",
+               project: "grailbio/grail",
+               mr_iid: 700,
+               discussion_id: "discussion-700",
+               note_id: 701,
+               note_updated_at: "2026-10-01T00:00:00Z",
+               author_id: 17,
+               body_sha256: String.duplicate("a", 64)
+             })
+
+    Store.query!(store, "UPDATE mr_feedback_notes SET status = 'CLAIMED', request_key = 'feedback-request-700'")
+
+    Store.query!(store, """
+    INSERT INTO desktop_requests (
+      request_key, target_kind, target_key, action, status, payload_sha256,
+      codex_project_id, model, reasoning_effort, title, prompt, schema_json,
+      cwd, metadata_json, created_at, updated_at
+    ) VALUES (
+      'feedback-request-700', 'CONTROLLER', 'assigned-jira-work', 'FOLLOWUP', 'PENDING',
+      '#{String.duplicate("b", 64)}', 'projectless', 'gpt-test', 'medium', 'Controller followup',
+      'Question', '{}', '#{checkout}', '{}', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z'
+    )
+    """)
+
+    changed_jira_snapshot =
+      snapshot(["ai-running", "repo-grail"])
+      |> Map.put("summary", "Jira changed after failed delivery")
+      |> Map.put("updated", "2026-10-01T01:00:00Z")
+
+    Process.put(:factory_controller_response, %{"snapshot_json" => Jason.encode!([changed_jira_snapshot])})
+
+    initial_runs = Store.query!(store, "SELECT * FROM runs ORDER BY run_id").rows
+    initial_events = Store.query!(store, "SELECT * FROM events ORDER BY id").rows
+    initial_feedback = Store.query!(store, "SELECT * FROM mr_feedback_notes ORDER BY feedback_key").rows
+    initial_requests = Store.query!(store, "SELECT * FROM desktop_requests ORDER BY request_key").rows
+    initial_file = File.read!(marker_path)
+
+    database_rows = fn ->
+      Store.query!(store, "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name").rows
+      |> Enum.map(fn [table] -> {table, Store.query!(store, "SELECT * FROM #{table} ORDER BY rowid").rows} end)
+    end
+
+    initial_database_rows = database_rows.()
+
+    for transport <- ["app_server", "desktop_broker"], _attempt <- 1..2 do
+      factory =
+        context.factory
+        |> Map.put(:task_transport, transport)
+        |> Map.put(:review_feedback, %{"enabled" => true, "required_apps" => ["polaris-app"]})
+
+      assert {:error, :ticket_supervisor_runtime_capability_unproven} =
+               Scheduler.tick(%{context | factory: factory, workspace_root: workspace_root},
+                 controller_task: FakeControllerTask,
+                 jira_connector: FakeJiraConnector,
+                 jira_reader: FakeReviewJiraReader,
+                 gitlab_reader: FakeReviewGitLabReader,
+                 feedback_consumer: FakeReviewConsumer,
+                 task_launcher: FakeTaskLauncher,
+                 cleanup: FakeCleanup,
+                 worktree: FakeWorktree
+               )
+
+      assert Store.query!(store, "SELECT * FROM runs ORDER BY run_id").rows == initial_runs
+      assert Store.query!(store, "SELECT * FROM events ORDER BY id").rows == initial_events
+      assert Store.query!(store, "SELECT * FROM mr_feedback_notes ORDER BY feedback_key").rows == initial_feedback
+      assert Store.query!(store, "SELECT * FROM desktop_requests ORDER BY request_key").rows == initial_requests
+      assert database_rows.() == initial_database_rows
+      assert File.read!(marker_path) == initial_file
+      refute File.exists?(workspace_root)
+      refute_received {:jira_search_jql, _jql}
+      refute_received {:jira_write_options, _options}
+      refute_received {:controller_prompt, _prompt}
+      refute_received {:controller_options, _options}
+      refute_received {:review_issue_read, _issue_key}
+      refute_received {:review_mr_read, _run_id}
+      refute_received :review_consumer_called
+      refute_received {:stage_launch, _run_id, _workspace, _prompt, _opts}
+      refute_received {:cleanup_candidates_requested, _repo_key}
+      refute_received {:removed_detached, _path}
+      refute_received {:ensure_writer, _route, _issue_key, _run_id}
+      refute_received {:create_detached, _stage, _sha}
+      refute_received {:validate_native, _path, _opts}
+    end
+
+    Store.query!(store, "UPDATE runs SET execution_mode = 'UNKNOWN'")
+    unknown_mode_rows = Store.query!(store, "SELECT * FROM runs ORDER BY run_id").rows
+    unknown_mode_events = Store.query!(store, "SELECT * FROM events ORDER BY id").rows
+
+    assert {:error, :invalid_execution_mode} =
+             Scheduler.tick(%{context | workspace_root: workspace_root}, cleanup: FakeCleanup)
+
+    assert Store.query!(store, "SELECT * FROM runs ORDER BY run_id").rows == unknown_mode_rows
+    assert Store.query!(store, "SELECT * FROM events ORDER BY id").rows == unknown_mode_events
+    assert File.read!(marker_path) == initial_file
+    refute File.exists?(workspace_root)
+    refute_received {:cleanup_candidates_requested, _repo_key}
+  end
+
   test "review feedback still polls when unrelated Jira intake fails", %{context: context, store: store} do
     run = %{
       run_id: "review-42",

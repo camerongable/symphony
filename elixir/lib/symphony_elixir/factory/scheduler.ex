@@ -48,6 +48,13 @@ defmodule SymphonyElixir.Factory.Scheduler do
   @spec tick(context(), keyword()) :: {:ok, map()} | {:error, term()}
   def tick(context, opts \\ []) do
     context = dependencies(context, opts)
+
+    with :ok <- validate_stored_execution_modes(context.store) do
+      run_tick(context)
+    end
+  end
+
+  defp run_tick(context) do
     workspace = controller_workspace(context)
     File.mkdir_p!(workspace)
 
@@ -69,6 +76,21 @@ defmodule SymphonyElixir.Factory.Scheduler do
       maybe_consume_review_feedback(context, workspace)
       maybe_admit_review_rework(context, workspace)
       result
+    end
+  end
+
+  defp validate_stored_execution_modes(store) do
+    rows =
+      Store.query!(
+        store,
+        "SELECT execution_mode FROM runs WHERE execution_mode IS NOT NULL AND execution_mode != 'LEGACY' ORDER BY run_id",
+        []
+      ).rows
+
+    case rows do
+      [] -> :ok
+      [["TICKET_SUPERVISOR_V1"] | _rest] -> {:error, :ticket_supervisor_runtime_capability_unproven}
+      [[_unsupported] | _rest] -> {:error, :invalid_execution_mode}
     end
   end
 
@@ -1031,11 +1053,22 @@ defmodule SymphonyElixir.Factory.Scheduler do
         end
 
       {:error, reason} ->
-        block_run(context, workspace, run, reason, acc)
+        if reason in [:ticket_supervisor_runtime_capability_unproven, :invalid_execution_mode],
+          do: {:error, reason},
+          else: block_run(context, workspace, run, reason, acc)
     end
   end
 
   defp validate_run_transport(context, run) do
+    case run["execution_mode"] do
+      nil -> validate_legacy_run_transport(context, run)
+      "LEGACY" -> validate_legacy_run_transport(context, run)
+      "TICKET_SUPERVISOR_V1" -> {:error, :ticket_supervisor_runtime_capability_unproven}
+      _other -> {:error, :invalid_execution_mode}
+    end
+  end
+
+  defp validate_legacy_run_transport(context, run) do
     if native_transport?(context) == (run["factory_owned"] == 0),
       do: :ok,
       else: {:error, :factory_task_transport_changed}

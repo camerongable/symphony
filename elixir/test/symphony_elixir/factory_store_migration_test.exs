@@ -79,4 +79,77 @@ defmodule SymphonyElixir.FactoryStoreMigrationTest do
     assert Store.one!(store, "SELECT status FROM mr_feedback_notes WHERE feedback_key = 'old-receipt'")["status"] ==
              "REWORKING"
   end
+
+  test "adds a nullable execution mode idempotently and preserves a historical file database" do
+    database = Path.join(System.tmp_dir!(), "factory-execution-mode-#{System.unique_integer([:positive])}.sqlite")
+    on_exit(fn -> File.rm(database) end)
+
+    {:ok, original} = Store.start_link(database: database)
+
+    try do
+      Store.query!(original, "ALTER TABLE runs DROP COLUMN execution_mode")
+
+      Store.query!(original, """
+      INSERT INTO runs (run_id, issue_key, kind, state, candidate_sha, created_at, updated_at)
+      VALUES ('historical-run', 'PPL-100', 'SPECIFICATION', 'FAILED', 'old-candidate', 'created-old', 'updated-old')
+      """)
+
+      Store.query!(original, """
+      INSERT INTO events (occurred_at, event_type, run_id, payload_json)
+      VALUES ('event-old', 'HISTORICAL_EVENT', 'historical-run', '{"kept":true}')
+      """)
+
+      Store.query!(original, """
+      INSERT INTO desktop_requests (
+        request_key, target_kind, target_key, action, status, payload_sha256,
+        codex_project_id, model, reasoning_effort, title, prompt, schema_json,
+        cwd, metadata_json, created_at, updated_at
+      ) VALUES (
+        'historical-request', 'CONTROLLER', 'assigned-jira-work', 'FOLLOWUP', 'PENDING',
+        '#{String.duplicate("c", 64)}', 'projectless', 'gpt-test', 'medium', 'Old controller',
+        'Preserve exact request bytes', '{}', '/tmp/controller', '{}', 'created-request', 'updated-request'
+      )
+      """)
+
+      historical_before = Store.one!(original, "SELECT * FROM runs WHERE run_id = 'historical-run'")
+      events_before = Store.query!(original, "SELECT * FROM events WHERE run_id = 'historical-run'").rows
+      request_before = Store.one!(original, "SELECT * FROM desktop_requests WHERE request_key = 'historical-request'")
+
+      assert :ok = Store.initialize(original)
+      assert :ok = Store.initialize(original)
+
+      upgraded = Store.one!(original, "SELECT * FROM runs WHERE run_id = 'historical-run'")
+      assert upgraded["execution_mode"] == nil
+      assert Map.drop(upgraded, ["execution_mode"]) == historical_before
+      assert Store.query!(original, "SELECT * FROM events WHERE run_id = 'historical-run'").rows == events_before
+      assert Store.one!(original, "SELECT * FROM desktop_requests WHERE request_key = 'historical-request'") == request_before
+      assert Store.one!(original, "SELECT MAX(version) AS version FROM factory_schema_migrations")["version"] == 16
+    after
+      GenServer.stop(original)
+    end
+
+    {:ok, reopened} = Store.start_link(database: database)
+
+    try do
+      reopened_run = Store.one!(reopened, "SELECT * FROM runs WHERE run_id = 'historical-run'")
+      assert reopened_run["execution_mode"] == nil
+      assert reopened_run["candidate_sha"] == "old-candidate"
+      assert reopened_run["created_at"] == "created-old"
+      assert reopened_run["updated_at"] == "updated-old"
+
+      assert Store.one!(reopened, "SELECT event_type, run_id, payload_json FROM events WHERE run_id = 'historical-run'") == %{
+               "event_type" => "HISTORICAL_EVENT",
+               "run_id" => "historical-run",
+               "payload_json" => "{\"kept\":true}"
+             }
+
+      assert Store.one!(reopened, "SELECT payload_sha256, prompt, status FROM desktop_requests WHERE request_key = 'historical-request'") == %{
+               "payload_sha256" => String.duplicate("c", 64),
+               "prompt" => "Preserve exact request bytes",
+               "status" => "PENDING"
+             }
+    after
+      GenServer.stop(reopened)
+    end
+  end
 end

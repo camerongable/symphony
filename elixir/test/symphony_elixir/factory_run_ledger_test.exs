@@ -42,6 +42,66 @@ defmodule SymphonyElixir.FactoryRunLedgerTest do
            ]
   end
 
+  test "persists explicit execution modes and normalizes missing and null modes to legacy", %{connection: connection} do
+    assert {:ok, %{run: defaulted}} =
+             RunLedger.register(connection, %{
+               run_id: "mode-default",
+               issue_key: "PPL-101",
+               kind: "DELIVERY",
+               state: "WRITING"
+             })
+
+    assert defaulted["execution_mode"] == "LEGACY"
+
+    assert {:ok, %{run: %{"execution_mode" => "LEGACY"}}} =
+             RunLedger.register(connection, %{
+               "run_id" => "mode-null",
+               "issue_key" => "PPL-102",
+               "kind" => "DELIVERY",
+               "state" => "WRITING",
+               "execution_mode" => nil
+             })
+
+    assert {:ok, %{run: explicit}} =
+             RunLedger.register(connection, %{
+               run_id: "mode-supervisor",
+               issue_key: "PPL-103",
+               kind: "SPECIFICATION",
+               state: "SPEC_DRAFTING",
+               execution_mode: "TICKET_SUPERVISOR_V1"
+             })
+
+    assert explicit["execution_mode"] == "TICKET_SUPERVISOR_V1"
+  end
+
+  test "rejects invalid execution modes before inserting a run or event", %{connection: connection} do
+    attrs = %{run_id: "mode-invalid", issue_key: "PPL-104", kind: "DELIVERY", state: "WRITING"}
+    events_before = Store.one!(connection, "SELECT COUNT(*) AS count FROM events")["count"]
+
+    assert {:error, :invalid_execution_mode} =
+             RunLedger.register(connection, Map.put(attrs, :execution_mode, "UNKNOWN"))
+
+    assert {:error, :unknown_run} = RunLedger.get(connection, "mode-invalid")
+    assert Store.one!(connection, "SELECT COUNT(*) AS count FROM events")["count"] == events_before
+  end
+
+  test "execution mode cannot be updated, including with a mixed mutable-field update", %{connection: connection} do
+    assert {:ok, %{run: before}} =
+             RunLedger.register(connection, %{run_id: "mode-immutable", issue_key: "PPL-105", kind: "DELIVERY", state: "WRITING"})
+
+    events_before = RunLedger.events(connection, "mode-immutable")
+
+    assert {:error, :execution_mode_immutable} =
+             RunLedger.update(connection, "mode-immutable", %{execution_mode: "TICKET_SUPERVISOR_V1"})
+
+    assert {:error, :execution_mode_immutable} =
+             RunLedger.update(connection, "mode-immutable", %{"state" => "FAILED", "execution_mode" => nil})
+
+    assert {:ok, after_rejected_updates} = RunLedger.get(connection, "mode-immutable")
+    assert after_rejected_updates == before
+    assert RunLedger.events(connection, "mode-immutable") == events_before
+  end
+
   test "enforces one active run per issue and kind", %{connection: connection} do
     attrs = %{run_id: "run-1", issue_key: "PPL-100", kind: "DELIVERY", state: "WRITING"}
     assert {:ok, _registered} = RunLedger.register(connection, attrs, now: @now)

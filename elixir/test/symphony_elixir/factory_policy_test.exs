@@ -69,6 +69,32 @@ defmodule SymphonyElixir.FactoryPolicyTest do
     assert {:error, :native_archive_restore_capability_unproven} = Policy.validate(factory)
   end
 
+  test "ticket supervisor policy is disabled by default and never bypasses the capability fence" do
+    factory = valid_factory() |> put_in([:manual_validation, "required_apps"], ["polaris-app"])
+    assert :ok = Policy.validate(factory)
+    assert :ok = Policy.validate(Map.put(factory, :ticket_supervisor, %{}))
+
+    assert :ok =
+             Policy.validate(Map.put(factory, :ticket_supervisor, %{"enabled" => false, "pilot_issue_keys" => ["PPL-123"]}))
+
+    assert {:error, :ticket_supervisor_runtime_capability_unproven} =
+             Policy.validate(Map.put(factory, :ticket_supervisor, %{"enabled" => true, "pilot_issue_keys" => ["PPL-123"]}))
+  end
+
+  test "ticket supervisor policy rejects malformed values" do
+    factory = valid_factory() |> put_in([:manual_validation, "required_apps"], ["polaris-app"])
+
+    for policy <- [
+          %{"enabled" => "true", "pilot_issue_keys" => []},
+          %{"enabled" => false, "pilot_issue_keys" => "PPL-123"},
+          %{"enabled" => false, "pilot_issue_keys" => ["  "]},
+          nil
+        ] do
+      assert {:error, :invalid_ticket_supervisor_policy} =
+               Policy.validate(Map.put(factory, :ticket_supervisor, policy))
+    end
+  end
+
   test "requires a safe branch prefix and complete enabled hibernation policy" do
     factory = valid_factory()
 

@@ -64,6 +64,14 @@ verification, and optional Slack-coordinated manual validation as visible
 Codex tasks. The controller retains Git push and draft-MR ownership.
 Configuration, safety boundaries, recovery, and cutover are documented in
 [Local factory control plane](../docs/factory-control-plane.md).
+
+The `factory.ticket_supervisor` setting is a default-off foundation only:
+`{"enabled": false, "pilot_issue_keys": []}`. New run registrations record an
+immutable execution mode, while historical rows remain `NULL` and continue to
+follow the legacy route. No ticket-supervisor chat or worker runtime is enabled;
+the scheduler refuses to tick if it finds a recorded non-legacy mode until a
+compatible runner passes its acceptance gate. Existing runs and global transport
+behavior are otherwise unchanged.
 Manual-validation results are bound to the confirmed contract's named
 non-production environment as well as its exact candidate SHA. The safety
 policy is rechecked before a validator starts and before its result is used.

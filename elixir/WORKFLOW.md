@@ -304,6 +304,17 @@ acceptance pass. This flag does not enable archival or cache reclamation; native
 cleanup remains separately disabled. See the implementation README and broker
 source-bootstrap reference for command/attachment evidence requirements.
 
+## Ticket supervisor execution-mode foundation (disabled)
+
+`factory.ticket_supervisor` defaults to `{"enabled": false, "pilot_issue_keys": []}`.
+This setting and the immutable `runs.execution_mode` column only prepare durable
+mode recording; they do not create ticket-supervisor chats, workers, or a
+runtime route. Historical runs keep a null mode and continue using legacy
+transport behavior. Until a compatible supervisor runner passes its acceptance
+gate, the scheduler stops before side effects if it encounters any non-legacy
+recorded mode. Changing the global transport does not enable that mode or
+rewrite existing runs.
+
 ## Workpad template
 
 Use this exact structure for the persistent workpad comment and keep it updated in place throughout execution:

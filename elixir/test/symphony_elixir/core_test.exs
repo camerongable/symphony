@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.CoreTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.Config.Schema
+
   test "config defaults and validation checks" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
@@ -2404,5 +2406,17 @@ defmodule SymphonyElixir.CoreTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  test "ticket supervisor configuration casts the default-off map" do
+    assert {:ok, settings} = Schema.parse(%{})
+    assert settings.factory.ticket_supervisor == %{"enabled" => false, "pilot_issue_keys" => []}
+
+    assert {:ok, configured} =
+             Schema.parse(%{
+               "factory" => %{"ticket_supervisor" => %{"enabled" => false, "pilot_issue_keys" => ["PPL-123"]}}
+             })
+
+    assert configured.factory.ticket_supervisor == %{"enabled" => false, "pilot_issue_keys" => ["PPL-123"]}
   end
 end

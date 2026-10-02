@@ -6,7 +6,7 @@ defmodule SymphonyElixir.Factory.RunLedger do
   alias SymphonyElixir.Factory.{Contract, Control, StageSchemas, Store}
 
   @insert_columns ~w(
-    run_id issue_key kind state dispatcher_id spec_revision contract_sha256
+    run_id issue_key kind state execution_mode dispatcher_id spec_revision contract_sha256
     repo_key repo_path base_branch worktree branch candidate_sha
     candidate_handoff ci_preflight_sha ci_pipeline_id ci_pipeline_url
     ci_evidence_json ci_last_checked_at attempt validation_attempt slack_claim_ts
@@ -45,15 +45,17 @@ defmodule SymphonyElixir.Factory.RunLedger do
   @spec register(Store.connection(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def register(connection, attrs, opts \\ []) do
     with :ok <- require_fields(attrs, ~w(run_id issue_key kind state)),
-         :ok <- validate_kind(value(attrs, "kind")) do
+         :ok <- validate_kind(value(attrs, "kind")),
+         {:ok, execution_mode} <- normalize_execution_mode(value(attrs, "execution_mode")) do
       now = opts |> Keyword.get_lazy(:now, &DateTime.utc_now/0) |> iso()
-      Store.transaction!(connection, &insert_run(&1, normalize_new_run(attrs, now)))
+      Store.transaction!(connection, &insert_run(&1, normalize_new_run(attrs, now, execution_mode)))
     end
   end
 
-  defp normalize_new_run(attrs, now) do
+  defp normalize_new_run(attrs, now, execution_mode) do
     attrs
     |> stringify_keys()
+    |> Map.put("execution_mode", execution_mode)
     |> Map.put_new("attempt", 1)
     |> Map.put_new("validation_attempt", 0)
     |> Map.put_new("implementation_iteration", 0)
@@ -106,14 +108,23 @@ defmodule SymphonyElixir.Factory.RunLedger do
       when is_binary(old_run_id) and is_map(snapshot) and is_map(route) and is_map(attrs) and
              reason in [:local_retry, :jira_input_changed] do
     with :ok <- require_fields(attrs, ~w(run_id issue_key kind state)),
-         :ok <- validate_kind(value(attrs, "kind")) do
+         :ok <- validate_kind(value(attrs, "kind")),
+         {:ok, execution_mode} <- normalize_execution_mode(value(attrs, "execution_mode")) do
       Store.transaction!(connection, fn transaction ->
-        restart_failed_specification_native_transaction(transaction, old_run_id, snapshot, route, attrs, reason)
+        restart_failed_specification_native_transaction(
+          transaction,
+          old_run_id,
+          snapshot,
+          route,
+          attrs,
+          reason,
+          execution_mode
+        )
       end)
     end
   end
 
-  defp restart_failed_specification_native_transaction(transaction, old_run_id, snapshot, route, attrs, reason) do
+  defp restart_failed_specification_native_transaction(transaction, old_run_id, snapshot, route, attrs, reason, execution_mode) do
     with {:ok, %{"kind" => "SPECIFICATION", "state" => "FAILED"} = old} <- get(transaction, old_run_id),
          :ok <- validate_resume_reason(transaction, old_run_id, reason),
          :ok <- require_no_active_issue_run(transaction, old["issue_key"]),
@@ -121,7 +132,8 @@ defmodule SymphonyElixir.Factory.RunLedger do
          true <- latest_issue_run(transaction, old["issue_key"])["run_id"] == old_run_id or {:error, :retry_not_latest},
          :ok <- validate_repository_retry_route(old, route),
          :ok <- require_native_replacement(old, snapshot, attrs),
-         {:ok, %{run: new_run}} <- insert_run(transaction, normalize_new_run(attrs, iso(DateTime.utc_now()))) do
+         {:ok, %{run: new_run}} <-
+           insert_run(transaction, normalize_new_run(attrs, iso(DateTime.utc_now()), execution_mode)) do
       if specification_retry_pending?(transaction, old_run_id) do
         record_event!(transaction, "SPECIFICATION_RETRY_CONSUMED", old_run_id, %{replacement_run_id: new_run["run_id"]})
       end
@@ -537,10 +549,17 @@ defmodule SymphonyElixir.Factory.RunLedger do
   """
   @spec update(Store.connection(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def update(connection, run_id, attrs, opts \\ []) do
-    updates =
-      attrs
-      |> stringify_keys()
-      |> Map.take(@updatable_columns)
+    normalized_attrs = stringify_keys(attrs)
+
+    if Map.has_key?(normalized_attrs, "execution_mode") do
+      {:error, :execution_mode_immutable}
+    else
+      update_fields(connection, run_id, normalized_attrs, opts)
+    end
+  end
+
+  defp update_fields(connection, run_id, attrs, opts) do
+    updates = Map.take(attrs, @updatable_columns)
 
     if map_size(updates) == 0 do
       {:error, :no_run_fields}
@@ -779,6 +798,10 @@ defmodule SymphonyElixir.Factory.RunLedger do
 
   defp validate_kind(kind) when kind in ["SPECIFICATION", "DELIVERY", "VALIDATION"], do: :ok
   defp validate_kind(kind), do: {:error, {:invalid_run_kind, kind}}
+
+  defp normalize_execution_mode(nil), do: {:ok, "LEGACY"}
+  defp normalize_execution_mode(mode) when mode in ["LEGACY", "TICKET_SUPERVISOR_V1"], do: {:ok, mode}
+  defp normalize_execution_mode(_mode), do: {:error, :invalid_execution_mode}
 
   defp stringify_keys(attrs) do
     Map.new(attrs, fn {key, item} -> {to_string(key), item} end)

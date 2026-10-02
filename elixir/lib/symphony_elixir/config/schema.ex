@@ -330,6 +330,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:hibernation, :map, default: %{})
       field(:review_feedback, :map, default: %{})
       field(:manual_validation, :map, default: %{})
+      field(:ticket_supervisor, :map, default: %{"enabled" => false, "pilot_issue_keys" => []})
       field(:models, :map, default: %{})
       field(:repositories, :map, default: %{})
     end
@@ -367,6 +368,7 @@ defmodule SymphonyElixir.Config.Schema do
           :hibernation,
           :review_feedback,
           :manual_validation,
+          :ticket_supervisor,
           :models,
           :repositories
         ],
@@ -589,7 +591,8 @@ defmodule SymphonyElixir.Config.Schema do
         queue: normalize_keys(settings.factory.queue),
         cleanup: normalize_keys(settings.factory.cleanup),
         hibernation: normalize_keys(settings.factory.hibernation),
-        manual_validation: normalize_keys(settings.factory.manual_validation)
+        manual_validation: normalize_keys(settings.factory.manual_validation),
+        ticket_supervisor: normalize_keys(settings.factory.ticket_supervisor)
     }
 
     %{settings | tracker: tracker, workspace: workspace, codex: codex, factory: factory}

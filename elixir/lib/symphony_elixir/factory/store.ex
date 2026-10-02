@@ -85,6 +85,7 @@ defmodule SymphonyElixir.Factory.Store do
       issue_key TEXT NOT NULL,
       kind TEXT NOT NULL CHECK(kind IN ('SPECIFICATION', 'DELIVERY', 'VALIDATION')),
       state TEXT NOT NULL,
+      execution_mode TEXT,
       dispatcher_id TEXT,
       spec_revision INTEGER,
       contract_sha256 TEXT,
@@ -343,6 +344,7 @@ defmodule SymphonyElixir.Factory.Store do
   ]
 
   @model_run_columns %{
+    "execution_mode" => "TEXT",
     "runtime" => "TEXT",
     "model_role" => "TEXT",
     "model_provider" => "TEXT",
@@ -484,9 +486,9 @@ defmodule SymphonyElixir.Factory.Store do
       connection,
       """
       INSERT OR IGNORE INTO factory_schema_migrations(version, applied_at)
-      VALUES (1, ?), (2, ?), (3, ?), (4, ?), (5, ?), (6, ?), (7, ?), (8, ?), (9, ?), (10, ?), (11, ?), (12, ?), (13, ?), (14, ?), (15, ?)
+      VALUES (1, ?), (2, ?), (3, ?), (4, ?), (5, ?), (6, ?), (7, ?), (8, ?), (9, ?), (10, ?), (11, ?), (12, ?), (13, ?), (14, ?), (15, ?), (16, ?)
       """,
-      List.duplicate(iso_now(), 15)
+      List.duplicate(iso_now(), 16)
     )
 
     :ok

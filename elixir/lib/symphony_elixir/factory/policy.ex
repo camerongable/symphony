@@ -13,7 +13,8 @@ defmodule SymphonyElixir.Factory.Policy do
   @doc "Validates every capability needed before an enabled controller starts."
   @spec validate(struct() | map()) :: :ok | {:error, term()}
   def validate(factory) do
-    with {:ok, _jql} <- Queue.jql(value(factory, "queue", %{})),
+    with :ok <- validate_ticket_supervisor(value(factory, "ticket_supervisor", %{})),
+         {:ok, _jql} <- Queue.jql(value(factory, "queue", %{})),
          :ok <- validate_specification_authorization(value(factory, "specification_authorization_mode", "auto_after_critic")),
          :ok <- validate_branch_prefix(value(factory, "branch_prefix", "ai")),
          :ok <- validate_repositories(value(factory, "repositories", %{})),
@@ -25,6 +26,20 @@ defmodule SymphonyElixir.Factory.Policy do
       end
     end
   end
+
+  defp validate_ticket_supervisor(policy) when is_map(policy) do
+    enabled = value(policy, "enabled", false)
+    pilot_issue_keys = value(policy, "pilot_issue_keys", [])
+
+    cond do
+      not is_boolean(enabled) -> {:error, :invalid_ticket_supervisor_policy}
+      not valid_string_list?(pilot_issue_keys) -> {:error, :invalid_ticket_supervisor_policy}
+      enabled -> {:error, :ticket_supervisor_runtime_capability_unproven}
+      true -> :ok
+    end
+  end
+
+  defp validate_ticket_supervisor(_policy), do: {:error, :invalid_ticket_supervisor_policy}
 
   defp validate_specification_authorization(mode) when mode in ["auto_after_critic", "human_confirmation"], do: :ok
   defp validate_specification_authorization(_mode), do: {:error, :invalid_specification_authorization_mode}
