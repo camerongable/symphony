@@ -613,17 +613,22 @@ defmodule SymphonyElixir.Config.Schema do
   defp normalize_key(value) when is_atom(value), do: Atom.to_string(value)
   defp normalize_key(value), do: to_string(value)
 
-  defp drop_nil_values(value) when is_map(value) do
+  defp drop_nil_values(value), do: drop_nil_values(value, false)
+
+  defp drop_nil_values(value, preserve_nulls) when is_map(value) do
     Enum.reduce(value, %{}, fn {key, nested}, acc ->
-      case drop_nil_values(nested) do
+      preserve_nested_nulls = preserve_nulls or key == "ticket_supervisor"
+
+      case drop_nil_values(nested, preserve_nested_nulls) do
+        nil when preserve_nested_nulls -> Map.put(acc, key, nil)
         nil -> acc
         normalized -> Map.put(acc, key, normalized)
       end
     end)
   end
 
-  defp drop_nil_values(value) when is_list(value), do: Enum.map(value, &drop_nil_values/1)
-  defp drop_nil_values(value), do: value
+  defp drop_nil_values(value, preserve_nulls) when is_list(value), do: Enum.map(value, &drop_nil_values(&1, preserve_nulls))
+  defp drop_nil_values(value, _preserve_nulls), do: value
 
   defp resolve_secret_setting(nil, fallback), do: normalize_secret_value(fallback)
 

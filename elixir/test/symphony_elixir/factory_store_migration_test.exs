@@ -86,47 +86,56 @@ defmodule SymphonyElixir.FactoryStoreMigrationTest do
 
     {:ok, original} = Store.start_link(database: database)
 
-    try do
-      Store.query!(original, "ALTER TABLE runs DROP COLUMN execution_mode")
+    version16_applied_at =
+      try do
+        Store.query!(original, "DELETE FROM factory_schema_migrations WHERE version = 16")
+        Store.query!(original, "ALTER TABLE runs DROP COLUMN execution_mode")
+        assert Store.one!(original, "SELECT MAX(version) AS version FROM factory_schema_migrations")["version"] == 15
+        assert Store.one!(original, "SELECT COUNT(*) AS count FROM factory_schema_migrations")["count"] == 15
 
-      Store.query!(original, """
-      INSERT INTO runs (run_id, issue_key, kind, state, candidate_sha, created_at, updated_at)
-      VALUES ('historical-run', 'PPL-100', 'SPECIFICATION', 'FAILED', 'old-candidate', 'created-old', 'updated-old')
-      """)
+        Store.query!(original, """
+        INSERT INTO runs (run_id, issue_key, kind, state, candidate_sha, created_at, updated_at)
+        VALUES ('historical-run', 'PPL-100', 'SPECIFICATION', 'FAILED', 'old-candidate', 'created-old', 'updated-old')
+        """)
 
-      Store.query!(original, """
-      INSERT INTO events (occurred_at, event_type, run_id, payload_json)
-      VALUES ('event-old', 'HISTORICAL_EVENT', 'historical-run', '{"kept":true}')
-      """)
+        Store.query!(original, """
+        INSERT INTO events (occurred_at, event_type, run_id, payload_json)
+        VALUES ('event-old', 'HISTORICAL_EVENT', 'historical-run', '{"kept":true}')
+        """)
 
-      Store.query!(original, """
-      INSERT INTO desktop_requests (
-        request_key, target_kind, target_key, action, status, payload_sha256,
-        codex_project_id, model, reasoning_effort, title, prompt, schema_json,
-        cwd, metadata_json, created_at, updated_at
-      ) VALUES (
-        'historical-request', 'CONTROLLER', 'assigned-jira-work', 'FOLLOWUP', 'PENDING',
-        '#{String.duplicate("c", 64)}', 'projectless', 'gpt-test', 'medium', 'Old controller',
-        'Preserve exact request bytes', '{}', '/tmp/controller', '{}', 'created-request', 'updated-request'
-      )
-      """)
+        Store.query!(original, """
+        INSERT INTO desktop_requests (
+          request_key, target_kind, target_key, action, status, payload_sha256,
+          codex_project_id, model, reasoning_effort, title, prompt, schema_json,
+          cwd, metadata_json, created_at, updated_at
+        ) VALUES (
+          'historical-request', 'CONTROLLER', 'assigned-jira-work', 'FOLLOWUP', 'PENDING',
+          '#{String.duplicate("c", 64)}', 'projectless', 'gpt-test', 'medium', 'Old controller',
+          'Preserve exact request bytes', '{}', '/tmp/controller', '{}', 'created-request', 'updated-request'
+        )
+        """)
 
-      historical_before = Store.one!(original, "SELECT * FROM runs WHERE run_id = 'historical-run'")
-      events_before = Store.query!(original, "SELECT * FROM events WHERE run_id = 'historical-run'").rows
-      request_before = Store.one!(original, "SELECT * FROM desktop_requests WHERE request_key = 'historical-request'")
+        historical_before = Store.one!(original, "SELECT * FROM runs WHERE run_id = 'historical-run'")
+        events_before = Store.query!(original, "SELECT * FROM events WHERE run_id = 'historical-run'").rows
+        request_before = Store.one!(original, "SELECT * FROM desktop_requests WHERE request_key = 'historical-request'")
 
-      assert :ok = Store.initialize(original)
-      assert :ok = Store.initialize(original)
+        assert :ok = Store.initialize(original)
+        version16_receipt = Store.one!(original, "SELECT applied_at FROM factory_schema_migrations WHERE version = 16")
+        assert is_binary(version16_receipt["applied_at"])
 
-      upgraded = Store.one!(original, "SELECT * FROM runs WHERE run_id = 'historical-run'")
-      assert upgraded["execution_mode"] == nil
-      assert Map.drop(upgraded, ["execution_mode"]) == historical_before
-      assert Store.query!(original, "SELECT * FROM events WHERE run_id = 'historical-run'").rows == events_before
-      assert Store.one!(original, "SELECT * FROM desktop_requests WHERE request_key = 'historical-request'") == request_before
-      assert Store.one!(original, "SELECT MAX(version) AS version FROM factory_schema_migrations")["version"] == 16
-    after
-      GenServer.stop(original)
-    end
+        assert :ok = Store.initialize(original)
+        assert Store.one!(original, "SELECT applied_at FROM factory_schema_migrations WHERE version = 16") == version16_receipt
+
+        upgraded = Store.one!(original, "SELECT * FROM runs WHERE run_id = 'historical-run'")
+        assert upgraded["execution_mode"] == nil
+        assert Map.drop(upgraded, ["execution_mode"]) == historical_before
+        assert Store.query!(original, "SELECT * FROM events WHERE run_id = 'historical-run'").rows == events_before
+        assert Store.one!(original, "SELECT * FROM desktop_requests WHERE request_key = 'historical-request'") == request_before
+        assert Store.one!(original, "SELECT MAX(version) AS version FROM factory_schema_migrations")["version"] == 16
+        version16_receipt["applied_at"]
+      after
+        GenServer.stop(original)
+      end
 
     {:ok, reopened} = Store.start_link(database: database)
 
@@ -148,6 +157,9 @@ defmodule SymphonyElixir.FactoryStoreMigrationTest do
                "prompt" => "Preserve exact request bytes",
                "status" => "PENDING"
              }
+
+      assert Store.one!(reopened, "SELECT applied_at FROM factory_schema_migrations WHERE version = 16")["applied_at"] ==
+               version16_applied_at
     after
       GenServer.stop(reopened)
     end

@@ -1,6 +1,7 @@
 defmodule SymphonyElixir.FactoryPolicyTest do
   use ExUnit.Case, async: true
 
+  alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.Factory.Policy
 
   test "fails closed before startup when required routing or model roles are missing" do
@@ -95,6 +96,29 @@ defmodule SymphonyElixir.FactoryPolicyTest do
     end
   end
 
+  test "parsed ticket supervisor defaults are valid and explicit nulls reach policy validation" do
+    factory = valid_factory() |> put_in([:manual_validation, "required_apps"], ["polaris-app"])
+
+    assert :ok = validate_parsed_factory(Map.delete(factory, :ticket_supervisor))
+    assert :ok = validate_parsed_factory(Map.put(factory, :ticket_supervisor, %{}))
+
+    assert :ok =
+             validate_parsed_factory(Map.put(factory, :ticket_supervisor, %{"enabled" => false, "pilot_issue_keys" => []}))
+
+    malformed = [
+      Map.put(factory, :ticket_supervisor, nil),
+      Map.put(factory, :ticket_supervisor, %{enabled: nil, pilot_issue_keys: []}),
+      Map.put(factory, :ticket_supervisor, %{"enabled" => false, "pilot_issue_keys" => nil}),
+      factory
+      |> Map.delete(:ticket_supervisor)
+      |> Map.put("ticket_supervisor", %{"enabled" => false, "pilot_issue_keys" => nil})
+    ]
+
+    for attrs <- malformed do
+      assert {:error, :invalid_ticket_supervisor_policy} = validate_parsed_factory(attrs)
+    end
+  end
+
   test "requires a safe branch prefix and complete enabled hibernation policy" do
     factory = valid_factory()
 
@@ -175,5 +199,11 @@ defmodule SymphonyElixir.FactoryPolicyTest do
         "allow_database_ddl" => false
       }
     }
+  end
+
+  defp validate_parsed_factory(factory_attrs) do
+    with {:ok, settings} <- Schema.parse(%{"factory" => factory_attrs}) do
+      Policy.validate(settings.factory)
+    end
   end
 end
