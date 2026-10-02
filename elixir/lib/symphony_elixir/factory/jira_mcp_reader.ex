@@ -181,5 +181,5 @@ defmodule SymphonyElixir.Factory.JiraMcpReader do
   defp normalize_comments(values) when is_list(values), do: {:error, :jira_issue_comments_truncated}
   defp normalize_comments(_values), do: {:error, :jira_issue_comments_invalid}
 
-  defp connector_opts(opts), do: Keyword.take(opts, [:workspace, :app_server])
+  defp connector_opts(opts), do: Keyword.take(opts, [:workspace, :app_server, :mcp_session])
 end

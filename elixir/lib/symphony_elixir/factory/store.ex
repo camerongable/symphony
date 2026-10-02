@@ -11,6 +11,46 @@ defmodule SymphonyElixir.Factory.Store do
 
   @schema_statements [
     """
+    CREATE TABLE IF NOT EXISTS native_source_bindings (
+      run_id TEXT PRIMARY KEY REFERENCES runs(run_id),
+      task_key TEXT NOT NULL UNIQUE REFERENCES factory_tasks(task_key),
+      thread_id TEXT NOT NULL UNIQUE,
+      codex_project_id TEXT NOT NULL,
+      control_workspace TEXT NOT NULL UNIQUE,
+      source_workspace TEXT NOT NULL UNIQUE,
+      attachment_identity TEXT NOT NULL UNIQUE,
+      bootstrap_sha TEXT NOT NULL,
+      bootstrap_request_key TEXT NOT NULL UNIQUE,
+      bootstrap_turn_id TEXT NOT NULL,
+      evidence_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS native_workspace_maintenance (
+      run_id TEXT PRIMARY KEY REFERENCES runs(run_id),
+      generation INTEGER NOT NULL DEFAULT 0,
+      phase TEXT NOT NULL DEFAULT 'AVAILABLE' CHECK(phase IN (
+        'AVAILABLE', 'PROBING', 'ARCHIVE_PENDING', 'ARCHIVED', 'RESTORE_PENDING', 'RECONCILE_REQUIRED'
+      )),
+      binding_json TEXT NOT NULL,
+      binding_sha256 TEXT NOT NULL,
+      request_key TEXT,
+      attachment_identity TEXT,
+      authorization_json TEXT,
+      authorization_at TEXT,
+      cache_receipt_json TEXT,
+      last_error TEXT,
+      checked_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS one_native_workspace_maintenance
+      ON native_workspace_maintenance((1))
+      WHERE phase IN ('PROBING', 'ARCHIVE_PENDING', 'RESTORE_PENDING', 'RECONCILE_REQUIRED')
+    """,
+    """
     CREATE TABLE IF NOT EXISTS factory_schema_migrations (
       version INTEGER PRIMARY KEY,
       applied_at TEXT NOT NULL
@@ -207,6 +247,35 @@ defmodule SymphonyElixir.Factory.Store do
     ON contract_chats(task_key)
     """,
     """
+    CREATE TABLE IF NOT EXISTS mr_feedback_notes (
+      feedback_key TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES runs(run_id),
+      project TEXT NOT NULL,
+      mr_iid INTEGER NOT NULL,
+      discussion_id TEXT NOT NULL,
+      note_id INTEGER NOT NULL,
+      note_updated_at TEXT NOT NULL,
+      author_id INTEGER NOT NULL,
+      body_sha256 TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN (
+        'PENDING', 'CLAIMED', 'COMPLETE', 'FAILED', 'SUPERSEDED',
+        'CHANGE_REQUEST', 'REWORKING', 'RECONCILE_REQUIRED'
+      )),
+      request_key TEXT,
+      controller_previous_turn_id TEXT,
+      reply_id INTEGER,
+      last_error TEXT,
+      reply_phase INTEGER NOT NULL DEFAULT 0,
+      review_batch_key TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS mr_feedback_notes_by_status
+    ON mr_feedback_notes(status, created_at)
+    """,
+    """
     CREATE TABLE IF NOT EXISTS desktop_requests (
       request_key TEXT PRIMARY KEY,
       target_kind TEXT NOT NULL CHECK(target_kind IN ('TASK', 'CONTROLLER')),
@@ -286,6 +355,8 @@ defmodule SymphonyElixir.Factory.Store do
     "contract_markdown" => "TEXT",
     "plan_markdown" => "TEXT",
     "repair_findings_json" => "TEXT",
+    "review_feedback_json" => "TEXT",
+    "review_base_sha" => "TEXT",
     "manual_validation_required" => "INTEGER",
     "implementation_iteration" => "INTEGER NOT NULL DEFAULT 0",
     "code_repair_round" => "INTEGER NOT NULL DEFAULT 0",
@@ -338,6 +409,15 @@ defmodule SymphonyElixir.Factory.Store do
 
   @contract_chat_columns %{
     "reply_evidence_json" => "TEXT"
+  }
+
+  @mr_feedback_columns %{
+    "request_key" => "TEXT",
+    "controller_previous_turn_id" => "TEXT",
+    "reply_id" => "INTEGER",
+    "last_error" => "TEXT",
+    "reply_phase" => "INTEGER NOT NULL DEFAULT 0",
+    "review_batch_key" => "TEXT"
   }
 
   @type connection :: DBConnection.conn()
@@ -397,14 +477,16 @@ defmodule SymphonyElixir.Factory.Store do
     ensure_columns(connection, "factory_tasks", @task_columns)
     ensure_columns(connection, "desktop_requests", @desktop_request_columns)
     ensure_columns(connection, "contract_chats", @contract_chat_columns)
+    ensure_columns(connection, "mr_feedback_notes", @mr_feedback_columns)
+    migrate_mr_feedback_statuses(connection)
 
     query!(
       connection,
       """
       INSERT OR IGNORE INTO factory_schema_migrations(version, applied_at)
-      VALUES (1, ?), (2, ?), (3, ?), (4, ?), (5, ?), (6, ?), (7, ?), (8, ?), (9, ?), (10, ?), (11, ?), (12, ?), (13, ?)
+      VALUES (1, ?), (2, ?), (3, ?), (4, ?), (5, ?), (6, ?), (7, ?), (8, ?), (9, ?), (10, ?), (11, ?), (12, ?), (13, ?), (14, ?), (15, ?)
       """,
-      List.duplicate(iso_now(), 13)
+      List.duplicate(iso_now(), 15)
     )
 
     :ok
@@ -465,6 +547,58 @@ defmodule SymphonyElixir.Factory.Store do
         query!(connection, "ALTER TABLE #{table} ADD COLUMN #{name} #{definition}")
       end
     end)
+  end
+
+  defp migrate_mr_feedback_statuses(connection) do
+    %{"sql" => schema} = one!(connection, "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'mr_feedback_notes'")
+
+    unless Enum.all?(~w(SUPERSEDED CHANGE_REQUEST REWORKING RECONCILE_REQUIRED), &String.contains?(schema, "'#{&1}'")) do
+      transaction!(connection, fn transaction ->
+        query!(transaction, """
+        CREATE TABLE mr_feedback_notes_upgrade (
+          feedback_key TEXT PRIMARY KEY,
+          run_id TEXT NOT NULL REFERENCES runs(run_id),
+          project TEXT NOT NULL,
+          mr_iid INTEGER NOT NULL,
+          discussion_id TEXT NOT NULL,
+          note_id INTEGER NOT NULL,
+          note_updated_at TEXT NOT NULL,
+          author_id INTEGER NOT NULL,
+          body_sha256 TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN (
+            'PENDING', 'CLAIMED', 'COMPLETE', 'FAILED', 'SUPERSEDED',
+            'CHANGE_REQUEST', 'REWORKING', 'RECONCILE_REQUIRED'
+          )),
+          request_key TEXT,
+          controller_previous_turn_id TEXT,
+          reply_id INTEGER,
+          last_error TEXT,
+          reply_phase INTEGER NOT NULL DEFAULT 0,
+          review_batch_key TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        )
+        """)
+
+        query!(transaction, """
+        INSERT INTO mr_feedback_notes_upgrade (
+          feedback_key, run_id, project, mr_iid, discussion_id, note_id,
+          note_updated_at, author_id, body_sha256, status, request_key,
+          controller_previous_turn_id, reply_id, last_error, reply_phase,
+          review_batch_key, created_at, updated_at
+        )
+        SELECT feedback_key, run_id, project, mr_iid, discussion_id, note_id,
+               note_updated_at, author_id, body_sha256, status, request_key,
+               controller_previous_turn_id, reply_id, last_error, reply_phase,
+               review_batch_key, created_at, updated_at
+        FROM mr_feedback_notes
+        """)
+
+        query!(transaction, "DROP TABLE mr_feedback_notes")
+        query!(transaction, "ALTER TABLE mr_feedback_notes_upgrade RENAME TO mr_feedback_notes")
+        query!(transaction, "CREATE INDEX mr_feedback_notes_by_status ON mr_feedback_notes(status, created_at)")
+      end)
+    end
   end
 
   defp iso_now, do: DateTime.utc_now() |> DateTime.to_iso8601()

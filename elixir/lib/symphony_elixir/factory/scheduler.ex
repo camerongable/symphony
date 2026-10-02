@@ -9,6 +9,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
 
   require Logger
 
+  alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.Config
 
   alias SymphonyElixir.Factory.{
@@ -19,10 +20,17 @@ defmodule SymphonyElixir.Factory.Scheduler do
     ControllerTask,
     DesktopRequest,
     IntakeLedger,
+    JiraMcpConnector,
     JiraMcpReader,
     JiraMcpWriter,
+    MrFeedbackConsumer,
+    MrFeedbackLedger,
+    MrFeedbackPoller,
+    MrFeedbackRework,
+    NativeWorkspaceMaintenance,
     Prompt,
     Queue,
+    Recovery,
     RunLedger,
     StageSchemas,
     Store,
@@ -43,18 +51,253 @@ defmodule SymphonyElixir.Factory.Scheduler do
     workspace = controller_workspace(context)
     File.mkdir_p!(workspace)
 
-    with :ok <- DesktopRequest.reconcile_native_successes(context.store),
-         :ok <- reconcile_stale_tasks(context),
-         {:ok, jql} <- Queue.jql(context.factory.queue),
-         {:ok, queued_snapshots} <- fetch_queue(context, workspace, jql),
-         {:ok, _intake_snapshot} <-
-           IntakeLedger.replace(context.store, context.factory.scope, queued_snapshots),
-         {:ok, snapshots} <- fetch_active_snapshots(context, workspace, queued_snapshots),
-         {:ok, intake} <- reconcile_intake(context, snapshots),
-         {:ok, result} <- advance_runs(context, workspace, intake) do
-      :ok = sweep_one_cleanup_candidate(context)
-      {:ok, result}
+    if feedback_controller_in_flight?(context.store) do
+      maybe_consume_review_feedback(context, workspace)
+
+      if feedback_controller_in_flight?(context.store) do
+        {:ok, %{launches: [], events: [], routing_required: []}}
+      else
+        result = run_factory_tick(context, workspace)
+        maybe_poll_review_feedback(context, workspace)
+        maybe_consume_review_feedback(context, workspace)
+        maybe_admit_review_rework(context, workspace)
+        result
+      end
+    else
+      result = run_factory_tick(context, workspace)
+      maybe_poll_review_feedback(context, workspace)
+      maybe_consume_review_feedback(context, workspace)
+      maybe_admit_review_rework(context, workspace)
+      result
     end
+  end
+
+  defp run_factory_tick(context, workspace) do
+    retry_rejected_verifier_creation(context)
+
+    result =
+      with :ok <- DesktopRequest.reconcile_native_successes(context.store),
+           :ok <- reconcile_stale_tasks(context),
+           {:ok, jql} <- Queue.jql(context.factory.queue),
+           {:ok, queued_snapshots} <- fetch_queue(context, workspace, jql),
+           {:ok, _intake_snapshot} <-
+             IntakeLedger.replace(context.store, context.factory.scope, queued_snapshots),
+           {:ok, snapshots} <- fetch_active_snapshots(context, workspace, queued_snapshots),
+           {:ok, intake} <- reconcile_intake(context, snapshots),
+           {:ok, advance_result} <- advance_runs(context, workspace, intake) do
+        :ok = sweep_one_cleanup_candidate(context)
+        NativeWorkspaceMaintenance.reconcile(context.store, context.factory)
+        {:ok, advance_result}
+      end
+
+    result
+  end
+
+  defp retry_rejected_verifier_creation(context) do
+    candidates =
+      Store.query!(
+        context.store,
+        """
+        SELECT request.request_key FROM desktop_requests AS request
+        JOIN factory_tasks AS task ON task.task_key = request.target_key
+        JOIN runs AS run ON run.run_id = task.run_id
+        WHERE request.status = 'RECONCILE_REQUIRED' AND request.failure_code = 'CREATE_THREAD_INVALID_ARGUMENTS'
+          AND request.thread_id IS NULL AND task.role = 'change-verifier' AND task.status = 'WAITING_FOR_BROKER'
+          AND run.state = 'VERIFYING' AND task.task_key = run.run_id || ':change-verifier:' || run.verifier_round
+          AND NOT EXISTS (SELECT id FROM events WHERE event_type = 'REJECTED_NATIVE_CREATE_REARMED'
+            AND json_extract(payload_json, '$.request_key') = request.request_key)
+        ORDER BY request.created_at ASC
+        """,
+        []
+      ).rows
+
+    Enum.reduce_while(candidates, :ok, fn [request_key], :ok ->
+      case Recovery.retry_rejected_native_create(context.store, context.factory, request_key) do
+        {:ok, _recovered} -> {:halt, :ok}
+        {:error, _reason} -> {:cont, :ok}
+      end
+    end)
+  end
+
+  defp feedback_controller_in_flight?(store) do
+    Store.one!(store, "SELECT feedback_key FROM mr_feedback_notes WHERE status = 'CLAIMED' LIMIT 1") != nil or
+      Store.one!(
+        store,
+        "SELECT note.feedback_key FROM mr_feedback_notes AS note JOIN desktop_requests AS request ON request.request_key = note.request_key WHERE note.status = 'CLAIMED' AND request.target_kind = 'CONTROLLER' AND request.status IN ('PENDING', 'CREATE_UNCERTAIN', 'FOLLOWUP_UNCERTAIN', 'THREAD_RECORDED', 'RECONCILE_REQUIRED') LIMIT 1"
+      ) != nil
+  end
+
+  defp maybe_consume_review_feedback(context, workspace) do
+    if review_feedback_enabled?(context.factory) and
+         MrFeedbackLedger.next(context.store) != nil do
+      result =
+        with_review_mcp_session(context, workspace, fn session ->
+          context.feedback_consumer.process_one(context,
+            workspace: workspace,
+            jira_reader: context.jira_reader,
+            gitlab_reader: context.gitlab_reader,
+            gitlab_connector: context.gitlab_connector,
+            gitlab_app_server: context.gitlab_app_server,
+            mcp_session: session,
+            controller_task: context.controller_task
+          )
+        end)
+
+      case result do
+        {:ok, _status} -> :ok
+        {:error, reason} -> Logger.warning("MR feedback consumption deferred reason=#{inspect(reason)}")
+      end
+    end
+
+    :ok
+  end
+
+  defp maybe_poll_review_feedback(context, workspace) do
+    if review_feedback_enabled?(context.factory) and MrFeedbackPoller.review_runs?(context.store) do
+      poll_review_feedback(context, workspace)
+    end
+
+    :ok
+  end
+
+  defp poll_review_feedback(context, workspace) do
+    context
+    |> with_review_mcp_session(workspace, fn session ->
+      MrFeedbackPoller.poll(context,
+        workspace: workspace,
+        jira_reader: context.jira_reader,
+        jira_connector: context.jira_connector || JiraMcpConnector,
+        jira_app_server: context.jira_app_server,
+        gitlab_reader: context.gitlab_reader,
+        gitlab_connector: context.gitlab_connector,
+        gitlab_app_server: context.gitlab_app_server,
+        mcp_session: session
+      )
+    end)
+    |> log_feedback_poll_result()
+  end
+
+  defp log_feedback_poll_result({:error, reason}),
+    do: Logger.warning("MR feedback poll deferred reason=#{inspect(reason)}")
+
+  defp log_feedback_poll_result(%{failures: failures}) do
+    Enum.each(failures, fn {run_id, reason} ->
+      Logger.warning("MR feedback poll skipped run_id=#{run_id} reason=#{inspect(reason)}")
+    end)
+  end
+
+  defp maybe_admit_review_rework(context, workspace) do
+    case MrFeedbackRework.pending_batch(context.store, context.factory.scope) do
+      [] ->
+        :ok
+
+      [%{"run_id" => run_id} | _] = receipts ->
+        result =
+          with_review_mcp_session(context, workspace, fn session ->
+            admit_review_rework(context, workspace, run_id, receipts, session)
+          end)
+
+        case result do
+          {:ok, :clarification_queued} -> :ok
+          {:ok, _batch_key} -> :ok
+          {:error, reason} -> Logger.warning("MR review rework deferred run_id=#{run_id} reason=#{inspect(reason)}")
+        end
+    end
+  end
+
+  defp admit_review_rework(context, workspace, run_id, receipts, session) do
+    with {:ok, run} <- RunLedger.get(context.store, run_id),
+         true <- native_transport?(context) or {:error, :review_rework_requires_native_writer},
+         route <- route_for_run(context, run),
+         {:ok, jira} <-
+           context.jira_reader.issue(run["issue_key"],
+             workspace: workspace,
+             connector: context.jira_connector || JiraMcpConnector,
+             app_server: context.jira_app_server,
+             mcp_session: session
+           ),
+         {:ok, %{mr: mr, discussions: discussions}} <-
+           context.gitlab_reader.fetch(route, run,
+             workspace: workspace,
+             connector: context.gitlab_connector,
+             app_server: context.gitlab_app_server,
+             mcp_session: session
+           ) do
+      case MrFeedbackRework.ambiguous_receipt(receipts, discussions) do
+        nil ->
+          admit_verified_review_rework(context, run, receipts, route, jira, mr, discussions)
+
+        receipt ->
+          handle_ambiguous_review_receipt(context.store, receipt)
+      end
+    else
+      false -> {:error, :review_rework_requires_native_writer}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp handle_ambiguous_review_receipt(store, %{"status" => "CHANGE_REQUEST", "feedback_key" => key}) do
+    :ok = MrFeedbackLedger.requeue_clarification(store, key)
+    {:ok, :clarification_queued}
+  end
+
+  defp handle_ambiguous_review_receipt(_store, %{"status" => "RECONCILE_REQUIRED"}),
+    do: {:ok, :reconciliation_required}
+
+  defp admit_verified_review_rework(context, run, receipts, route, jira, mr, discussions) do
+    policy = Map.get(context.factory, :review_feedback, %{})
+    allowed = Map.get(policy, "allowed_author_ids", [11_599_766])
+    bot_id = Map.get(policy, "bot_author_id", 0)
+
+    with {:ok, _capacity} <- ensure_writer_capacity(context, run["repo_key"], exclude_writer_issue_key: run["issue_key"]),
+         {:ok, %{sha: sha}} <-
+           context.worktree.validate_native(writer_route(context, run), run["worktree"],
+             clean: true,
+             detached: false,
+             expected_branch: run["branch"],
+             expected_sha: run["candidate_sha"]
+           ) do
+      MrFeedbackRework.admit(context.store, run, receipts, %{
+        route: route,
+        jira: jira,
+        mr: mr,
+        discussions: discussions,
+        verified_writer_sha: sha,
+        allowed_authors: allowed,
+        bot_id: bot_id,
+        controller_scope: context.factory.scope
+      })
+    end
+  end
+
+  defp with_review_mcp_session(context, workspace, operation) do
+    if context.jira_reader == JiraMcpReader and context.gitlab_reader == SymphonyElixir.Factory.MrFeedbackMcpReader and
+         context.jira_app_server == AppServer and context.gitlab_app_server == AppServer do
+      case AppServer.start_session(workspace,
+             ephemeral: true,
+             required_mcp_servers: ["Jira", "GitLab"],
+             mcp_startup_timeout_ms: 60_000,
+             gitlab_mcp_startup_timeout_sec: 45,
+             service_name: "symphony-factory-connector",
+             thread_source: "symphonyFactoryConnector"
+           ) do
+        {:ok, session} ->
+          try do
+            operation.(session)
+          after
+            AppServer.stop_session(session)
+          end
+
+        {:error, _reason} = error ->
+          error
+      end
+    else
+      operation.(nil)
+    end
+  end
+
+  defp review_feedback_enabled?(factory) do
+    Map.get(Map.get(factory, :review_feedback, %{}), "enabled", Map.get(factory, :task_transport) == "desktop_broker")
   end
 
   defp dependencies(context, opts) do
@@ -68,6 +311,10 @@ defmodule SymphonyElixir.Factory.Scheduler do
     |> Map.put(:jira_reader, Keyword.get(opts, :jira_reader, JiraMcpReader))
     |> Map.put(:jira_connector, Keyword.get(opts, :jira_connector))
     |> Map.put(:jira_app_server, Keyword.get(opts, :jira_app_server, SymphonyElixir.Codex.AppServer))
+    |> Map.put(:gitlab_reader, Keyword.get(opts, :gitlab_reader, SymphonyElixir.Factory.MrFeedbackMcpReader))
+    |> Map.put(:gitlab_connector, Keyword.get(opts, :gitlab_connector, SymphonyElixir.Factory.GitLabMcpConnector))
+    |> Map.put(:gitlab_app_server, Keyword.get(opts, :gitlab_app_server, SymphonyElixir.Codex.AppServer))
+    |> Map.put(:feedback_consumer, Keyword.get(opts, :feedback_consumer, MrFeedbackConsumer))
   end
 
   defp reconcile_stale_tasks(context) do
@@ -637,6 +884,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
            ),
          {:ok, contract} <- Contract.authorized_from_snapshot(snapshot, issue_key),
          :ok <- validate_delivery_authorization(context, snapshot, contract),
+         {risk, risk_signals} <- delivery_risk_metadata(context.store, contract),
          {:ok, manual_required} <- Contract.manual_validation_required(contract.markdown),
          {:ok, manual_environment} <- Contract.manual_validation_environment(contract.markdown),
          :ok <- validate_manual_policy(context.factory.manual_validation, manual_required, manual_environment),
@@ -651,6 +899,8 @@ defmodule SymphonyElixir.Factory.Scheduler do
              spec_revision: contract.revision,
              contract_sha256: contract.sha256,
              contract_markdown: contract.markdown,
+             risk: risk,
+             risk_signals_json: Jason.encode!(risk_signals),
              manual_validation_required: manual_required,
              repo_key: route["repo_key"],
              repo_path: route["path"],
@@ -679,6 +929,32 @@ defmodule SymphonyElixir.Factory.Scheduler do
 
       {:error, reason} ->
         {:error, {:delivery_registration_failed, reason}}
+    end
+  end
+
+  defp delivery_risk_metadata(store, contract) do
+    result =
+      Store.query!(
+        store,
+        "SELECT risk, risk_signals_json FROM runs WHERE issue_key = ? AND kind = 'SPECIFICATION' " <>
+          "AND state = 'DELIVERED' AND spec_revision = ? AND contract_sha256 = ? AND contract_markdown = ?",
+        [contract.issue_key, contract.revision, contract.sha256, contract.markdown]
+      )
+
+    # Jira prose cannot downgrade a writer; only a unique, exact authorized specification supplies risk metadata.
+    case result.rows do
+      [[risk, signals]] when is_binary(risk) and is_binary(signals) ->
+        with normalized <- risk |> String.trim() |> String.downcase(),
+             true <- normalized in ~w(low routine medium high critical unknown),
+             {:ok, values} when is_list(values) <- Jason.decode(signals),
+             true <- Enum.all?(values, &is_binary/1) do
+          {normalized, values}
+        else
+          _other -> {"unknown", []}
+        end
+
+      _other ->
+        {"unknown", []}
     end
   end
 
@@ -787,18 +1063,24 @@ defmodule SymphonyElixir.Factory.Scheduler do
   end
 
   defp validate_status(status, allowed, snapshot, run, labels) do
-    in_dev_delivery? = status == "IN DEV" and run["kind"] == "DELIVERY" and Enum.any?(["ai-running", "ai-ready"], &(&1 in labels))
-
-    in_dev_contract_update? =
-      status == "IN DEV" and run["kind"] == "SPECIFICATION" and
-        present?(run["parent_run_id"]) and "ai-running" in labels
-
-    if status in allowed or in_dev_delivery? or in_dev_contract_update? do
+    if status in allowed or in_dev_delivery?(status, run, labels) or in_dev_contract_update?(status, run, labels) do
       :ok
     else
       {:cancel, {:jira_status_left_factory_scope, snapshot_value(snapshot, "status")}}
     end
   end
+
+  defp in_dev_delivery?("IN DEV", %{"kind" => "DELIVERY"} = run, labels) do
+    Enum.any?(["ai-running", "ai-ready"], &(&1 in labels)) or
+      (review_rework?(run) and "ai-review" in labels)
+  end
+
+  defp in_dev_delivery?(_status, _run, _labels), do: false
+
+  defp in_dev_contract_update?("IN DEV", %{"kind" => "SPECIFICATION"} = run, labels),
+    do: present?(run["parent_run_id"]) and "ai-running" in labels
+
+  defp in_dev_contract_update?(_status, _run, _labels), do: false
 
   defp validate_kind_labels(%{"kind" => "SPECIFICATION"} = run, labels) do
     contract_update? = present?(run["parent_run_id"]) and "ai-running" in labels
@@ -810,8 +1092,10 @@ defmodule SymphonyElixir.Factory.Scheduler do
     end
   end
 
-  defp validate_kind_labels(%{"kind" => "DELIVERY"}, labels) do
-    if delivery_label?(labels), do: :ok, else: {:cancel, :delivery_labels_removed}
+  defp validate_kind_labels(%{"kind" => "DELIVERY"} = run, labels) do
+    if delivery_label?(labels) or (review_rework?(run) and "ai-review" in labels),
+      do: :ok,
+      else: {:cancel, :delivery_labels_removed}
   end
 
   defp validate_kind_labels(%{"kind" => "VALIDATION"}, labels) do
@@ -1592,7 +1876,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
   end
 
   defp advance_delivery(context, _workspace, %{"state" => state} = run, acc)
-       when state in ["WRITING", "REPAIRING"] do
+       when state in ["WRITING", "REPAIRING", "REVIEW_WRITING"] do
     case ensure_run_writer(context, run, acc) do
       {:ok, materialized_run, updated_acc} -> advance_writer(context, materialized_run, updated_acc)
       {:error, reason} -> block_run(context, controller_workspace(context), run, reason, acc)
@@ -1601,6 +1885,10 @@ defmodule SymphonyElixir.Factory.Scheduler do
 
   defp advance_delivery(context, _workspace, %{"state" => "VERIFYING"} = run, acc) do
     advance_verifier(context, run, acc)
+  end
+
+  defp advance_delivery(context, workspace, %{"state" => "REVIEW_PUSHING"} = run, acc) do
+    advance_review_push(context, workspace, run, acc)
   end
 
   defp advance_delivery(context, workspace, %{"state" => "CI_PUSHING"} = run, acc) do
@@ -1728,6 +2016,113 @@ defmodule SymphonyElixir.Factory.Scheduler do
 
   defp advance_delivery(_context, _workspace, _run, acc), do: {:ok, acc}
 
+  defp advance_review_push(context, workspace, run, acc) do
+    route = route_for_run(context, run)
+
+    result =
+      with_review_mcp_session(context, workspace, fn session ->
+        with :ok <- require_review_verifier_pass(context.store, run),
+             {:ok, %{sha: candidate}} <-
+               context.worktree.validate_native(writer_route(context, run), run["worktree"],
+                 clean: true,
+                 detached: false,
+                 expected_branch: run["branch"],
+                 expected_sha: run["candidate_sha"]
+               ),
+             {:ok, jira} <-
+               context.jira_reader.issue(run["issue_key"],
+                 workspace: workspace,
+                 connector: context.jira_connector || JiraMcpConnector,
+                 app_server: context.jira_app_server,
+                 mcp_session: session
+               ),
+             true <- "ai-review" in Map.get(jira, "labels", []) or {:error, :jira_review_label_missing},
+             {:ok, source} <- read_review_push_source(context, workspace, route, run, session),
+             true <- MrFeedbackRework.source_notes_match?(run, source.discussions) or {:error, :review_source_changed},
+             {:ok, %{sha: ^candidate}} <-
+               context.worktree.push_exact(writer_route(context, run), run["worktree"], run["branch"], candidate),
+             {:ok, %{discussions: readback}} <-
+               context.gitlab_reader.fetch(route, run,
+                 workspace: workspace,
+                 connector: context.gitlab_connector,
+                 app_server: context.gitlab_app_server,
+                 mcp_session: session
+               ),
+             true <- MrFeedbackRework.source_notes_match?(run, readback) or {:error, :review_source_changed},
+             {:ok, batch_key} <- review_batch_key(context.store, run["run_id"]),
+             :ok <- MrFeedbackRework.complete_push(context.store, run["run_id"], batch_key, candidate) do
+          {:ok, candidate}
+        end
+      end)
+
+    case result do
+      {:ok, candidate} ->
+        {:ok, add_event(acc, run["issue_key"], "REVIEW_FEEDBACK_PUSHED", candidate)}
+
+      {:error, reason}
+      when reason in [
+             :review_source_changed,
+             :gitlab_feedback_mr_mismatch,
+             :jira_review_label_missing,
+             :review_verifier_pass_missing
+           ] ->
+        quarantine_review_push(context, run, reason, acc)
+
+      {:error, reason} ->
+        Logger.warning("MR review push deferred run_id=#{run["run_id"]} reason=#{inspect(reason)}")
+        RunLedger.update(context.store, run["run_id"], %{last_error: inspect(reason)})
+        {:ok, acc}
+    end
+  end
+
+  defp quarantine_review_push(context, run, reason, acc) do
+    with {:ok, batch_key} <- review_batch_key(context.store, run["run_id"]),
+         :ok <- MrFeedbackRework.quarantine(context.store, run["run_id"], batch_key, reason) do
+      {:ok, add_event(acc, run["issue_key"], "REVIEW_FEEDBACK_RECONCILE_REQUIRED", Atom.to_string(reason))}
+    end
+  end
+
+  defp require_review_verifier_pass(store, run) do
+    key = "#{run["run_id"]}:change-verifier:#{run["verifier_round"]}"
+    task = Store.one!(store, "SELECT status, output_json FROM factory_tasks WHERE task_key = ?", [key])
+    candidate = run["candidate_sha"]
+
+    case task do
+      %{"status" => "CONSUMED", "output_json" => json} when is_binary(json) ->
+        case Jason.decode(json) do
+          {:ok, %{"status" => "PASS", "candidate_sha" => ^candidate}} -> :ok
+          _other -> {:error, :review_verifier_pass_missing}
+        end
+
+      _other ->
+        {:error, :review_verifier_pass_missing}
+    end
+  end
+
+  defp read_review_push_source(context, workspace, route, run, session) do
+    opts = [
+      workspace: workspace,
+      connector: context.gitlab_connector,
+      app_server: context.gitlab_app_server,
+      mcp_session: session
+    ]
+
+    old_run = Map.put(run, "candidate_sha", run["review_base_sha"])
+
+    case context.gitlab_reader.fetch(route, old_run, opts) do
+      {:ok, source} -> {:ok, source}
+      {:error, :gitlab_feedback_mr_mismatch} -> context.gitlab_reader.fetch(route, run, opts)
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp review_batch_key(store, run_id) do
+    case Store.query!(store, "SELECT DISTINCT review_batch_key FROM mr_feedback_notes WHERE run_id = ? AND status = 'REWORKING' LIMIT 2", [run_id]).rows do
+      [[key]] when is_binary(key) -> {:ok, key}
+      _other -> {:error, :review_feedback_batch_missing}
+    end
+  end
+
   defp consume_feature_planner(context, run, route, planning_path, output, acc) do
     with :ok <- remove_stage_workspace(context, run, route, planning_path) do
       case output do
@@ -1758,10 +2153,27 @@ defmodule SymphonyElixir.Factory.Scheduler do
     else
       writer_schema = if native_transport?(context), do: :native_feature_writer, else: :feature_writer
 
-      stage = %{
-        issue: issue_from_snapshot(snapshot),
-        workspace: run["worktree"],
-        prompt:
+      writer_opts = [
+        controller_commits: native_transport?(context),
+        run_id: run["run_id"],
+        spec_revision: run["spec_revision"],
+        base_ref: "origin/#{run["base_branch"]}",
+        iteration_limit: context.factory.maximum_implementation_iterations
+      ]
+
+      prompt =
+        if review_rework?(run) do
+          Prompt.review_feedback_writer(
+            snapshot,
+            run["contract_markdown"],
+            run["contract_sha256"],
+            run["plan_markdown"],
+            iteration,
+            decode_json(run["review_feedback_json"], []),
+            findings,
+            writer_opts
+          )
+        else
           Prompt.feature_writer(
             snapshot,
             run["contract_markdown"],
@@ -1769,12 +2181,14 @@ defmodule SymphonyElixir.Factory.Scheduler do
             run["plan_markdown"],
             iteration,
             findings,
-            controller_commits: native_transport?(context),
-            run_id: run["run_id"],
-            spec_revision: run["spec_revision"],
-            base_ref: "origin/#{run["base_branch"]}",
-            iteration_limit: context.factory.maximum_implementation_iterations
-          ),
+            writer_opts
+          )
+        end
+
+      stage = %{
+        issue: issue_from_snapshot(snapshot),
+        workspace: run["worktree"],
+        prompt: prompt,
         schema: StageSchemas.for_stage(writer_schema),
         task_key: "#{run["run_id"]}:feature-writer",
         stage: run["state"],
@@ -1803,7 +2217,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
   end
 
   defp consume_feature_writer(context, run, iteration, %{"status" => "COMPLETE", "commit_sha" => commit_sha}, acc) do
-    preflight? = ci_preflight?(route_for_run(context, run))
+    preflight? = ci_preflight?(route_for_run(context, run)) and not review_rework?(run)
 
     with {:ok, head} <- context.worktree.candidate(run["worktree"], run["base_branch"]),
          true <- commit_sha == head or {:error, :writer_sha_mismatch},
@@ -1836,15 +2250,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
         stage_spec = %{
           issue: issue_from_snapshot(snapshot),
           workspace: verification_path,
-          prompt:
-            Prompt.change_verifier(
-              snapshot,
-              run["contract_markdown"],
-              run["contract_sha256"],
-              run["candidate_sha"],
-              run["base_branch"],
-              decode_json(run["ci_evidence_json"], nil)
-            ),
+          prompt: verifier_prompt(run, snapshot),
           schema: StageSchemas.for_stage(:change_verifier),
           task_key: task_key,
           stage: "VERIFYING",
@@ -1867,6 +2273,28 @@ defmodule SymphonyElixir.Factory.Scheduler do
     end
   end
 
+  defp verifier_prompt(run, snapshot) do
+    if review_rework?(run) do
+      Prompt.review_feedback_verifier(
+        snapshot,
+        run["contract_markdown"],
+        run["contract_sha256"],
+        run["candidate_sha"],
+        run["base_branch"],
+        decode_json(run["review_feedback_json"], [])
+      )
+    else
+      Prompt.change_verifier(
+        snapshot,
+        run["contract_markdown"],
+        run["contract_sha256"],
+        run["candidate_sha"],
+        run["base_branch"],
+        decode_json(run["ci_evidence_json"], nil)
+      )
+    end
+  end
+
   defp consume_change_verifier(context, run, route, verification_path, output, acc) do
     cleanup_result = remove_stage_workspace(context, run, route, verification_path)
 
@@ -1877,7 +2305,13 @@ defmodule SymphonyElixir.Factory.Scheduler do
   end
 
   defp consume_change_verifier_output(context, run, %{"status" => "PASS"}, acc) do
-    state = if preflight_verified?(context, run), do: "MR_CREATING", else: "PUSHING"
+    state =
+      cond do
+        review_rework?(run) -> "REVIEW_PUSHING"
+        preflight_verified?(context, run) -> "MR_CREATING"
+        true -> "PUSHING"
+      end
+
     RunLedger.update(context.store, run["run_id"], %{state: state})
     {:ok, add_event(acc, run["issue_key"], "VERIFICATION_PASSED", run["candidate_sha"])}
   end
@@ -1887,7 +2321,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
 
     if repair_round <= context.factory.maximum_code_repair_rounds do
       RunLedger.update(context.store, run["run_id"], %{
-        state: "REPAIRING",
+        state: if(review_rework?(run), do: "REVIEW_WRITING", else: "REPAIRING"),
         code_repair_round: repair_round,
         repair_findings_json: Jason.encode!(findings)
       })
@@ -2010,6 +2444,12 @@ defmodule SymphonyElixir.Factory.Scheduler do
   defp ci_bazel_passed?(_output), do: false
 
   defp ci_preflight?(route), do: route["ci_preflight"] == "draft_mr"
+
+  defp review_rework?(%{"review_base_sha" => sha, "review_feedback_json" => feedback})
+       when is_binary(sha) and is_binary(feedback),
+       do: true
+
+  defp review_rework?(_run), do: false
 
   defp preflight_verified?(context, run) do
     evidence = decode_json(run["ci_evidence_json"], %{})
@@ -2555,7 +2995,14 @@ defmodule SymphonyElixir.Factory.Scheduler do
       task = Store.one!(transaction, "SELECT * FROM factory_tasks WHERE task_key = ?", [task_key])
 
       if native_writer_slice_current?(current_run, run, task, output_json) do
-        write_native_writer_slice(transaction, run, task_key, status, sha, ci_preflight?(route_for_run(context, run)))
+        write_native_writer_slice(
+          transaction,
+          run,
+          task_key,
+          status,
+          sha,
+          ci_preflight?(route_for_run(context, run)) and not review_rework?(run)
+        )
       else
         {:error, :native_writer_slice_state_changed}
       end
@@ -2567,16 +3014,19 @@ defmodule SymphonyElixir.Factory.Scheduler do
     next_state = if status == "COMPLETE", do: if(preflight?, do: "CI_PUSHING", else: "VERIFYING"), else: run["state"]
     verifier_round = run["verifier_round"] + if(status == "COMPLETE" and not preflight?, do: 1, else: 0)
 
-    Store.query!(
-      transaction,
-      "UPDATE runs SET state = ?, candidate_sha = ?, implementation_iteration = ?, verifier_round = ?, repair_findings_json = '[]', updated_at = ? WHERE run_id = ?",
-      [next_state, sha, run["implementation_iteration"] + 1, verifier_round, timestamp, run["run_id"]]
-    )
+    {:ok, _updated_run} =
+      RunLedger.update(transaction, run["run_id"], %{
+        state: next_state,
+        candidate_sha: sha,
+        implementation_iteration: run["implementation_iteration"] + 1,
+        verifier_round: verifier_round,
+        repair_findings_json: "[]"
+      })
 
     Store.query!(
       transaction,
-      "UPDATE factory_tasks SET status = 'CONSUMED', updated_at = ? WHERE task_key = ?",
-      [timestamp, task_key]
+      "UPDATE factory_tasks SET status = 'CONSUMED', workspace_sha = ?, updated_at = ? WHERE task_key = ?",
+      [sha, timestamp, task_key]
     )
 
     {:ok, sha}
@@ -2593,7 +3043,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
 
     expected_task = %{"status" => "COMPLETE", "output_json" => output_json, "run_id" => run["run_id"]}
 
-    run["state"] in ["WRITING", "REPAIRING"] and is_map(current_run) and is_map(task) and
+    run["state"] in ["WRITING", "REPAIRING", "REVIEW_WRITING"] and is_map(current_run) and is_map(task) and
       Map.take(current_run, Map.keys(expected_run)) == expected_run and
       Map.take(task, Map.keys(expected_task)) == expected_task
   end
@@ -2660,6 +3110,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
         resume_terminal: stage_spec.persistent?,
         active_task_keys: context.active_task_keys,
         task_transport: Map.get(context.factory, :task_transport, "app_server"),
+        native_source_attachment_enabled: Map.get(context.factory, :native_source_attachment_enabled, false),
         workspace_mode: Map.get(stage_spec, :workspace_mode),
         expected_sha: Map.get(stage_spec, :expected_sha)
       )

@@ -554,6 +554,11 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         Answer the question in that Codex chat to continue this ticket.
                       </span>
                       <span :if={run.last_error} class="danger-text"><%= task_failure_summary(run.last_error) %></span>
+                      <div :if={Map.get(run, :handoff_attention)} class="detail-stack danger-text">
+                        <strong><%= run.handoff_attention.label %></strong>
+                        <span><%= run.handoff_attention.reason %></span>
+                        <span class="muted">Request: <%= run.handoff_attention.request_key %></span>
+                      </div>
                     </div>
                   </td>
                   <td data-label="Workspace">
@@ -792,7 +797,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         </div>
                       </td>
                       <td data-label="Status">
-                        <span class={state_badge_class(task.status)}><%= humanize_factory_code(task.status) %></span>
+                        <span class={state_badge_class(if Map.get(task, :handoff_attention), do: "NEEDS_ATTENTION", else: task.status)}>
+                          <%= humanize_factory_code(if Map.get(task, :handoff_attention), do: "NEEDS_ATTENTION", else: task.status) %>
+                        </span>
                       </td>
                       <td data-label="Model">
                         <div class="detail-stack">
@@ -801,8 +808,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         </div>
                       </td>
                       <td data-label="Failure" class="task-failure">
-                        <span :if={task.failure_code} class="danger-text"><%= task_failure_summary(task.failure_code) %></span>
-                        <span :if={!task.failure_code} class="muted">—</span>
+                        <div :if={Map.get(task, :handoff_attention)} class="detail-stack danger-text">
+                          <strong><%= task.handoff_attention.label %></strong>
+                          <span><%= task.handoff_attention.reason %></span>
+                        </div>
+                        <span :if={task.failure_code && !Map.get(task, :handoff_attention)} class="danger-text"><%= task_failure_summary(task.failure_code) %></span>
+                        <span :if={!task.failure_code && !Map.get(task, :handoff_attention)} class="muted">—</span>
                       </td>
                       <td data-label="Codex task">
                         <div :if={task.thread_id} class="inline-actions">

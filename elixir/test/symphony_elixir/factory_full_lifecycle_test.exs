@@ -3,10 +3,16 @@ defmodule SymphonyElixir.FactoryFullLifecycleTest do
 
   alias SymphonyElixir.Factory.{
     Contract,
+    Control,
     DesktopRequest,
+    DesktopToolArgs,
     JiraMcpConnector,
+    MrFeedback,
+    MrFeedbackLedger,
+    Recovery,
     RunLedger,
     Scheduler,
+    StageSchemas,
     Store,
     TaskLauncher,
     TaskLedger
@@ -24,7 +30,8 @@ defmodule SymphonyElixir.FactoryFullLifecycleTest do
       cond do
         Map.has_key?(properties, "snapshot_json") -> snapshot(issue)
         Map.has_key?(properties, "readback_text") -> write_jira(issue, prompt, opts)
-        Map.has_key?(properties, "mr_url") -> create_mr()
+        Map.has_key?(properties, "pipeline_status") -> ci_status(issue)
+        Map.has_key?(properties, "mr_url") -> create_mr(issue)
       end
     end
 
@@ -81,11 +88,41 @@ defmodule SymphonyElixir.FactoryFullLifecycleTest do
        }}
     end
 
-    defp create_mr do
+    defp ci_status(issue) do
+      run = Process.get(:full_lifecycle_store) |> RunLedger.list() |> Enum.find(&(&1["issue_key"] == issue.identifier))
+      [status | remaining] = Process.get(:full_lifecycle_ci_statuses)
+      Process.put(:full_lifecycle_ci_statuses, remaining)
+      {remote_head, 0} = System.cmd("git", ["rev-parse", "refs/heads/#{run["branch"]}"], cd: Process.get(:full_lifecycle_origin))
+      if String.trim(remote_head) != run["candidate_sha"], do: raise("CI cannot report on an unpublished candidate")
+
+      {:ok,
+       %{
+         "status" => status,
+         "mr_url" => run["mr_url"],
+         "iid" => run["mr_iid"],
+         "source_branch" => run["branch"],
+         "target_branch" => run["base_branch"],
+         "sha" => run["candidate_sha"],
+         "draft" => true,
+         "reviewers_count" => 0,
+         "assignee_id" => 11_599_766,
+         "mr_state" => "opened",
+         "pipeline_id" => if(status == "REPAIR", do: 99, else: 100),
+         "pipeline_url" => "https://gitlab.example/pipelines/100",
+         "pipeline_sha" => run["candidate_sha"],
+         "pipeline_ref" => "refs/merge-requests/#{run["mr_iid"]}/head",
+         "pipeline_source" => "merge_request_event",
+         "pipeline_status" => if(status == "REPAIR", do: "failed", else: "success"),
+         "required_jobs" => [%{"id" => 88, "name" => "bazel", "status" => if(status == "REPAIR", do: "failed", else: "success")}],
+         "findings" => if(status == "REPAIR", do: ["repair the deterministic test"], else: [])
+       }}
+    end
+
+    defp create_mr(issue) do
       run =
         Process.get(:full_lifecycle_store)
         |> RunLedger.list()
-        |> Enum.find(&(&1["kind"] == "DELIVERY"))
+        |> Enum.find(&(&1["kind"] == "DELIVERY" and &1["issue_key"] == issue.identifier))
 
       send(self(), {:synthetic_mr, run["branch"], run["candidate_sha"]})
 
@@ -106,9 +143,10 @@ defmodule SymphonyElixir.FactoryFullLifecycleTest do
   end
 
   defmodule JiraConnector do
+    alias SymphonyElixir.FactoryFullLifecycleTest.Tickets
     @spec call(String.t(), map(), keyword()) :: {:ok, map()}
     def call("jira_get_issue", %{"issue_key" => issue_key, "include" => "comments"}, _opts) do
-      ticket = Process.get(:full_lifecycle_ticket)
+      ticket = Tickets.get(issue_key)
       if ticket["key"] != issue_key, do: raise("wrong Jira issue")
 
       ticket =
@@ -125,31 +163,32 @@ defmodule SymphonyElixir.FactoryFullLifecycleTest do
     end
 
     def call("jira_add_comment", %{"issue_key" => issue_key, "body" => body}, _opts) do
-      ticket = Process.get(:full_lifecycle_ticket)
+      ticket = Tickets.get(issue_key)
       if ticket["key"] != issue_key, do: raise("wrong Jira issue")
       id = Integer.to_string(length(ticket["comments"]) + 1)
-      Process.put(:full_lifecycle_ticket, Map.update!(ticket, "comments", &(&1 ++ [%{"id" => id, "text" => body}])))
+      Tickets.put(Map.update!(ticket, "comments", &(&1 ++ [%{"id" => id, "text" => body}])))
       send(self(), {:synthetic_jira_comment, issue_key, body})
       {:ok, %{"id" => id}}
     end
 
     def call("jira_update_issue", %{"issue_key" => issue_key, "fields" => fields}, _opts) when is_binary(fields) do
       %{"labels" => labels} = Jason.decode!(fields)
-      ticket = Process.get(:full_lifecycle_ticket)
+      ticket = Tickets.get(issue_key)
       if ticket["key"] != issue_key, do: raise("wrong Jira issue")
-      Process.put(:full_lifecycle_ticket, Map.put(ticket, "labels", labels))
+      Tickets.put(Map.put(ticket, "labels", labels))
       send(self(), {:synthetic_jira_labels, issue_key, labels})
       {:ok, %{}}
     end
   end
 
   defmodule JiraReader do
+    alias SymphonyElixir.FactoryFullLifecycleTest.Tickets
     @spec search(String.t(), keyword()) :: {:ok, [map()]}
-    def search(_jql, _opts), do: {:ok, [Process.get(:full_lifecycle_ticket)]}
+    def search(_jql, _opts), do: {:ok, [Process.get(:full_lifecycle_ticket) | Process.get(:additional_lifecycle_tickets, [])]}
 
     @spec issue(String.t(), keyword()) :: {:ok, map()}
-    def issue(_issue_key, _opts) do
-      ticket = Process.get(:full_lifecycle_ticket)
+    def issue(issue_key, _opts) do
+      ticket = Tickets.get(issue_key)
       trace = Process.get(:mcp_shell_trace)
       comment = Process.get(:mcp_shell_comment)
 
@@ -161,9 +200,29 @@ defmodule SymphonyElixir.FactoryFullLifecycleTest do
           ticket
         end
 
-      Process.put(:full_lifecycle_ticket, ticket)
+      Tickets.put(ticket)
       {:ok, ticket}
     end
+  end
+
+  defmodule Tickets do
+    def get(issue_key) do
+      [Process.get(:full_lifecycle_ticket) | Process.get(:additional_lifecycle_tickets, [])]
+      |> Enum.find(&(&1["key"] == issue_key))
+    end
+
+    def put(ticket) do
+      if Process.get(:full_lifecycle_ticket)["key"] == ticket["key"] do
+        Process.put(:full_lifecycle_ticket, ticket)
+      else
+        Process.put(
+          :additional_lifecycle_tickets,
+          Enum.map(Process.get(:additional_lifecycle_tickets), &replace(&1, ticket))
+        )
+      end
+    end
+
+    defp replace(current, ticket), do: if(current["key"] == ticket["key"], do: ticket, else: current)
   end
 
   defmodule FakeMcpAppServer do
@@ -183,6 +242,21 @@ defmodule SymphonyElixir.FactoryFullLifecycleTest do
       Process.put(:full_lifecycle_ticket, Map.update!(ticket, "comments", &(&1 ++ [%{"id" => id, "text" => body}])))
       send(self(), {:mcp_jira_comment, issue_key, body})
       {:ok, %{"content" => [%{"type" => "text", "text" => "comment added"}]}}
+    end
+  end
+
+  defmodule GitlabReader do
+    def fetch(route, run, _opts) do
+      mr = Process.get(:full_lifecycle_mr)
+      {head, 0} = System.cmd("git", ["rev-parse", "refs/heads/#{mr["source_branch"]}"], cd: Process.get(:full_lifecycle_origin))
+      mr = Map.put(mr, "sha", String.trim(head))
+
+      if route["gitlab_project"] == mr["project"] and run["mr_iid"] == mr["iid"] and
+           run["mr_url"] == mr["web_url"] and run["branch"] == mr["source_branch"] and run["candidate_sha"] == mr["sha"] do
+        {:ok, %{mr: mr, discussions: Process.get(:full_lifecycle_discussions)}}
+      else
+        {:error, :gitlab_feedback_mr_mismatch}
+      end
     end
   end
 
@@ -294,7 +368,7 @@ defmodule SymphonyElixir.FactoryFullLifecycleTest do
       },
       models: %{
         "default_provider" => "codex",
-        "providers" => %{"codex" => %{"deep" => "gpt-test"}},
+        "providers" => %{"codex" => %{"deep" => "gpt-6-sol"}},
         "roles" =>
           Map.new(
             ~w(specification-author specification-critic feature-planner feature-writer change-verifier),
@@ -302,6 +376,7 @@ defmodule SymphonyElixir.FactoryFullLifecycleTest do
           )
       },
       cleanup: %{},
+      review_feedback: %{"enabled" => false},
       hibernation: %{},
       manual_validation: %{},
       maximum_specifiers: 2,
@@ -332,7 +407,7 @@ defmodule SymphonyElixir.FactoryFullLifecycleTest do
       File.rm_rf(root)
     end)
 
-    %{context: context, store: store, trace: trace}
+    %{context: context, store: store, trace: trace, database: database}
   end
 
   test "a ticket crosses specification confirmation, one resumed writer, verification and draft MR delivery", state do
@@ -451,7 +526,7 @@ defmodule SymphonyElixir.FactoryFullLifecycleTest do
     worktree = SymphonyElixir.Factory.Worktree
 
     assert {:ok, %{launches: [author]}} = tick(context, worktree)
-    complete_native_stage(state.store, author, fn _path -> author_output() end)
+    complete_native_stage(state.store, author, fn _path -> Map.put(author_output(), "risk", "high") end)
     finish(author)
     assert {:ok, %{launches: []}} = tick(context, worktree)
     assert {:ok, %{launches: []}} = tick(context, worktree)
@@ -551,6 +626,418 @@ defmodule SymphonyElixir.FactoryFullLifecycleTest do
              Enum.filter(TaskLedger.list_for_run(state.store, delivery["run_id"]), &TaskLedger.source_writer?/1)
 
     assert [[4]] = Store.query!(state.store, "SELECT COUNT(*) FROM desktop_requests WHERE action = 'CREATE'").rows
+  end
+
+  test "authorized ai-ready work uses the default writer and survives SQLite reopen before verifier dispatch", state do
+    Process.put(:forbid_controller_jira_write, true)
+    repo = state.context.factory.repositories["grail"]["path"]
+    origin = Path.join(state.context.workspace_root, "origin.git")
+    initialize_native_repository!(repo, origin)
+    contract = Contract.bind("PPL-123", 1, author_output()["contract_markdown"] <> "\n\nRisk: low")
+
+    Process.put(
+      :full_lifecycle_ticket,
+      ticket()
+      |> Map.put("labels", ["repo-grail", "ai-ready"])
+      |> Map.put("comments", [
+        %{"id" => "1", "text" => Contract.draft_comment(contract)},
+        %{"id" => "2", "text" => Contract.confirmation_marker(contract)},
+        %{"id" => "3", "text" => Contract.authorization_marker(contract, "2")}
+      ])
+    )
+
+    context =
+      Map.update!(state.context, :factory, fn factory ->
+        models =
+          factory.models
+          |> put_in(["providers", "codex", "fast"], "gpt-6-luna")
+          |> put_in(["roles", "feature-writer"], %{
+            "provider" => "codex",
+            "model_class" => "fast",
+            "reasoning_effort" => "medium"
+          })
+
+        factory |> Map.put(:task_transport, "desktop_broker") |> Map.put(:models, models)
+      end)
+
+    worktree = SymphonyElixir.Factory.Worktree
+    assert {:ok, %{launches: []}} = tick(context, worktree)
+    assert state_for(state.store, "DELIVERY") == "WRITING"
+    refute run_for(state.store, "SPECIFICATION")
+
+    assert {:ok, %{launches: [first_writer]}} = tick(context, worktree)
+
+    assert {:ok, %{"role" => "feature-writer", "model_class" => "fast", "model" => "gpt-6-luna"}} =
+             TaskLedger.get(state.store, first_writer.task_key)
+
+    writer_thread =
+      complete_native_stage(state.store, first_writer, fn path ->
+        File.write!(Path.join(path, "first.txt"), "first\n")
+
+        %{
+          "status" => "CONTINUE",
+          "summary" => "first slice",
+          "changed_paths" => ["first.txt"],
+          "commit_message" => "feat(PPL-123): add first slice",
+          "remaining_criteria" => ["AC-1"],
+          "blockers" => [],
+          "checks" => ["synthetic check"]
+        }
+      end)
+
+    finish(first_writer)
+    assert {:ok, %{launches: []}} = tick(context, worktree)
+    assert {:ok, %{launches: [second_writer]}} = tick(context, worktree)
+    assert second_writer.task_key == first_writer.task_key
+
+    assert complete_native_stage(state.store, second_writer, fn path ->
+             File.write!(Path.join(path, "second.txt"), "second\n")
+
+             %{
+               "status" => "COMPLETE",
+               "summary" => "candidate complete",
+               "changed_paths" => ["second.txt"],
+               "commit_message" => "feat(PPL-123): complete candidate",
+               "remaining_criteria" => [],
+               "blockers" => [],
+               "checks" => ["synthetic check"]
+             }
+           end) == writer_thread
+
+    finish(second_writer)
+    assert %{state: "WRITING", iteration: 1} = delivery_state(state.store)
+    assert {:ok, completed_task} = TaskLedger.get(state.store, second_writer.task_key)
+
+    completed_requests_sql = """
+    SELECT request_key, thread_id, turn_id, output_json FROM desktop_requests
+    WHERE target_key = ? AND status = 'SUCCEEDED' ORDER BY request_key
+    """
+
+    completed_requests = Store.query!(state.store, completed_requests_sql, [second_writer.task_key]).rows
+
+    assert length(completed_requests) == 3
+    GenServer.stop(state.store)
+    {:ok, reopened_store} = Store.start_link(database: state.database)
+    Process.put(:full_lifecycle_store, reopened_store)
+    context = %{context | store: reopened_store}
+
+    assert {:ok, ^completed_task} = TaskLedger.get(reopened_store, second_writer.task_key)
+
+    assert Store.query!(reopened_store, completed_requests_sql, [second_writer.task_key]).rows == completed_requests
+
+    assert {:ok, %{launches: []}} = tick(context, worktree)
+    assert state_for(reopened_store, "DELIVERY") == "VERIFYING"
+    delivery = run_for(reopened_store, "DELIVERY")
+    candidate = delivery["candidate_sha"]
+    assert String.trim(git!(repo, ["rev-list", "--count", "origin/master..#{delivery["branch"]}"])) == "2"
+    refute_received {:synthetic_mr, _, _}
+
+    assert {:ok, %{launches: [verifier]}} = tick(context, worktree)
+    assert {:ok, verifier_task} = TaskLedger.get(reopened_store, verifier.task_key)
+    assert verifier_task["role"] == "change-verifier"
+    assert verifier_task["model_class"] == "deep"
+    bootstrap = await_native_request(reopened_store, verifier.task_key)
+    assert bootstrap["action"] == "CREATE"
+    assert %{result: "INITIALIZED"} = Control.initialize(reopened_store, context.factory)
+    assert {:ok, _} = Control.activate(reopened_store, context.factory, context.factory.dispatcher_id)
+    assert {:ok, _} = DesktopRequest.claim(reopened_store, bootstrap["request_key"])
+
+    assert {:ok, %{"status" => "RECONCILE_REQUIRED"}} =
+             DesktopRequest.fail(reopened_store, bootstrap["request_key"], "CREATE_THREAD_INVALID_ARGUMENTS",
+               rejected_tool_call_id: "exec-1234abcd",
+               tool_error: "create_thread received invalid arguments"
+             )
+
+    verifier_key = verifier.task_key
+    rejection_error = {:desktop_request_reconciliation_required, "CREATE_THREAD_INVALID_ARGUMENTS"}
+    assert_receive {:factory_task_finished, ^verifier_key, {:error, ^rejection_error}}, 5_000
+    Process.demonitor(verifier.ref, [:flush])
+    assert {:ok, %{"status" => "WAITING_FOR_BROKER"}} = TaskLedger.get(reopened_store, verifier_key)
+
+    assert {:ok, %{launches: []}} = tick(context, worktree)
+    assert {:ok, recovered} = DesktopRequest.get(reopened_store, bootstrap["request_key"])
+    assert recovered["status"] == "PENDING"
+    assert recovered["payload_sha256"] == bootstrap["payload_sha256"]
+    assert recovered["target_key"] == verifier.task_key
+
+    assert [[1]] =
+             Store.query!(
+               reopened_store,
+               """
+               SELECT COUNT(*) FROM events WHERE event_type = 'REJECTED_NATIVE_CREATE_REARMED'
+               AND json_extract(payload_json, '$.request_key') = ?
+               """,
+               [bootstrap["request_key"]]
+             ).rows
+
+    complete_native_bootstrap(reopened_store, recovered)
+    Store.query!(reopened_store, "UPDATE factory_tasks SET updated_at = ? WHERE task_key = ?", ["2020-01-01T00:00:00Z", verifier_key])
+    assert {:ok, %{launches: [resumed_verifier]}} = tick(context, worktree)
+    assert resumed_verifier.task_key == verifier_key
+
+    verifier_thread =
+      complete_native_stage(reopened_store, resumed_verifier, fn path ->
+        assert String.trim(git!(path, ["rev-parse", "HEAD"])) == candidate
+        assert String.trim(git!(path, ["rev-parse", "--abbrev-ref", "HEAD"])) == "HEAD"
+        assert path != completed_task["workspace"]
+        %{"status" => "PASS", "candidate_sha" => candidate, "findings" => [], "checks" => ["synthetic check"]}
+      end)
+
+    refute verifier_thread == writer_thread
+    finish(resumed_verifier)
+    assert {:ok, %{launches: []}} = tick(context, worktree)
+    assert state_for(reopened_store, "DELIVERY") == "PUSHING"
+    assert {:ok, %{launches: []}} = tick(context, worktree)
+    assert state_for(reopened_store, "DELIVERY") == "READY_FOR_REVIEW"
+    delivered = run_for(reopened_store, "DELIVERY")
+    assert delivered["candidate_sha"] == candidate
+    assert {:ok, consumed_writer} = TaskLedger.get(reopened_store, second_writer.task_key)
+    assert consumed_writer["workspace_sha"] == candidate
+    assert consumed_writer["turn_id"] == completed_task["turn_id"]
+    assert consumed_writer["output_json"] == completed_task["output_json"]
+    assert delivered["mr_url"] == "https://gitlab.example/grail/-/merge_requests/42"
+    assert String.trim(git!(origin, ["rev-parse", "refs/heads/#{delivered["branch"]}"])) == candidate
+    assert_received {:synthetic_mr, _, ^candidate}
+
+    assert {:ok, %{launches: []}} = tick(context, worktree)
+    assert run_for(reopened_store, "DELIVERY")["mr_url"] == delivered["mr_url"]
+    refute_received {:synthetic_mr, _, _}
+    assert [[2]] = Store.query!(reopened_store, "SELECT COUNT(*) FROM desktop_requests WHERE action = 'CREATE'").rows
+
+    tasks = TaskLedger.list_for_run(reopened_store, delivery["run_id"])
+    assert Enum.sort(Enum.map(tasks, & &1["role"])) == ["change-verifier", "feature-writer"]
+    assert [%{"thread_id" => ^writer_thread}] = Enum.filter(tasks, &TaskLedger.source_writer?/1)
+    refute run_for(reopened_store, "SPECIFICATION")
+
+    route = context.factory.repositories["grail"] |> Map.put("repo_key", "grail")
+
+    mr = %{
+      "project" => route["gitlab_project"],
+      "iid" => delivered["mr_iid"],
+      "web_url" => delivered["mr_url"],
+      "source_branch" => delivered["branch"],
+      "sha" => candidate,
+      "state" => "opened"
+    }
+
+    note = %{
+      "id" => 51,
+      "body" => "@Symphony please update the first slice",
+      "updated_at" => "2026-10-01T00:00:00Z",
+      "author" => %{"id" => 11_599_766}
+    }
+
+    discussion = %{"id" => "discussion-51", "notes" => [note]}
+    Process.put(:full_lifecycle_mr, mr)
+    Process.put(:full_lifecycle_origin, origin)
+    Process.put(:full_lifecycle_discussions, [discussion])
+    receipt_key = classify_review_edit(reopened_store, context, delivered, route, mr, discussion, note)
+    assert {:ok, %{launches: []}} = tick(context, worktree)
+    assert state_for(reopened_store, "DELIVERY") == "REVIEW_WRITING"
+
+    assert {:ok, %{"status" => "RETRY_PENDING", "thread_id" => ^writer_thread, "output_json" => nil}} =
+             TaskLedger.get(reopened_store, second_writer.task_key)
+
+    assert {:ok, %{launches: [review_writer]}} = tick(context, worktree)
+    assert review_writer.task_key == second_writer.task_key
+    review_request = await_native_request(reopened_store, review_writer.task_key)
+    assert review_request["action"] == "FOLLOWUP"
+    assert review_request["existing_thread_id"] == writer_thread
+    refute Enum.any?(completed_requests, &(hd(&1) == review_request["request_key"]))
+    assert String.trim(git!(origin, ["rev-parse", "refs/heads/#{delivered["branch"]}"])) == candidate
+
+    assert complete_native_stage(reopened_store, review_writer, fn path ->
+             File.write!(Path.join(path, "first.txt"), "reviewed\n")
+
+             %{
+               "status" => "COMPLETE",
+               "summary" => "addressed review request",
+               "changed_paths" => ["first.txt"],
+               "commit_message" => "fix(PPL-123): address review feedback",
+               "remaining_criteria" => [],
+               "blockers" => [],
+               "checks" => ["synthetic check"]
+             }
+           end) == writer_thread
+
+    finish(review_writer)
+    assert {:ok, %{launches: []}} = tick(context, worktree)
+    reworked = run_for(reopened_store, "DELIVERY")
+    assert reworked["state"] == "VERIFYING"
+    assert reworked["verifier_round"] == delivered["verifier_round"] + 1
+    assert reworked["implementation_iteration"] == delivered["implementation_iteration"] + 1
+    review_candidate = reworked["candidate_sha"]
+    refute review_candidate == candidate
+    assert {:ok, reworked_writer} = TaskLedger.get(reopened_store, review_writer.task_key)
+    assert reworked_writer["workspace_sha"] == review_candidate
+    assert reworked_writer["thread_id"] == writer_thread
+    assert String.trim(git!(origin, ["rev-parse", "refs/heads/#{delivered["branch"]}"])) == candidate
+    assert {:ok, %{launches: [review_verifier]}} = tick(context, worktree)
+    refute review_verifier.task_key == verifier_key
+
+    fresh_thread =
+      complete_native_stage(reopened_store, review_verifier, fn path ->
+        assert String.trim(git!(path, ["rev-parse", "HEAD"])) == review_candidate
+        assert String.trim(git!(path, ["rev-parse", "--abbrev-ref", "HEAD"])) == "HEAD"
+        %{"status" => "PASS", "candidate_sha" => review_candidate, "findings" => [], "checks" => ["synthetic check"]}
+      end)
+
+    refute fresh_thread in [writer_thread, verifier_thread]
+    finish(review_verifier)
+    assert {:ok, completed_verifier} = TaskLedger.get(reopened_store, review_verifier.task_key)
+    assert completed_verifier["status"] == "COMPLETE"
+    verifier_requests = Store.query!(reopened_store, completed_requests_sql, [review_verifier.task_key]).rows
+    assert length(verifier_requests) == 2
+    GenServer.stop(reopened_store)
+    {:ok, restored_store} = Store.start_link(database: state.database)
+    context = %{context | store: restored_store}
+    Process.put(:full_lifecycle_store, restored_store)
+    assert {:ok, ^completed_verifier} = TaskLedger.get(restored_store, review_verifier.task_key)
+    assert Store.query!(restored_store, completed_requests_sql, [review_verifier.task_key]).rows == verifier_requests
+    assert {:ok, %{launches: []}} = tick(context, worktree)
+    assert state_for(restored_store, "DELIVERY") == "REVIEW_PUSHING"
+    assert String.trim(git!(origin, ["rev-parse", "refs/heads/#{delivered["branch"]}"])) == candidate
+    assert {:ok, %{launches: []}} = tick(context, worktree)
+    reviewed = run_for(restored_store, "DELIVERY")
+    assert reviewed["state"] == "READY_FOR_REVIEW"
+    assert reviewed["mr_url"] == delivered["mr_url"]
+    assert reviewed["mr_iid"] == delivered["mr_iid"]
+    assert reviewed["candidate_sha"] == review_candidate
+    assert String.trim(git!(origin, ["rev-parse", "refs/heads/#{delivered["branch"]}"])) == review_candidate
+
+    assert %{"status" => "PENDING", "reply_phase" => 1} =
+             Store.one!(restored_store, "SELECT status, reply_phase FROM mr_feedback_notes WHERE feedback_key = ?", [receipt_key])
+
+    refute_received {:synthetic_mr, _, _}
+    assert [[3]] = Store.query!(restored_store, "SELECT COUNT(*) FROM desktop_requests WHERE action = 'CREATE'").rows
+
+    assert [%{"thread_id" => ^writer_thread}] =
+             Enum.filter(TaskLedger.list_for_run(restored_store, delivery["run_id"]), &TaskLedger.source_writer?/1)
+  end
+
+  test "an approval-blocked writer and CI repair preserve unrelated dispatch and exact verification", state do
+    repo = state.context.factory.repositories["grail"]["path"]
+    origin = Path.join(state.context.workspace_root, "origin.git")
+    initialize_native_repository!(repo, origin)
+    Process.put(:full_lifecycle_origin, origin)
+    Process.put(:full_lifecycle_ticket, authorized_delivery_ticket("PPL-123"))
+
+    context =
+      Map.update!(state.context, :factory, fn factory ->
+        factory
+        |> Map.put(:task_transport, "desktop_broker")
+        |> put_in([:repositories, "grail", "ci_preflight"], "draft_mr")
+      end)
+
+    assert %{result: "INITIALIZED"} = Control.initialize(state.store, context.factory)
+    assert {:ok, _} = Control.activate(state.store, context.factory, context.factory.dispatcher_id)
+    worktree = SymphonyElixir.Factory.Worktree
+    assert {:ok, %{launches: []}} = tick(context, worktree)
+    assert {:ok, %{launches: [first]}} = tick(context, worktree)
+    writer_thread = complete_native_stage(state.store, first, &native_test_slice(&1, "CONTINUE", "initial"))
+    finish(first)
+    assert {:ok, %{launches: []}} = tick(context, worktree)
+    assert {:ok, %{launches: [denied]}} = tick(context, worktree)
+    blocked_request = await_native_request(state.store, denied.task_key)
+
+    complete_native_stage(state.store, denied, fn _path ->
+      %{
+        "status" => "BLOCKED",
+        "summary" => "approval denied",
+        "changed_paths" => [],
+        "commit_message" => nil,
+        "remaining_criteria" => ["AC-1"],
+        "blockers" => ["required approval denied"],
+        "checks" => []
+      }
+    end)
+
+    finish(denied)
+    assert {:ok, %{launches: []}} = tick(context, worktree)
+    failed = run_for(state.store, "DELIVERY")
+    assert failed["state"] == "FAILED"
+    assert failed["candidate_sha"] != nil
+    assert failed["mr_url"] == nil
+    assert {:ok, denied_request} = DesktopRequest.get(state.store, blocked_request["request_key"])
+    refute_received {:synthetic_mr, _, _}
+    assert Enum.all?(TaskLedger.list_for_run(state.store, failed["run_id"]), &(&1["role"] != "change-verifier"))
+
+    Process.put(:additional_lifecycle_tickets, [authorized_delivery_ticket("PPL-124")])
+    assert {:ok, %{launches: []}} = tick(context, worktree)
+    assert {:ok, %{launches: [unrelated]}} = tick(context, worktree)
+    assert {:ok, unrelated_task} = TaskLedger.get(state.store, unrelated.task_key)
+    assert {:ok, unrelated_run} = RunLedger.get(state.store, unrelated_task["run_id"])
+    assert unrelated_run["issue_key"] == "PPL-124"
+    assert unrelated_run["state"] == "WRITING"
+    assert await_native_request(state.store, unrelated.task_key)["action"] == "CREATE"
+    assert :ok = Task.Supervisor.terminate_child(context.task_supervisor, unrelated.pid)
+    Process.demonitor(unrelated.ref, [:flush])
+    assert {:ok, %{"state" => "FAILED"}} = RunLedger.get(state.store, failed["run_id"])
+
+    assert {:ok, _} = Control.pause(state.store, context.factory, context.factory.dispatcher_id)
+    blocked_key = denied_request["request_key"]
+    blocked_turn = denied_request["turn_id"]
+
+    assert {:ok, %{result: "BLOCKED_NATIVE_WRITER_INVESTIGATION_REARMED"}} =
+             Recovery.resume_blocked_native_writer_investigation(state.store, context.factory, blocked_key, blocked_turn)
+
+    Process.put(:full_lifecycle_ticket, Map.put(Process.get(:full_lifecycle_ticket), "labels", ["repo-grail", "ai-running"]))
+    assert {:ok, _} = Control.activate(state.store, context.factory, context.factory.dispatcher_id)
+    assert {:ok, %{launches: [resumed]}} = tick(context, worktree)
+    assert resumed.task_key == first.task_key
+    assert complete_native_stage(state.store, resumed, &native_test_slice(&1, "COMPLETE", "approval resolved")) == writer_thread
+    finish(resumed)
+    assert {:ok, %{launches: []}} = tick(context, worktree)
+    assert state_for(state.store, "DELIVERY") == "CI_PUSHING"
+    assert {:ok, %{launches: []}} = tick(context, worktree)
+    assert state_for(state.store, "DELIVERY") == "CI_WAITING"
+    preflight = run_for(state.store, "DELIVERY")
+    assert_received {:synthetic_mr, _, _}
+    assert Enum.all?(TaskLedger.list_for_run(state.store, failed["run_id"]), &(&1["role"] != "change-verifier"))
+
+    Process.put(:full_lifecycle_ci_statuses, ["REPAIR", "PASS"])
+    assert {:ok, %{launches: []}} = tick(context, worktree)
+    assert state_for(state.store, "DELIVERY") == "REPAIRING"
+    assert {:ok, %{launches: [ci_repair]}} = tick(context, worktree)
+    assert ci_repair.task_key == first.task_key
+    assert complete_native_stage(state.store, ci_repair, &native_test_slice(&1, "COMPLETE", "CI repaired")) == writer_thread
+    finish(ci_repair)
+    assert {:ok, %{launches: []}} = tick(context, worktree)
+    assert {:ok, %{launches: []}} = tick(context, worktree)
+    repaired = run_for(state.store, "DELIVERY")
+    assert repaired["state"] == "CI_WAITING"
+    assert repaired["mr_iid"] == preflight["mr_iid"]
+    assert repaired["mr_url"] == preflight["mr_url"]
+    refute repaired["candidate_sha"] == preflight["candidate_sha"]
+    assert_received {:synthetic_mr, _, _}
+    assert {:ok, %{launches: []}} = tick(context, worktree)
+    assert state_for(state.store, "DELIVERY") == "VERIFYING"
+    candidate = run_for(state.store, "DELIVERY")["candidate_sha"]
+    assert {:ok, %{launches: [verifier]}} = tick(context, worktree)
+    request = await_native_request(state.store, verifier.task_key)
+    complete_native_bootstrap(state.store, request)
+    request = await_native_request(state.store, verifier.task_key)
+    assert request["action"] == "FOLLOWUP"
+    assert request["prompt"] =~ candidate
+    assert request["prompt"] =~ "bazel"
+
+    complete_native_stage(state.store, verifier, fn path ->
+      assert String.trim(git!(path, ["rev-parse", "HEAD"])) == candidate
+      %{"status" => "PASS", "candidate_sha" => candidate, "findings" => [], "checks" => ["CI bazel passed"]}
+    end)
+
+    finish(verifier)
+    assert {:ok, %{launches: []}} = tick(context, worktree)
+    assert state_for(state.store, "DELIVERY") == "MR_CREATING"
+    assert {:ok, %{launches: []}} = tick(context, worktree)
+    delivered = run_for(state.store, "DELIVERY")
+    assert delivered["state"] == "READY_FOR_REVIEW"
+    assert delivered["mr_iid"] == preflight["mr_iid"]
+    assert delivered["mr_url"] == preflight["mr_url"]
+    assert delivered["candidate_sha"] == candidate
+    assert delivered["ci_preflight_sha"] == candidate
+    assert delivered["ci_pipeline_id"] == 100
+    assert {:ok, %{"state" => "WRITING"}} = RunLedger.get(state.store, unrelated_run["run_id"])
   end
 
   test "a concurrent Jira label change blocks the native write without overwriting it", state do
@@ -984,6 +1471,7 @@ defmodule SymphonyElixir.FactoryFullLifecycleTest do
       controller_task: Controller,
       jira_reader: JiraReader,
       jira_connector: JiraConnector,
+      gitlab_reader: GitlabReader,
       task_launcher: Launcher,
       cleanup: Cleanup,
       worktree: worktree
@@ -995,6 +1483,80 @@ defmodule SymphonyElixir.FactoryFullLifecycleTest do
     assert_receive {:factory_task_started, ^task_key, _thread_id}, 5_000
     assert_receive {:factory_task_finished, ^task_key, {:ok, _result}}, 5_000
     Process.demonitor(launch.ref, [:flush])
+  end
+
+  defp classify_review_edit(store, context, run, route, mr, discussion, note) do
+    jira = Process.get(:full_lifecycle_ticket)
+    assert {:ok, candidate} = MrFeedback.candidate(run, route, jira, mr, discussion, note, [11_599_766], 99)
+    assert {:ok, :recorded} = MrFeedbackLedger.record_candidate(store, candidate)
+    key = "feedback-classification:#{candidate.feedback_key}"
+    Control.record_controller_task(store, context.factory, "feedback-controller", "previous-feedback-turn", %{project_id: "projectless"})
+
+    assert {:ok, _} =
+             DesktopRequest.enqueue(store, %{
+               request_key: key,
+               target_kind: "CONTROLLER",
+               target_key: context.factory.scope,
+               action: "FOLLOWUP",
+               existing_thread_id: "feedback-controller",
+               codex_project_id: "projectless",
+               model: "gpt-6-sol",
+               reasoning_effort: "high",
+               title: "Classify review edit",
+               prompt: "Classify the explicit review edit",
+               cwd: context.workspace_root,
+               schema: StageSchemas.for_stage(:gitlab_feedback_reply)
+             })
+
+    assert {:ok, _} = MrFeedbackLedger.claim(store, candidate.feedback_key, key, "previous-feedback-turn")
+    assert {:ok, _} = DesktopRequest.claim(store, key)
+    assert {:ok, _} = DesktopRequest.record_thread(store, key, "feedback-controller", "projectless")
+
+    assert {:ok, _} =
+             DesktopRequest.complete(store, key, %{
+               thread_id: "feedback-controller",
+               turn_id: "feedback-classified",
+               output: %{
+                 "result" => %{
+                   "status" => "CHANGE_REQUEST",
+                   "feedback_key" => candidate.feedback_key,
+                   "reply_id" => nil,
+                   "reply_body" => nil,
+                   "reason" => "explicit edit"
+                 },
+                 "completed_tool_calls" => []
+               }
+             })
+
+    assert :ok = MrFeedbackLedger.finish(store, candidate.feedback_key, key, "CHANGE_REQUEST", nil, "explicit edit")
+    candidate.feedback_key
+  end
+
+  defp authorized_delivery_ticket(issue_key) do
+    contract = Contract.bind(issue_key, 1, author_output()["contract_markdown"])
+
+    ticket()
+    |> Map.put("key", issue_key)
+    |> Map.put("labels", ["repo-grail", "ai-ready"])
+    |> Map.put("comments", [
+      %{"id" => "1", "text" => Contract.draft_comment(contract)},
+      %{"id" => "2", "text" => Contract.confirmation_marker(contract)},
+      %{"id" => "3", "text" => Contract.authorization_marker(contract, "2")}
+    ])
+  end
+
+  defp native_test_slice(path, status, text) do
+    File.write!(Path.join(path, "feature.txt"), text <> "\n")
+
+    %{
+      "status" => status,
+      "summary" => text,
+      "changed_paths" => ["feature.txt"],
+      "commit_message" => "fix(PPL-123): #{text}",
+      "remaining_criteria" => if(status == "CONTINUE", do: ["AC-1"], else: []),
+      "blockers" => [],
+      "checks" => ["synthetic check"]
+    }
   end
 
   defp run_for(store, kind), do: Enum.find(RunLedger.list(store), &(&1["kind"] == kind))
@@ -1022,27 +1584,7 @@ defmodule SymphonyElixir.FactoryFullLifecycleTest do
 
     {request, thread_id, path} =
       if request["action"] == "CREATE" do
-        assert String.ends_with?(request["request_key"], ":bootstrap")
-        metadata = Jason.decode!(request["metadata_json"])
-        sha = metadata["expected_sha"]
-        path = Path.join(Path.dirname(request["cwd"]), "native-#{System.unique_integer([:positive])}")
-        git!(request["cwd"], ["worktree", "add", "--detach", path, sha])
-        thread_id = "thread-#{task_key}"
-        assert {:ok, _claimed} = DesktopRequest.claim(store, request["request_key"])
-
-        assert {:ok, _recorded} =
-                 DesktopRequest.record_thread(store, request["request_key"], thread_id, "project-grail", %{
-                   cwd: path,
-                   head_sha: sha
-                 })
-
-        assert {:ok, _completed} =
-                 DesktopRequest.complete(store, request["request_key"], %{
-                   thread_id: thread_id,
-                   turn_id: "bootstrap-#{task_key}",
-                   output: %{"result" => %{"status" => "WORKSPACE_READY"}, "completed_tool_calls" => []}
-                 })
-
+        {thread_id, path} = complete_native_bootstrap(store, request)
         {await_native_request(store, task_key), thread_id, path}
       else
         {:ok, task} = TaskLedger.get(store, task_key)
@@ -1084,6 +1626,32 @@ defmodule SymphonyElixir.FactoryFullLifecycleTest do
              })
 
     thread_id
+  end
+
+  defp complete_native_bootstrap(store, request) do
+    assert String.ends_with?(request["request_key"], ":bootstrap")
+    metadata = Jason.decode!(request["metadata_json"])
+    sha = metadata["expected_sha"]
+    assert {:ok, create_arguments} = DesktopToolArgs.create_thread(store, request["request_key"])
+    refute Map.has_key?(create_arguments, "projectId")
+    assert get_in(create_arguments, ["target", "projectId"]) == "project-grail"
+    assert get_in(create_arguments, ["target", "environment", "startingState", "branchName"]) == sha
+    path = Path.join(Path.dirname(request["cwd"]), "native-#{System.unique_integer([:positive])}")
+    git!(request["cwd"], ["worktree", "add", "--detach", path, sha])
+    thread_id = "thread-#{request["target_key"]}"
+    assert {:ok, _claimed} = DesktopRequest.claim(store, request["request_key"])
+
+    assert {:ok, _recorded} =
+             DesktopRequest.record_thread(store, request["request_key"], thread_id, "project-grail", %{cwd: path, head_sha: sha})
+
+    assert {:ok, _completed} =
+             DesktopRequest.complete(store, request["request_key"], %{
+               thread_id: thread_id,
+               turn_id: "bootstrap-#{request["target_key"]}",
+               output: %{"result" => %{"status" => "WORKSPACE_READY"}, "completed_tool_calls" => []}
+             })
+
+    {thread_id, path}
   end
 
   defp await_native_request(store, task_key, attempts \\ 200)

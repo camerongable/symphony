@@ -25,7 +25,7 @@ defmodule SymphonyElixir.Factory.ModelRouter do
   @spec resolve(map(), String.t(), keyword()) :: {:ok, route()} | {:error, term()}
   def resolve(policy, requested_role, opts \\ []) do
     with {:ok, resolved_role, routing_reason} <- resolve_role(policy, requested_role, opts),
-         {:ok, role_policy} <- fetch_path(policy, ["roles", resolved_role]),
+         {:ok, role_policy} <- role_policy(policy, resolved_role),
          provider <-
            Keyword.get(opts, :provider) || value(role_policy, "provider") ||
              value(policy, "default_provider"),
@@ -51,6 +51,15 @@ defmodule SymphonyElixir.Factory.ModelRouter do
       _other -> {:error, :invalid_model_policy}
     end
   end
+
+  defp role_policy(policy, "workspace-maintainer") do
+    case fetch_path(policy, ["roles", "workspace-maintainer"]) do
+      {:ok, role} -> {:ok, role}
+      {:error, _reason} -> {:ok, %{"model_class" => "fast", "reasoning_effort" => "low"}}
+    end
+  end
+
+  defp role_policy(policy, role), do: fetch_path(policy, ["roles", role])
 
   defp resolve_role(policy, requested_role, opts) do
     delivery = value(policy, "delivery_routing") || %{}

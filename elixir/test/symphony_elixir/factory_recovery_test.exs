@@ -1,7 +1,17 @@
 defmodule SymphonyElixir.FactoryRecoveryTest do
   use ExUnit.Case, async: false
 
-  alias SymphonyElixir.Factory.{Admin, Contract, Control, DesktopRequest, RunLedger, Store, TaskLedger, Worktree}
+  alias SymphonyElixir.Factory.{
+    Admin,
+    Contract,
+    Control,
+    DesktopRequest,
+    Recovery,
+    RunLedger,
+    Store,
+    TaskLedger,
+    Worktree
+  }
 
   setup do
     token = "#{System.system_time(:nanosecond)}-#{System.unique_integer([:positive])}"
@@ -277,106 +287,137 @@ defmodule SymphonyElixir.FactoryRecoveryTest do
              Admin.resume_controller_owned_delivery(factory, writer.run_id, candidate)
   end
 
-  test "requeues only an unbound verifier CREATE rejected before task creation", context do
-    writer = native_writer_fixture(context)
-    route = %{"path" => writer.repo, "base_branch" => "master", "codex_project_id" => "grail-project"}
-    factory = Map.put(context.factory, :repositories, %{"grail" => route})
-    task_key = "#{writer.run_id}:change-verifier:2"
-    request_key = "desktop:rejected-verifier-create:bootstrap"
+  for recovery_mode <- [:manual, :automatic] do
+    @tag recovery_mode: recovery_mode
+    test "#{recovery_mode} recovery requeues only an unbound verifier CREATE rejected before task creation", context do
+      recovery_mode = context.recovery_mode
+      writer = native_writer_fixture(context)
+      route = %{"path" => writer.repo, "base_branch" => "master", "codex_project_id" => "grail-project"}
+      factory = Map.put(context.factory, :repositories, %{"grail" => route})
+      task_key = "#{writer.run_id}:change-verifier:2"
+      request_key = "desktop:rejected-verifier-create:bootstrap"
 
-    assert {:ok, _run} =
-             RunLedger.update(context.store, writer.run_id, %{
-               state: "VERIFYING",
-               workspace_state: "CODEX_NATIVE",
-               candidate_sha: writer.parent_sha,
-               verifier_round: 2
-             })
+      assert {:ok, _run} =
+               RunLedger.update(context.store, writer.run_id, %{
+                 state: "VERIFYING",
+                 workspace_state: "CODEX_NATIVE",
+                 candidate_sha: writer.parent_sha,
+                 verifier_round: 2
+               })
 
-    assert {:ok, _task} =
-             TaskLedger.register(context.store, %{
-               task_key: task_key,
-               run_id: writer.run_id,
-               stage: "VERIFYING",
-               role: "change-verifier",
-               status: "WAITING_FOR_BROKER",
-               model_provider: "codex",
-               model_class: "deep",
-               model: "gpt-6-sol",
-               reasoning_effort: "xhigh",
-               routing_reason: "test",
-               prompt_sha256: String.duplicate("e", 64),
-               codex_project_id: "grail-project",
-               workspace_sha: writer.parent_sha
-             })
+      assert {:ok, _task} =
+               TaskLedger.register(context.store, %{
+                 task_key: task_key,
+                 run_id: writer.run_id,
+                 stage: "VERIFYING",
+                 role: "change-verifier",
+                 status: "WAITING_FOR_BROKER",
+                 model_provider: "codex",
+                 model_class: "deep",
+                 model: "gpt-6-sol",
+                 reasoning_effort: "xhigh",
+                 routing_reason: "test",
+                 prompt_sha256: String.duplicate("e", 64),
+                 codex_project_id: "grail-project",
+                 workspace_sha: writer.parent_sha
+               })
 
-    assert {:ok, _request} =
-             DesktopRequest.enqueue(context.store, %{
-               request_key: request_key,
-               target_kind: "TASK",
-               target_key: task_key,
-               action: "CREATE",
-               codex_project_id: "grail-project",
-               model: "gpt-6-sol",
-               reasoning_effort: "xhigh",
-               title: "PPL-456 · R2 · Change Verifier",
-               prompt: "Factory request ID: #{request_key}\n\nVerify the checkout",
-               schema: %{"type" => "object"},
-               cwd: writer.repo,
-               branch: writer.branch,
-               base_branch: "master",
-               metadata: %{"workspace_mode" => "CODEX_NATIVE", "expected_sha" => writer.parent_sha}
-             })
+      assert {:ok, _request} =
+               DesktopRequest.enqueue(context.store, %{
+                 request_key: request_key,
+                 target_kind: "TASK",
+                 target_key: task_key,
+                 action: "CREATE",
+                 codex_project_id: "grail-project",
+                 model: "gpt-6-sol",
+                 reasoning_effort: "xhigh",
+                 title: "PPL-456 · R2 · Change Verifier",
+                 prompt: "Factory request ID: #{request_key}\n\nVerify the checkout",
+                 schema: %{"type" => "object"},
+                 cwd: writer.repo,
+                 branch: writer.branch,
+                 base_branch: "master",
+                 metadata: %{"workspace_mode" => "CODEX_NATIVE", "expected_sha" => writer.parent_sha}
+               })
 
-    assert {:ok, _claimed} = DesktopRequest.claim(context.store, request_key)
+      assert {:ok, _claimed} = DesktopRequest.claim(context.store, request_key)
 
-    assert {:error, :definitive_create_rejection_evidence_required} =
-             DesktopRequest.fail(context.store, request_key, "CREATE_THREAD_INVALID_ARGUMENTS")
+      assert {:error, :definitive_create_rejection_evidence_required} =
+               DesktopRequest.fail(context.store, request_key, "CREATE_THREAD_INVALID_ARGUMENTS")
 
-    assert {:error, :definitive_create_rejection_evidence_required} =
-             DesktopRequest.fail(context.store, request_key, "CREATE_THREAD_INVALID_ARGUMENTS",
-               rejected_tool_call_id: "exec-a1b2",
-               tool_error: "create_thread timed out"
-             )
+      assert {:error, :definitive_create_rejection_evidence_required} =
+               DesktopRequest.fail(context.store, request_key, "CREATE_THREAD_INVALID_ARGUMENTS",
+                 rejected_tool_call_id: "exec-a1b2",
+                 tool_error: "create_thread timed out"
+               )
 
-    assert {:ok, _failed} =
-             DesktopRequest.fail(context.store, request_key, "CREATE_THREAD_INVALID_ARGUMENTS",
-               rejected_tool_call_id: "exec-a1b2",
-               tool_error: "create_thread received invalid arguments"
-             )
+      assert {:ok, _failed} =
+               DesktopRequest.fail(context.store, request_key, "CREATE_THREAD_INVALID_ARGUMENTS",
+                 rejected_tool_call_id: "exec-a1b2",
+                 tool_error: "create_thread received invalid arguments"
+               )
 
-    assert {:ok, %{"rejected_tool_call_id" => "exec-a1b2", "failure_code" => "CREATE_THREAD_INVALID_ARGUMENTS"}} =
-             DesktopRequest.get(context.store, request_key)
+      assert {:ok, %{"rejected_tool_call_id" => "exec-a1b2", "failure_code" => "CREATE_THREAD_INVALID_ARGUMENTS"}} =
+               DesktopRequest.get(context.store, request_key)
 
-    assert {:error, :definitive_create_rejection_evidence_required} =
-             DesktopRequest.fail(context.store, request_key, "CREATE_THREAD_INVALID_ARGUMENTS",
-               rejected_tool_call_id: "exec-deadbeef",
-               tool_error: "create_thread received invalid arguments"
-             )
+      assert {:error, :definitive_create_rejection_evidence_required} =
+               DesktopRequest.fail(context.store, request_key, "CREATE_THREAD_INVALID_ARGUMENTS",
+                 rejected_tool_call_id: "exec-deadbeef",
+                 tool_error: "create_thread received invalid arguments"
+               )
 
-    assert {:ok, %{result: "ACTIVE"}} = Admin.activate(factory)
+      if recovery_mode == :manual do
+        assert {:ok, %{result: "ACTIVE"}} = Admin.activate(factory)
 
-    assert {:error, :recovery_requires_paused_unleased_control} =
-             Admin.resume_rejected_native_create(factory, request_key, "exec-a1b2")
+        assert {:error, :recovery_requires_paused_unleased_control} =
+                 Admin.resume_rejected_native_create(factory, request_key, "exec-a1b2")
 
-    assert {:ok, %{result: "PAUSED"}} = Admin.pause(factory)
+        assert {:ok, %{result: "PAUSED"}} = Admin.pause(factory)
 
-    assert {:error, :rejected_create_not_proven} =
-             Admin.resume_rejected_native_create(factory, request_key, "not-a-tool-call")
+        assert {:error, :rejected_create_not_proven} =
+                 Admin.resume_rejected_native_create(factory, request_key, "not-a-tool-call")
 
-    assert {:error, :rejected_create_not_proven} =
-             Admin.resume_rejected_native_create(factory, request_key, "exec-deadbeef")
+        assert {:error, :rejected_create_not_proven} =
+                 Admin.resume_rejected_native_create(factory, request_key, "exec-deadbeef")
 
-    assert {:ok, %{result: "REJECTED_NATIVE_CREATE_REARMED"}} =
-             Admin.resume_rejected_native_create(factory, request_key, "exec-a1b2")
+        assert {:ok, %{result: "REJECTED_NATIVE_CREATE_REARMED"}} =
+                 Admin.resume_rejected_native_create(factory, request_key, "exec-a1b2")
+      else
+        assert {:error, :recovery_requires_active_control} =
+                 Recovery.retry_rejected_native_create(context.store, factory, request_key)
 
-    assert {:ok, %{"status" => "PENDING", "claimed_at" => nil, "failure_code" => nil}} =
-             DesktopRequest.get(context.store, request_key)
+        assert {:ok, %{result: "ACTIVE"}} = Admin.activate(factory)
 
-    assert [[1]] = Store.query!(context.store, "SELECT COUNT(*) FROM factory_tasks WHERE task_key = ?", [task_key]).rows
-    assert [[1]] = Store.query!(context.store, "SELECT COUNT(*) FROM desktop_requests WHERE target_key = ? AND action = 'CREATE'", [task_key]).rows
+        assert {:ok, %{result: "REJECTED_NATIVE_CREATE_REARMED"}} =
+                 Recovery.retry_rejected_native_create(context.store, factory, request_key)
+      end
 
-    assert {:error, :rejected_create_not_proven} =
-             Admin.resume_rejected_native_create(factory, request_key, "exec-a1b2")
+      assert {:ok, %{"status" => "PENDING", "claimed_at" => nil, "failure_code" => nil}} =
+               DesktopRequest.get(context.store, request_key)
+
+      assert [[1]] = Store.query!(context.store, "SELECT COUNT(*) FROM factory_tasks WHERE task_key = ?", [task_key]).rows
+      assert [[1]] = Store.query!(context.store, "SELECT COUNT(*) FROM desktop_requests WHERE target_key = ? AND action = 'CREATE'", [task_key]).rows
+
+      if recovery_mode == :manual do
+        assert {:error, :rejected_create_not_proven} =
+                 Admin.resume_rejected_native_create(factory, request_key, "exec-a1b2")
+      else
+        {:ok, reopened} = Store.start_link(database: context.factory.database)
+        assert {:ok, _claimed} = DesktopRequest.claim(reopened, request_key)
+
+        assert {:ok, _failed} =
+                 DesktopRequest.fail(reopened, request_key, "CREATE_THREAD_INVALID_ARGUMENTS",
+                   rejected_tool_call_id: "exec-beef",
+                   tool_error: "create_thread received invalid arguments"
+                 )
+
+        assert {:error, :rejected_create_retry_exhausted} =
+                 Recovery.retry_rejected_native_create(reopened, factory, request_key)
+
+        assert {:ok, %{"status" => "RECONCILE_REQUIRED", "rejected_tool_call_id" => "exec-beef"}} =
+                 DesktopRequest.get(reopened, request_key)
+      end
+    end
   end
 
   test "recovers a completed native bootstrap by attaching its exact run branch without creating another task", context do

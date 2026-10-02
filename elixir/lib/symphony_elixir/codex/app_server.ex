@@ -72,23 +72,30 @@ defmodule SymphonyElixir.Codex.AppServer do
              thread_source: "symphonyFactoryConnector"
            ) do
       try do
-        send_message(session.port, %{
-          "method" => "mcpServer/tool/call",
-          "id" => @mcp_tool_call_id,
-          "params" => %{
-            "server" => server,
-            "tool" => tool,
-            "arguments" => arguments,
-            "threadId" => session.thread_id
-          }
-        })
-
-        deadline_ms = System.monotonic_time(:millisecond) + Config.settings!().codex.read_timeout_ms
-        await_mcp_tool_response(session.port, deadline_ms, "")
+        call_mcp_tool_in_session(session, server, tool, arguments)
       after
         stop_session(session)
       end
     end
+  end
+
+  @doc "Calls a configured MCP tool on an already-open, caller-owned session."
+  @spec call_mcp_tool_in_session(session(), String.t(), String.t(), map()) :: {:ok, map()} | {:error, term()}
+  def call_mcp_tool_in_session(%{port: port, thread_id: thread_id}, server, tool, arguments)
+      when is_binary(server) and is_binary(tool) and is_map(arguments) do
+    send_message(port, %{
+      "method" => "mcpServer/tool/call",
+      "id" => @mcp_tool_call_id,
+      "params" => %{
+        "server" => server,
+        "tool" => tool,
+        "arguments" => arguments,
+        "threadId" => thread_id
+      }
+    })
+
+    deadline_ms = System.monotonic_time(:millisecond) + Config.settings!().codex.read_timeout_ms
+    await_mcp_tool_response(port, deadline_ms, "")
   end
 
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
@@ -97,6 +104,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     thread_options = %{
       mcp_startup_timeout_ms: Keyword.get(opts, :mcp_startup_timeout_ms, 60_000),
+      gitlab_mcp_startup_timeout_sec: Keyword.get(opts, :gitlab_mcp_startup_timeout_sec),
       approval_policy: Keyword.get(opts, :approval_policy),
       allowed_mcp_tool_approvals: Keyword.get(opts, :allowed_mcp_tool_approvals, []),
       fork_on_active_writer: Keyword.get(opts, :fork_on_active_writer, false),
@@ -121,7 +129,13 @@ defmodule SymphonyElixir.Codex.AppServer do
       dynamic_tool_binding = DynamicTool.bind()
 
       with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
-           {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
+           {:ok, port} <-
+             start_port(
+               expanded_workspace,
+               worker_host,
+               dynamic_tool_binding,
+               thread_options.gitlab_mcp_startup_timeout_sec
+             ) do
         metadata = port_metadata(port, worker_host)
 
         with {:ok, configured_policies} <- session_policies(expanded_workspace, worker_host),
@@ -452,12 +466,17 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_port(workspace, nil, dynamic_tool_binding) do
+  defp start_port(workspace, worker_host, dynamic_tool_binding),
+    do: start_port(workspace, worker_host, dynamic_tool_binding, nil)
+
+  defp start_port(workspace, nil, dynamic_tool_binding, gitlab_mcp_startup_timeout_sec) do
     executable = System.find_executable("bash")
 
     if is_nil(executable) do
       {:error, :bash_not_found}
     else
+      launch_command = local_launch_command(dynamic_tool_binding, gitlab_mcp_startup_timeout_sec)
+
       port =
         Port.open(
           {:spawn_executable, String.to_charlist(executable)},
@@ -465,7 +484,7 @@ defmodule SymphonyElixir.Codex.AppServer do
             :binary,
             :exit_status,
             :stderr_to_stdout,
-            args: [~c"-lc", String.to_charlist(local_launch_command(dynamic_tool_binding))],
+            args: [~c"-lc", String.to_charlist(launch_command)],
             cd: String.to_charlist(workspace),
             env: tracker_secret_port_env(dynamic_tool_binding),
             line: @port_line_bytes
@@ -476,28 +495,36 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_port(workspace, worker_host, dynamic_tool_binding) when is_binary(worker_host) do
-    remote_command = remote_launch_command(workspace, dynamic_tool_binding)
+  defp start_port(workspace, worker_host, dynamic_tool_binding, gitlab_mcp_startup_timeout_sec)
+       when is_binary(worker_host) do
+    remote_command = remote_launch_command(workspace, dynamic_tool_binding, gitlab_mcp_startup_timeout_sec)
     SSH.start_port(worker_host, remote_command, line: @port_line_bytes)
   end
 
-  defp local_launch_command(dynamic_tool_binding) do
+  defp local_launch_command(dynamic_tool_binding, gitlab_mcp_startup_timeout_sec) do
     [
       tracker_secret_unset_command(dynamic_tool_binding),
-      "exec #{Config.settings!().codex.command}"
+      "exec #{codex_command(gitlab_mcp_startup_timeout_sec)}"
     ]
     |> Enum.reject(&is_nil/1)
     |> Enum.join(" && ")
   end
 
-  defp remote_launch_command(workspace, dynamic_tool_binding) when is_binary(workspace) do
+  defp remote_launch_command(workspace, dynamic_tool_binding, gitlab_mcp_startup_timeout_sec)
+       when is_binary(workspace) do
     [
       "cd #{shell_escape(workspace)}",
       tracker_secret_unset_command(dynamic_tool_binding),
-      "exec #{Config.settings!().codex.command}"
+      "exec #{codex_command(gitlab_mcp_startup_timeout_sec)}"
     ]
     |> Enum.reject(&is_nil/1)
     |> Enum.join(" && ")
+  end
+
+  defp codex_command(nil), do: Config.settings!().codex.command
+
+  defp codex_command(seconds) when is_integer(seconds) and seconds in 31..55 do
+    Config.settings!().codex.command <> " --config mcp_servers.GitLab.startup_timeout_sec=#{seconds}"
   end
 
   defp tracker_secret_port_env(dynamic_tool_binding) do

@@ -995,7 +995,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert workflow =~ "Spec drafting · Delivery · grail"
   end
 
-  test "dashboard summary uses the exclusive factory needs-attention bucket" do
+  test "dashboard shows rejected verifier creation in the exclusive needs-attention bucket" do
     orchestrator_name = Module.concat(__MODULE__, :FactoryBlockedSummaryOrchestrator)
 
     {:ok, _pid} =
@@ -1014,6 +1014,16 @@ defmodule SymphonyElixir.ExtensionsTest do
         by_issue: %{"PPL-123" => "NEEDS_ATTENTION"}
       })
 
+    handoff = %{
+      label: "Verifier creation failed",
+      reason: "Desktop rejected the creation arguments. Correct them and recover this same request.",
+      request_key: "run-1:change-verifier:3:create"
+    }
+
+    run = factory_snapshot.runs |> hd() |> Map.merge(%{state: "VERIFYING", handoff_attention: handoff})
+    task = factory_snapshot.tasks |> hd() |> Map.merge(%{status: "WAITING_FOR_BROKER", thread_id: nil, handoff_attention: handoff})
+    factory_snapshot = %{factory_snapshot | runs: [run], tasks: [task]}
+
     start_test_endpoint(
       orchestrator: orchestrator_name,
       snapshot_timeout_ms: 50,
@@ -1031,6 +1041,16 @@ defmodule SymphonyElixir.ExtensionsTest do
     attention_text = Floki.text(attention_card, sep: " ")
     assert attention_text =~ "Needs attention 1"
     assert attention_text =~ "1 ticket needs attention"
+
+    workflow = html |> Floki.parse_document!() |> Floki.find(".factory-runs-table") |> Floki.text(sep: " ")
+    assert workflow =~ "Needs attention"
+    assert workflow =~ "Verifier creation failed"
+    assert workflow =~ "Correct them and recover this same request"
+    assert workflow =~ handoff.request_key
+    refute workflow =~ "Active"
+
+    task_failure = html |> Floki.parse_document!() |> Floki.find(".task-failure") |> Floki.text(sep: " ")
+    assert task_failure =~ "Verifier creation failed"
   end
 
   test "active ticket workflow links to its current Codex task" do

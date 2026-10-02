@@ -838,6 +838,58 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "one ephemeral MCP session serves repeated calls with a factory-scoped startup override" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-mcp-reuse-#{System.unique_integer([:positive])}")
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "FACTORY-CONTROLLER")
+      codex_binary = Path.join(test_root, "fake-codex")
+      args_file = Path.join(test_root, "launch-args")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      printf '%s\n' "$@" > '#{args_file}'
+      while IFS= read -r line; do
+        case "$line" in
+          *'"method":"initialize"'*)
+            printf '%s\n' '{"id":1,"result":{}}'
+            ;;
+          *'"method":"thread/start"'*)
+            printf '%s\n' '{"id":2,"result":{"thread":{"id":"shared-mcp-thread"}}}'
+            printf '%s\n' '{"method":"mcpServer/startupStatus/updated","params":{"name":"GitLab","status":"ready"}}'
+            ;;
+          *'"method":"mcpServer/tool/call"'*)
+            printf '%s\n' '{"id":14,"result":{"content":[]}}'
+            ;;
+          *'"method":"thread/unsubscribe"'*)
+            printf '%s\n' '{"id":6,"result":{"status":"unsubscribed"}}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root, codex_command: "#{codex_binary} app-server")
+
+      assert {:ok, session} =
+               AppServer.start_session(workspace,
+                 ephemeral: true,
+                 required_mcp_servers: ["GitLab"],
+                 mcp_startup_timeout_ms: 1_000,
+                 gitlab_mcp_startup_timeout_sec: 45
+               )
+
+      assert {:ok, %{"content" => []}} = AppServer.call_mcp_tool_in_session(session, "GitLab", "whoami", %{})
+      assert {:ok, %{"content" => []}} = AppServer.call_mcp_tool_in_session(session, "GitLab", "whoami", %{})
+      assert :ok = AppServer.stop_session(session)
+      assert File.read!(args_file) =~ "mcp_servers.GitLab.startup_timeout_sec=45"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server requires an installed callable app before returning a session" do
     test_root =
       Path.join(

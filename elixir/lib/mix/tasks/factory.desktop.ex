@@ -2,7 +2,9 @@ defmodule Mix.Tasks.Factory.Desktop do
   use Mix.Task
 
   alias SymphonyElixir.Config.Schema
-  alias SymphonyElixir.Factory.{ContractChat, DesktopRequest, NativeSessionDiscovery, Store}
+  alias SymphonyElixir.Factory.{ContractChat, DesktopRequest, DesktopToolArgs, NativeSessionDiscovery, Store}
+  alias SymphonyElixir.Factory.NativeMaintenanceEvidence
+  alias SymphonyElixir.Factory.NativeWorkspaceMaintenance
   alias SymphonyElixir.Workflow
 
   @shortdoc "Exchange durable factory requests with a Codex Desktop broker"
@@ -11,11 +13,14 @@ defmodule Mix.Tasks.Factory.Desktop do
   Exchanges one durable request at a time with the Codex Desktop task broker.
 
       mix factory.desktop list --workflow /path/to/WORKFLOW.md
+      mix factory.desktop maintenance-plan --workflow /path/to/WORKFLOW.md
       mix factory.desktop show REQUEST_KEY --workflow /path/to/WORKFLOW.md
+      mix factory.desktop create-thread-args REQUEST_KEY --workflow /path/to/WORKFLOW.md
       mix factory.desktop find-thread REQUEST_KEY --source-thread-id BROKER_THREAD_ID --workflow /path/to/WORKFLOW.md
       mix factory.desktop claim REQUEST_KEY --workflow /path/to/WORKFLOW.md
       mix factory.desktop record-thread REQUEST_KEY THREAD_ID VERIFIED_PROJECT_ID --verified-cwd PATH --verified-head-sha SHA --workflow /path/to/WORKFLOW.md
       mix factory.desktop complete REQUEST_KEY --payload-base64 BASE64_JSON --workflow /path/to/WORKFLOW.md
+      mix factory.desktop record-maintenance-evidence REQUEST_KEY --payload-base64 BASE64_JSON --workflow /path/to/WORKFLOW.md
       mix factory.desktop record-user-reply TASK_KEY --payload-base64 BASE64_JSON --workflow /path/to/WORKFLOW.md
       mix factory.desktop fail REQUEST_KEY FAILURE_CODE --workflow /path/to/WORKFLOW.md
       mix factory.desktop fail REQUEST_KEY CREATE_THREAD_INVALID_ARGUMENTS --rejected-tool-call-id ID --tool-error "create_thread received invalid arguments" --workflow /path/to/WORKFLOW.md
@@ -68,7 +73,9 @@ defmodule Mix.Tasks.Factory.Desktop do
   end
 
   defp valid_action?(["list"], _opts), do: true
+  defp valid_action?(["maintenance-plan"], _opts), do: true
   defp valid_action?(["show", key], _opts), do: key != ""
+  defp valid_action?(["create-thread-args", key], _opts), do: key != ""
   defp valid_action?(["find-thread", key], _opts), do: key != ""
   defp valid_action?(["claim", key], _opts), do: key != ""
 
@@ -76,6 +83,7 @@ defmodule Mix.Tasks.Factory.Desktop do
     do: key != "" and thread_id != "" and project_id != ""
 
   defp valid_action?(["complete", key], opts), do: key != "" and is_binary(opts[:payload_base64])
+  defp valid_action?(["record-maintenance-evidence", key], opts), do: key != "" and is_binary(opts[:payload_base64])
   defp valid_action?(["record-user-reply", key], opts), do: key != "" and is_binary(opts[:payload_base64])
   defp valid_action?(["fail", key, reason], _opts), do: key != "" and reason != ""
   defp valid_action?(_action, _opts), do: false
@@ -89,7 +97,19 @@ defmodule Mix.Tasks.Factory.Desktop do
      }}
   end
 
+  defp execute(["maintenance-plan"], store, _opts) do
+    {:ok,
+     %{
+       capability: "ARCHIVE_RESTORE_NOT_PROVEN",
+       authorization: "NOT_REQUESTED",
+       candidates: NativeWorkspaceMaintenance.plan(store),
+       lifecycle: NativeWorkspaceMaintenance.snapshot(store)
+     }}
+  end
+
   defp execute(["show", key], store, _opts), do: DesktopRequest.get(store, key)
+
+  defp execute(["create-thread-args", key], store, _opts), do: DesktopToolArgs.create_thread(store, key)
 
   defp execute(["find-thread", key], store, opts) do
     if opts[:native_session_discovery_enabled] do
@@ -109,24 +129,32 @@ defmodule Mix.Tasks.Factory.Desktop do
   defp execute(["claim", key], store, _opts), do: DesktopRequest.claim(store, key)
 
   defp execute(["record-thread", key, thread_id, project_id], store, opts) do
-    proof =
-      if is_binary(opts[:verified_cwd]) or is_binary(opts[:verified_head_sha]) do
-        %{cwd: opts[:verified_cwd], head_sha: opts[:verified_head_sha]}
-      end
-
-    DesktopRequest.record_thread(store, key, thread_id, project_id, proof)
+    with {:ok, proof} <- record_proof(opts) do
+      DesktopRequest.record_thread(store, key, thread_id, project_id, proof)
+    end
   end
 
   defp execute(["complete", key], store, opts) do
     with {:ok, json} <- Base.decode64(opts[:payload_base64]),
-         {:ok, %{"thread_id" => thread_id, "turn_id" => turn_id, "output" => output}} <- Jason.decode(json),
+         {:ok, %{"thread_id" => thread_id, "turn_id" => turn_id, "output" => output} = payload} <- Jason.decode(json),
          true <- is_binary(thread_id) and thread_id != "" and is_binary(turn_id) and turn_id != "" and is_map(output) do
-      DesktopRequest.complete(store, key, %{thread_id: thread_id, turn_id: turn_id, output: output})
+      DesktopRequest.complete(store, key, Map.take(payload, ~w(thread_id turn_id output artifact_output source_execution)))
     else
       :error -> {:error, :invalid_base64_payload}
       false -> {:error, :incomplete_completion_payload}
       {:ok, _other} -> {:error, :incomplete_completion_payload}
       {:error, reason} -> {:error, {:invalid_completion_payload, reason}}
+    end
+  end
+
+  defp execute(["record-maintenance-evidence", key], store, opts) do
+    with {:ok, json} <- Base.decode64(opts[:payload_base64]),
+         {:ok, payload} when is_map(payload) <- Jason.decode(json) do
+      NativeMaintenanceEvidence.record(store, key, payload)
+    else
+      :error -> {:error, :invalid_base64_payload}
+      {:ok, _other} -> {:error, :invalid_maintenance_evidence}
+      {:error, reason} -> {:error, {:invalid_maintenance_payload, reason}}
     end
   end
 
@@ -156,6 +184,24 @@ defmodule Mix.Tasks.Factory.Desktop do
       settings.factory
     else
       reason -> Mix.raise("Unable to resolve factory configuration: #{inspect(reason)}")
+    end
+  end
+
+  defp record_proof(opts) do
+    if is_binary(opts[:payload_base64]) do
+      with {:ok, json} <- Base.decode64(opts[:payload_base64]),
+           {:ok, proof} when is_map(proof) <- Jason.decode(json) do
+        {:ok, proof}
+      else
+        _other -> {:error, :invalid_workspace_proof}
+      end
+    else
+      proof =
+        if is_binary(opts[:verified_cwd]) or is_binary(opts[:verified_head_sha]) do
+          %{cwd: opts[:verified_cwd], head_sha: opts[:verified_head_sha]}
+        end
+
+      {:ok, proof}
     end
   end
 

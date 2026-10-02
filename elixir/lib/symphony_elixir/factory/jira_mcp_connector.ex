@@ -16,7 +16,7 @@ defmodule SymphonyElixir.Factory.JiraMcpConnector do
     workspace = Keyword.fetch!(opts, :workspace)
     app_server = Keyword.get(opts, :app_server, AppServer)
 
-    with {:ok, response} <- app_server.call_mcp_tool(workspace, "Jira", tool, arguments) do
+    with {:ok, response} <- call_tool(app_server, Keyword.get(opts, :mcp_session), workspace, tool, arguments) do
       cond do
         response["isError"] == true -> {:error, :jira_tool_error}
         tool in ["jira_search", "jira_get_issue"] -> decode_result(response)
@@ -26,6 +26,12 @@ defmodule SymphonyElixir.Factory.JiraMcpConnector do
   end
 
   def call(_tool, _arguments, _opts), do: {:error, :jira_tool_not_allowed}
+
+  defp call_tool(app_server, nil, workspace, tool, arguments),
+    do: app_server.call_mcp_tool(workspace, "Jira", tool, arguments)
+
+  defp call_tool(app_server, session, _workspace, tool, arguments),
+    do: app_server.call_mcp_tool_in_session(session, "Jira", tool, arguments)
 
   defp decode_result(%{"structuredContent" => %{"result" => result}}) when is_binary(result),
     do: decode_json_map(result)

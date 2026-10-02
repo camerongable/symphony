@@ -700,6 +700,256 @@ defmodule SymphonyElixir.FactoryObservabilityTest do
     assert recovered_snapshot.overview.by_issue == %{"PPL-406" => "NEEDS_ATTENTION"}
   end
 
+  test "rejected verifier creation needs attention while the controller is active and clears on same-request recovery", context do
+    config = Map.take(context.factory, [:scope, :dispatcher_id, :lease_seconds])
+    assert {:ok, _} = Control.activate(context.store, config, context.factory.dispatcher_id)
+    register_run(context.store, "run-verifier", "PPL-9723", "VERIFYING")
+    task_key = "run-verifier:change-verifier:3"
+    request_key = "#{task_key}:create"
+
+    assert {:ok, _} =
+             TaskLedger.register(context.store, %{
+               task_key: task_key,
+               run_id: "run-verifier",
+               codex_project_id: "project-symphony",
+               stage: "VERIFYING",
+               role: "change-verifier",
+               status: "WAITING_FOR_BROKER",
+               model_provider: "codex",
+               model_class: "deep",
+               model: "gpt-6-sol",
+               reasoning_effort: "high",
+               routing_reason: "explicit-role",
+               prompt_sha256: String.duplicate("a", 64)
+             })
+
+    assert {:ok, _} =
+             DesktopRequest.enqueue(context.store, %{
+               request_key: request_key,
+               target_kind: "TASK",
+               target_key: task_key,
+               action: "CREATE",
+               codex_project_id: "project-symphony",
+               model: "gpt-6-sol",
+               reasoning_effort: "high",
+               title: "PPL-9723 · Verifier",
+               prompt: "Verify candidate",
+               schema: %{"type" => "object"},
+               cwd: "/tmp/symphony-verifier"
+             })
+
+    snapshot = fn ->
+      Observability.snapshot(
+        settings: %{factory: Map.put(context.factory, :task_transport, "desktop_broker")},
+        store: context.store,
+        control_server: context.control_server,
+        capacity_opts: [free_bytes: 45_000_000_000]
+      )
+    end
+
+    assert snapshot.().overview.active == 1
+    assert snapshot.().overview.needs_attention == 0
+    assert {:ok, _} = DesktopRequest.claim(context.store, request_key)
+    assert snapshot.().overview.active == 1
+
+    assert {:ok, _} =
+             DesktopRequest.fail(context.store, request_key, "CREATE_THREAD_INVALID_ARGUMENTS",
+               rejected_tool_call_id: "exec-a1b2",
+               tool_error: "create_thread received invalid arguments"
+             )
+
+    failed = snapshot.()
+    assert failed.control.status == "ACTIVE"
+    assert failed.overview.by_issue == %{"PPL-9723" => "NEEDS_ATTENTION"}
+    assert failed.overview.active == 0
+    assert failed.overview.needs_attention == 1
+    assert failed.counts.in_progress == 0
+    assert failed.counts.blocked == 1
+    assert failed.broker.needs_reconciliation == 1
+    assert [run] = failed.current_runs
+    assert run.handoff_attention.label == "Verifier creation failed"
+    assert run.handoff_attention.reason =~ "Correct them and recover this same request"
+    assert run.handoff_attention.request_key == request_key
+    assert [task] = failed.tasks
+    assert task.handoff_attention == run.handoff_attention
+    assert task.thread_id == nil
+
+    Store.query!(context.store, "UPDATE desktop_requests SET failure_code = 'BROKER_INTERRUPTED' WHERE request_key = ?", [request_key])
+    ambiguous = snapshot.()
+    assert ambiguous.overview.needs_attention == 1
+    assert hd(ambiguous.current_runs).handoff_attention.label == "Verifier creation needs attention"
+    assert hd(ambiguous.current_runs).handoff_attention.reason =~ "Reconcile this Desktop request before retrying"
+
+    Store.query!(context.store, "UPDATE desktop_requests SET action = 'FOLLOWUP', failure_code = 'FOLLOWUP_TURN_REPLAYED' WHERE request_key = ?", [request_key])
+    assert hd(snapshot.().current_runs).handoff_attention.label == "Worker handoff needs attention"
+    Store.query!(context.store, "UPDATE desktop_requests SET action = 'CREATE', failure_code = 'CREATE_THREAD_INVALID_ARGUMENTS' WHERE request_key = ?", [request_key])
+
+    assert {:ok, _} = TaskLedger.update(context.store, task_key, %{status: "CONSUMED"})
+    assert snapshot.().overview.active == 1
+    assert hd(snapshot.().current_runs).handoff_attention == nil
+    assert {:ok, _} = TaskLedger.update(context.store, task_key, %{status: "WAITING_FOR_BROKER"})
+
+    Store.query!(context.store, "UPDATE desktop_requests SET status = 'PENDING', failure_code = NULL WHERE request_key = ?", [request_key])
+    recovered = snapshot.()
+    assert recovered.overview.active == 1
+    assert recovered.overview.needs_attention == 0
+    assert recovered.counts.in_progress == 1
+    assert recovered.counts.blocked == 0
+    assert hd(recovered.current_runs).handoff_attention == nil
+    assert hd(recovered.tasks).handoff_attention == nil
+  end
+
+  test "persistent writer recovery projects only its newest created handoff despite old failure updates", context do
+    config = Map.take(context.factory, [:scope, :dispatcher_id, :lease_seconds])
+    assert {:ok, _} = Control.activate(context.store, config, context.factory.dispatcher_id)
+    register_run(context.store, "run-writer", "PPL-9723", "WRITING")
+    task_key = "run-writer:feature-writer"
+
+    assert {:ok, _} =
+             TaskLedger.register(context.store, %{
+               task_key: task_key,
+               run_id: "run-writer",
+               codex_project_id: "project-symphony",
+               stage: "WRITING",
+               role: "feature-writer",
+               status: "STARTING",
+               thread_id: "thread-persistent-writer",
+               model_provider: "codex",
+               model_class: "deep",
+               model: "gpt-6-sol",
+               reasoning_effort: "high",
+               routing_reason: "explicit-role",
+               prompt_sha256: String.duplicate("a", 64)
+             })
+
+    request = %{
+      request_key: "desktop:951c9f-old",
+      target_kind: "TASK",
+      target_key: task_key,
+      action: "FOLLOWUP",
+      existing_thread_id: "thread-persistent-writer",
+      codex_project_id: "project-symphony",
+      model: "gpt-6-sol",
+      reasoning_effort: "high",
+      title: "PPL-9723 · Writer",
+      prompt: "Repair candidate",
+      schema: %{"type" => "object"},
+      cwd: "/tmp/symphony-writer"
+    }
+
+    assert {:ok, _} = DesktopRequest.enqueue(context.store, request)
+    assert {:ok, _} = DesktopRequest.fail(context.store, request.request_key, "RECOVERED_INTERRUPTED_NATIVE_WRITER")
+    newer_request = %{request | request_key: "desktop:4da673-new"}
+    assert {:ok, _} = DesktopRequest.enqueue(context.store, newer_request)
+
+    snapshot = fn ->
+      Observability.snapshot(
+        settings: %{factory: Map.put(context.factory, :task_transport, "desktop_broker")},
+        store: context.store,
+        control_server: context.control_server,
+        capacity_opts: [free_bytes: 45_000_000_000]
+      )
+    end
+
+    for {old_created_at, new_created_at} <- [
+          {"2026-10-01T19:00:00Z", "2026-10-01T19:01:00Z"},
+          {"2026-10-01T19:01:00Z", "2026-10-01T19:01:00Z"}
+        ] do
+      Store.query!(context.store, "UPDATE desktop_requests SET created_at = ?, updated_at = '2026-10-01T20:00:00Z' WHERE request_key = ?", [old_created_at, request.request_key])
+      Store.query!(context.store, "UPDATE desktop_requests SET created_at = ?, updated_at = '2026-10-01T19:01:00Z' WHERE request_key = ?", [new_created_at, newer_request.request_key])
+
+      for status <- ~w(PENDING FOLLOWUP_UNCERTAIN THREAD_RECORDED SUCCEEDED) do
+        Store.query!(context.store, "UPDATE desktop_requests SET status = ?, failure_code = NULL WHERE request_key = ?", [status, newer_request.request_key])
+        recovered = snapshot.()
+        assert recovered.available
+        assert recovered.overview.by_issue == %{"PPL-9723" => "ACTIVE"}
+        assert recovered.overview.active == 1
+        assert recovered.overview.needs_attention == 0
+        assert recovered.counts.in_progress == 1
+        assert recovered.counts.blocked == 0
+        assert hd(recovered.current_runs).handoff_attention == nil
+        assert hd(recovered.tasks).handoff_attention == nil
+      end
+
+      for status <- ~w(FAILED RECONCILE_REQUIRED) do
+        Store.query!(context.store, "UPDATE desktop_requests SET status = ?, failure_code = 'LATEST_HANDOFF_FAILED' WHERE request_key = ?", [status, newer_request.request_key])
+        failed = snapshot.()
+        assert failed.overview.by_issue == %{"PPL-9723" => "NEEDS_ATTENTION"}
+        assert failed.overview.active == 0
+        assert failed.overview.needs_attention == 1
+        assert failed.counts.in_progress == 0
+        assert failed.counts.blocked == 1
+        assert hd(failed.current_runs).handoff_attention.request_key == newer_request.request_key
+        assert hd(failed.tasks).handoff_attention.reason =~ "LATEST_HANDOFF_FAILED"
+      end
+    end
+  end
+
+  test "informational maintenance neither creates nor suppresses writer handoff attention", context do
+    config = Map.take(context.factory, [:scope, :dispatcher_id, :lease_seconds])
+    assert {:ok, _} = Control.activate(context.store, config, context.factory.dispatcher_id)
+    register_run(context.store, "maintenance-run", "PPL-9723", "WRITING")
+    key = "maintenance-run:feature-writer"
+
+    assert {:ok, _} =
+             TaskLedger.register(context.store, %{
+               task_key: key,
+               run_id: "maintenance-run",
+               codex_project_id: "project",
+               stage: "WRITING",
+               role: "feature-writer",
+               status: "CONSUMED",
+               thread_id: "writer",
+               model_provider: "codex",
+               model_class: "deep",
+               model: "gpt-6-sol",
+               reasoning_effort: "high",
+               routing_reason: "test",
+               prompt_sha256: String.duplicate("a", 64)
+             })
+
+    attrs = %{
+      request_key: "probe",
+      target_kind: "TASK",
+      target_key: key,
+      action: "FOLLOWUP",
+      existing_thread_id: "writer",
+      codex_project_id: "project",
+      model: "gpt-6-sol",
+      reasoning_effort: "high",
+      title: "Probe",
+      prompt: "Read-only probe",
+      cwd: "/tmp/writer"
+    }
+
+    assert {:ok, _} = DesktopRequest.enqueue(context.store, attrs)
+
+    Store.query!(
+      context.store,
+      """
+      UPDATE desktop_requests SET metadata_json = ?, status = 'FAILED', failure_code = 'PROBE_UNAVAILABLE'
+      WHERE request_key = 'probe'
+      """,
+      [Jason.encode!(%{"maintenance_operation" => "NATIVE_WORKTREE_PROBE"})]
+    )
+
+    snapshot = fn -> Observability.snapshot(settings: %{factory: context.factory}, store: context.store, control_server: context.control_server, capacity_opts: [free_bytes: 45_000_000_000]) end
+    assert snapshot.().overview.needs_attention == 0
+    assert {:ok, _} = TaskLedger.update(context.store, key, %{status: "RETRY_PENDING"})
+    active = snapshot.()
+    assert active.overview.needs_attention == 0
+    assert hd(active.tasks).handoff_attention == nil
+
+    assert {:ok, _} = DesktopRequest.enqueue(context.store, %{attrs | request_key: "source-failed"})
+    assert {:ok, _} = DesktopRequest.fail(context.store, "source-failed", "SOURCE_FAILED")
+    Store.query!(context.store, "UPDATE desktop_requests SET created_at = '2020-01-01T00:00:00Z' WHERE request_key = 'source-failed'")
+    Store.query!(context.store, "UPDATE desktop_requests SET status = 'SUCCEEDED', failure_code = NULL WHERE request_key = 'probe'")
+    attention = snapshot.()
+    assert attention.overview.needs_attention == 1
+    assert hd(attention.tasks).handoff_attention.request_key == "source-failed"
+    assert hd(attention.current_runs).handoff_attention.request_key == "source-failed"
+  end
+
   test "fails closed when the configured ledger is unavailable", context do
     assert %{available: false, error: %{code: "factory_snapshot_unavailable"}} =
              Observability.snapshot(

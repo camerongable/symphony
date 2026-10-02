@@ -167,6 +167,27 @@ defmodule SymphonyElixir.Factory.StageSchemas do
     )
   end
 
+  def for_stage(:gitlab_feedback_reply) do
+    object(~w(status feedback_key reply_id reply_body reason), %{
+      "status" => enum(~w(REPLIED CHANGE_REQUEST BLOCK STALE)),
+      "feedback_key" => string(),
+      "reply_id" => nullable_string(),
+      "reply_body" => nullable_string(),
+      "reason" => string()
+    })
+  end
+
+  def for_stage(:gitlab_feedback_batch) do
+    %{
+      "type" => "object",
+      "additionalProperties" => false,
+      "required" => ["results"],
+      "properties" => %{
+        "results" => %{"type" => "array", "items" => for_stage(:gitlab_feedback_reply)}
+      }
+    }
+  end
+
   def for_stage(:cleanup_authorization) do
     object(~w(status candidates), %{
       "status" => enum(~w(PASS BLOCK)),
@@ -180,6 +201,61 @@ defmodule SymphonyElixir.Factory.StageSchemas do
             "mr_state" => nullable_string()
           })
       }
+    })
+  end
+
+  def for_stage(:native_worktree_probe) do
+    object(~w(status run_id task_key thread_id writer_turn_id worktree candidate_sha source_cwd artifact_id artifact_identity_key reason), %{
+      "status" => enum(~w(SUPPORTED UNAVAILABLE AMBIGUOUS)),
+      "run_id" => string(),
+      "task_key" => string(),
+      "thread_id" => string(),
+      "writer_turn_id" => string(),
+      "worktree" => string(),
+      "candidate_sha" => string(),
+      "source_cwd" => string(),
+      "artifact_id" => nullable_string(),
+      "artifact_identity_key" => nullable_string(),
+      "reason" => string()
+    })
+  end
+
+  def for_stage(:native_maintenance_evidence) do
+    binding =
+      object(
+        ~w(run_id task_key thread_id writer_turn_id codex_project_id worktree candidate_sha source_cwd),
+        Map.new(~w(run_id task_key thread_id writer_turn_id codex_project_id worktree candidate_sha source_cwd), &{&1, string()})
+      )
+
+    object(~w(version provenance request_key binding tool artifact_output emitter_sha256), %{
+      "version" => %{"type" => "integer", "enum" => [1]},
+      "provenance" => enum(["TARGET_ATTESTED_NATIVE_CHAT"]),
+      "request_key" => string(),
+      "emitter_sha256" => string(),
+      "binding" => binding,
+      "tool" => enum(["mcp__codex_app__list_artifacts"]),
+      "artifact_output" => object(["artifacts"], %{"artifacts" => %{"type" => "array", "items" => %{"type" => "object"}}})
+    })
+  end
+
+  def for_stage(:native_maintenance_command_proof) do
+    command =
+      object(~w(type id command cwd status exitCode output), %{
+        "type" => enum(["commandExecution"]),
+        "id" => string(),
+        "command" => string(),
+        "cwd" => string(),
+        "status" => enum(["completed"]),
+        "exitCode" => %{"type" => "integer", "enum" => [0]},
+        "durationMs" => %{"type" => "integer"},
+        "output" => object(~w(text truncated), %{"text" => string(), "truncated" => %{"type" => "boolean", "enum" => [false]}})
+      })
+
+    object(~w(thread_id turn_id turn_status command_item), %{
+      "thread_id" => string(),
+      "turn_id" => string(),
+      "turn_status" => enum(["completed"]),
+      "command_item" => command
     })
   end
 

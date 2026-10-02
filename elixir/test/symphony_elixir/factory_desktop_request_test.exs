@@ -318,12 +318,25 @@ defmodule SymphonyElixir.FactoryDesktopRequestTest do
   end
 
   test "reconciles a completed change verifier report into one repair result", %{store: store} do
-    sha = String.duplicate("a", 40)
+    workspace = Path.join(System.tmp_dir!(), "verifier-report-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(workspace)
+    on_exit(fn -> File.rm_rf!(workspace) end)
+    git!(workspace, ["init", "-b", "master"])
+    git!(workspace, ["config", "user.email", "factory@example.com"])
+    git!(workspace, ["config", "user.name", "Factory test"])
+    File.write!(Path.join(workspace, "README.md"), "base\n")
+    git!(workspace, ["add", "README.md"])
+    git!(workspace, ["commit", "--no-verify", "-m", "base"])
+    base_sha = String.trim(git!(workspace, ["rev-parse", "HEAD"]))
+    git!(workspace, ["update-ref", "refs/remotes/origin/master", base_sha])
+    File.write!(Path.join(workspace, "README.md"), "candidate\n")
+    git!(workspace, ["add", "README.md"])
+    git!(workspace, ["commit", "--no-verify", "-m", "candidate"])
+    sha = String.trim(git!(workspace, ["rev-parse", "HEAD"]))
     contract_sha = String.duplicate("b", 64)
     prompt_sha = String.duplicate("c", 64)
     request_key = "delivery-run:verifier:followup"
     task_key = "delivery-run:change-verifier:1"
-    workspace = "/tmp/grail-verifier"
 
     assert {:ok, _run} =
              RunLedger.register(store, %{
@@ -397,7 +410,7 @@ defmodule SymphonyElixir.FactoryDesktopRequestTest do
       "issue_key" => "PPL-10035",
       "spec_revision" => 2,
       "contract_sha256" => contract_sha,
-      "base_ref" => "master",
+      "base_ref" => base_sha,
       "head_sha" => sha,
       "review_worktree" => workspace,
       "acceptance" => [
@@ -417,6 +430,7 @@ defmodule SymphonyElixir.FactoryDesktopRequestTest do
 
     for invalid <- [
           %{review | "head_sha" => String.duplicate("0", 40)},
+          %{review | "base_ref" => String.duplicate("0", 40)},
           %{review | "contract_sha256" => String.duplicate("0", 64)},
           put_in(review, ["manual_validation", "required"], true),
           %{review | "required_repairs" => []}
@@ -433,7 +447,10 @@ defmodule SymphonyElixir.FactoryDesktopRequestTest do
              DesktopRequest.complete(store, request_key, %{
                thread_id: "verifier-thread",
                turn_id: "completed-turn",
-               output: broker_output(review)
+               output:
+                 Map.put(broker_output(review), "completed_tool_calls", [
+                   %{"server" => "GitLab", "tool" => "get_merge_request", "status" => "completed"}
+                 ])
              })
 
     assert Jason.decode!(output_json)["result"] == %{
@@ -442,6 +459,10 @@ defmodule SymphonyElixir.FactoryDesktopRequestTest do
              "findings" => ["AC-2 lacks combined evidence", "Add DB-backed worker test with different defaults"],
              "checks" => ["PASS: git diff --check [feature diff]", "NOT_RUN: focused Bazel test [sandbox denied]"]
            }
+
+    assert Jason.decode!(output_json)["completed_tool_calls"] == [
+             %{"server" => "GitLab", "tool" => "get_merge_request", "status" => "completed"}
+           ]
 
     assert {:ok, %{"status" => "COMPLETE", "turn_id" => "completed-turn"}} = TaskLedger.get(store, task_key)
   end
@@ -732,6 +753,14 @@ defmodule SymphonyElixir.FactoryDesktopRequestTest do
              })
 
     assert {:ok, %{"status" => "CONSUMED", "turn_id" => "turn-2"}} =
+             TaskLedger.get(store, "native-run:author")
+
+    assert {:ok, _task} =
+             TaskLedger.update(store, "native-run:author", %{status: "RETRY_PENDING", output_json: nil})
+
+    assert :ok = DesktopRequest.reconcile_native_successes(store)
+
+    assert {:ok, %{"status" => "RETRY_PENDING", "turn_id" => "turn-2", "output_json" => nil}} =
              TaskLedger.get(store, "native-run:author")
 
     assert {:ok, _task} =

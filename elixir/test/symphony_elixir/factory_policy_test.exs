@@ -64,6 +64,11 @@ defmodule SymphonyElixir.FactoryPolicyTest do
     assert :ok = Policy.validate(configured)
   end
 
+  test "native cleanup cannot be enabled before archive and restore capability is proven" do
+    factory = valid_factory() |> put_in([:cleanup, "native"], %{"enabled" => true})
+    assert {:error, :native_archive_restore_capability_unproven} = Policy.validate(factory)
+  end
+
   test "requires a safe branch prefix and complete enabled hibernation policy" do
     factory = valid_factory()
 
@@ -84,6 +89,16 @@ defmodule SymphonyElixir.FactoryPolicyTest do
   test "rejects an unrecognized specification authorization policy" do
     factory = valid_factory() |> Map.put(:specification_authorization_mode, "unreviewed")
     assert {:error, :invalid_specification_authorization_mode} = Policy.validate(factory)
+  end
+
+  test "Desktop broker enables authorized MR feedback by default" do
+    factory = valid_factory() |> put_in([:manual_validation, "required_apps"], ["polaris-app"])
+    desktop = Map.put(factory, :task_transport, "desktop_broker")
+
+    assert :ok = Policy.validate(desktop)
+
+    assert {:error, :review_feedback_author_ids_required} =
+             Policy.validate(Map.put(desktop, :review_feedback, %{"allowed_author_ids" => []}))
   end
 
   defp valid_factory do

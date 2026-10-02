@@ -13,7 +13,7 @@ defmodule SymphonyElixir.Factory.RunLedger do
     last_input_marker task_id mr_url jira_status mr_state runtime model_role model_provider model_class
     model reasoning_effort model_routing_reason factory_owned created_at updated_at
     parent_run_id snapshot_json contract_markdown plan_markdown
-    repair_findings_json manual_validation_required implementation_iteration
+    repair_findings_json review_feedback_json review_base_sha manual_validation_required implementation_iteration
     code_repair_round validation_repair_round verifier_round spec_comment_id
     confirmation_comment_id mr_iid last_error risk risk_signals_json
     workspace_state hibernated_at
@@ -26,7 +26,7 @@ defmodule SymphonyElixir.Factory.RunLedger do
     last_input_marker task_id mr_url jira_status mr_state failure_code runtime
     model_role model_provider model_class model reasoning_effort
     model_routing_reason parent_run_id snapshot_json contract_markdown
-    plan_markdown repair_findings_json manual_validation_required
+    plan_markdown repair_findings_json review_feedback_json review_base_sha manual_validation_required
     implementation_iteration code_repair_round validation_repair_round
     verifier_round spec_comment_id confirmation_comment_id mr_iid last_error
     risk risk_signals_json

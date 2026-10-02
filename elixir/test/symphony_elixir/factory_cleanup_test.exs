@@ -1,7 +1,41 @@
 defmodule SymphonyElixir.FactoryCleanupTest do
   use ExUnit.Case, async: true
 
-  alias SymphonyElixir.Factory.{Cleanup, RunLedger, Store, Worktree}
+  alias SymphonyElixir.Factory.{Cleanup, RunLedger, Scheduler, Store, Worktree}
+
+  defmodule SweepController do
+    def run(_factory, _workspace, _issue, _prompt, schema, _opts) do
+      if Map.has_key?(schema["properties"], "snapshot_json") do
+        {:ok, %{"status" => "PASS", "snapshot_json" => "[]"}}
+      else
+        {:ok,
+         %{
+           "status" => "PASS",
+           "candidates" => [%{"run_id" => "run-cleanup", "issue_key" => "PPL-123", "jira_status" => "DONE", "mr_state" => "opened"}]
+         }}
+      end
+    end
+  end
+
+  defmodule SweepCleanup do
+    alias SymphonyElixir.Factory.Cleanup
+
+    defdelegate authorization_candidates(store, policy, repo_key), to: Cleanup
+    defdelegate authorize(store, policy, run_id, jira_status, mr_state), to: Cleanup
+
+    def apply(store, policy, run_id, opts) do
+      runner = fn _executable, args, _opts ->
+        send(self(), {:scheduler_reclaim, args})
+        {Jason.encode!(%{"reclaimed_bytes" => 123}), 0}
+      end
+
+      failure = fn boundary ->
+        if boundary == Process.get(:scheduler_cleanup_failure), do: {:error, :injected_crash}, else: :ok
+      end
+
+      Cleanup.apply(store, policy, run_id, opts ++ [command_runner: runner, failure_injector: failure])
+    end
+  end
 
   setup do
     root = Path.join(System.tmp_dir!(), "factory-cleanup-#{System.unique_integer([:positive])}")
@@ -70,6 +104,7 @@ defmodule SymphonyElixir.FactoryCleanupTest do
 
     %{
       store: store,
+      database: database,
       policy: policy,
       writer: writer,
       route: route,
@@ -255,6 +290,88 @@ defmodule SymphonyElixir.FactoryCleanupTest do
     assert candidate["candidate_sha"]
 
     assert [] == Cleanup.authorization_candidates(context.store, context.policy, "other")
+  end
+
+  test "scheduler cleanup protects dirty live and unpublished work then resumes removal across SQLite reopen", context do
+    scope = "cleanup-sweep"
+
+    factory = %{
+      scope: scope,
+      dispatcher_id: "dispatcher-1",
+      queue: %{"assignee" => "currentUser()", "statuses" => ["READY"], "factory_labels" => ["ai-ready"], "projects" => [], "epics" => []},
+      repositories: %{"grail" => context.route},
+      cleanup: context.policy["cleanup"],
+      hibernation: %{},
+      review_feedback: %{"enabled" => false},
+      maximum_specifiers: 1,
+      maximum_writers: 1,
+      maximum_validators: 1,
+      writer_disk_gb: 1,
+      stale_task_minutes: 90
+    }
+
+    scheduler = %{factory: factory, store: context.store, workspace_root: context.workspace_root, control_server: self()}
+    tick = fn scheduler -> Scheduler.tick(scheduler, controller_task: SweepController, cleanup: SweepCleanup) end
+    dirty = Path.join(context.writer.path, "preserve.txt")
+    File.write!(dirty, "uncommitted\n")
+    assert {:ok, %{launches: []}} = tick.(scheduler)
+    assert File.read!(dirty) == "uncommitted\n"
+    refute_received {:scheduler_reclaim, _}
+    File.rm!(dirty)
+
+    live = Path.join([context.workspace_root, "factory-controller", scope])
+    File.rmdir!(live)
+    cmd!(context.repo, ["worktree", "move", context.writer.path, live])
+    assert {:ok, _} = RunLedger.update(context.store, "run-cleanup", %{worktree: live})
+    assert {:ok, %{launches: []}} = tick.(scheduler)
+    assert File.exists?(Path.join(live, "feature.txt"))
+    assert {:ok, live_run} = RunLedger.get(context.store, "run-cleanup")
+
+    assert %{eligible: false, reasons: ["worktree is the live workspace"]} =
+             Cleanup.preflight(context.store, context.policy, live_run, active_workspace: live)
+
+    refute_received {:scheduler_reclaim, _}
+    cmd!(context.repo, ["worktree", "move", live, context.writer.path])
+    assert {:ok, _} = RunLedger.update(context.store, "run-cleanup", %{worktree: context.writer.path})
+
+    File.write!(Path.join(context.writer.path, "unpublished.txt"), "local only\n")
+    cmd!(context.writer.path, ["add", "unpublished.txt"])
+    cmd!(context.writer.path, ["commit", "--no-verify", "-m", "local candidate"])
+    candidate = String.trim(cmd!(context.writer.path, ["rev-parse", "HEAD"]))
+    assert {:ok, _} = RunLedger.update(context.store, "run-cleanup", %{candidate_sha: candidate})
+    assert {:ok, %{launches: []}} = tick.(scheduler)
+    assert File.exists?(Path.join(context.writer.path, "unpublished.txt"))
+    assert {:ok, unpublished_run} = RunLedger.get(context.store, "run-cleanup")
+    assert %{eligible: false, reasons: reasons} = Cleanup.preflight(context.store, context.policy, unpublished_run)
+    assert "candidate is not remotely recoverable" in reasons
+    refute_received {:scheduler_reclaim, _}
+    assert {:ok, _} = Worktree.push_exact(context.route, context.writer.path, context.writer.branch, candidate)
+
+    Process.put(:scheduler_cleanup_failure, :after_worktree_remove)
+    assert {:ok, %{launches: []}} = tick.(scheduler)
+    refute File.exists?(context.writer.path)
+    assert {:ok, %{"cleaned_at" => nil}} = RunLedger.get(context.store, "run-cleanup")
+    refute_received {:scheduler_reclaim, _}
+
+    GenServer.stop(context.store)
+    {:ok, reopened_store} = Store.start_link(database: context.database)
+    Process.delete(:scheduler_cleanup_failure)
+    scheduler = %{scheduler | store: reopened_store}
+    assert {:ok, %{launches: []}} = tick.(scheduler)
+    assert_received {:scheduler_reclaim, args}
+    assert context.writer.path in args
+    assert "--bazel-for-sources" in args
+    assert {:ok, cleaned} = RunLedger.get(reopened_store, "run-cleanup")
+    assert is_binary(cleaned["cleaned_at"])
+    assert cleaned["candidate_sha"] == candidate
+    assert {:ok, %{launches: []}} = tick.(scheduler)
+    refute_received {:scheduler_reclaim, _}
+
+    route = context.route |> Map.put("branch", context.writer.branch) |> Map.put("expected_sha", candidate)
+    assert {:ok, rehydrated} = Worktree.ensure_writer(route, "PPL-123", "run-cleanup")
+    assert rehydrated.head == candidate
+    assert rehydrated.path == context.writer.path
+    assert File.read!(Path.join(rehydrated.path, "unpublished.txt")) == "local only\n"
   end
 
   defp cmd!(cwd, args) do

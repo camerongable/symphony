@@ -1,7 +1,18 @@
 defmodule SymphonyElixir.FactorySchedulerTest do
   use ExUnit.Case, async: true
 
-  alias SymphonyElixir.Factory.{Contract, ContractChat, Control, IntakeLedger, Prompt, RunLedger}
+  alias SymphonyElixir.Factory.{
+    Contract,
+    ContractChat,
+    Control,
+    DesktopRequest,
+    IntakeLedger,
+    ModelRouter,
+    MrFeedback,
+    MrFeedbackLedger
+  }
+
+  alias SymphonyElixir.Factory.{Prompt, RunLedger}
   alias SymphonyElixir.Factory.{Scheduler, Store, TaskLedger}
 
   defmodule FakeControllerTask do
@@ -80,6 +91,58 @@ defmodule SymphonyElixir.FactorySchedulerTest do
 
     defp decode_snapshots(value) when is_binary(value), do: value |> Jason.decode!() |> decode_snapshots()
     defp decode_snapshots(value) when is_list(value), do: value
+  end
+
+  defmodule FakeReviewJiraReader do
+    @spec search(String.t(), keyword()) :: {:error, atom()}
+    def search(_jql, _opts), do: {:error, :queue_offline}
+
+    @spec issue(String.t(), keyword()) :: {:ok, map()}
+    def issue(key, opts) do
+      send(self(), {:review_issue_read, key})
+      send(self(), {:review_issue_connector, Keyword.get(opts, :connector)})
+      {:ok, Process.get(:review_issue)}
+    end
+  end
+
+  defmodule FakeReviewGitLabReader do
+    @spec fetch(map(), map(), keyword()) :: {:ok, map()}
+    def fetch(route, run, _opts) do
+      send(self(), {:review_mr_read, run["run_id"]})
+
+      {:ok,
+       %{
+         mr: %{
+           "project" => route["gitlab_project"],
+           "iid" => run["mr_iid"],
+           "web_url" => run["mr_url"],
+           "source_branch" => run["branch"],
+           "sha" => run["candidate_sha"],
+           "state" => "opened"
+         },
+         discussions: [
+           %{
+             "id" => "discussion-1",
+             "notes" => [
+               %{
+                 "id" => 51,
+                 "body" => Process.get(:review_note_body, "@Symphony please check this"),
+                 "updated_at" => "2026-09-30T10:00:00Z",
+                 "author" => %{"id" => 12}
+               }
+             ]
+           }
+         ]
+       }}
+    end
+  end
+
+  defmodule FakeReviewConsumer do
+    @spec process_one(map(), keyword()) :: {:ok, :pending}
+    def process_one(_context, _opts) do
+      send(self(), :review_consumer_called)
+      {:ok, :pending}
+    end
   end
 
   defmodule FakeTaskLauncher do
@@ -304,6 +367,384 @@ defmodule SymphonyElixir.FactorySchedulerTest do
 
     on_exit(fn -> File.rm_rf(root) end)
     %{context: context, store: store, root: root}
+  end
+
+  test "review feedback still polls when unrelated Jira intake fails", %{context: context, store: store} do
+    run = %{
+      run_id: "review-42",
+      issue_key: "PPL-123",
+      kind: "DELIVERY",
+      state: "READY_FOR_REVIEW",
+      repo_key: "grail",
+      branch: "factory/PPL-123",
+      candidate_sha: String.duplicate("a", 40),
+      mr_iid: 123,
+      mr_url: "https://gitlab.example/grailbio/grail/-/merge_requests/123"
+    }
+
+    assert {:ok, _registered} = RunLedger.register(store, run)
+    Process.put(:review_issue, snapshot(["repo-grail", "ai-review"]))
+
+    factory =
+      context.factory
+      |> Map.put(:task_transport, "desktop_broker")
+      |> Map.put(:review_feedback, %{"allowed_author_ids" => [12], "bot_author_id" => 99})
+
+    assert {:error, :queue_offline} =
+             Scheduler.tick(%{context | factory: factory},
+               jira_reader: FakeReviewJiraReader,
+               gitlab_reader: FakeReviewGitLabReader,
+               feedback_consumer: FakeReviewConsumer,
+               cleanup: FakeCleanup
+             )
+
+    assert_received {:review_issue_read, "PPL-123"}
+    assert_received {:review_issue_connector, SymphonyElixir.Factory.JiraMcpConnector}
+    assert_received {:review_mr_read, "review-42"}
+    assert_received :review_consumer_called
+    assert [receipt] = MrFeedbackLedger.pending(store)
+    assert receipt["note_id"] == 51
+
+    Store.query!(store, "UPDATE mr_feedback_notes SET status = 'CLAIMED', request_key = 'feedback-request'")
+
+    assert {:ok, %{launches: [], events: []}} =
+             Scheduler.tick(%{context | factory: factory},
+               jira_reader: FakeReviewJiraReader,
+               gitlab_reader: FakeReviewGitLabReader,
+               feedback_consumer: FakeReviewConsumer,
+               cleanup: FakeCleanup
+             )
+
+    assert_receive first_feedback_action
+    assert first_feedback_action == :review_consumer_called
+
+    now = DateTime.utc_now() |> DateTime.to_iso8601()
+
+    Store.query!(
+      store,
+      "INSERT INTO desktop_requests (request_key, target_kind, target_key, action, status, payload_sha256, codex_project_id, model, reasoning_effort, title, prompt, schema_json, cwd, metadata_json, created_at, updated_at) VALUES ('feedback-request', 'CONTROLLER', 'assigned-jira-work', 'FOLLOWUP', 'PENDING', ?, 'projectless', 'gpt-test', 'medium', 'Controller', 'question', '{}', '/tmp/controller', '{}', ?, ?)",
+      [String.duplicate("a", 64), now, now]
+    )
+
+    Store.query!(store, "UPDATE mr_feedback_notes SET status = 'SUPERSEDED'")
+
+    assert {:error, :queue_offline} =
+             Scheduler.tick(%{context | factory: factory},
+               jira_reader: FakeReviewJiraReader,
+               gitlab_reader: FakeReviewGitLabReader,
+               feedback_consumer: FakeReviewConsumer,
+               cleanup: FakeCleanup
+             )
+
+    Store.query!(store, "UPDATE mr_feedback_notes SET status = 'COMPLETE'")
+
+    assert {:error, :queue_offline} =
+             Scheduler.tick(%{context | factory: factory},
+               jira_reader: FakeReviewJiraReader,
+               gitlab_reader: FakeReviewGitLabReader,
+               feedback_consumer: FakeReviewConsumer,
+               cleanup: FakeCleanup
+             )
+  end
+
+  test "verified review rework pushes the existing MR branch and queues exact-thread replies", %{context: context, store: store, root: root} do
+    candidate = String.duplicate("a", 40)
+    prior = String.duplicate("b", 40)
+    writer_path = Path.join(root, "review-writer")
+    File.mkdir_p!(writer_path)
+
+    contract = Contract.bind("PPL-123", 1, "# Contract\n\n## Acceptance Criteria\n- AC-1: works")
+    snapshot = authorized_snapshot(contract, ["ai-review", "repo-grail"]) |> Map.put("status", "In Dev")
+    Process.put(:factory_controller_response, intake_response(snapshot))
+    Process.put(:factory_jira_issue, snapshot)
+
+    factory =
+      context.factory
+      |> Map.put(:task_transport, "desktop_broker")
+      |> Map.put(:review_feedback, %{"enabled" => false})
+
+    note = %{
+      "id" => 51,
+      "body" => "@Symphony please check this",
+      "updated_at" => "2026-09-30T10:00:00Z",
+      "author" => %{"id" => 12}
+    }
+
+    discussion = %{"id" => "discussion-1", "notes" => [note]}
+    route = Map.put(factory.repositories["grail"], "repo_key", "grail")
+    mr_url = "https://gitlab.example/grailbio/grail/-/merge_requests/123"
+    old_mr = %{"project" => route["gitlab_project"], "iid" => 123, "web_url" => mr_url, "source_branch" => "cgable/PPL-123-factory-work", "sha" => prior, "state" => "opened"}
+
+    old_run = %{
+      "run_id" => "review-push-run",
+      "issue_key" => "PPL-123",
+      "kind" => "DELIVERY",
+      "state" => "READY_FOR_REVIEW",
+      "repo_key" => "grail",
+      "branch" => old_mr["source_branch"],
+      "candidate_sha" => prior,
+      "mr_iid" => 123,
+      "mr_url" => mr_url
+    }
+
+    {:ok, feedback} = MrFeedback.candidate(old_run, route, snapshot, old_mr, discussion, note, [12], 99)
+
+    feedback_json =
+      Jason.encode!([
+        %{
+          "feedback_key" => feedback.feedback_key,
+          "discussion_id" => discussion["id"],
+          "note_id" => note["id"],
+          "note_updated_at" => note["updated_at"],
+          "author_id" => 12,
+          "body_sha256" => feedback.body_sha256,
+          "body" => note["body"]
+        }
+      ])
+
+    assert {:ok, %{run: run}} =
+             RunLedger.register(store, %{
+               run_id: "review-push-run",
+               issue_key: "PPL-123",
+               kind: "DELIVERY",
+               state: "REVIEW_PUSHING",
+               repo_key: "grail",
+               repo_path: route["path"],
+               base_branch: "master",
+               branch: old_mr["source_branch"],
+               worktree: writer_path,
+               candidate_sha: candidate,
+               review_base_sha: prior,
+               review_feedback_json: feedback_json,
+               mr_iid: 123,
+               mr_url: mr_url,
+               snapshot_json: Jason.encode!(snapshot),
+               contract_markdown: contract.markdown,
+               contract_sha256: contract.sha256,
+               spec_revision: 1,
+               verifier_round: 1,
+               factory_owned: false
+             })
+
+    assert {:ok, verifier_task} =
+             TaskLedger.register(store, %{
+               task_key: "review-push-run:change-verifier:1",
+               run_id: run["run_id"],
+               stage: "VERIFYING",
+               role: "change-verifier",
+               status: "CONSUMED",
+               model_provider: "codex",
+               model_class: "test",
+               model: "gpt-test",
+               reasoning_effort: "medium",
+               routing_reason: "test",
+               codex_project_id: "project-grail",
+               prompt_sha256: String.duplicate("a", 64)
+             })
+
+    assert {:ok, _task} =
+             TaskLedger.update(store, verifier_task["task_key"], %{
+               output_json: Jason.encode!(%{"status" => "PASS", "candidate_sha" => candidate})
+             })
+
+    assert {:ok, :recorded} = MrFeedbackLedger.record_candidate(store, feedback)
+    batch_key = "review-batch-1"
+    Store.query!(store, "UPDATE mr_feedback_notes SET status = 'REWORKING', review_batch_key = ?", [batch_key])
+
+    assert {:ok, _result} =
+             Scheduler.tick(%{context | factory: factory},
+               controller_task: FakeControllerTask,
+               jira_connector: FakeJiraConnector,
+               gitlab_reader: FakeReviewGitLabReader,
+               task_launcher: FakeTaskLauncher,
+               cleanup: FakeCleanup,
+               worktree: FakeWorktree
+             )
+
+    assert %{"state" => "READY_FOR_REVIEW", "last_error" => nil} =
+             Store.one!(store, "SELECT state, last_error FROM runs WHERE run_id = 'review-push-run'")
+
+    assert_received {:push_exact, "cgable/PPL-123-factory-work", ^candidate}
+
+    assert Store.one!(store, "SELECT status, reply_phase FROM mr_feedback_notes WHERE feedback_key = ?", [feedback.feedback_key]) ==
+             %{"status" => "PENDING", "reply_phase" => 1}
+  end
+
+  test "a clear review edit resumes the existing writer without restarting planning", %{context: context, store: store, root: root} do
+    candidate = String.duplicate("a", 40)
+    writer_path = Path.join(root, "review-writer")
+    File.mkdir_p!(writer_path)
+    Process.put(:review_note_body, "@Symphony please simplify the switch")
+
+    contract = Contract.bind("PPL-123", 1, "# Contract\n\n## Acceptance Criteria\n- AC-1: works")
+    snapshot = authorized_snapshot(contract, ["ai-review", "repo-grail"]) |> Map.put("status", "In Dev")
+    Process.put(:factory_controller_response, intake_response(snapshot))
+    Process.put(:factory_jira_issue, snapshot)
+
+    factory =
+      context.factory
+      |> Map.put(:task_transport, "desktop_broker")
+      |> Map.put(:review_feedback, %{"enabled" => true, "allowed_author_ids" => [12], "bot_author_id" => 99})
+
+    assert {:ok, %{run: run}} =
+             RunLedger.register(store, %{
+               run_id: "review-admit-run",
+               issue_key: "PPL-123",
+               kind: "DELIVERY",
+               state: "READY_FOR_REVIEW",
+               repo_key: "grail",
+               repo_path: factory.repositories["grail"]["path"],
+               base_branch: "master",
+               branch: "cgable/PPL-123-factory-work",
+               worktree: writer_path,
+               candidate_sha: candidate,
+               mr_iid: 123,
+               mr_url: "https://gitlab.example/grailbio/grail/-/merge_requests/123",
+               snapshot_json: Jason.encode!(snapshot),
+               contract_markdown: contract.markdown,
+               contract_sha256: contract.sha256,
+               spec_revision: 1,
+               factory_owned: false
+             })
+
+    assert {:ok, writer} =
+             TaskLedger.register(store, %{
+               task_key: "review-admit-run:feature-writer",
+               run_id: run["run_id"],
+               stage: "WRITING",
+               role: "feature-writer",
+               status: "COMPLETE",
+               model_provider: "codex",
+               model_class: "test",
+               model: "gpt-test",
+               reasoning_effort: "medium",
+               routing_reason: "test",
+               codex_project_id: "project-grail",
+               thread_id: "existing-writer-thread",
+               workspace: writer_path,
+               workspace_sha: candidate,
+               prompt_sha256: String.duplicate("a", 64)
+             })
+
+    assert {:ok, _updated} = TaskLedger.update(store, writer["task_key"], %{turn_id: "existing-writer-turn"})
+
+    note = %{"id" => 51, "body" => "@Symphony please simplify the switch", "updated_at" => "2026-09-30T10:00:00Z", "author" => %{"id" => 12}}
+    discussion = %{"id" => "discussion-1", "notes" => [note]}
+    route = Map.put(factory.repositories["grail"], "repo_key", "grail")
+    mr = %{"project" => route["gitlab_project"], "iid" => 123, "web_url" => run["mr_url"], "source_branch" => run["branch"], "sha" => candidate, "state" => "opened"}
+    {:ok, feedback} = MrFeedback.candidate(run, route, snapshot, mr, discussion, note, [12], 99)
+    assert {:ok, :recorded} = MrFeedbackLedger.record_candidate(store, feedback)
+    request_key = "review-admit-run:feedback-classification"
+    Control.initialize(store, %{scope: factory.scope, dispatcher_id: factory.dispatcher_id})
+    Control.record_controller_task(store, %{scope: factory.scope}, "controller-thread", "classified-turn", %{})
+
+    assert {:ok, _request} =
+             DesktopRequest.enqueue(store, %{
+               request_key: request_key,
+               target_kind: "CONTROLLER",
+               target_key: factory.scope,
+               action: "FOLLOWUP",
+               existing_thread_id: "controller-thread",
+               codex_project_id: "projectless",
+               model: "gpt-test",
+               reasoning_effort: "medium",
+               title: "Classify review feedback",
+               prompt: "Classify the requested edit",
+               cwd: root
+             })
+
+    Store.query!(store, "UPDATE desktop_requests SET status = 'SUCCEEDED' WHERE request_key = ?", [request_key])
+    Store.query!(store, "UPDATE mr_feedback_notes SET status = 'CHANGE_REQUEST', request_key = ? WHERE feedback_key = ?", [request_key, feedback.feedback_key])
+
+    assert {:ok, _result} =
+             Scheduler.tick(%{context | factory: factory},
+               controller_task: FakeControllerTask,
+               jira_connector: FakeJiraConnector,
+               gitlab_reader: FakeReviewGitLabReader,
+               feedback_consumer: FakeReviewConsumer,
+               task_launcher: FakeTaskLauncher,
+               cleanup: FakeCleanup,
+               worktree: FakeWorktree
+             )
+
+    assert Store.one!(store, "SELECT state FROM runs WHERE run_id = 'review-admit-run'")["state"] == "REVIEW_WRITING"
+
+    assert Store.one!(store, "SELECT status, thread_id FROM factory_tasks WHERE task_key = ?", [writer["task_key"]]) ==
+             %{"status" => "RETRY_PENDING", "thread_id" => "existing-writer-thread"}
+
+    assert Store.one!(store, "SELECT status FROM mr_feedback_notes WHERE feedback_key = ?", [feedback.feedback_key])["status"] == "REWORKING"
+
+    assert {:ok, %{launches: [_launch]}} =
+             Scheduler.tick(%{context | factory: factory},
+               controller_task: FakeControllerTask,
+               jira_connector: FakeJiraConnector,
+               gitlab_reader: FakeReviewGitLabReader,
+               feedback_consumer: FakeReviewConsumer,
+               task_launcher: FakeTaskLauncher,
+               cleanup: FakeCleanup,
+               worktree: FakeWorktree
+             )
+
+    assert_received {:stage_launch, "review-admit-run", ^writer_path, writer_prompt, writer_opts}
+    assert writer_prompt =~ "REVIEW FEEDBACK BATCH"
+    assert writer_prompt =~ "please simplify the switch"
+    assert writer_opts[:task_key] == writer["task_key"]
+
+    writer_output = Jason.encode!(%{"status" => "COMPLETE", "changed_paths" => [], "commit_message" => nil})
+    assert {:ok, _task} = TaskLedger.update(store, writer["task_key"], %{status: "COMPLETE", output_json: writer_output})
+
+    assert {:ok, _result} =
+             Scheduler.tick(%{context | factory: factory},
+               controller_task: FakeControllerTask,
+               jira_connector: FakeJiraConnector,
+               gitlab_reader: FakeReviewGitLabReader,
+               feedback_consumer: FakeReviewConsumer,
+               task_launcher: FakeTaskLauncher,
+               cleanup: FakeCleanup,
+               worktree: FakeWorktree
+             )
+
+    assert %{"state" => "VERIFYING", "verifier_round" => 1} =
+             Store.one!(store, "SELECT state, verifier_round FROM runs WHERE run_id = 'review-admit-run'")
+
+    assert {:ok, %{launches: [_launch]}} =
+             Scheduler.tick(%{context | factory: factory},
+               controller_task: FakeControllerTask,
+               jira_connector: FakeJiraConnector,
+               gitlab_reader: FakeReviewGitLabReader,
+               feedback_consumer: FakeReviewConsumer,
+               task_launcher: FakeTaskLauncher,
+               cleanup: FakeCleanup,
+               worktree: FakeWorktree
+             )
+
+    assert_received {:stage_launch, "review-admit-run", _, verifier_prompt, verifier_opts}
+    assert verifier_prompt =~ "REVIEW FEEDBACK BATCH"
+    assert verifier_opts[:role] == "change-verifier"
+
+    verifier_path = Path.join(root, "review-verifier")
+    File.mkdir_p!(verifier_path)
+
+    assert {:ok, _task} =
+             TaskLedger.update(store, "review-admit-run:change-verifier:1", %{
+               status: "COMPLETE",
+               workspace: verifier_path,
+               workspace_sha: candidate,
+               output_json: Jason.encode!(%{"status" => "PASS", "candidate_sha" => candidate, "findings" => [], "checks" => []})
+             })
+
+    assert {:ok, _result} =
+             Scheduler.tick(%{context | factory: factory},
+               controller_task: FakeControllerTask,
+               jira_connector: FakeJiraConnector,
+               gitlab_reader: FakeReviewGitLabReader,
+               feedback_consumer: FakeReviewConsumer,
+               task_launcher: FakeTaskLauncher,
+               cleanup: FakeCleanup,
+               worktree: FakeWorktree
+             )
+
+    assert Store.one!(store, "SELECT state FROM runs WHERE run_id = 'review-admit-run'")["state"] == "REVIEW_PUSHING"
   end
 
   test "registers and launches an assignee-wide specification task", %{context: context, store: store} do
@@ -1477,6 +1918,97 @@ defmodule SymphonyElixir.FactorySchedulerTest do
     assert run["contract_sha256"] == contract.sha256
     assert run["manual_validation_required"] == 0
     Process.exit(pid, :kill)
+  end
+
+  test "delivery routing carries only unique exact-contract specification risk", %{context: context, root: root} do
+    contract = Contract.bind("PPL-123", 1, "## Manual Validation\n- Required: no")
+
+    policy = %{
+      "default_provider" => "codex",
+      "providers" => %{"codex" => %{"balanced" => "balanced-test", "deep" => "deep-test"}},
+      "roles" => %{
+        "feature-writer" => %{"model_class" => "balanced", "reasoning_effort" => "high"},
+        "feature-writer-high-risk" => %{"model_class" => "deep", "reasoning_effort" => "xhigh"}
+      },
+      "delivery_routing" => %{
+        "default_role" => "feature-writer",
+        "high_risk_role" => "feature-writer-high-risk",
+        "high_risk_values" => ["high", "critical", "unknown"],
+        "high_risk_signals" => ["security"],
+        "unknown_risk_is_high" => true
+      }
+    }
+
+    cases = [
+      {"low", [%{risk: "low"}], "low", [], "feature-writer"},
+      {"routine", [%{risk: "routine"}], "routine", [], "feature-writer"},
+      {"medium", [%{risk: "medium"}], "medium", [], "feature-writer"},
+      {"high", [%{risk: "high"}], "high", [], "feature-writer-high-risk"},
+      {"critical", [%{risk: "critical"}], "critical", [], "feature-writer-high-risk"},
+      {"signal", [%{risk: "low", risk_signals_json: ~s(["security"])}], "low", ["security"], "feature-writer-high-risk"},
+      {"missing", [], "unknown", [], "feature-writer-high-risk"},
+      {"invalid", [%{risk: "probably safe"}], "unknown", [], "feature-writer-high-risk"},
+      {"invalid-signals", [%{risk: "low", risk_signals_json: "{}"}], "unknown", [], "feature-writer-high-risk"},
+      {"invalid-signals-json", [%{risk: "low", risk_signals_json: "not json"}], "unknown", [], "feature-writer-high-risk"},
+      {"invalid-signal-item", [%{risk: "low", risk_signals_json: "[1]"}], "unknown", [], "feature-writer-high-risk"},
+      {"nil-risk", [%{risk: nil}], "unknown", [], "feature-writer-high-risk"},
+      {"nil-signals", [%{risk: "low", risk_signals_json: nil}], "unknown", [], "feature-writer-high-risk"},
+      {"wrong-digest", [%{risk: "low", contract_sha256: String.duplicate("f", 64)}], "unknown", [], "feature-writer-high-risk"},
+      {"wrong-markdown", [%{risk: "low", contract_markdown: "Risk: low"}], "unknown", [], "feature-writer-high-risk"},
+      {"wrong-revision", [%{risk: "low", spec_revision: 2}], "unknown", [], "feature-writer-high-risk"},
+      {"unfinished", [%{risk: "low", state: "FAILED"}], "unknown", [], "feature-writer-high-risk"},
+      {"wrong-issue", [%{risk: "low", issue_key: "PPL-456"}], "unknown", [], "feature-writer-high-risk"},
+      {"duplicate", [%{risk: "low"}, %{risk: "low"}], "unknown", [], "feature-writer-high-risk"},
+      {"conflicting", [%{risk: "low"}, %{risk: "critical"}], "unknown", [], "feature-writer-high-risk"}
+    ]
+
+    for {name, specifications, expected_risk, expected_signals, expected_role} <- cases do
+      {:ok, store} = Store.start_link(database: Path.join(root, "risk-#{name}.sqlite"))
+      local_context = %{context | store: store}
+
+      try do
+        for {overrides, index} <- Enum.with_index(specifications) do
+          attrs = %{
+            run_id: "spec-#{index}",
+            issue_key: contract.issue_key,
+            kind: "SPECIFICATION",
+            state: "DELIVERED",
+            spec_revision: contract.revision,
+            contract_sha256: contract.sha256,
+            contract_markdown: contract.markdown,
+            risk_signals_json: "[]"
+          }
+
+          assert {:ok, _registered} = RunLedger.register(store, Map.merge(attrs, overrides))
+        end
+
+        ready =
+          authorized_snapshot(contract, ["ai-ready", "repo-grail"])
+          |> Map.put("description", "Risk: low")
+          |> Map.put("risk", "low")
+          |> Map.update!("comments", &(&1 ++ [%{"id" => "4", "text" => "Risk: low"}]))
+
+        Process.put(:factory_controller_responses, [
+          intake_response(ready),
+          jira_write_response(["ai-running", "repo-grail"], "ai-running")
+        ])
+
+        assert {:ok, _result} = tick(local_context)
+        delivery = Enum.find(RunLedger.list(store), &(&1["kind"] == "DELIVERY"))
+        assert delivery["risk"] == expected_risk, name
+        assert Jason.decode!(delivery["risk_signals_json"]) == expected_signals, name
+
+        assert {:ok, route} =
+                 ModelRouter.resolve(policy, "feature-writer",
+                   risk: delivery["risk"],
+                   risk_signals: Jason.decode!(delivery["risk_signals_json"])
+                 )
+
+        assert route.resolved_role == expected_role, name
+      after
+        GenServer.stop(store)
+      end
+    end
   end
 
   test "a newer unconfirmed contract blocks delivery despite the ai-ready label", %{context: context, store: store} do

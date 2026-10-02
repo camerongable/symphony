@@ -292,12 +292,31 @@ Use this only when completion is blocked by missing required tools or missing au
 - Keep issue text concise, specific, and reviewer-oriented.
 - If blocked and no workpad exists yet, add one blocker comment describing blocker, impact, and next unblock action.
 
+## Native source attachment pilot
+
+`factory.native_source_attachment_enabled` defaults to `false`. This opt-in
+bootstrap creates an attached SOURCE checkout and records its separate isolated
+CONTROL checkout. It applies only to new native delivery writers; existing
+requests are not migrated. Setup uses fast/low maintenance routing and source
+turns retain their saved writer allocation. Keep it off in production until the
+workspace-write sandbox, control-context recovery, and broker-driven lifecycle
+acceptance pass. This flag does not enable archival or cache reclamation; native
+cleanup remains separately disabled. See the implementation README and broker
+source-bootstrap reference for command/attachment evidence requirements.
+
 ## Workpad template
 
 Use this exact structure for the persistent workpad comment and keep it updated in place throughout execution:
 
 ````md
 ## Codex Workpad
+
+Native cleanup is disabled by default through `factory.cleanup.native.enabled:
+false`. The current native factory chat route has not passed managed-attachment
+archive/restore acceptance; setting it to true is rejected at startup. The staged
+`workspace-maintainer` role uses the configured fast provider model at low reasoning
+and never changes the stored source writer allocation. See the implementation
+README for the read-only maintenance plan and remaining activation prerequisites.
 
 ```text
 <hostname>:<abs-path>@<short-sha>

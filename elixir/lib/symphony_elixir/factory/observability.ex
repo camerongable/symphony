@@ -12,6 +12,7 @@ defmodule SymphonyElixir.Factory.Observability do
     Capacity,
     ControlServer,
     IntakeLedger,
+    NativeWorkspaceMaintenance,
     Queue,
     RunLedger,
     Store,
@@ -52,13 +53,14 @@ defmodule SymphonyElixir.Factory.Observability do
     runs = Enum.reject(all_runs, &hidden_from_dashboard?/1)
     current_runs = Enum.reject(current_runs, &hidden_from_dashboard?/1)
     tasks = TaskLedger.list_recent(store, task_limit)
+    handoffs = attention_handoffs(store)
     tasks_by_run = Enum.group_by(tasks, & &1["run_id"])
     issue_by_run = Map.new(all_runs ++ current_runs, &{&1["run_id"], &1["issue_key"]})
 
-    projected_runs = project_runs(runs, tasks_by_run, issue_by_run)
-    projected_current_runs = project_runs(current_runs, tasks_by_run, issue_by_run)
+    projected_runs = project_runs(runs, tasks_by_run, issue_by_run, handoffs)
+    projected_current_runs = project_runs(current_runs, tasks_by_run, issue_by_run, handoffs)
 
-    projected_tasks = Enum.map(tasks, &project_task(&1, issue_by_run))
+    projected_tasks = Enum.map(tasks, &project_task(&1, issue_by_run, handoffs))
     intake = project_intake(IntakeLedger.get(store, value(factory, :scope, "default")), factory, current_runs)
     control = project_control(ControlServer.status(control_server))
     intake = Map.put(intake, :stale, control.status == "PAUSED")
@@ -69,7 +71,8 @@ defmodule SymphonyElixir.Factory.Observability do
       available: true,
       control: control,
       broker: project_broker(store, factory),
-      counts: counts(current_runs, tasks),
+      workspace_maintenance: NativeWorkspaceMaintenance.snapshot(store),
+      counts: counts(current_runs, tasks, handoffs),
       overview: overview(projected_current_runs, projected_tasks, intake, stalled_run_ids),
       intake: intake,
       capacity: capacities(store, factory, opts),
@@ -80,7 +83,7 @@ defmodule SymphonyElixir.Factory.Observability do
     }
   end
 
-  defp project_runs(runs, tasks_by_run, issue_by_run) do
+  defp project_runs(runs, tasks_by_run, issue_by_run, handoffs) do
     Enum.map(runs, fn run ->
       run
       |> project_run()
@@ -88,10 +91,50 @@ defmodule SymphonyElixir.Factory.Observability do
         :tasks,
         tasks_by_run
         |> Map.get(run["run_id"], [])
-        |> Enum.map(&project_task(&1, issue_by_run))
+        |> Enum.map(&project_task(&1, issue_by_run, handoffs))
       )
+      |> Map.put(:handoff_attention, handoffs |> Map.values() |> Enum.find(&(&1.run_id == run["run_id"])))
     end)
   end
+
+  defp attention_handoffs(store) do
+    Store.query!(store, """
+    SELECT request.request_key, request.target_key, request.action, request.failure_code, task.run_id, task.role
+    FROM desktop_requests AS request
+    JOIN factory_tasks AS task ON task.task_key = request.target_key
+    WHERE request.target_kind = 'TASK' AND request.status IN ('RECONCILE_REQUIRED', 'FAILED')
+      AND json_type(request.metadata_json, '$.maintenance_operation') IS NULL
+      AND task.status IN ('STARTING', 'RUNNING', 'WAITING_FOR_BROKER', 'WAITING_FOR_WRITER', 'RETRY_PENDING', 'STALE')
+      AND NOT EXISTS (
+        SELECT 1 FROM desktop_requests AS newer
+        WHERE newer.target_kind = request.target_kind AND newer.target_key = request.target_key
+          AND json_type(newer.metadata_json, '$.maintenance_operation') IS NULL
+          AND (newer.created_at > request.created_at
+            OR (newer.created_at = request.created_at AND newer.rowid > request.rowid))
+      )
+    ORDER BY request.created_at DESC, request.rowid DESC
+    """).rows
+    |> Enum.reduce(%{}, fn [request_key, task_key, action, failure, run_id, role], acc ->
+      Map.put_new(acc, task_key, %{
+        request_key: request_key,
+        run_id: run_id,
+        label: handoff_label(role, action, failure),
+        reason: handoff_reason(failure)
+      })
+    end)
+  end
+
+  defp handoff_label("change-verifier", "CREATE", "CREATE_THREAD_INVALID_ARGUMENTS"), do: "Verifier creation failed"
+  defp handoff_label(_role, "CREATE", "CREATE_THREAD_INVALID_ARGUMENTS"), do: "Worker creation failed"
+  defp handoff_label("change-verifier", "CREATE", _failure), do: "Verifier creation needs attention"
+  defp handoff_label(_role, "CREATE", _failure), do: "Worker creation needs attention"
+  defp handoff_label(_role, _action, _failure), do: "Worker handoff needs attention"
+
+  defp handoff_reason("CREATE_THREAD_INVALID_ARGUMENTS"),
+    do: "Desktop rejected the creation arguments. Correct them and recover this same request."
+
+  defp handoff_reason(failure),
+    do: "Reconcile this Desktop request before retrying. Reason: #{failure || "unknown"}"
 
   defp project_control(control) do
     %{
@@ -272,7 +315,7 @@ defmodule SymphonyElixir.Factory.Observability do
 
   defp hidden_status?(_status), do: false
 
-  defp project_task(task, issue_by_run) do
+  defp project_task(task, issue_by_run, handoffs) do
     %{
       task_key: task["task_key"],
       run_id: task["run_id"],
@@ -286,6 +329,7 @@ defmodule SymphonyElixir.Factory.Observability do
       model: task["model"],
       reasoning_effort: task["reasoning_effort"],
       failure_code: task["failure_code"],
+      handoff_attention: handoffs[task["task_key"]],
       updated_at: task["updated_at"]
     }
   end
@@ -300,14 +344,15 @@ defmodule SymphonyElixir.Factory.Observability do
     }
   end
 
-  defp counts(runs, tasks) do
+  defp counts(runs, tasks, handoffs) do
     current_runs = Enum.uniq_by(runs, & &1["issue_key"])
+    attention_run_ids = handoffs |> Map.values() |> Enum.map(& &1.run_id)
 
     %{
       total_runs: length(current_runs),
-      in_progress: Enum.count(current_runs, &(&1["state"] not in @terminal_states)),
+      in_progress: Enum.count(current_runs, &(&1["state"] not in @terminal_states and &1["run_id"] not in attention_run_ids)),
       review_ready: Enum.count(current_runs, &(&1["state"] in @review_states)),
-      blocked: Enum.count(current_runs, &blocked?/1),
+      blocked: Enum.count(current_runs, &(blocked?(&1) or &1["run_id"] in attention_run_ids)),
       hibernated: Enum.count(current_runs, &(&1["workspace_state"] == "HIBERNATED")),
       visible_tasks: Enum.count(tasks, &present?(&1["thread_id"])),
       by_state: Enum.frequencies_by(current_runs, & &1["state"])
@@ -349,6 +394,7 @@ defmodule SymphonyElixir.Factory.Observability do
   defp overview_state(issue, run, tasks, stalled_run_ids) do
     cond do
       projected_run_blocked?(run) -> "NEEDS_ATTENTION"
+      run && run.handoff_attention -> "NEEDS_ATTENTION"
       run && run.state == "AWAITING_CONTRACT_INPUT" -> "NEEDS_ATTENTION"
       run && run.run_id in stalled_run_ids -> "NEEDS_ATTENTION"
       true -> overview_unblocked_state(issue, run, tasks)

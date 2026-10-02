@@ -289,7 +289,9 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
         workspace_mode:
           Keyword.get(launch.opts, :workspace_mode) ||
             if(Keyword.get(launch.opts, :task_transport) == "desktop_broker", do: "CODEX_NATIVE"),
-        expected_sha: Keyword.get(launch.opts, :expected_sha)
+        expected_sha: Keyword.get(launch.opts, :expected_sha),
+        native_source_attachment_enabled: Keyword.get(launch.opts, :native_source_attachment_enabled, false),
+        model_policy: Keyword.get(launch.opts, :model_policy, %{})
       )
 
     persist_result(store, task_key, launch_prompt_sha256, result)

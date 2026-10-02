@@ -1,5 +1,28 @@
 # Symphony Elixir
 
+### Attachment-backed source bootstrap (disabled pilot)
+
+`factory.native_source_attachment_enabled` defaults to `false`. When explicitly
+enabled for a pilot, new native delivery writers create an explicit managed
+source attachment in their existing native chat. `native_source_bindings`
+records the isolated control checkout separately; `runs.worktree` and
+`factory_tasks.workspace` remain the authoritative source path. Setup uses the
+configured fast/low `workspace-maintainer`; source FOLLOWUPs explicitly use the
+saved writer allocation. Historical requests and workspaces are not migrated.
+
+Bootstrap requires a pinned read-only command receipt, target-attested attachment
+observations, and independent Git checks. Source completion requires observed
+same-turn source-command cwd and file-change paths. Ambiguous creation retains
+the original request for reconciliation, not a second checkout. This evidence
+is not a substitute for sandbox enforcement. The pilot does not thin its control
+checkout automatically, archive chats, archive sources, or reclaim caches.
+
+Production enablement awaits workspace-write access to the attached source,
+control-context recovery/retention, and a broker-driven acceptance cycle.
+`factory.cleanup.native.enabled` remains disabled and capability-gated.
+Disabling new attachment bootstrap does not remove existing bindings or chats;
+already-bound source turns retain their recorded workspace boundary.
+
 This directory contains the current Elixir/OTP implementation of Symphony, based on
 [`SPEC.md`](../SPEC.md) at the repository root.
 
@@ -82,6 +105,37 @@ An approval or elicitation prompt is not answered automatically; the write
 fails closed for reconciliation. The visible Desktop controller task remains
 the audit and GitLab-delivery interface, not the Jira data transport.
 
+Review-feedback discovery is enabled by default for this local factory through
+`factory.review_feedback`. Set `allowed_author_ids` to the numeric GitLab IDs authorized to
+address `$Symphony`. The trigger is plain text, so it does not tag a GitLab user.
+Reply readback resolves the authenticated GitLab account
+through read-only `whoami` and requires the reply author to match it. An optional
+`bot_author_id` pins that identity when the connection uses a dedicated bot account;
+omit it when the existing connection posts as a human account. Each scheduler
+tick reads fresh Jira state, the exact open factory MR, and all GitLab discussion
+pages through a scoped, reused MCP session without a model turn. It records one
+durable receipt per new authorized note body. Notes discovered on the same MR
+are handled in one controller batch, while each conversational answer is read
+back in its own discussion. Questions and ambiguous criticism receive an
+explanation or clarifying reply, not a silent source-change classification.
+Clear edit requests, including approvals that follow a concrete proposed edit,
+continue through the existing writer and verifier. A replayed controller reply
+can be retired only after its exact GitLab discussion marker is read back; the
+same receipt then continues into source rework without reposting the reply.
+Scheduler ticks reconcile a claimed controller request before polling other MRs.
+Edits supersede older pending receipts, including when the mention is removed.
+Any future receipt consumer must re-read the exact note and MR head immediately
+before acting, since either can change after the most recent poll.
+Clear source-change requests form one review-rework batch on the existing
+delivery run and writer chat, pinned to the exact MR head and clean checkout.
+The independent verifier checks the new candidate before the controller pushes
+the existing branch; verified push readback then queues exact-thread replies.
+No new planner or MR is created, and the factory does not change draft or
+reviewer state. If the original native writer checkout is unavailable, rework
+fails closed instead of silently creating a second source checkout. Uncertain
+GitLab replies require reconciliation; the controller never blindly posts them
+again.
+
 If a Desktop controller permanently lacks a required connector, pause the
 factory and broker first. After proving a replacement projectless task can
 complete the connector read, and proving the old request made no required
@@ -156,12 +210,60 @@ the same run to controller-owned CI push, MR read-back, and fresh verification;
 it neither relaunches the writer nor edits the MR itself. Record any missing
 contract-required MR evidence before reactivation.
 
-If Codex rejects a verifier CREATE with `invalid arguments` before returning
-any task or client ID, leave it in reconciliation. After reading back that
-exact failed tool call, pause dispatch and run `mise exec -- mix factory
+The broker generates creation arguments with `mix factory.desktop
+create-thread-args REQUEST_KEY --workflow WORKFLOW.local.md` before claiming.
+The returned object uses the native tool schema, including `target.projectId`
+and a worktree pinned to the expected commit.
+
+If Codex rejects a verifier CREATE with the exact `invalid arguments` result
+before returning any task or client ID, the broker records the rejected tool
+call. The active scheduler can requeue that same request once after checking
+its rejection receipt, current verifier/candidate, repository route, and
+unchanged payload. The retry budget persists across restart. Accepted or
+ambiguous creation results remain in reconciliation. A second rejection is
+shown as a verifier creation failure requiring correction. Paused operator
+recovery remains available through `mise exec -- mix factory
 resume-rejected-create REQUEST_KEY REJECTED_TOOL_CALL_ID --workflow
-WORKFLOW.local.md`. This requeues only the unbound, failed request for one
-corrected broker claim; an ambiguous or accepted CREATE is never retried.
+WORKFLOW.local.md` after exact tool-call readback.
+
+`mix factory.pilot_report --issue PPL-9723 --workflow WORKFLOW.local.md`
+reads the ledger without migrations or mutations. It reports stage and
+request wall-clock durations, current handoff failures, task/request counts,
+model routes, candidate/MR identity, and recovery/cleanup receipts. Token totals,
+human-intervention totals, and historical disk growth are marked unavailable
+when the ledger has no measurements. See [the hardening plan](docs/factory-hardening-plan.md)
+for lifecycle regression and live-trial acceptance criteria.
+
+Dashboard handoff attention uses the newest request created for each persistent
+task. Updating an old recovered failure cannot override a newer healthy request.
+When the controller commits a native writer slice, its candidate SHA and the
+consumed writer's recorded checkout SHA advance in the same transaction, so a
+later review edit can reuse that writer without stale provenance.
+
+Delivery registration inherits risk and risk signals only from one completed
+specification with the exact authorized issue, revision, digest, and Markdown.
+Missing, malformed, or ambiguous metadata remains conservative `unknown`.
+Externally specified contracts without structured risk metadata are unchanged;
+free-text Jira descriptions cannot downgrade routing.
+
+Native cleanup capability can be inspected with
+`SymphonyElixir.Factory.NativeWorktreeProbe.enqueue(store, run_id)`; it creates
+one exact-writer read-only maintenance request, not an implementation pass.
+Broker completion must supply the observed artifact map as `artifact_output`
+and in the completed `list_artifacts` tool receipt. Probe completion preserves
+the writer's stage result, status and turn. Empty/ambiguous attachments do not
+authorize cleanup. No automatic native archive/delete scheduling is enabled;
+see the hardening plan's synthetic attachment/restore proof and remaining
+production execution-context limitation.
+
+The broker can record target-attested maintenance data using
+`mix factory.desktop record-maintenance-evidence REQUEST_KEY --payload-base64
+BASE64_JSON --workflow WORKFLOW_PATH`. The target's standalone Python emitter
+writes stdout only; the broker supplies the full read-backed command frame.
+Recording is immutable/idempotent and returns a machine-generated probe receipt.
+Completion checks the same maintenance turn's observed `list_artifacts` call
+and preserves the writer's implementation result. This is a production evidence
+transport, not automatic cleanup activation or independent raw-MCP readback.
 
 The scheduler also polls the exact issue key of a failed delivery, even when
 Jira has moved it to In Dev and it is absent from the normal intake query. A
@@ -636,5 +738,32 @@ Launch `codex` in your repo, give it the URL to the Symphony repo, and ask it to
 you.
 
 ## License
+
+## Native workspace maintenance
+
+`factory.cleanup.native.enabled` defaults to `false`. Enabling it currently fails
+startup with `native_archive_restore_capability_unproven`: the actual factory
+native-chat route produces a source checkout but no managed attachment identity.
+Automatic archival, restoration, and native Bazel reclamation are not shipped or
+enabled. The legacy cleanup route remains unchanged and excludes native runs.
+
+The staged coordinator has separate durable lifecycle rows and a single probe
+reservation, independent of writer and delivery state. `workspace-maintainer`
+resolves to the configured provider's `fast` model with `low` reasoning. Ordinary
+source requests retain the writer's model allocation. An unavailable or ambiguous
+attachment is remembered for that exact binding without repeatedly waking a model.
+Even a supported attachment receipt does not authorize archival.
+
+`mix factory.desktop maintenance-plan --workflow /absolute/WORKFLOW.local.md`
+reads candidate and lifecycle state without adding lifecycle rows, requests,
+events, or external authorization. Its `eligible` flag means **probe eligibility**,
+not cleanup permission. API state exposes `workspace_maintenance` separately;
+untouched runs with no lifecycle row remain available for normal review rework.
+Existing probe reservations reconcile even with native cleanup disabled.
+
+The production acceptance gate remains a complete factory-route archive/restore
+cycle, same-chat access, fresh external authorization, exact remote recoverability,
+and isolated cache reclamation. No filesystem removal fallback or extra attachment
+may be used to bypass the missing managed identity.
 
 This project is licensed under the [Apache License 2.0](../LICENSE).

@@ -7,7 +7,9 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
   create or follow-up after an interrupted attempt.
   """
 
-  alias SymphonyElixir.Factory.{RunLedger, StageSchemas, Store, TaskLauncher, TaskLedger, Worktree}
+  alias SymphonyElixir.Factory.NativeMaintenanceEvidence
+  alias SymphonyElixir.Factory.{NativeSourceBinding, NativeWorktreeProbe, RunLedger, StageSchemas}
+  alias SymphonyElixir.Factory.{Store, TaskLauncher, TaskLedger, Worktree}
 
   @required_strings ~w(
     request_key target_kind target_key action codex_project_id model
@@ -23,7 +25,8 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
   @doc "Enqueues one request, returning an identical existing request by stable key."
   @spec enqueue(Store.connection(), map()) :: {:ok, map()} | {:error, term()}
   def enqueue(connection, attrs) when is_map(attrs) do
-    with {:ok, payload} <- normalize(attrs) do
+    with {:ok, payload} <- normalize(attrs),
+         :ok <- NativeWorktreeProbe.validate_request(connection, payload) do
       Store.transaction!(connection, fn transaction -> enqueue_transaction(transaction, payload) end)
     end
   end
@@ -59,6 +62,8 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
 
     Store.transaction!(connection, fn transaction ->
       with {:ok, request} <- get(transaction, request_key),
+           {:ok, attrs} <- NativeMaintenanceEvidence.attach(transaction, request, attrs),
+           {:ok, attrs} <- NativeSourceBinding.attach(transaction, request, attrs),
            {:ok, output} <- normalize_legacy_controller_snapshot(request, Map.get(attrs, "output")),
            {:ok, output} <- normalize_specification_critic_review(transaction, request, output),
            {:ok, output} <- normalize_change_verifier_review(transaction, request, output),
@@ -111,8 +116,9 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
   defp normalize_change_verifier_review(
          connection,
          %{"target_kind" => "TASK", "action" => "FOLLOWUP", "target_key" => task_key} = request,
-         %{"result" => %{"verdict" => verdict} = review, "completed_tool_calls" => []} = output
-       ) do
+         %{"result" => %{"verdict" => verdict} = review, "completed_tool_calls" => tool_calls} = output
+       )
+       when is_list(tool_calls) do
     with {:ok, %{"role" => "change-verifier", "run_id" => run_id} = task} <- TaskLedger.get(connection, task_key),
          {:ok, %{"kind" => "DELIVERY", "state" => "VERIFYING"} = run} <- RunLedger.get(connection, run_id),
          {:ok, schema} <- Jason.decode(request["schema_json"]),
@@ -138,15 +144,36 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
   defp normalize_change_verifier_review(_connection, _request, output), do: {:ok, output}
 
   defp valid_change_verifier_provenance?(review, request, task, run) do
-    valid_change_verifier_contract?(review, run) and
-      valid_change_verifier_checkout?(review, request, task, run)
+    valid_change_verifier_checkout?(review, request, task, run) and
+      valid_change_verifier_contract?(review, run)
   end
 
   defp valid_change_verifier_contract?(review, run) do
     review["issue_key"] == run["issue_key"] and
       review["spec_revision"] == run["spec_revision"] and
       review["contract_sha256"] == run["contract_sha256"] and
-      review["base_ref"] in [run["base_branch"], "origin/#{run["base_branch"]}"]
+      valid_change_verifier_base?(review, run)
+  end
+
+  defp valid_change_verifier_base?(review, run) do
+    base_ref = review["base_ref"]
+
+    cond do
+      base_ref in [run["base_branch"], "origin/#{run["base_branch"]}"] ->
+        true
+
+      not is_binary(base_ref) or not Regex.match?(~r/\A[0-9a-f]{40}\z/, base_ref) ->
+        false
+
+      not File.dir?(review["review_worktree"]) ->
+        false
+
+      true ->
+        case System.cmd("git", ["merge-base", "refs/remotes/origin/#{run["base_branch"]}", run["candidate_sha"]], cd: review["review_worktree"], stderr_to_stdout: true) do
+          {sha, 0} -> String.trim(sha) == base_ref
+          _other -> false
+        end
+    end
   end
 
   defp valid_change_verifier_checkout?(review, request, task, run) do
@@ -376,12 +403,15 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
         JOIN factory_tasks AS task ON task.task_key = request.target_key
         WHERE request.target_kind = 'TASK' AND request.action = 'FOLLOWUP'
           AND request.status = 'SUCCEEDED' AND task.output_json IS NULL
+          AND (task.turn_id IS NULL OR task.turn_id != request.turn_id)
           AND json_extract(request.metadata_json, '$.workspace_mode') = 'CODEX_NATIVE'
+          AND json_type(request.metadata_json, '$.maintenance_operation') IS NULL
           AND task.status IN ('STARTING', 'RUNNING', 'WAITING_FOR_BROKER', 'WAITING_FOR_WRITER', 'STALE', 'RETRY_PENDING')
           AND request.request_key = (
             SELECT latest.request_key FROM desktop_requests AS latest
             WHERE latest.target_kind = 'TASK' AND latest.target_key = request.target_key
               AND latest.action = 'FOLLOWUP'
+              AND json_type(latest.metadata_json, '$.maintenance_operation') IS NULL
             ORDER BY latest.updated_at DESC, latest.request_key DESC LIMIT 1
           )
         ORDER BY request.updated_at DESC LIMIT ?
@@ -443,6 +473,23 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
        do: {:ok, request}
 
   defp bind_recorded_thread(connection, request, thread_id, project_id, proof) do
+    case NativeWorktreeProbe.operation(request) do
+      {:ok, nil} ->
+        bind_standard_thread(connection, request, thread_id, project_id, proof)
+
+      {:ok, _operation} ->
+        with {:ok, workspace} <- NativeWorktreeProbe.record(connection, request, thread_id, proof) do
+          maybe_record_thread(connection, request, thread_id, project_id, workspace)
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp bind_standard_thread(connection, request, thread_id, project_id, proof) do
+    proof = if is_map(proof), do: proof |> stringify_keys() |> Map.put("thread_id", thread_id), else: proof
+
     with {:ok, workspace} <- verify_native_workspace(connection, request, proof),
          :ok <- bind_target_thread(connection, request, thread_id),
          :ok <- bind_native_workspace(connection, request, workspace) do
@@ -521,6 +568,15 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
 
   defp verify_native_task_workspace(connection, request, metadata, proof) do
     proof = stringify_keys(proof)
+
+    if NativeSourceBinding.bootstrap?(request) do
+      NativeSourceBinding.record(connection, request, proof["thread_id"], proof)
+    else
+      verify_standard_native_workspace(connection, request, metadata, proof)
+    end
+  end
+
+  defp verify_standard_native_workspace(connection, request, metadata, proof) do
     cwd = proof["cwd"]
     head_sha = proof["head_sha"]
 
@@ -651,6 +707,8 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
          :ok <- require_completion(request, attrs, output_json),
          :ok <- require_unseen_turn(connection, request, attrs),
          :ok <- validate_output(request, attrs),
+         :ok <- NativeWorktreeProbe.validate_completion(connection, request, attrs),
+         :ok <- NativeSourceBinding.validate_completion(connection, request, attrs),
          :ok <- require_controller_format_repair_completion(connection, request, attrs, output_json),
          {:ok, completed} <- maybe_complete(connection, request, attrs, output_json),
          :ok <- finish_controller_format_repair(connection, request, attrs, output_json) do
@@ -865,6 +923,9 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
 
   defp complete_native_stage(connection, %{"target_kind" => "TASK", "action" => "FOLLOWUP"} = request, attrs) do
     case Jason.decode(request["metadata_json"]) do
+      {:ok, %{"maintenance_operation" => _operation}} ->
+        :ok
+
       {:ok, %{"workspace_mode" => "CODEX_NATIVE"} = metadata} ->
         complete_native_task_stage(connection, request, metadata, attrs)
 
@@ -1077,7 +1138,8 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
           else: {:error, :request_key_conflict}
 
       {:error, :unknown_request} ->
-        with :ok <- validate_target(connection, payload),
+        with :ok <- NativeWorktreeProbe.validate_request(connection, payload),
+             :ok <- validate_target(connection, payload),
              :ok <- validate_target_available(connection, payload) do
           timestamp = now()
 
@@ -1183,8 +1245,15 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
 
   defp validate_target(connection, %{"target_kind" => "TASK"} = payload) do
     case Store.one!(connection, "SELECT * FROM factory_tasks WHERE task_key = ?", [payload["target_key"]]) do
-      nil -> {:error, :unknown_target_task}
-      task -> validate_route_and_thread(task, payload, "codex_project_id", "thread_id")
+      nil ->
+        {:error, :unknown_target_task}
+
+      task ->
+        with :ok <- NativeWorktreeProbe.validate_request(connection, payload),
+             :ok <- NativeSourceBinding.validate_request(connection, payload),
+             {:ok, operation} <- NativeWorktreeProbe.operation(payload) do
+          validate_task_route(task, payload, operation || source_bootstrap_operation(payload))
+        end
     end
   end
 
@@ -1192,6 +1261,19 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
     case Store.one!(connection, "SELECT * FROM control WHERE scope = ?", [payload["target_key"]]) do
       nil -> {:error, :unknown_controller_scope}
       control -> validate_route_and_thread(control, payload, "controller_codex_project_id", "controller_thread_id")
+    end
+  end
+
+  defp source_bootstrap_operation(payload) do
+    if NativeSourceBinding.bootstrap?(payload), do: :source_bootstrap
+  end
+
+  defp validate_task_route(task, payload, nil),
+    do: validate_route_and_thread(task, payload, "codex_project_id", "thread_id")
+
+  defp validate_task_route(task, payload, _maintenance_operation) do
+    with :ok <- validate_project_route(task, payload, "codex_project_id") do
+      validate_thread_route(task, payload, "thread_id")
     end
   end
 

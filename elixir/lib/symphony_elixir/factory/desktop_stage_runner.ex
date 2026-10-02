@@ -7,7 +7,8 @@ defmodule SymphonyElixir.Factory.DesktopStageRunner do
   call is reconciled before any new task or turn can be issued.
   """
 
-  alias SymphonyElixir.Factory.{DesktopRequest, RunLedger, StageSchemas, Store, TaskLedger, Worktree}
+  alias SymphonyElixir.Factory.{DesktopRequest, ModelRouter, NativeSourceBinding, RunLedger}
+  alias SymphonyElixir.Factory.{StageSchemas, Store, TaskLedger, Worktree}
   alias SymphonyElixir.Tracker.Issue
 
   @default_poll_ms 500
@@ -157,13 +158,8 @@ defmodule SymphonyElixir.Factory.DesktopStageRunner do
 
   defp ensure_bootstrap(store, workspace, bootstrap_key, opts) do
     case DesktopRequest.get(store, bootstrap_key) do
-      {:ok, %{"status" => "SUCCEEDED"} = request} ->
-        with :ok <- require_reusable_bootstrap(store, request, opts) do
-          {:ok, bootstrap_key}
-        end
-
       {:ok, request} ->
-        with {:ok, _request} <- enqueue_bootstrap_request(store, request["cwd"], bootstrap_key, opts) do
+        with :ok <- require_reusable_bootstrap(store, request, opts) do
           {:ok, bootstrap_key}
         end
 
@@ -195,7 +191,8 @@ defmodule SymphonyElixir.Factory.DesktopStageRunner do
   end
 
   defp require_reusable_bootstrap(store, request, opts) do
-    with {:ok, metadata} <- Jason.decode(request["metadata_json"]),
+    with true <- DesktopRequest.payload_intact?(request) or {:error, :request_payload_corrupt},
+         {:ok, metadata} <- Jason.decode(request["metadata_json"]),
          {:ok, task} <- TaskLedger.get(store, Keyword.fetch!(opts, :target_key)),
          {:ok, run} <- RunLedger.get(store, task["run_id"]),
          :ok <- require_bootstrap_route(store, request, run, task, opts),
@@ -205,13 +202,7 @@ defmodule SymphonyElixir.Factory.DesktopStageRunner do
   end
 
   defp require_bootstrap_route(store, request, run, task, opts) do
-    expected = %{
-      "action" => "CREATE",
-      "codex_project_id" => Keyword.fetch!(opts, :project_id),
-      "model" => Keyword.fetch!(opts, :model),
-      "reasoning_effort" => Keyword.fetch!(opts, :reasoning_effort),
-      "base_branch" => Keyword.get(opts, :base_branch)
-    }
+    expected = bootstrap_route_fields(request, opts)
 
     route_matches =
       present?(run["repo_path"]) and
@@ -234,6 +225,19 @@ defmodule SymphonyElixir.Factory.DesktopStageRunner do
       true ->
         {:error, {:native_bootstrap_route_mismatch, [:branch_recovery_binding]}}
     end
+  end
+
+  defp bootstrap_route_fields(request, opts) do
+    allocation =
+      if NativeSourceBinding.bootstrap?(request),
+        do: Jason.decode!(request["metadata_json"])["bootstrap_model_route"],
+        else: %{"model" => Keyword.fetch!(opts, :model), "reasoning_effort" => Keyword.fetch!(opts, :reasoning_effort)}
+
+    Map.merge(Map.take(allocation, ~w(model reasoning_effort)), %{
+      "action" => "CREATE",
+      "codex_project_id" => Keyword.fetch!(opts, :project_id),
+      "base_branch" => Keyword.get(opts, :base_branch)
+    })
   end
 
   defp route_mismatches(request, expected, run, opts) do
@@ -361,6 +365,32 @@ defmodule SymphonyElixir.Factory.DesktopStageRunner do
   end
 
   defp enqueue_bootstrap_request(store, workspace, bootstrap_key, opts) do
+    with {:ok, opts} <- bootstrap_options(store, opts) do
+      enqueue_bootstrap_with_route(store, workspace, bootstrap_key, opts)
+    end
+  end
+
+  defp bootstrap_options(store, opts) do
+    with {:ok, task} <- TaskLedger.get(store, Keyword.fetch!(opts, :target_key)) do
+      if Keyword.get(opts, :native_source_attachment_enabled, false) and TaskLedger.source_writer?(task) do
+        attachment_bootstrap_options(opts)
+      else
+        {:ok, opts}
+      end
+    end
+  end
+
+  defp attachment_bootstrap_options(opts) do
+    with {:ok, route} <- ModelRouter.resolve(Keyword.fetch!(opts, :model_policy), "workspace-maintainer"),
+         true <-
+           (route.model_class == "fast" and route.reasoning_effort == "low") or
+             {:error, :native_source_requires_fast_low_route} do
+      {:ok,
+       opts |> Keyword.put(:native_source_bootstrap, true) |> Keyword.put(:bootstrap_model_route, route) |> Keyword.put(:model, route.model) |> Keyword.put(:reasoning_effort, route.reasoning_effort)}
+    end
+  end
+
+  defp enqueue_bootstrap_with_route(store, workspace, bootstrap_key, opts) do
     prompt = """
     Factory workspace bootstrap ID: #{bootstrap_key}
 
@@ -372,12 +402,35 @@ defmodule SymphonyElixir.Factory.DesktopStageRunner do
     Report only {\"status\":\"WORKSPACE_READY\"} after checking the checkout.
     """
 
+    prompt = if Keyword.get(opts, :native_source_bootstrap), do: attachment_bootstrap_prompt(bootstrap_key, opts), else: prompt
     attrs = request_attrs(workspace, prompt, @bootstrap_schema, opts, bootstrap_key, nil)
 
     case DesktopRequest.enqueue(store, attrs) do
       {:ok, _request} -> {:ok, bootstrap_key}
       {:error, _reason} = error -> error
     end
+  end
+
+  defp attachment_bootstrap_prompt(key, opts) do
+    """
+    Factory workspace bootstrap ID: #{key}
+    This is mechanical source-workspace setup, not feature implementation.
+    The initial native checkout is the CONTROL context. Read its absolute pwd and HEAD.
+    Keep the primary repository and CONTROL checkout unchanged. Call the supported
+    create_worktree tool ONCE in this chat with allowAsync:true and
+    ref:#{Keyword.fetch!(opts, :expected_sha)}. Reconcile a queued/uncertain result
+    by readback; never create another worktree. Call list_artifacts and retain its
+    exact returned object. Require one matching active managed source attachment
+    whose payload.sourceCwd is CONTROL. Do not manufacture attachment identity.
+    Run this read-only emitter with explicit workdir set to the new SOURCE root:
+    python3 -B #{NativeSourceBinding.emitter_path()} #{key} --payload-base64 BASE64_JSON
+    Encode {"control_cwd":CONTROL,"artifact_output":RAW_LIST_ARTIFACTS_OBJECT}.
+    It emits actual source cwd/HEAD with target-attested attachment evidence.
+    Do not begin ticket work, commit, push, create branches, archive, restore, or
+    thin the CONTROL checkout. No permission escalation or approval request.
+    If setup cannot be proven, report the exact failure without replacing the chat.
+    Otherwise report only {"status":"WORKSPACE_READY"}.
+    """
   end
 
   defp require_bootstrap_binding(request, task, result) do
@@ -429,7 +482,11 @@ defmodule SymphonyElixir.Factory.DesktopStageRunner do
   end
 
   defp request_attrs(workspace, prompt, schema, opts, request_key, thread_id) do
-    %{
+    binding = if present?(thread_id), do: NativeSourceBinding.get(Keyword.fetch!(opts, :store), Keyword.fetch!(opts, :target_key))
+    stage_prompt_digest = :sha256 |> :crypto.hash(prompt) |> Base.encode16(case: :lower)
+    prompt = source_bound_prompt(prompt, binding)
+
+    attrs = %{
       request_key: request_key,
       target_kind: Keyword.fetch!(opts, :target_kind),
       target_key: Keyword.fetch!(opts, :target_key),
@@ -448,7 +505,7 @@ defmodule SymphonyElixir.Factory.DesktopStageRunner do
         "issue_key" => Keyword.fetch!(opts, :issue_key),
         "display_title" => Keyword.fetch!(opts, :thread_name),
         "workspace_mode" => Keyword.get(opts, :workspace_mode),
-        "stage_prompt_sha256" => :sha256 |> :crypto.hash(prompt) |> Base.encode16(case: :lower),
+        "stage_prompt_sha256" => stage_prompt_digest,
         "expected_sha" => Keyword.get(opts, :expected_sha),
         "previous_turn_id" => Keyword.get(opts, :previous_turn_id),
         "format_repair_attempts" => Keyword.get(opts, :format_repair_attempts, 0),
@@ -463,6 +520,30 @@ defmodule SymphonyElixir.Factory.DesktopStageRunner do
         "allowed_mcp_tool_approvals" => Keyword.get(opts, :allowed_mcp_tool_approvals, [])
       }
     }
+
+    metadata =
+      if Keyword.get(opts, :native_source_bootstrap) do
+        Map.merge(attrs.metadata, %{
+          "native_source_bootstrap" => true,
+          "bootstrap_model_route" => Keyword.fetch!(opts, :bootstrap_model_route),
+          "source_emitter_sha256" => NativeSourceBinding.emitter_sha256()
+        })
+      else
+        attrs.metadata
+      end
+
+    metadata = if binding, do: Map.put(metadata, "control_workspace", binding["control_workspace"]), else: metadata
+    %{attrs | metadata: metadata}
+  end
+
+  defp source_bound_prompt(prompt, nil), do: prompt
+
+  defp source_bound_prompt(prompt, binding) do
+    prompt <>
+      "\n\nWorkspace boundary: SOURCE is #{binding["source_workspace"]}; " <>
+      "CONTROL is #{binding["control_workspace"]}. All source commands must explicitly use SOURCE workdir; " <>
+      "all file edits must use absolute SOURCE paths. Never edit CONTROL or the primary checkout. " <>
+      "Do not create another worktree, escalate permissions, or archive this chat."
   end
 
   defp await(store, request_key, schema, opts, started_at, reported_thread_id) do

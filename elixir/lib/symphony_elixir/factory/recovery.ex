@@ -3,7 +3,16 @@ defmodule SymphonyElixir.Factory.Recovery do
   Proof-bound recovery of native factory tasks and their durable runs.
   """
 
-  alias SymphonyElixir.Factory.{Contract, Control, DesktopRequest, StageSchemas, Store, TaskLedger, Worktree}
+  alias SymphonyElixir.Factory.{
+    Contract,
+    Control,
+    DesktopRequest,
+    DesktopToolArgs,
+    StageSchemas,
+    Store,
+    TaskLedger,
+    Worktree
+  }
 
   @readback_failure "COMPLETED_TURN_EMPTY_NO_SCHEMA_RESULT"
 
@@ -253,6 +262,22 @@ defmodule SymphonyElixir.Factory.Recovery do
           {:ok, map()} | {:error, term()}
   def resume_rejected_native_create(connection, config, request_key, rejected_tool_call_id)
       when is_binary(request_key) and is_binary(rejected_tool_call_id) do
+    rearm_rejected_native_create(connection, config, request_key, rejected_tool_call_id, :manual)
+  end
+
+  @doc "Retries one proven pre-creation verifier rejection once while dispatch is active."
+  @spec retry_rejected_native_create(Store.connection(), map(), String.t()) :: {:ok, map()} | {:error, term()}
+  def retry_rejected_native_create(connection, config, request_key) do
+    case DesktopRequest.get(connection, request_key) do
+      {:ok, %{"rejected_tool_call_id" => call_id}} when is_binary(call_id) ->
+        rearm_rejected_native_create(connection, config, request_key, call_id, :automatic)
+
+      _other ->
+        {:error, :rejected_create_not_proven}
+    end
+  end
+
+  defp rearm_rejected_native_create(connection, config, request_key, rejected_tool_call_id, mode) do
     Store.transaction!(connection, fn transaction ->
       control = Control.status(transaction, config.scope)
       request = Store.one!(transaction, "SELECT * FROM desktop_requests WHERE request_key = ?", [request_key])
@@ -260,8 +285,9 @@ defmodule SymphonyElixir.Factory.Recovery do
       run = if task, do: Store.one!(transaction, "SELECT * FROM runs WHERE run_id = ?", [task["run_id"]])
       route = get_in(config.repositories, [run && run["repo_key"]])
 
-      with :ok <- require_paused_control(control, config),
+      with :ok <- require_rejected_create_control(control, config, mode),
            :ok <- require_rejected_native_create(transaction, request, task, run, route, rejected_tool_call_id),
+           :ok <- require_rejected_create_retry(transaction, request, rejected_tool_call_id, mode),
            true <- Worktree.reachable?(route, run["candidate_sha"]) or {:error, :rejected_create_candidate_unreachable} do
         timestamp = DateTime.utc_now() |> DateTime.to_iso8601()
 
@@ -271,15 +297,59 @@ defmodule SymphonyElixir.Factory.Recovery do
           [timestamp, request_key]
         )
 
+        reset_rejected_create_receipt(transaction, request_key, mode)
+
+        TaskLedger.update(transaction, task["task_key"], %{failure_code: nil})
+
         record_recovery_event(transaction, timestamp, "REJECTED_NATIVE_CREATE_REARMED", run, task, %{
           request_key: request_key,
           rejected_tool_call_id: rejected_tool_call_id,
-          candidate_sha: run["candidate_sha"]
+          candidate_sha: run["candidate_sha"],
+          recovery_mode: mode
         })
 
         {:ok, %{result: "REJECTED_NATIVE_CREATE_REARMED", request_key: request_key, task_key: task["task_key"]}}
       end
     end)
+  end
+
+  defp reset_rejected_create_receipt(transaction, request_key, :automatic) do
+    Store.query!(transaction, "UPDATE desktop_requests SET rejected_tool_call_id = NULL WHERE request_key = ?", [request_key])
+  end
+
+  defp reset_rejected_create_receipt(_transaction, _request_key, :manual), do: :ok
+
+  defp require_rejected_create_control(control, config, :manual), do: require_paused_control(control, config)
+
+  defp require_rejected_create_control(control, config, :automatic) do
+    if control["status"] == "ACTIVE" and control["dispatcher_id"] == config.dispatcher_id,
+      do: :ok,
+      else: {:error, :recovery_requires_active_control}
+  end
+
+  defp require_rejected_create_retry(_connection, _request, _call_id, :manual), do: :ok
+
+  defp require_rejected_create_retry(connection, request, call_id, :automatic) do
+    rejection =
+      Store.one!(
+        connection,
+        "SELECT id FROM events WHERE event_type = 'NATIVE_CREATE_PRECREATION_REJECTED' AND json_extract(payload_json, '$.request_key') = ? AND json_extract(payload_json, '$.rejected_tool_call_id') = ? LIMIT 1",
+        [request["request_key"], call_id]
+      )
+
+    prior_retry =
+      Store.one!(
+        connection,
+        "SELECT id FROM events WHERE event_type = 'REJECTED_NATIVE_CREATE_REARMED' AND json_extract(payload_json, '$.request_key') = ? LIMIT 1",
+        [request["request_key"]]
+      )
+
+    with true <- not is_nil(rejection) or {:error, :rejected_create_not_proven},
+         true <- is_nil(prior_retry) or {:error, :rejected_create_retry_exhausted},
+         true <- DesktopRequest.payload_intact?(request) or {:error, :request_payload_corrupt},
+         {:ok, _arguments} <- DesktopToolArgs.create_thread(request) do
+      :ok
+    end
   end
 
   defp require_rejected_native_create(_connection, request, task, run, route, _call_id)

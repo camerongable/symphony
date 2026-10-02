@@ -51,6 +51,7 @@ defmodule SymphonyElixir.Factory.ControllerTask do
           thread_name: "FACTORY · #{factory.scope} · Orchestrator",
           format_repair_attempts: 1,
           required_tool_calls: Keyword.get(opts, :required_tool_calls, []),
+          wait_timeout_ms: Keyword.get(opts, :wait_timeout_ms, 30 * 60 * 1_000),
           store: Keyword.get(opts, :store, SymphonyElixir.Factory.Supervisor.store_name()),
           target_kind: "CONTROLLER",
           target_key: factory.scope,

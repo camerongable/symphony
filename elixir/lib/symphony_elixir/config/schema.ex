@@ -310,6 +310,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:controller_codex_project_id, :string)
       field(:task_transport, :string, default: "app_server")
       field(:native_session_discovery_enabled, :boolean, default: false)
+      field(:native_source_attachment_enabled, :boolean, default: false)
       field(:branch_prefix, :string, default: "ai")
       field(:lease_seconds, :integer, default: 240)
       field(:controller_required_mcp_servers, {:array, :string}, default: [])
@@ -327,6 +328,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:queue, :map, default: %{})
       field(:cleanup, :map, default: %{})
       field(:hibernation, :map, default: %{})
+      field(:review_feedback, :map, default: %{})
       field(:manual_validation, :map, default: %{})
       field(:models, :map, default: %{})
       field(:repositories, :map, default: %{})
@@ -345,6 +347,7 @@ defmodule SymphonyElixir.Config.Schema do
           :controller_codex_project_id,
           :task_transport,
           :native_session_discovery_enabled,
+          :native_source_attachment_enabled,
           :branch_prefix,
           :lease_seconds,
           :controller_required_mcp_servers,
@@ -362,6 +365,7 @@ defmodule SymphonyElixir.Config.Schema do
           :queue,
           :cleanup,
           :hibernation,
+          :review_feedback,
           :manual_validation,
           :models,
           :repositories

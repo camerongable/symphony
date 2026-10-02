@@ -20,7 +20,9 @@ defmodule SymphonyElixir.Factory.Policy do
          :ok <- validate_models(value(factory, "models", %{})),
          :ok <- validate_cleanup(value(factory, "cleanup", %{})),
          :ok <- validate_hibernation(value(factory, "hibernation", %{})) do
-      validate_manual_validation(value(factory, "manual_validation", %{}))
+      with :ok <- validate_review_feedback(factory, value(factory, "review_feedback", %{})) do
+        validate_manual_validation(value(factory, "manual_validation", %{}))
+      end
     end
   end
 
@@ -80,6 +82,14 @@ defmodule SymphonyElixir.Factory.Policy do
   end
 
   defp validate_cleanup(cleanup) do
+    if value(value(cleanup, "native", %{}), "enabled", false) do
+      {:error, :native_archive_restore_capability_unproven}
+    else
+      validate_legacy_cleanup(cleanup)
+    end
+  end
+
+  defp validate_legacy_cleanup(cleanup) do
     if value(cleanup, "enabled", false) do
       roots = value(cleanup, "allowed_worktree_roots", [])
 
@@ -106,6 +116,35 @@ defmodule SymphonyElixir.Factory.Policy do
     else
       :ok
     end
+  end
+
+  defp validate_review_feedback(factory, policy) do
+    if value(policy, "enabled", value(factory, "task_transport") == "desktop_broker") do
+      with :ok <- require_desktop_review_transport(factory),
+           :ok <- validate_review_authors(value(policy, "allowed_author_ids", [11_599_766])) do
+        validate_review_bot(value(policy, "bot_author_id", 0), value(policy, "allowed_author_ids", [11_599_766]))
+      end
+    else
+      :ok
+    end
+  end
+
+  defp require_desktop_review_transport(factory) do
+    if value(factory, "task_transport") == "desktop_broker",
+      do: :ok,
+      else: {:error, :review_feedback_requires_desktop_transport}
+  end
+
+  defp validate_review_authors(allowed) do
+    if is_list(allowed) and allowed != [] and Enum.all?(allowed, &(is_integer(&1) and &1 > 0)),
+      do: :ok,
+      else: {:error, :review_feedback_author_ids_required}
+  end
+
+  defp validate_review_bot(bot_id, allowed) do
+    if is_integer(bot_id) and bot_id >= 0 and bot_id not in allowed,
+      do: :ok,
+      else: {:error, :invalid_review_feedback_bot_author_id}
   end
 
   defp validate_manual_validation(policy) do
