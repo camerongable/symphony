@@ -5,6 +5,33 @@ controller-launched role workers and one source checkout used sequentially.
 
 ## Current checkpoint
 
+### October 12 all-eligible ordinary cutover
+
+User authorized replacing pilot selection with the new route for all new
+eligible deliveries. Commit `f5e50f9` adds explicit
+`factory.ticket_supervisor.all_eligible_tickets: true` selection across parent,
+scheduler advancement, MR and Jira-effect admission. Existing execution modes,
+queue scope, contract authorization and capacity checks remain unchanged.
+Required:yes contracts are still rejected by this route, not routed to legacy.
+Independent frozen-diff adversarial review found no concrete blocker; the focused
+policy selector and scheduler global-admission/required-validation rejection
+tests passed (three selected tests total). Compilation with warnings as errors
+passed. No full suite or new model test was run.
+
+Local configuration enables the global option with the existing broker UUID and
+the implementation CLI. The terminal runtime preflight passed without a model
+turn. LaunchAgent startup initially timed out with the parent directory under
+Documents; using the service-owned
+`/Users/cgable/Library/Application Support/ai-factory/ticket-chats` succeeded.
+The underlying environment/directory-specific cause is not established.
+Synchronous HTTP state reports route enabled, control ACTIVE, zero running
+agents, and process start `2026-10-12T03:57:54.117130Z`. The ledger had no active
+delivery runs to migrate. Native cleanup remains explicitly disabled.
+
+This is configuration/admission acceptance, not proof of a real-ticket delivery.
+The remote push still fails with GitHub TLS connection errors. Before/after
+release evidence remains under `/private/tmp/symphony-disabled-release.GUSdjS`.
+
 ### October 12 disabled local release
 
 User authorization to finish covered commit, push and disabled local deployment.
