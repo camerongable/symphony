@@ -5,6 +5,32 @@ controller-launched role workers and one source checkout used sequentially.
 
 ## Current checkpoint
 
+### October 12 runtime-update compatibility repair
+
+Installed Codex changed to `0.162.0-alpha.17.2`; the exact runtime whitelist
+rejected startup with `worker_runtime_unsupported`. A regression reproduced
+that rejection before the repair. The adapter now accepts that exact version
+while continuing to reject unknown platforms, homes, versions and lookalikes.
+Worker launch overrides explicitly disable the injected API-key confirmation
+MCP server. Its disabled transport must remain configured for parser validity;
+the inert `/usr/bin/false` transport cannot provide tools. The connector-catalog
+gate and worker permission checks are unchanged.
+
+Focused initialization/shutdown, identity rejection, scoped review profile and
+policy-drift/catalog rejection tests pass. Actual model-free native REVIEW
+qualification returned profile `symphony_ticket_review_v1`, approval `never`,
+read-only sandbox, zero dynamic tools and empty connector catalog; its owned
+session stopped with exit status zero. Independent frozen-diff review passed.
+No full suite, real-ticket dispatch or model inference turn was used. This
+qualification does not claim a complete new-version source-turn delivery.
+
+Dashboard browser inspection matches its API: route enabled, scheduler active,
+zero current tickets/workers, and shared capacity available. Broker status
+Unknown is intentional: request-ledger observations do not prove automation
+heartbeat. Populated per-ticket rows await a real ticket; no fabricated trial
+rows were introduced. Unrelated research documentation and Python caches remain
+untouched.
+
 ### October 12 all-eligible ordinary cutover
 
 User authorized replacing pilot selection with the new route for all new

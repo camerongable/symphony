@@ -34,7 +34,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @thread_list_source_kinds ~w(cli vscode exec appServer subAgent subAgentReview subAgentCompact subAgentThreadSpawn subAgentOther unknown)
   @thread_unsubscribe_timeout_ms 1_000
   @port_line_bytes 1_048_576
-  @ticket_worker_runtime_versions ~w(0.160.0 0.162.0-alpha.2)
+  @ticket_worker_runtime_versions ~w(0.160.0 0.162.0-alpha.2 0.162.0-alpha.17.2)
   @max_stream_log_bytes 1_000
   @mcp_startup_statuses_key {__MODULE__, :mcp_startup_statuses}
   @mcp_approval_state_key {__MODULE__, :mcp_approval_state}
@@ -1341,6 +1341,9 @@ defmodule SymphonyElixir.Codex.AppServer do
         "permissions.#{profile}.filesystem=#{filesystem}",
         "permissions.#{profile}.network.enabled=false",
         "plugins.openai-developers@openai-curated-remote.enabled=false",
+        # Disabled plugin-injected servers still need a transport during config validation.
+        "mcp_servers.openai-api-key-local-confirmation.command=\"/usr/bin/false\"",
+        "mcp_servers.openai-api-key-local-confirmation.enabled=false",
         "plugins.openai-developers@openai-curated-remote.mcp_servers.openai-api-key-local-confirmation.disabled_tools=[\"confirm_openai_api_key_local_destination\"]"
       ]
 

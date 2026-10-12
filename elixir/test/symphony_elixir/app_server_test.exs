@@ -30,6 +30,8 @@ defmodule SymphonyElixir.AppServerTest do
         assert args =~ "default_permissions=\"#{profile}\""
         assert args =~ "mcp_servers.Jira.enabled=false"
         assert args =~ "mcp_servers.AI Toolkit Skills.enabled=false"
+        assert args =~ "mcp_servers.openai-api-key-local-confirmation.enabled=false"
+        assert args =~ "mcp_servers.openai-api-key-local-confirmation.command=\"/usr/bin/false\""
         assert args =~ "plugins.test-plugin@provider.enabled=false"
         refute args =~ "mcp_servers.\"Jira\""
         assert args =~ "network.enabled=false"
@@ -63,6 +65,7 @@ defmodule SymphonyElixir.AppServerTest do
           {"malformed-home", Map.put(supported, "codexHome", []), :worker_runtime_identity_unproven},
           {"version", Map.put(supported, "userAgent", "symphony-orchestrator/0.161.0 (fixture)"), :worker_runtime_unsupported},
           {"candidate-version-lookalike", Map.put(supported, "userAgent", "symphony-orchestrator/0.162.0-alpha.20 (fixture)"), :worker_runtime_unsupported},
+          {"updated-version-lookalike", Map.put(supported, "userAgent", "symphony-orchestrator/0.162.0-alpha.17.20 (fixture)"), :worker_runtime_unsupported},
           {"agent", Map.put(supported, "userAgent", "other/0.160.0 (fixture)"), :worker_runtime_unsupported},
           {"platform", Map.put(supported, "platformOs", "linux"), :worker_runtime_unsupported},
           {"home", Map.put(supported, "codexHome", System.tmp_dir!()), :worker_runtime_home_mismatch}
@@ -96,10 +99,12 @@ defmodule SymphonyElixir.AppServerTest do
 
   test "ticket runtime probes initialize only and observe process exit on success and rejection" do
     candidate_runtime = Map.put(fixture_runtime(), "userAgent", "symphony-orchestrator/0.162.0-alpha.2 (fixture)")
+    updated_runtime = Map.put(fixture_runtime(), "userAgent", "symphony-orchestrator/0.162.0-alpha.17.2 (fixture)")
 
     for {name, response, expected} <- [
           {"supported", fixture_runtime(), :ok},
           {"installed-candidate-version", candidate_runtime, :ok},
+          {"updated-installed-version", updated_runtime, :ok},
           {"unsupported", %{}, {:error, :worker_runtime_identity_unproven}}
         ] do
       with_thread_listing_server(
