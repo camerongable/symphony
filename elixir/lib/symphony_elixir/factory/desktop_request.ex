@@ -7,9 +7,12 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
   create or follow-up after an interrupted attempt.
   """
 
+  alias SymphonyElixir.Codex.AppServer
+  alias SymphonyElixir.Factory.DesktopToolArgs
   alias SymphonyElixir.Factory.NativeMaintenanceEvidence
   alias SymphonyElixir.Factory.{NativeSourceBinding, NativeWorktreeProbe, RunLedger, StageSchemas}
-  alias SymphonyElixir.Factory.{Store, TaskLauncher, TaskLedger, Worktree}
+  alias SymphonyElixir.Factory.{Store, TaskLauncher, TaskLedger, TicketChat, Worktree}
+  alias SymphonyElixir.Factory.{TicketJiraJournal, TicketMrOperation, TicketParentGuard}
 
   @required_strings ~w(
     request_key target_kind target_key action codex_project_id model
@@ -22,6 +25,43 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
   )
   @native_stage_in_flight ~w(STARTING RUNNING WAITING_FOR_BROKER WAITING_FOR_WRITER STALE RETRY_PENDING)
 
+  @doc "Keeps shared-controller uncertainty fenced, except proven unissued quarantined feedback."
+  @spec controller_busy?(Store.connection(), String.t() | nil, String.t() | nil) :: boolean()
+  def controller_busy?(connection, scope \\ nil, except_jira_operation \\ nil) do
+    native_busy = native_controller_busy?(connection, scope)
+    native_busy or TicketJiraJournal.controller_busy?(connection, scope, except_jira_operation)
+  end
+
+  @doc "Checks native controller requests only; Jira recovery must not be mistaken for an active native turn."
+  @spec native_controller_busy?(Store.connection(), String.t() | nil) :: boolean()
+  def native_controller_busy?(connection, scope \\ nil) do
+    Store.one!(
+      connection,
+      """
+      SELECT request.request_key FROM desktop_requests AS request
+      WHERE request.target_kind = 'CONTROLLER'
+        AND (? IS NULL OR request.target_key = ?)
+        AND request.status IN ('PENDING', 'CREATE_UNCERTAIN', 'FOLLOWUP_UNCERTAIN', 'THREAD_RECORDED', 'RECONCILE_REQUIRED')
+        AND NOT (
+          request.status = 'PENDING' AND request.thread_id IS NULL AND request.turn_id IS NULL
+          AND request.target_observation_json IS NULL AND request.verified_project_id IS NULL
+          AND request.verified_cwd IS NULL AND request.verified_head_sha IS NULL AND request.output_json IS NULL
+          AND EXISTS (SELECT 1 FROM mr_feedback_notes AS note WHERE note.request_key = request.request_key)
+          AND NOT EXISTS (
+            SELECT 1 FROM mr_feedback_notes AS note LEFT JOIN runs AS owner ON owner.run_id = note.run_id
+            WHERE note.request_key = request.request_key AND (
+              owner.run_id IS NULL OR NOT EXISTS (
+                SELECT 1 FROM runs AS supervisor WHERE supervisor.issue_key = owner.issue_key
+                  AND supervisor.execution_mode = 'TICKET_SUPERVISOR_V1'
+              )
+            )
+          )
+        ) LIMIT 1
+      """,
+      [scope, scope]
+    ) != nil
+  end
+
   @doc "Enqueues one request, returning an identical existing request by stable key."
   @spec enqueue(Store.connection(), map()) :: {:ok, map()} | {:error, term()}
   def enqueue(connection, attrs) when is_map(attrs) do
@@ -32,9 +72,87 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
   end
 
   @doc "Atomically claims a pending request; claims are never automatically reissued."
-  @spec claim(Store.connection(), String.t()) :: {:ok, map()} | {:error, term()}
-  def claim(connection, request_key) do
-    Store.transaction!(connection, &claim_transaction(&1, request_key))
+  @spec claim(Store.connection(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def claim(connection, request_key, opts \\ []) do
+    case get(connection, request_key) do
+      {:ok, %{"target_kind" => "TICKET_CHAT"} = request} -> claim_ticket_parent(connection, request, opts)
+      {:ok, request} -> claim_project_request(connection, request, opts)
+      {:error, _} = error -> error
+    end
+  end
+
+  defp claim_project_request(connection, request, opts) do
+    if TicketMrOperation.typed_request?(request) do
+      claim_typed_mr_request(connection, request, opts)
+    else
+      Store.transaction!(connection, &claim_transaction(&1, request["request_key"], opts, request))
+    end
+  end
+
+  defp claim_typed_mr_request(connection, request, opts) do
+    case Keyword.fetch(opts, :ticket_mr_admission) do
+      {:ok, admission} ->
+        with {:ok, %{request: claimed}} <- claim_mr_followup(connection, request["request_key"], admission, opts) do
+          {:ok, claimed}
+        end
+
+      :error ->
+        {:error, :request_run_quarantined}
+    end
+  end
+
+  @doc "Qualifies and atomically claims an unissued MR followup; returns exact arguments after commit."
+  @spec claim_mr_followup(Store.connection(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
+  def claim_mr_followup(connection, key, admission, opts) do
+    qualified_opts = Keyword.put(opts, :ticket_mr_admission, admission)
+
+    with {:ok, request} <- get(connection, key),
+         true <- TicketMrOperation.typed_request?(request) or {:error, :ticket_mr_claim_authority_required},
+         {:ok, _arguments} <- DesktopToolArgs.followup(request),
+         {:ok, receipt} <- issuance_admission(connection, request, qualified_opts),
+         %{factory: factory} <- admission,
+         {:ok, run} <- RunLedger.get(connection, receipt["binding"]["run_id"]),
+         :ok <- AppServer.check_ticket_runtime(receipt["binding"]["controller_cwd"]),
+         {:ok, current_request, current_run, authorization} <-
+           TicketMrOperation.read_claim_authorization(
+             connection,
+             key,
+             factory,
+             opts
+           ),
+         true <- current_request == request or {:error, :ticket_mr_request_changed},
+         true <- current_run == run or {:error, :ticket_mr_claim_run_changed} do
+      fresh_opts = Keyword.put(opts, :ticket_mr_admission, Map.put(admission, :authorization, authorization))
+
+      case Exqlite.transaction(connection, &claim_mr_transaction(&1, request, run, fresh_opts)) do
+        {:ok, result} -> result
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :ticket_mr_claim_authority_required}
+    end
+  end
+
+  defp claim_mr_transaction(connection, request, run, opts) do
+    with {:ok, current_run} <- RunLedger.get(connection, run["run_id"]),
+         true <- current_run == run or {:error, :ticket_mr_claim_run_changed},
+         {:ok, arguments} <- DesktopToolArgs.followup(request),
+         {:ok, claimed} <- claim_transaction(connection, request["request_key"], opts, request) do
+      {:ok, %{request: claimed, arguments: arguments}}
+    else
+      {:error, reason} -> Exqlite.rollback(connection, reason)
+    end
+  end
+
+  defp claim_ticket_parent(connection, request, opts) do
+    with :ok <- authorize_issuance(connection, request, opts),
+         :ok <- require_status(request, "PENDING"),
+         {:ok, _receipt} <- parent_guard_receipt(request, opts),
+         cwd = if(request["action"] == "CREATE", do: Path.dirname(request["cwd"]), else: request["cwd"]),
+         :ok <- AppServer.check_ticket_runtime(cwd) do
+      Store.transaction!(connection, &claim_transaction(&1, request["request_key"], opts, request))
+    end
   end
 
   @doc "Binds a verified Codex thread to the request and its task or controller."
@@ -55,6 +173,18 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
     end)
   end
 
+  @doc "Records an explicitly projectless ticket-parent observation without source binding."
+  @spec record_ticket_thread(Store.connection(), String.t(), map()) :: {:ok, map()} | {:error, term()}
+  def record_ticket_thread(connection, request_key, proof) when is_map(proof) do
+    Store.transaction!(connection, fn transaction ->
+      case get(transaction, request_key) do
+        {:ok, %{"target_kind" => "TICKET_CHAT"} = request} -> TicketChat.record_thread(transaction, request, proof["thread_id"], proof)
+        {:ok, _} -> {:error, :not_a_ticket_chat_request}
+        {:error, _} = error -> error
+      end
+    end)
+  end
+
   @doc "Records a broker-verified result for the exact bound thread."
   @spec complete(Store.connection(), String.t(), map()) :: {:ok, map()} | {:error, term()}
   def complete(connection, request_key, attrs) when is_map(attrs) do
@@ -62,8 +192,9 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
 
     Store.transaction!(connection, fn transaction ->
       with {:ok, request} <- get(transaction, request_key),
+           :ok <- require_not_quarantined_request(transaction, request),
            {:ok, attrs} <- NativeMaintenanceEvidence.attach(transaction, request, attrs),
-           {:ok, attrs} <- NativeSourceBinding.attach(transaction, request, attrs),
+           {:ok, attrs} <- attach_source_evidence(transaction, request, attrs),
            {:ok, output} <- normalize_legacy_controller_snapshot(request, Map.get(attrs, "output")),
            {:ok, output} <- normalize_specification_critic_review(transaction, request, output),
            {:ok, output} <- normalize_change_verifier_review(transaction, request, output),
@@ -72,6 +203,318 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
         complete_transaction(transaction, request_key, Map.put(attrs, "output", output), output_json)
       end
     end)
+  end
+
+  @spec reconcile_negative_ticket_chat_presentation(
+          Store.connection(),
+          String.t(),
+          String.t(),
+          String.t(),
+          keyword()
+        ) :: {:ok, map()} | {:error, term()}
+  def reconcile_negative_ticket_chat_presentation(connection, request_key, thread_id, broker_thread_id, opts \\ []) do
+    case get(connection, request_key) do
+      {:ok, %{"status" => "FAILED", "failure_code" => "TICKET_CHAT_PRESENTATION_NOT_ACKNOWLEDGED"} = request} ->
+        replay_negative_presentation(connection, request, thread_id, broker_thread_id)
+
+      {:ok, request} ->
+        reconcile_negative_presentation(connection, request, thread_id, broker_thread_id, Keyword.get(opts, :reader, AppServer))
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  defp reconcile_negative_presentation(connection, request, thread_id, broker, reader) do
+    with {:ok, chat} <- validate_negative_presentation_request(connection, request, thread_id, broker, true),
+         {:ok, readback} <-
+           TicketChat.read_native_turn(
+             connection,
+             request["request_key"],
+             thread_id,
+             broker,
+             reader: reader,
+             include_completion: true
+           ),
+         {:ok, completion} <- negative_presentation_completion(request, chat, readback, thread_id, broker) do
+      persist_negative_presentation(connection, request, chat, readback, completion, thread_id, broker)
+    end
+  end
+
+  defp negative_presentation_completion(request, chat, readback, thread_id, broker) do
+    completion = readback["completion"] || %{}
+    output = completion["output"] || %{}
+    observation = Jason.decode!(request["target_observation_json"] || "{}")
+
+    valid =
+      valid_negative_presentation_history?(request, chat, readback, thread_id, broker) and
+        valid_negative_presentation_turn?(readback, completion, thread_id) and
+        valid_negative_presentation_output?(readback, output, observation)
+
+    if valid do
+      {:ok, %{turn_id: readback["turn_id"], output: output, receipt: negative_receipt(readback)}}
+    else
+      {:error, :ticket_chat_negative_presentation_unproven}
+    end
+  end
+
+  defp valid_negative_presentation_history?(request, chat, readback, thread_id, broker) do
+    readback["history_complete"] === true and readback["request_key"] == request["request_key"] and
+      readback["payload_sha256"] == request["payload_sha256"] and readback["generation"] == chat["generation"] and
+      readback["source_thread_id"] == broker and readback["thread_id"] == thread_id
+  end
+
+  defp valid_negative_presentation_turn?(readback, completion, thread_id) do
+    is_binary(readback["turn_id"]) and readback["turn_id"] != "" and completion["thread_id"] == thread_id and
+      completion["turn_id"] == readback["turn_id"]
+  end
+
+  defp valid_negative_presentation_output?(readback, output, observation) do
+    output["result"] == %{"acknowledged" => false} and valid_sha256?(readback["readback_sha256"]) and
+      valid_sha256?(readback["invocation_sha256"]) and
+      (is_nil(observation["native_readback_sha256"]) or observation["native_readback_sha256"] == readback["readback_sha256"]) and
+      output["native_readback_sha256"] == readback["readback_sha256"]
+  end
+
+  defp negative_receipt(readback),
+    do: Map.take(readback, ~w(request_key payload_sha256 generation source_thread_id thread_id cwd turn_id item_id started_at completed_at readback_sha256 invocation_sha256 status))
+
+  defp persist_negative_presentation(connection, request, chat, _readback, completion, thread_id, broker) do
+    Store.transaction!(connection, fn transaction ->
+      persist_negative_presentation_transaction(transaction, request, chat, completion, thread_id, broker)
+    end)
+  end
+
+  defp persist_negative_presentation_transaction(transaction, request, chat, completion, thread_id, broker) do
+    with {:ok, current} <- get(transaction, request["request_key"]),
+         true <- current == request or {:error, :ticket_chat_request_changed},
+         {:ok, current_chat} <- TicketChat.get(transaction, chat["chat_key"]),
+         {:ok, _} <- validate_negative_presentation_request(transaction, current, thread_id, broker, true),
+         true <- current_chat == chat or {:error, :ticket_chat_binding_changed},
+         output_json <- Jason.encode!(completion.output),
+         attestation <- negative_presentation_attestation(request, chat, completion, output_json),
+         attestation_json <- Jason.encode!(attestation),
+         encoded_observation <- put_negative_presentation_attestation(request["target_observation_json"], attestation_json) do
+      Store.query!(
+        transaction,
+        "UPDATE desktop_requests SET status = 'FAILED', failure_code = 'TICKET_CHAT_PRESENTATION_NOT_ACKNOWLEDGED', turn_id = ?, output_json = ?, target_observation_json = ?, updated_at = ? WHERE request_key = ? AND status = 'THREAD_RECORDED' AND payload_sha256 = ? AND target_observation_json = ?",
+        [completion.turn_id, output_json, encoded_observation, now(), request["request_key"], request["payload_sha256"], request["target_observation_json"]]
+      )
+
+      with :ok <- ensure_single_change(transaction, :ticket_chat_negative_presentation_conflict),
+           {:ok,
+            %{
+              "status" => "FAILED",
+              "failure_code" => "TICKET_CHAT_PRESENTATION_NOT_ACKNOWLEDGED",
+              "turn_id" => turn,
+              "output_json" => ^output_json,
+              "target_observation_json" => ^encoded_observation
+            } = failed} <- get(transaction, request["request_key"]),
+           true <- turn == completion.turn_id do
+        {:ok, failed}
+      else
+        _ -> Exqlite.rollback(transaction, :ticket_chat_negative_presentation_conflict)
+      end
+    else
+      {:error, reason} -> Exqlite.rollback(transaction, reason)
+    end
+  end
+
+  defp negative_presentation_attestation(request, chat, completion, output_json) do
+    observation = Jason.decode!(request["target_observation_json"] || "{}")
+
+    proof = %{
+      "kind" => "NATIVE_COMPLETED_NEGATIVE_TICKET_PRESENTATION",
+      "request_key" => request["request_key"],
+      "payload_sha256" => request["payload_sha256"],
+      "generation" => chat["generation"],
+      "thread_id" => chat["thread_id"],
+      "source_thread_id" => chat["broker_thread_id"],
+      "turn_id" => completion.turn_id,
+      "readback_sha256" => completion.receipt["readback_sha256"],
+      "native_readback_sha256_present" => Map.has_key?(observation, "native_readback_sha256"),
+      "native_readback_sha256" => observation["native_readback_sha256"],
+      "invocation_sha256" => completion.receipt["invocation_sha256"],
+      "receipt_json" => Jason.encode!(completion.receipt),
+      "receipt_sha256" => sha256(Jason.encode!(completion.receipt)),
+      "output_sha256" => sha256(output_json)
+    }
+
+    Map.put(proof, "attestation_sha256", sha256(Jason.encode!(proof)))
+  end
+
+  defp put_negative_presentation_attestation(observation_json, attestation_json) do
+    proof = Jason.decode!(observation_json)
+    Jason.encode!(Map.put(proof, "negative_presentation_attestation", Jason.decode!(attestation_json)))
+  end
+
+  defp replay_negative_presentation(connection, request, thread_id, broker) do
+    with {:ok, chat} <- TicketChat.get(connection, request["target_key"]),
+         :ok <- validate_negative_presentation_binding(request, chat, thread_id, broker),
+         {:ok, attestation} <- stored_negative_presentation_attestation(request),
+         true <- payload_intact?(request),
+         :ok <- TicketChat.validate_request(connection, request),
+         true <- request["status"] == "FAILED" and request["failure_code"] == "TICKET_CHAT_PRESENTATION_NOT_ACKNOWLEDGED",
+         true <- replay_observation_matches?(request, chat, thread_id) do
+      {:ok, receipt} = Jason.decode(attestation["receipt_json"])
+
+      if replay_negative_presentation_receipt_identity?(receipt, request, chat, thread_id, broker, attestation) and
+           replay_negative_presentation_receipt_invocation?(receipt, attestation) do
+        {:ok, request}
+      else
+        {:error, :ticket_chat_negative_presentation_replay_unproven}
+      end
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :ticket_chat_negative_presentation_replay_unproven}
+    end
+  end
+
+  defp replay_negative_presentation_receipt_identity?(receipt, request, chat, thread_id, broker, attestation) do
+    receipt["request_key"] == request["request_key"] and receipt["payload_sha256"] == request["payload_sha256"] and
+      receipt["generation"] == chat["generation"] and receipt["thread_id"] == thread_id and
+      receipt["source_thread_id"] == broker and receipt["cwd"] == chat["cwd"] and
+      receipt["turn_id"] == request["turn_id"] and receipt["readback_sha256"] == attestation["readback_sha256"]
+  end
+
+  defp replay_negative_presentation_receipt_invocation?(receipt, attestation) do
+    receipt["invocation_sha256"] == attestation["invocation_sha256"] and valid_sha256?(receipt["invocation_sha256"])
+  end
+
+  defp stored_negative_presentation_attestation(request) do
+    with {:ok, observation} when is_map(observation) <- Jason.decode(request["target_observation_json"] || "null"),
+         %{"kind" => "NATIVE_COMPLETED_NEGATIVE_TICKET_PRESENTATION"} = attestation <- observation["negative_presentation_attestation"],
+         true <- negative_presentation_output_attestation_valid?(request, attestation),
+         true <- request["failure_code"] == "TICKET_CHAT_PRESENTATION_NOT_ACKNOWLEDGED" and request["turn_id"] == attestation["turn_id"],
+         true <- is_binary(attestation["receipt_json"]) and attestation["receipt_sha256"] == sha256(attestation["receipt_json"]),
+         {:ok, receipt} when is_map(receipt) <- Jason.decode(attestation["receipt_json"]),
+         true <- stored_negative_presentation_receipt_matches?(receipt, attestation) do
+      {:ok, attestation}
+    else
+      _ -> {:error, :ticket_chat_negative_presentation_replay_unproven}
+    end
+  end
+
+  defp negative_presentation_output_attestation_valid?(request, attestation) do
+    with true <- digest(Map.delete(attestation, "attestation_sha256")) == attestation["attestation_sha256"],
+         true <- valid_sha256?(attestation["output_sha256"]) and attestation["output_sha256"] == sha256(request["output_json"] || ""),
+         {:ok, %{"result" => %{"acknowledged" => false}, "native_readback_sha256" => readback}} <- Jason.decode(request["output_json"] || "null"),
+         true <- valid_sha256?(readback) and readback == attestation["readback_sha256"] do
+      true
+    else
+      _ -> false
+    end
+  end
+
+  defp stored_negative_presentation_receipt_matches?(receipt, attestation) do
+    receipt["request_key"] == attestation["request_key"] and receipt["payload_sha256"] == attestation["payload_sha256"] and
+      receipt["generation"] == attestation["generation"] and receipt["thread_id"] == attestation["thread_id"] and
+      receipt["source_thread_id"] == attestation["source_thread_id"] and receipt["turn_id"] == attestation["turn_id"] and
+      receipt["readback_sha256"] == attestation["readback_sha256"] and receipt["invocation_sha256"] == attestation["invocation_sha256"]
+  end
+
+  defp replay_observation_matches?(request, chat, thread_id) do
+    with {:ok, observation} when is_map(observation) <- Jason.decode(request["target_observation_json"] || "null"),
+         %{"kind" => "NATIVE_COMPLETED_NEGATIVE_TICKET_PRESENTATION"} = attestation <- observation["negative_presentation_attestation"],
+         proof <- Map.delete(observation, "negative_presentation_attestation"),
+         true <- replay_native_observation_hash_matches?(proof, attestation),
+         true <- exact_ticket_followup_observation?(request, chat, thread_id, proof) do
+      true
+    else
+      _ -> false
+    end
+  end
+
+  defp replay_native_observation_hash_matches?(proof, %{"native_readback_sha256_present" => present} = attestation)
+       when is_boolean(present) do
+    Map.has_key?(proof, "native_readback_sha256") == present and
+      proof["native_readback_sha256"] == attestation["native_readback_sha256"] and
+      (is_nil(proof["native_readback_sha256"]) or proof["native_readback_sha256"] == attestation["readback_sha256"])
+  end
+
+  defp replay_native_observation_hash_matches?(proof, attestation) do
+    not Map.has_key?(attestation, "native_readback_sha256_present") and
+      not Map.has_key?(proof, "native_readback_sha256")
+  end
+
+  defp validate_negative_presentation_request(store, request, thread_id, broker, require_current) do
+    with {:ok, chat} <- TicketChat.get(store, request["target_key"]),
+         :ok <- validate_negative_presentation_binding(request, chat, thread_id, broker),
+         true <-
+           request["status"] == "THREAD_RECORDED" and is_binary(request["claimed_at"]) and is_nil(request["turn_id"]) and
+             is_nil(request["output_json"]) and request["failure_code"] in [nil, "NATIVE_PRESENTATION_REFRESH_LOOP_STOPPED"],
+         true <- not require_current or chat["presentation_request_key"] == request["request_key"],
+         true <- payload_intact?(request),
+         :ok <- TicketChat.validate_request(store, request),
+         true <- exact_ticket_followup_observation?(request, chat, thread_id) do
+      {:ok, chat}
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :ticket_chat_negative_presentation_not_current}
+    end
+  end
+
+  defp validate_negative_presentation_binding(request, chat, thread_id, broker) do
+    valid =
+      valid_negative_presentation_target?(request, chat) and
+        valid_negative_presentation_thread?(request, chat, thread_id) and
+        valid_negative_presentation_broker?(request, chat, broker)
+
+    if valid, do: :ok, else: {:error, :ticket_chat_negative_presentation_binding_mismatch}
+  end
+
+  defp valid_negative_presentation_target?(request, chat) do
+    request["target_kind"] == "TICKET_CHAT" and request["target_key"] == chat["chat_key"] and
+      request["action"] == "FOLLOWUP"
+  end
+
+  defp valid_negative_presentation_thread?(request, chat, thread_id) do
+    is_binary(thread_id) and request["thread_id"] == thread_id and request["existing_thread_id"] == thread_id and
+      chat["thread_id"] == thread_id
+  end
+
+  defp valid_negative_presentation_broker?(request, chat, broker) do
+    chat["broker_thread_id"] == broker and is_binary(broker) and
+      Regex.match?(~r/\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/, broker) and
+      request["verified_cwd"] == chat["cwd"] and is_nil(request["verified_project_id"])
+  end
+
+  defp exact_ticket_followup_observation?(request, chat, thread_id) do
+    with {:ok, arguments} <- DesktopToolArgs.followup(request),
+         {:ok, observation} when is_map(observation) <- Jason.decode(request["target_observation_json"] || "null") do
+      valid_native_observation_hash?(observation) and
+        Map.delete(observation, "native_readback_sha256") == expected_ticket_followup_observation(request, chat, thread_id, arguments)
+    else
+      _ -> false
+    end
+  end
+
+  defp exact_ticket_followup_observation?(request, chat, thread_id, observation) do
+    case DesktopToolArgs.followup(request) do
+      {:ok, arguments} ->
+        valid_native_observation_hash?(observation) and
+          Map.delete(observation, "native_readback_sha256") == expected_ticket_followup_observation(request, chat, thread_id, arguments)
+
+      _ ->
+        false
+    end
+  end
+
+  defp valid_native_observation_hash?(observation) do
+    is_nil(observation["native_readback_sha256"]) or valid_sha256?(observation["native_readback_sha256"])
+  end
+
+  defp expected_ticket_followup_observation(request, chat, thread_id, arguments) do
+    %{
+      "request_key" => request["request_key"],
+      "payload_sha256" => request["payload_sha256"],
+      "generation" => chat["generation"],
+      "thread_id" => thread_id,
+      "project_id" => nil,
+      "cwd" => chat["cwd"],
+      "tool_arguments" => arguments,
+      "worktree_attachments" => []
+    }
   end
 
   defp normalize_legacy_controller_snapshot(
@@ -377,19 +820,62 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
   def payload_intact?(_request), do: false
 
   @doc "Lists only requests safe to issue exactly once through the Desktop broker."
-  @spec list_pending(Store.connection(), pos_integer()) :: [map()]
-  def list_pending(connection, limit \\ 50) when is_integer(limit) and limit > 0 do
-    list_by_status(connection, "status = 'PENDING'", limit)
+  @spec list_pending(Store.connection(), pos_integer(), keyword()) :: [map()]
+  def list_pending(connection, limit \\ 50, opts \\ []) when is_integer(limit) and limit > 0 do
+    legacy =
+      list_by_status(
+        connection,
+        "status = 'PENDING' AND target_kind != 'TICKET_CHAT' AND NOT #{v1_owner_predicate()}",
+        limit
+      )
+
+    parents = list_ticket_requests(connection, "status = 'PENDING'", limit, &TicketChat.authorize_issuance(connection, &1, Keyword.get(opts, :ticket_policy, %{})))
+    mrs = list_mr_pending(connection, limit, Keyword.get(opts, :ticket_mr_factory))
+    ordered_requests(legacy ++ parents ++ mrs, limit)
   end
+
+  defp list_mr_pending(connection, limit, factory) when is_map(factory) do
+    predicate = "status = 'PENDING' AND CASE WHEN json_valid(metadata_json) THEN json_type(metadata_json, '$.delivery_operation') END = 'object'"
+    authorize = &TicketMrOperation.authorize_discovery(connection, &1, factory)
+    list_ticket_requests(connection, predicate, limit, authorize, "CONTROLLER")
+  end
+
+  defp list_mr_pending(_connection, _limit, _factory), do: []
 
   @doc "Lists interrupted or ambiguous requests that need Codex readback."
   @spec list_reconciliation(Store.connection(), pos_integer()) :: [map()]
   def list_reconciliation(connection, limit \\ 50) when is_integer(limit) and limit > 0 do
-    list_by_status(
-      connection,
-      "status IN ('CREATE_UNCERTAIN', 'FOLLOWUP_UNCERTAIN', 'THREAD_RECORDED', 'RECONCILE_REQUIRED')",
-      limit
-    )
+    legacy =
+      list_by_status(
+        connection,
+        "status IN ('CREATE_UNCERTAIN', 'FOLLOWUP_UNCERTAIN', 'THREAD_RECORDED', 'RECONCILE_REQUIRED') AND target_kind != 'TICKET_CHAT' AND NOT #{v1_owner_predicate()}",
+        limit
+      )
+
+    parents = list_ticket_requests(connection, "status IN ('CREATE_UNCERTAIN', 'FOLLOWUP_UNCERTAIN', 'THREAD_RECORDED', 'RECONCILE_REQUIRED')", limit, &TicketChat.authorize_readback(connection, &1))
+    mrs = list_mr_readback(connection, limit)
+    ordered_requests(legacy ++ parents ++ mrs, limit)
+  end
+
+  defp ordered_requests(requests, limit), do: requests |> Enum.uniq_by(& &1["request_key"]) |> Enum.sort_by(&{&1["created_at"], &1["request_key"]}) |> Enum.take(limit)
+
+  defp list_mr_readback(connection, limit) do
+    predicate = "status IN ('FOLLOWUP_UNCERTAIN','THREAD_RECORDED','RECONCILE_REQUIRED') AND EXISTS (SELECT 1 FROM ticket_mr_claims AS claim WHERE claim.request_key = desktop_requests.request_key)"
+    list_ticket_requests(connection, predicate, limit, &TicketMrOperation.authorize_readback(connection, &1), "CONTROLLER")
+  end
+
+  defp list_ticket_requests(connection, predicate, limit, authorize, kind \\ "TICKET_CHAT") do
+    Stream.unfold(0, fn offset ->
+      rows = Store.query!(connection, "SELECT * FROM desktop_requests WHERE target_kind = ? AND #{predicate} ORDER BY created_at ASC, request_key ASC LIMIT ? OFFSET ?", [kind, limit, offset])
+
+      case rows.rows do
+        [] -> nil
+        page -> {Enum.map(page, &Map.new(Enum.zip(rows.columns, &1))), offset + length(page)}
+      end
+    end)
+    |> Stream.flat_map(& &1)
+    |> Stream.filter(&(authorize.(&1) == :ok))
+    |> Enum.take(limit)
   end
 
   @doc "Repairs pre-atomic native stage successes whose task result was never recorded."
@@ -407,6 +893,8 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
           AND json_extract(request.metadata_json, '$.workspace_mode') = 'CODEX_NATIVE'
           AND json_type(request.metadata_json, '$.maintenance_operation') IS NULL
           AND task.status IN ('STARTING', 'RUNNING', 'WAITING_FOR_BROKER', 'WAITING_FOR_WRITER', 'STALE', 'RETRY_PENDING')
+          AND EXISTS (SELECT 1 FROM runs AS run WHERE run.run_id = task.run_id AND COALESCE(run.execution_mode, 'LEGACY') = 'LEGACY'
+            AND NOT EXISTS (SELECT 1 FROM runs AS supervisor WHERE supervisor.issue_key = run.issue_key AND supervisor.execution_mode = 'TICKET_SUPERVISOR_V1'))
           AND request.request_key = (
             SELECT latest.request_key FROM desktop_requests AS latest
             WHERE latest.target_kind = 'TASK' AND latest.target_key = request.target_key
@@ -442,11 +930,15 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
     end
   end
 
-  defp claim_transaction(connection, request_key) do
+  defp claim_transaction(connection, request_key, opts, expected_request) do
     with {:ok, request} <- get(connection, request_key),
-         :ok <- require_status(request, "PENDING") do
+         true <- request == expected_request or {:error, :ticket_parent_request_changed},
+         {:ok, mr_receipt} <- issuance_admission(connection, request, opts),
+         :ok <- require_status(request, "PENDING"),
+         :ok <- record_parent_guard(connection, request, opts) do
       status = if request["action"] == "CREATE", do: "CREATE_UNCERTAIN", else: "FOLLOWUP_UNCERTAIN"
       timestamp = now()
+      record_mr_claim(connection, request, mr_receipt, timestamp)
 
       Store.query!(
         connection,
@@ -458,10 +950,118 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
     end
   end
 
+  defp record_mr_claim(_connection, _request, nil, _timestamp), do: :ok
+
+  defp record_mr_claim(connection, request, receipt, timestamp) do
+    json = receipt |> Map.put("claimed_at", timestamp) |> Jason.encode!()
+    Store.query!(connection, "INSERT INTO ticket_mr_claims(request_key, receipt_json, receipt_sha256, claimed_at) VALUES (?, ?, ?, ?)", [request["request_key"], json, sha256(json), timestamp])
+    :ok
+  end
+
+  defp record_parent_guard(connection, %{"target_kind" => "TICKET_CHAT", "action" => "FOLLOWUP"} = request, opts) do
+    with {:ok, receipt} <- parent_guard_receipt(request, opts) do
+      Store.query!(connection, "INSERT INTO ticket_parent_claims(request_key, receipt_json, claimed_at) VALUES (?, ?, ?)", [request["request_key"], Jason.encode!(receipt), now()])
+      :ok
+    end
+  end
+
+  defp record_parent_guard(_connection, _request, _opts), do: :ok
+
+  defp parent_guard_receipt(%{"target_kind" => "TICKET_CHAT", "action" => "FOLLOWUP"} = request, opts),
+    do: TicketParentGuard.receipt(request, Keyword.get(opts, :parent_guard), DateTime.utc_now())
+
+  defp parent_guard_receipt(_request, _opts), do: {:ok, nil}
+
+  defp require_not_quarantined_request(connection, request) do
+    cond do
+      mr_owned_request?(connection, request) -> TicketMrOperation.authorize_readback(connection, request)
+      request_owned_by_v1?(connection, request) -> {:error, :request_run_quarantined}
+      true -> :ok
+    end
+  end
+
+  defp mr_owned_request?(connection, request) do
+    TicketMrOperation.typed_request?(request) or
+      Store.one!(connection, "SELECT request_key FROM ticket_mr_claims WHERE request_key = ?", [request["request_key"]]) != nil
+  end
+
+  defp request_owned_by_v1?(connection, request) do
+    Store.one!(connection, v1_owner_sql(), [request["request_key"]]) != nil
+  end
+
+  defp v1_owner_predicate do
+    "(EXISTS (SELECT 1 FROM factory_tasks AS owner_task JOIN runs AS owner_run ON owner_run.run_id = owner_task.run_id WHERE desktop_requests.target_kind = 'TASK' AND owner_task.task_key = desktop_requests.target_key AND (owner_run.execution_mode = 'TICKET_SUPERVISOR_V1' OR EXISTS (SELECT 1 FROM runs AS supervisor WHERE supervisor.issue_key = owner_run.issue_key AND supervisor.execution_mode = 'TICKET_SUPERVISOR_V1'))) OR EXISTS (SELECT 1 FROM mr_feedback_notes AS owner_note JOIN runs AS owner_run ON owner_run.run_id = owner_note.run_id WHERE owner_note.request_key = desktop_requests.request_key AND (owner_run.execution_mode = 'TICKET_SUPERVISOR_V1' OR EXISTS (SELECT 1 FROM runs AS supervisor WHERE supervisor.issue_key = owner_run.issue_key AND supervisor.execution_mode = 'TICKET_SUPERVISOR_V1'))) OR #{v1_controller_owner_predicate()})"
+  end
+
+  defp v1_controller_owner_predicate do
+    """
+    (EXISTS (SELECT 1 FROM ticket_mr_claims AS claim WHERE claim.request_key = desktop_requests.request_key) OR EXISTS (
+      SELECT 1 FROM runs AS owner_run
+      WHERE desktop_requests.target_kind = 'CONTROLLER'
+        AND owner_run.execution_mode = 'TICKET_SUPERVISOR_V1'
+        AND CASE WHEN json_valid(desktop_requests.metadata_json) THEN
+          json_extract(desktop_requests.metadata_json, '$.delivery_operation.run_id') = owner_run.run_id
+          OR json_extract(desktop_requests.metadata_json, '$.issue_key') = owner_run.issue_key
+        ELSE 0 END
+    ))
+    """
+  end
+
+  defp v1_owner_sql do
+    "SELECT request_key FROM desktop_requests WHERE request_key = ? AND #{v1_owner_predicate()} LIMIT 1"
+  end
+
+  @spec authorize_issuance(Store.connection(), map(), keyword()) :: :ok | {:error, term()}
+  def authorize_issuance(connection, %{"target_kind" => "TICKET_CHAT"} = request, opts),
+    do: TicketChat.authorize_issuance(connection, request, Keyword.get(opts, :ticket_policy, %{}))
+
+  def authorize_issuance(connection, request, opts) do
+    case issuance_admission(connection, request, opts) do
+      {:ok, _receipt} -> :ok
+      {:error, _} = error -> error
+    end
+  end
+
+  defp issuance_admission(connection, request, opts) do
+    with :ok <- jira_controller_available(connection, request) do
+      request_admission(connection, request, opts)
+    end
+  end
+
+  defp jira_controller_available(connection, %{"target_kind" => "CONTROLLER", "target_key" => scope}) do
+    if TicketJiraJournal.controller_busy?(connection, scope) do
+      {:error, :controller_jira_reconciliation_required}
+    else
+      :ok
+    end
+  end
+
+  defp jira_controller_available(_connection, _request), do: :ok
+
+  defp request_admission(connection, request, opts) do
+    if mr_owned_request?(connection, request) do
+      case Keyword.fetch(opts, :ticket_mr_admission) do
+        {:ok, admission} -> TicketMrOperation.claim_receipt(connection, request, admission, opts)
+        :error -> {:error, :request_run_quarantined}
+      end
+    else
+      case authorize_ordinary_issuance(connection, request, opts) do
+        :ok -> {:ok, nil}
+        {:error, _} = error -> error
+      end
+    end
+  end
+
+  defp authorize_ordinary_issuance(connection, %{"target_kind" => "TICKET_CHAT"} = request, opts),
+    do: TicketChat.authorize_issuance(connection, request, Keyword.get(opts, :ticket_policy, %{}))
+
+  defp authorize_ordinary_issuance(connection, request, _opts), do: require_not_quarantined_request(connection, request)
+
   defp record_thread_transaction(connection, request_key, thread_id, verified_project_id, proof) do
     with :ok <- require_nonempty(thread_id, :thread_id),
          :ok <- require_nonempty(verified_project_id, :verified_project_id),
          {:ok, request} <- get(connection, request_key),
+         :ok <- require_not_quarantined_request(connection, request),
          :ok <- verify_project(request, verified_project_id),
          :ok <- require_recordable(request, thread_id) do
       bind_recorded_thread(connection, request, thread_id, verified_project_id, proof)
@@ -491,10 +1091,16 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
     proof = if is_map(proof), do: proof |> stringify_keys() |> Map.put("thread_id", thread_id), else: proof
 
     with {:ok, workspace} <- verify_native_workspace(connection, request, proof),
-         :ok <- bind_target_thread(connection, request, thread_id),
+         :ok <- bind_readback_target(connection, request, thread_id),
          :ok <- bind_native_workspace(connection, request, workspace) do
       maybe_record_thread(connection, request, thread_id, project_id, workspace)
     end
+  end
+
+  defp bind_readback_target(connection, request, thread_id) do
+    if mr_owned_request?(connection, request),
+      do: TicketMrOperation.authorize_readback(connection, request),
+      else: bind_target_thread(connection, request, thread_id)
   end
 
   defp verify_native_workspace(connection, request, proof) do
@@ -708,13 +1314,58 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
          :ok <- require_unseen_turn(connection, request, attrs),
          :ok <- validate_output(request, attrs),
          :ok <- NativeWorktreeProbe.validate_completion(connection, request, attrs),
-         :ok <- NativeSourceBinding.validate_completion(connection, request, attrs),
+         :ok <- validate_source_completion(connection, request, attrs),
          :ok <- require_controller_format_repair_completion(connection, request, attrs, output_json),
          {:ok, completed} <- maybe_complete(connection, request, attrs, output_json),
          :ok <- finish_controller_format_repair(connection, request, attrs, output_json) do
       {:ok, completed}
     end
   end
+
+  defp attach_source_evidence(_store, %{"target_kind" => "TICKET_CHAT"}, attrs), do: {:ok, attrs}
+  defp attach_source_evidence(store, request, attrs), do: NativeSourceBinding.attach(store, request, attrs)
+
+  defp validate_source_completion(store, %{"target_kind" => "TICKET_CHAT"} = request, attrs) do
+    with {:ok, proof} when is_map(proof) <- Jason.decode(request["target_observation_json"] || "null"),
+         {:ok, _} <- TicketChat.record_thread(store, request, request["thread_id"], proof),
+         :ok <- validate_ticket_chat_acknowledgment(attrs) do
+      :ok
+    else
+      {:ok, _} -> {:error, :ticket_chat_observation_required}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp validate_source_completion(store, request, attrs), do: NativeSourceBinding.validate_completion(store, request, attrs)
+
+  defp validate_ticket_chat_acknowledgment(attrs) do
+    result = get_in(attrs, ["output", "result"])
+
+    cond do
+      result == %{"acknowledged" => true} -> :ok
+      result == %{"acknowledged" => false} and exact_empty_attachment_read?(attrs) -> :ok
+      true -> {:error, :ticket_chat_acknowledgement_required}
+    end
+  end
+
+  defp exact_empty_attachment_read?(attrs) do
+    output = attrs["output"] || %{}
+    calls = get_in(output, ["bootstrap_evidence", "list_artifacts"])
+
+    valid_sha256?(output["native_readback_sha256"]) and
+      Enum.any?(calls || [], fn
+        %{"server" => "codex_app", "tool" => "list_artifacts", "arguments" => %{}, "result" => result} ->
+          case result do
+            %{"content" => [%{"type" => "text", "text" => text}]} -> Jason.decode(text) == {:ok, %{"artifacts" => []}}
+            _ -> false
+          end
+
+        _ ->
+          false
+      end)
+  end
+
+  defp valid_sha256?(value), do: is_binary(value) and Regex.match?(~r/\A[0-9a-f]{64}\z/, value)
 
   defp require_controller_format_repair_completion(
          connection,
@@ -909,6 +1560,27 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
   defp maybe_complete(_connection, %{"status" => "SUCCEEDED"} = request, _attrs, _output_json),
     do: {:ok, request}
 
+  defp maybe_complete(_connection, %{"status" => "FAILED", "failure_code" => "TICKET_CHAT_BOOTSTRAP_NOT_ACKNOWLEDGED"} = request, _attrs, _output_json),
+    do: {:ok, request}
+
+  defp maybe_complete(_connection, %{"status" => "FAILED", "failure_code" => "TICKET_CHAT_PRESENTATION_NOT_ACKNOWLEDGED"} = request, _attrs, _output_json),
+    do: {:ok, request}
+
+  defp maybe_complete(connection, %{"target_kind" => "TICKET_CHAT", "action" => "CREATE"} = request, %{"output" => %{"result" => %{"acknowledged" => false}}} = attrs, output_json) do
+    with :ok <- persist_ticket_chat_attestation(connection, request, attrs),
+         :ok <- persist_failed_bootstrap(connection, request, attrs, output_json) do
+      get(connection, request["request_key"])
+    end
+  end
+
+  defp maybe_complete(connection, %{"target_kind" => "TICKET_CHAT", "action" => "FOLLOWUP"} = request, attrs, output_json) do
+    if request["request_key"] == request["target_key"] <> ":g1:create:bootstrap-recovery:1" do
+      complete_ticket_chat_bootstrap_recovery(connection, request, attrs, output_json)
+    else
+      complete_ticket_chat_followup(connection, request, attrs, output_json)
+    end
+  end
+
   defp maybe_complete(connection, request, attrs, output_json) do
     with :ok <- complete_native_stage(connection, request, attrs) do
       Store.query!(
@@ -919,6 +1591,84 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
 
       get(connection, request["request_key"])
     end
+  end
+
+  defp complete_ticket_chat_bootstrap_recovery(connection, request, attrs, output_json) do
+    with :ok <- persist_ticket_chat_attestation(connection, request, attrs),
+         :ok <- complete_native_stage(connection, request, attrs) do
+      Store.query!(
+        connection,
+        "UPDATE desktop_requests SET status = 'SUCCEEDED', turn_id = ?, output_json = ?, failure_code = NULL, updated_at = ? WHERE request_key = ? AND status = 'THREAD_RECORDED'",
+        [Map.get(attrs, "turn_id"), output_json, now(), request["request_key"]]
+      )
+
+      with :ok <- ensure_single_change(connection, :ticket_chat_completion_conflict),
+           {:ok, %{"status" => "SUCCEEDED", "turn_id" => turn_id, "output_json" => ^output_json, "failure_code" => nil} = completed} <- get(connection, request["request_key"]),
+           true <- turn_id == attrs["turn_id"] do
+        {:ok, completed}
+      else
+        _ -> Exqlite.rollback(connection, :ticket_chat_completion_conflict)
+      end
+    end
+  end
+
+  defp complete_ticket_chat_followup(connection, request, attrs, output_json) do
+    with :ok <- complete_native_stage(connection, request, attrs) do
+      Store.query!(connection, "UPDATE desktop_requests SET status = 'SUCCEEDED', turn_id = ?, output_json = ?, failure_code = NULL, updated_at = ? WHERE request_key = ?", [
+        Map.get(attrs, "turn_id"),
+        output_json,
+        now(),
+        request["request_key"]
+      ])
+
+      get(connection, request["request_key"])
+    end
+  end
+
+  defp persist_ticket_chat_attestation(connection, request, attrs) do
+    with true <- request["target_kind"] == "TICKET_CHAT" and is_binary(request["target_observation_json"]),
+         true <- valid_sha256?(get_in(attrs, ["output", "native_readback_sha256"])),
+         {:ok, proof} when is_map(proof) <- Jason.decode(request["target_observation_json"]),
+         encoded <- Jason.encode!(Map.put(proof, "native_readback_sha256", get_in(attrs, ["output", "native_readback_sha256"]))) do
+      Store.query!(connection, "UPDATE desktop_requests SET target_observation_json = ? WHERE request_key = ? AND target_observation_json = ?", [
+        encoded,
+        request["request_key"],
+        request["target_observation_json"]
+      ])
+
+      verify_ticket_chat_attestation_update(connection, request, encoded)
+    else
+      _ -> {:error, :ticket_chat_observation_required}
+    end
+  end
+
+  defp verify_ticket_chat_attestation_update(connection, request, encoded) do
+    with :ok <- ensure_single_change(connection, :ticket_chat_observation_conflict) do
+      if get(connection, request["request_key"]) != {:ok, Map.put(request, "target_observation_json", encoded)},
+        do: Exqlite.rollback(connection, :ticket_chat_observation_conflict)
+
+      :ok
+    end
+  end
+
+  defp persist_failed_bootstrap(connection, request, attrs, output_json) do
+    Store.query!(
+      connection,
+      "UPDATE desktop_requests SET status = 'FAILED', turn_id = ?, output_json = ?, failure_code = 'TICKET_CHAT_BOOTSTRAP_NOT_ACKNOWLEDGED', updated_at = ? WHERE request_key = ? AND status = 'THREAD_RECORDED'",
+      [Map.get(attrs, "turn_id"), output_json, now(), request["request_key"]]
+    )
+
+    with :ok <- ensure_single_change(connection, :ticket_chat_completion_conflict),
+         {:ok, %{"status" => "FAILED", "failure_code" => "TICKET_CHAT_BOOTSTRAP_NOT_ACKNOWLEDGED", "turn_id" => turn_id, "output_json" => ^output_json}} <- get(connection, request["request_key"]),
+         true <- turn_id == attrs["turn_id"] do
+      :ok
+    else
+      _ -> Exqlite.rollback(connection, :ticket_chat_completion_conflict)
+    end
+  end
+
+  defp ensure_single_change(connection, reason) do
+    if Store.one!(connection, "SELECT changes() AS count")["count"] == 1, do: :ok, else: Exqlite.rollback(connection, reason)
   end
 
   defp complete_native_stage(connection, %{"target_kind" => "TASK", "action" => "FOLLOWUP"} = request, attrs) do
@@ -1085,6 +1835,7 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
   defp fail_transaction(connection, request_key, reason, opts) do
     with :ok <- require_nonempty(reason, :failure_code),
          {:ok, request} <- get(connection, request_key),
+         :ok <- require_not_quarantined_request(connection, request),
          :ok <- require_failable(request),
          :ok <- require_definitive_create_rejection(request, reason, opts) do
       status = if request["status"] == "PENDING", do: "FAILED", else: "RECONCILE_REQUIRED"
@@ -1193,13 +1944,25 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
 
   defp validate_fields(attrs) do
     unknown = Map.keys(attrs) -- @request_fields
-    missing = Enum.reject(@required_strings, &present?(Map.get(attrs, &1)))
+    required = if attrs["target_kind"] == "TICKET_CHAT", do: @required_strings -- ["codex_project_id"], else: @required_strings
+    missing = Enum.reject(required, &present?(Map.get(attrs, &1)))
 
     cond do
-      unknown != [] -> {:error, {:unknown_request_fields, Enum.sort(unknown)}}
-      missing != [] -> {:error, {:missing_request_fields, missing}}
-      attrs["target_kind"] not in ["TASK", "CONTROLLER"] -> {:error, :invalid_target_kind}
-      true -> :ok
+      unknown != [] ->
+        {:error, {:unknown_request_fields, Enum.sort(unknown)}}
+
+      missing != [] ->
+        {:error, {:missing_request_fields, missing}}
+
+      attrs["target_kind"] not in ["TASK", "CONTROLLER", "TICKET_CHAT"] ->
+        {:error, :invalid_target_kind}
+
+      attrs["target_kind"] == "TICKET_CHAT" and
+          (not Map.has_key?(attrs, "codex_project_id") or not is_nil(attrs["codex_project_id"])) ->
+        {:error, :ticket_chat_requires_projectless_route}
+
+      true ->
+        :ok
     end
   end
 
@@ -1263,6 +2026,9 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
       control -> validate_route_and_thread(control, payload, "controller_codex_project_id", "controller_thread_id")
     end
   end
+
+  defp validate_target(connection, %{"target_kind" => "TICKET_CHAT"} = payload),
+    do: TicketChat.validate_request(connection, payload)
 
   defp source_bootstrap_operation(payload) do
     if NativeSourceBinding.bootstrap?(payload), do: :source_bootstrap
@@ -1443,7 +2209,7 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
     end
   end
 
-  defp require_completion(%{"status" => "SUCCEEDED"} = request, attrs, output_json) do
+  defp require_completion(%{"status" => status} = request, attrs, output_json) when status in ["SUCCEEDED", "FAILED"] do
     if request["thread_id"] == attrs["thread_id"] and
          request["turn_id"] == attrs["turn_id"] and request["output_json"] == output_json,
        do: :ok,

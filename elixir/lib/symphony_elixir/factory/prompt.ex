@@ -415,9 +415,13 @@ defmodule SymphonyElixir.Factory.Prompt do
     #{issue_key}, source branch #{source_branch}, target #{target_branch}, and
     exact pushed SHA #{sha}. Use the canonical title form
     `Draft: <type>(#{issue_key}): <short descriptive title>`, selecting the
-    conventional-commit type that matches the change. Preserve draft state and
-    do not add reviewers. If an open MR for the source branch
-    already exists, update that same MR rather than creating a duplicate.
+    conventional-commit type that matches the change. Before any mutation, read
+    existing MRs for the exact source and target branches, including draft state,
+    reviewers, assignees, and open/closed/merged state. If a matching MR is ready
+    for review, has reviewers, is closed or merged, or its identity is ambiguous,
+    return BLOCK without changing it or creating a replacement. The user's draft
+    and reviewer decisions are authoritative; never redraft or clear reviewers.
+    Reuse an open reviewer-free draft instead of creating a duplicate.
 
     Use the concise supplied MR description as written. It is an index to the
     Jira source of truth, not a place to paste the Ticket Delivery Contract or
@@ -426,9 +430,12 @@ defmodule SymphonyElixir.Factory.Prompt do
     Read the MR back and prove its source branch HEAD SHA, target branch, draft
     state, reviewer count, state, IID, and URL. Return BLOCK on any mismatch.
     When creating it, pass `assignee_ids: [11599766]` for Cameron Gable and
-    `reviewer_ids: []`. When reusing an MR, preserve any existing assignee;
-    if none is assigned, set Cameron as assignee without changing draft or
-    reviewer state.
+    `reviewer_ids: []`. On every update of an already reviewer-free draft, even a
+    description-only or assignee-only update, send `draft: true`, the full title
+    including `Draft: `, and `reviewer_ids: []` together. Preserve any existing
+    assignee; if none is assigned, set Cameron as assignee with those same safety
+    fields. Read back draft state and reviewers after every create or update;
+    never treat a prior read as proof of the current human state.
     Never merge or undraft it.
 
     Repository route:

@@ -9,6 +9,41 @@ and exact delivery boundaries behind those tasks.
 The standard upstream Symphony loop is unchanged when `factory.enabled` is
 false.
 
+### Desktop-owned ticket route (default off)
+
+With the separately gated `factory.ticket_supervisor` route, an ordinary
+`Required: no` ticket has one projectless Desktop parent and one source checkout.
+The scheduler owns leases, role admission, source adoption and external writes.
+Internal planner/writer/verifier workers return exact receipts to that controller;
+their diagnostic threads do not replace the operator's parent chat. The Desktop
+broker only creates or updates the parent and reads back those handoffs. It is
+not the Jira poller or the source worker.
+
+Chat with the parent to inspect the candidate, findings or next action and to
+stage explicit answers/rework. A bounded answer uses `Answer QUESTION_KEY: value`
+with the current declared value. The controller independently admits the native
+input; a model's acknowledgment or staged PENDING proposal is not authority.
+Parent instructions are behavioral constraints, not an enforced read-only OS
+sandbox. This route deliberately trusts the operator-facing chat's permissions.
+The legacy stage graph below remains applicable to legacy runs.
+
+The dashboard/API show source progress separately from parent synchronization.
+An unavailable parent context does not change delivery facts, and a stale
+question is retained as history rather than counted as a current decision.
+Read-only `factory.ticket replay` exposes bounded evidence and fixed cursors,
+without executing actions, initializing a database or waking a model. Usage
+without an attributed receipt is unknown, not zero; task lifecycle wall time
+and recorded checkout intents do not establish active model time or physical
+checkout counts.
+
+Keep rollout default-off until the final acceptance gates and separate deployment
+approval. Pausing admission is not proof of draining: verify owned-turn shutdown
+and unresolved handoffs independently. Disabling the ordinary route quarantines
+its advancement without rebinding runs or enabling legacy dispatch. Retain
+readback and diagnosis for already-issued effects; do not resend uncertain work
+as a rollback tactic. Native workspace maintenance remains separately disabled
+and capability-gated; this route does not enable cleanup or archival.
+
 ## Operating model
 
 One bounded controller tick performs this sequence:

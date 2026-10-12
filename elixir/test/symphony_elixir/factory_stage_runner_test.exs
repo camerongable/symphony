@@ -9,35 +9,78 @@ defmodule SymphonyElixir.FactoryStageRunnerTest do
     def start_session(_workspace, opts) do
       send(self(), {:start_session, opts})
       if is_function(opts[:on_thread_created], 1), do: opts[:on_thread_created].("thread-123")
-      {:ok, %{thread_id: "thread-123"}}
+      {:ok, %{thread_id: "thread-123", worker_policy: Process.get(:factory_test_worker_policy, "test-policy")}}
     end
 
     @spec run_turn(map(), String.t(), Issue.t(), keyword()) :: {:ok, map()}
-    def run_turn(_session, _prompt, _issue, opts) do
+    def run_turn(session, _prompt, _issue, opts) do
       send(self(), {:run_turn, opts[:output_schema]})
 
       output =
-        if Process.get(:factory_test_schema_invalid, false),
-          do: %{"status" => "PASS"},
-          else: %{"status" => "PASS", "findings" => [], "required_questions" => []}
+        Process.get(:factory_test_output) ||
+          if Process.get(:factory_test_schema_invalid, false),
+            do: %{"status" => "PASS"},
+            else: %{"status" => "PASS", "findings" => [], "required_questions" => []}
+
+      if opts[:event_scope] == :exact_turn do
+        event_turn = Process.get(:factory_test_event_turn, "turn-456")
+        opts[:on_message].(%{event: :session_started, thread_id: session.thread_id, turn_id: event_turn})
+      end
+
+      item = %{"type" => "agentMessage", "text" => Jason.encode!(output)}
+      item = if opts[:event_scope] == :exact_turn, do: Map.put(item, "id", "item-789"), else: item
+
+      params = %{"item" => item}
+      params = if opts[:event_scope] == :exact_turn, do: Map.merge(params, %{"threadId" => session.thread_id, "turnId" => Process.get(:factory_test_event_turn, "turn-456")}), else: params
 
       opts[:on_message].(%{
         payload: %{
           "method" => "item/completed",
-          "params" => %{
-            "item" => %{
-              "type" => "agentMessage",
-              "text" => Jason.encode!(output)
-            }
-          }
+          "params" => params
         }
       })
 
       {:ok, %{turn_id: "turn-456"}}
     end
 
-    @spec stop_session(map()) :: :ok
-    def stop_session(_session), do: :ok
+    @spec stop_session(map()) :: term()
+    def stop_session(_session) do
+      if Process.get(:factory_test_watch_stop, false), do: send(self(), :factory_test_session_stopped)
+      Process.get(:factory_test_owner_stop, :ok)
+    end
+  end
+
+  test "native writer sends all declared properties as required without tightening persisted output validation" do
+    schema = StageSchemas.for_stage(:native_feature_writer)
+    output = %{"status" => "COMPLETE", "changed_paths" => [], "commit_message" => nil, "blockers" => [], "checks" => []}
+    Process.put(:factory_test_output, output)
+    issue = %Issue{identifier: "PPL-123", title: "Fixture"}
+    assert {:ok, _} = StageRunner.run("/tmp/workspace", issue, "Writer", schema, app_server: FakeAppServer)
+    assert_received {:run_turn, sent}
+    assert Enum.sort(sent["required"]) == Enum.sort(Map.keys(sent["properties"]))
+    assert sent["properties"] == schema["properties"]
+    assert :ok = StageSchemas.validate(output, schema)
+    refute "next_slice" in schema["required"]
+  end
+
+  test "provider schema requires nested fields while preserving strict schemas and field types" do
+    strict = StageSchemas.for_stage(:specification_critic)
+    assert StageSchemas.for_provider(strict) == strict
+    child = %{"type" => "object", "properties" => %{"optional" => %{"type" => "string"}}, "additionalProperties" => false}
+
+    schema = %{
+      "type" => "object",
+      "required" => ["rows"],
+      "additionalProperties" => false,
+      "properties" => %{"rows" => %{"type" => "array", "items" => child}, "choice" => %{"anyOf" => [child, %{"type" => "null"}]}}
+    }
+
+    normalized = StageSchemas.for_provider(schema)
+    assert normalized["required"] == ["rows", "choice"]
+    assert get_in(normalized, ["properties", "rows", "items", "required"]) == ["optional"]
+    assert hd(normalized["properties"]["choice"]["anyOf"])["required"] == ["optional"]
+    assert get_in(normalized, ["properties", "rows", "items", "properties"]) == child["properties"]
+    assert {:error, _} = StageSchemas.validate(%{}, StageSchemas.for_stage(:native_feature_writer))
   end
 
   defmodule FakeForkedAppServer do
@@ -292,10 +335,114 @@ defmodule SymphonyElixir.FactoryStageRunnerTest do
     assert start_opts[:reasoning_effort] == "high"
     assert start_opts[:service_name] == "symphony-factory"
     assert start_opts[:thread_source] == "symphonyFactory"
+    refute Keyword.has_key?(start_opts, :ephemeral)
     assert is_function(start_opts[:on_thread_created], 1)
     assert_received {:thread_started, "thread-123"}
     refute_received {:thread_started, "thread-123"}
     assert_received {:run_turn, ^schema}
+  end
+
+  test "forwards an explicit ephemeral choice without changing resume or approval policy" do
+    issue = %Issue{id: "100", identifier: "PPL-100", title: "Factory task"}
+    schema = StageSchemas.for_stage(:specification_critic)
+
+    assert {:ok, _result} =
+             StageRunner.run("/tmp/workspace", issue, "Review", schema,
+               app_server: FakeAppServer,
+               ephemeral: true,
+               resume_thread_id: "existing-thread",
+               approval_policy: "on-request",
+               allowed_mcp_tool_approvals: [%{server: "Jira", tool: "jira_search"}]
+             )
+
+    assert_received {:start_session, start_opts}
+    assert start_opts[:ephemeral] == true
+    assert start_opts[:resume_thread_id] == "existing-thread"
+    assert start_opts[:approval_policy] == "on-request"
+    assert start_opts[:allowed_mcp_tool_approvals] == [%{server: "Jira", tool: "jira_search"}]
+  end
+
+  test "owned ephemeral REVIEW returns the exact structured result and owner stop receipt" do
+    issue = %Issue{id: "100", identifier: "PPL-100", title: "Factory task"}
+    schema = StageSchemas.for_stage(:specification_critic)
+    policy = %{"access" => "REVIEW", "cwd" => "/tmp/workspace"}
+    owner_stop = %{"thread_id" => "thread-123", "exit_status" => 0}
+    Process.put(:factory_test_worker_policy, policy)
+    Process.put(:factory_test_owner_stop, {:ok, owner_stop})
+
+    assert {:ok, result} =
+             StageRunner.run("/tmp/workspace", issue, "Review", schema,
+               app_server: FakeAppServer,
+               include_evidence: true,
+               event_scope: :exact_turn,
+               worker_access: "REVIEW",
+               ephemeral: true
+             )
+
+    assert result == %{
+             thread_id: "thread-123",
+             turn_id: "turn-456",
+             output: %{"status" => "PASS", "findings" => [], "required_questions" => []},
+             item_id: "item-789",
+             policy: policy,
+             owner_stop: owner_stop
+           }
+  end
+
+  test "owned ephemeral REVIEW rejects an unproven owner stop with the observed receipt" do
+    issue = %Issue{id: "100", identifier: "PPL-100", title: "Factory task"}
+    policy = %{"access" => "REVIEW", "cwd" => "/tmp/workspace"}
+    Process.put(:factory_test_worker_policy, policy)
+    Process.put(:factory_test_owner_stop, {:error, :shutdown_unproven})
+
+    assert {:error,
+            {:worker_shutdown_unproven, {:error, :shutdown_unproven},
+             %{
+               thread_id: "thread-123",
+               turn_id: "turn-456",
+               output: %{"status" => "PASS", "findings" => [], "required_questions" => []},
+               item_id: "item-789",
+               policy: ^policy
+             }}} =
+             StageRunner.run("/tmp/workspace", issue, "Review", StageSchemas.for_stage(:specification_critic),
+               app_server: FakeAppServer,
+               include_evidence: true,
+               event_scope: :exact_turn,
+               worker_access: "REVIEW",
+               ephemeral: true
+             )
+  end
+
+  test "owned ephemeral REVIEW rejects mismatched turn identity" do
+    issue = %Issue{id: "100", identifier: "PPL-100", title: "Factory task"}
+    Process.put(:factory_test_event_turn, "observed-other-turn")
+
+    assert {:error, {:factory_stage_turn_identity_mismatch, _, _, _}} =
+             StageRunner.run("/tmp/workspace", issue, "Review", StageSchemas.for_stage(:specification_critic),
+               app_server: FakeAppServer,
+               include_evidence: true,
+               event_scope: :exact_turn,
+               worker_access: "REVIEW",
+               ephemeral: true
+             )
+  end
+
+  test "owned ephemeral REVIEW stops its session when a downstream callback raises" do
+    issue = %Issue{id: "100", identifier: "PPL-100", title: "Factory task"}
+    Process.put(:factory_test_watch_stop, true)
+
+    assert_raise RuntimeError, "callback failed", fn ->
+      StageRunner.run("/tmp/workspace", issue, "Review", StageSchemas.for_stage(:specification_critic),
+        app_server: FakeAppServer,
+        include_evidence: true,
+        event_scope: :exact_turn,
+        worker_access: "REVIEW",
+        ephemeral: true,
+        on_message: fn _message -> raise "callback failed" end
+      )
+    end
+
+    assert_received :factory_test_session_stopped
   end
 
   test "exact-turn collection ignores foreign output and foreign tool evidence" do

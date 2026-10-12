@@ -120,6 +120,12 @@ defmodule SymphonyElixir.Factory.Controller do
           control_server: state.control_server
         )
 
+      result =
+        case result do
+          {:skipped, "PAUSED"} -> TickLease.reconcile(context, control_server: state.control_server)
+          other -> other
+        end
+
       send(parent, {:factory_tick_finished, self(), result})
     end)
   end

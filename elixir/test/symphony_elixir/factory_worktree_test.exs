@@ -38,6 +38,79 @@ defmodule SymphonyElixir.FactoryWorktreeTest do
              "cgable/PPL-123-add-zip-array-handling"
   end
 
+  test "pinned writer creation keeps the recorded commit after the base advances and reuses only its clean checkout", %{route: route, repo: repo} do
+    sha = String.trim(cmd!(repo, ["rev-parse", "HEAD"]))
+    File.mkdir_p!(route["workspace_root"])
+    {:ok, root} = PathSafety.canonicalize(route["workspace_root"])
+    route = route |> Map.put("workspace_root", root) |> Map.put("branch", "cgable/PPL-123-pinned")
+    File.write!(Path.join(repo, "NEXT.md"), "next\n")
+    cmd!(repo, ["add", "NEXT.md"])
+    cmd!(repo, ["commit", "--no-verify", "-m", "advance base"])
+    advanced = String.trim(cmd!(repo, ["rev-parse", "HEAD"]))
+    cmd!(repo, ["update-ref", "refs/remotes/origin/master", advanced])
+    marker = Path.join(Path.dirname(repo), "checkout-hook-ran")
+    hook = Path.join(repo, ".git/hooks/post-checkout")
+    File.write!(hook, "#!/bin/sh\n: > '#{marker}'\n")
+    File.chmod!(hook, 0o755)
+
+    assert {:ok, writer} = Worktree.ensure_writer_pinned(route, "PPL-123", "pinned-run", sha)
+    refute File.exists?(marker)
+    assert writer.head == sha
+    assert writer.path == Worktree.writer_path(route, "PPL-123", "pinned-run")
+    assert {:ok, ^writer} = Worktree.ensure_writer_pinned(route, "PPL-123", "pinned-run", sha)
+    assert String.trim(cmd!(repo, ["rev-parse", "refs/remotes/origin/master"])) == advanced
+    File.write!(Path.join(writer.path, "UNTRACKED.md"), "preserve\n")
+    assert {:error, :worktree_dirty} = Worktree.ensure_writer_pinned(route, "PPL-123", "pinned-run", sha)
+    assert File.read!(Path.join(writer.path, "UNTRACKED.md")) == "preserve\n"
+    assert String.trim(cmd!(writer.path, ["rev-parse", "HEAD"])) == sha
+  end
+
+  test "pinned writer rejects protected branches, branch collisions and aliased roots without overwriting refs", %{route: route, repo: repo} do
+    sha = String.trim(cmd!(repo, ["rev-parse", "HEAD"]))
+    File.mkdir_p!(route["workspace_root"])
+    {:ok, root} = PathSafety.canonicalize(route["workspace_root"])
+    route = Map.put(route, "workspace_root", root)
+    assert {:error, :native_branch_protected} = Worktree.ensure_writer_pinned(Map.put(route, "branch", "master"), "PPL-123", "protected", sha)
+    cmd!(repo, ["branch", "cgable/existing"])
+    existing = Map.put(route, "branch", "cgable/existing")
+    assert {:error, {:pinned_writer_branch_already_exists, "cgable/existing"}} = Worktree.ensure_writer_pinned(existing, "PPL-123", "collision", sha)
+    refute File.exists?(Worktree.writer_path(existing, "PPL-123", "collision"))
+    assert String.trim(cmd!(repo, ["rev-parse", "cgable/existing"])) == sha
+    alias_root = root <> "-alias"
+    File.ln_s!(root, alias_root)
+    aliased = route |> Map.put("workspace_root", alias_root) |> Map.put("branch", "cgable/alias")
+    assert {:error, :pinned_writer_root_unproven} = Worktree.ensure_writer_pinned(aliased, "PPL-123", "alias", sha)
+    refute File.exists?(Worktree.writer_path(route, "PPL-123", "alias"))
+    cmd!(repo, ["tag", "-a", "annotated", "-m", "not a commit object"])
+    tag_sha = String.trim(cmd!(repo, ["rev-parse", "annotated"]))
+    tagged = Map.put(route, "branch", "cgable/tagged")
+    assert {:error, :pinned_writer_commit_required} = Worktree.ensure_writer_pinned(tagged, "PPL-123", "tag", tag_sha)
+    refute File.exists?(Worktree.writer_path(tagged, "PPL-123", "tag"))
+    {_, status} = System.cmd("git", ["-C", repo, "show-ref", "--verify", "refs/heads/cgable/tagged"], stderr_to_stdout: true)
+    assert status != 0
+  end
+
+  test "pinned creation ignores redirected Git environment instead of mutating a foreign repository", %{route: route, repo: repo} do
+    File.mkdir_p!(route["workspace_root"])
+    {:ok, root} = PathSafety.canonicalize(route["workspace_root"])
+    route = route |> Map.put("workspace_root", root) |> Map.put("branch", "cgable/PPL-123-env")
+    sha = String.trim(cmd!(repo, ["rev-parse", "HEAD"]))
+    foreign = Path.join(Path.dirname(repo), "foreign")
+    cmd!(Path.dirname(repo), ["clone", "--no-hardlinks", repo, foreign])
+    arguments = Enum.map_join([route, "PPL-123", "environment", sha], ", ", &inspect/1)
+    code = "IO.inspect(SymphonyElixir.Factory.Worktree.ensure_writer_pinned(#{arguments}))"
+    args = ["run", "--no-compile", "--no-start", "-e", code]
+    {output, status} = System.cmd(System.find_executable("mix"), args, env: [{"MIX_ENV", "test"}, {"GIT_DIR", Path.join(foreign, ".git")}, {"GIT_WORK_TREE", repo}], stderr_to_stdout: true)
+    assert status == 0
+    assert output =~ "{:ok,"
+    writer = Worktree.writer_path(route, "PPL-123", "environment")
+    proof_opts = [detached: false, expected_branch: route["branch"], expected_sha: sha]
+    assert {:ok, _} = Worktree.validate_native(route, writer, proof_opts)
+    {_, status} = System.cmd("git", ["-C", foreign, "show-ref", "--verify", "refs/heads/" <> route["branch"]], stderr_to_stdout: true)
+    assert status != 0
+    refute cmd!(foreign, ["worktree", "list", "--porcelain"]) =~ writer
+  end
+
   test "assigns a run suffix when a prior run left the stable issue branch", %{route: route, repo: repo} do
     branch = Worktree.branch_name("PPL-123", "Add ZIP handling", "cgable")
     cmd!(repo, ["branch", branch])
@@ -77,6 +150,59 @@ defmodule SymphonyElixir.FactoryWorktreeTest do
 
     remote = cmd!(repo, ["ls-remote", "origin", "refs/heads/#{writer.branch}"])
     assert String.starts_with?(remote, candidate)
+  end
+
+  test "remote branch recovery reads the exact branch without changing local refs, source or worktrees", %{route: route, repo: repo} do
+    sha = String.trim(cmd!(repo, ["rev-parse", "HEAD"]))
+    branch = "cgable/PPL-123-recovery"
+    cmd!(repo, ["push", "--no-verify", "origin", "#{sha}:refs/heads/#{branch}"])
+    refs = cmd!(repo, ["show-ref"])
+    status = cmd!(repo, ["status", "--porcelain", "--untracked-files=all"])
+    worktrees = cmd!(repo, ["worktree", "list", "--porcelain"])
+    assert {:ok, ^sha} = Worktree.read_remote_branch(route, branch)
+    assert {:error, :remote_branch_readback_mismatch} = Worktree.read_remote_branch(route, branch <> "-missing")
+    assert {:error, :native_branch_invalid} = Worktree.read_remote_branch(route, branch <> "*")
+    assert {:error, :native_branch_protected} = Worktree.read_remote_branch(route, "master")
+    assert cmd!(repo, ["show-ref"]) == refs
+    assert cmd!(repo, ["status", "--porcelain", "--untracked-files=all"]) == status
+    assert cmd!(repo, ["worktree", "list", "--porcelain"]) == worktrees
+  end
+
+  test "origin identity requires one matching destination and never exposes credential-bearing URLs", %{route: route, repo: repo} do
+    assert {:ok, %{"destination_sha256" => hash}} = Worktree.origin_identity(route, repo)
+    assert Regex.match?(~r/\A[0-9a-f]{64}\z/, hash)
+    secret = "https://fixture-user:fixture-secret@example.invalid/repository.git"
+    cmd!(repo, ["config", "remote.origin.pushurl", secret])
+    assert {:error, :origin_destination_unproven} = Worktree.origin_identity(route, repo)
+    cmd!(repo, ["config", "remote.origin.url", secret])
+    assert {:ok, pinned} = Worktree.origin_identity(route, repo)
+    assert Map.keys(pinned) == ["destination_sha256"]
+    refute inspect(pinned) =~ "fixture-secret"
+    cmd!(repo, ["config", "--add", "remote.origin.pushurl", "https://other.invalid/repo.git"])
+    assert {:error, :origin_destination_unproven} = Worktree.origin_identity(route, repo)
+
+    for {destination, allowed} <- [
+          {"https://example.invalid/team/repo.git", true},
+          {"ssh://git@example.invalid/team/repo.git", true},
+          {"git@example.invalid:team/repo.git", true},
+          {"file:///private/tmp/fixture-origin.git", true},
+          {"/private/tmp/fixture-origin.git", true},
+          {"file:relative-origin.git", false},
+          {"ext::echo fixture", false},
+          {"../origin.git", false}
+        ] do
+      cmd!(repo, ["config", "--replace-all", "remote.origin.url", destination])
+      cmd!(repo, ["config", "--replace-all", "remote.origin.pushurl", destination])
+      assert match?({:ok, _}, Worktree.origin_identity(route, repo)) == allowed
+    end
+  end
+
+  test "equal relative origin strings do not prove matching destinations across linked checkout directories", %{route: route, repo: repo} do
+    assert {:ok, writer} = Worktree.ensure_writer(route, "PPL-123", "relative-origin")
+    cmd!(repo, ["config", "remote.origin.url", "../origin.git"])
+    assert cmd!(repo, ["remote", "get-url", "origin"]) == cmd!(writer.path, ["remote", "get-url", "--push", "origin"])
+    refute Path.expand("../origin.git", repo) == Path.expand("../origin.git", writer.path)
+    assert {:error, :origin_destination_unproven} = Worktree.origin_identity(route, writer.path)
   end
 
   test "reuses a clean critic checkout at its pinned SHA but keeps exact-SHA creation strict", %{route: route, repo: repo} do

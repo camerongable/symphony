@@ -17,7 +17,9 @@ defmodule SymphonyElixir.Factory.Observability do
     RunLedger,
     Store,
     Supervisor,
-    TaskLedger
+    TaskLedger,
+    TicketChatOutbox,
+    TicketContext
   }
 
   @terminal_states ~w(READY_FOR_REVIEW DELIVERED AWAITING_VALIDATION CANCELLED FAILED)
@@ -26,16 +28,37 @@ defmodule SymphonyElixir.Factory.Observability do
   @active_task_statuses ~w(STARTING RUNNING)
   @overview_hidden_states ~w(DELIVERED CANCELLED)
 
-  @doc "Returns the bounded factory projection, or nil when the factory is disabled."
-  @spec snapshot(keyword()) :: map() | nil
+  @doc "Returns the bounded factory projection, including an explicit state when the factory is disabled."
+  @spec snapshot(keyword()) :: map()
   def snapshot(opts \\ []) do
     settings = Keyword.get_lazy(opts, :settings, &Config.settings!/0)
     factory = value(settings, :factory, %{})
 
+    feature_flags = %{
+      ordinary_factory_enabled: value(factory, :enabled, false),
+      ticket_supervisor_enabled: value(value(factory, :ticket_supervisor, %{}), :enabled, false)
+    }
+
     if value(factory, :enabled, false) do
       store = Keyword.get(opts, :store, Supervisor.store_name())
       control_server = Keyword.get(opts, :control_server, Supervisor.control_name())
-      build_snapshot(factory, store, control_server, opts)
+      build_snapshot(factory, store, control_server, opts) |> Map.merge(feature_flags)
+    else
+      %{
+        enabled: false,
+        available: false,
+        disabled: true,
+        error: nil,
+        runs: [],
+        current_runs: [],
+        tasks: [],
+        recent_events: [],
+        counts: empty_counts(),
+        overview: empty_overview(),
+        intake: %{available: false, observed_at: nil, count: 0, issues: [], error: nil},
+        capacity: []
+      }
+      |> Map.merge(feature_flags)
     end
   rescue
     error -> unavailable(Exception.message(error))
@@ -45,11 +68,12 @@ defmodule SymphonyElixir.Factory.Observability do
 
   defp build_snapshot(factory, store, control_server, opts) do
     run_limit = Keyword.get(opts, :run_limit, 50)
+    current_run_limit = Keyword.get(opts, :current_run_limit, max(run_limit, 50))
     event_limit = Keyword.get(opts, :event_limit, 20)
     task_limit = Keyword.get(opts, :task_limit, 100)
 
     all_runs = RunLedger.list_recent(store, run_limit)
-    current_runs = RunLedger.list_current(store, run_limit)
+    current_runs = RunLedger.list_current(store, current_run_limit)
     runs = Enum.reject(all_runs, &hidden_from_dashboard?/1)
     current_runs = Enum.reject(current_runs, &hidden_from_dashboard?/1)
     tasks = TaskLedger.list_recent(store, task_limit)
@@ -57,8 +81,15 @@ defmodule SymphonyElixir.Factory.Observability do
     tasks_by_run = Enum.group_by(tasks, & &1["run_id"])
     issue_by_run = Map.new(all_runs ++ current_runs, &{&1["run_id"], &1["issue_key"]})
 
-    projected_runs = project_runs(runs, tasks_by_run, issue_by_run, handoffs)
-    projected_current_runs = project_runs(current_runs, tasks_by_run, issue_by_run, handoffs)
+    combined_runs = Enum.uniq_by(runs ++ current_runs, & &1["run_id"])
+
+    enriched_runs =
+      project_runs(combined_runs, tasks_by_run, issue_by_run, handoffs)
+      |> enrich_ticket_context(store, opts)
+
+    enriched_by_id = Map.new(enriched_runs, &{&1.run_id, &1})
+    projected_runs = Enum.map(runs, &Map.fetch!(enriched_by_id, &1["run_id"]))
+    projected_current_runs = Enum.map(current_runs, &Map.fetch!(enriched_by_id, &1["run_id"]))
 
     projected_tasks = Enum.map(tasks, &project_task(&1, issue_by_run, handoffs))
     intake = project_intake(IntakeLedger.get(store, value(factory, :scope, "default")), factory, current_runs)
@@ -81,6 +112,80 @@ defmodule SymphonyElixir.Factory.Observability do
       tasks: projected_tasks,
       recent_events: Enum.map(RunLedger.recent_events(store, event_limit), &project_event/1)
     }
+  end
+
+  defp enrich_ticket_context(runs, store, opts) do
+    context_reader = Keyword.get(opts, :ticket_context, &TicketContext.context/2)
+    synchronization_reader = Keyword.get(opts, :ticket_synchronization, &TicketChatOutbox.synchronization/2)
+
+    Enum.map(runs, &enrich_ticket_context_run(&1, store, context_reader, synchronization_reader))
+  end
+
+  defp enrich_ticket_context_run(run, store, context_reader, synchronization_reader) do
+    case safe_read(fn -> context_reader.(store, run.run_id) end) do
+      {:ok, context} ->
+        synchronization = read_ticket_synchronization(store, run.run_id, synchronization_reader)
+        parent_thread_id = get_in(context, [:identity, "thread_id"]) || get_in(context, [:identity, :thread_id])
+
+        Map.put(run, :ticket_context, %{
+          available: true,
+          parent_thread_id: parent_thread_id,
+          codex_thread_url: codex_thread_url(parent_thread_id),
+          source_stage: run.state,
+          candidate_sha: get_in(context, [:run, "candidate_sha"]),
+          contract_revision: get_in(context, [:run, "spec_revision"]),
+          ci: context.ci,
+          validation: context.manual_validation,
+          questions: Enum.map(context.open_questions || [], &Map.take(&1, ~w(question_key opened_at binding body answers))),
+          actionable_question_count: Enum.count(context.open_questions || [], &(Map.get(&1, "binding") == "CURRENT")),
+          next_action: context.next_action,
+          worker_tasks: context.tasks || [],
+          attributed_usage: %{status: "UNKNOWN", tokens: nil, cost: nil, reason: "Per-run and per-turn factory token usage and cost are not recorded."},
+          checkout_count: checkout_evidence(store, run.run_id),
+          synchronization: synchronization_projection(synchronization)
+        })
+
+      {:error, reason} ->
+        Map.put(run, :ticket_context, %{
+          available: false,
+          error: inspect(reason),
+          parent_thread_id: nil,
+          codex_thread_url: nil,
+          source_stage: run.state,
+          next_action: nil,
+          questions: [],
+          synchronization: %{status: "UNKNOWN"},
+          attributed_usage: %{status: "UNKNOWN", tokens: nil, cost: nil}
+        })
+    end
+  end
+
+  defp read_ticket_synchronization(store, run_id, synchronization_reader) do
+    safe_read(fn -> synchronization_reader.(store, run_id) end)
+  end
+
+  defp codex_thread_url(thread_id) when is_binary(thread_id), do: "codex://threads/#{URI.encode(thread_id)}"
+  defp codex_thread_url(_thread_id), do: nil
+
+  defp checkout_evidence(store, run_id) do
+    count = Store.one!(store, "SELECT COUNT(*) AS total FROM ticket_checkout_intents WHERE run_id = ?", [run_id])["total"]
+    %{physical_checkouts: %{status: "UNKNOWN", count: nil}, recorded_intents: %{status: "RECORDED", count: count}}
+  end
+
+  defp synchronization_projection({:ok, synchronization}) do
+    request_status = get_in(synchronization, [:request, "status"])
+    status = if is_binary(request_status), do: request_status, else: Map.get(synchronization, :status, "UNKNOWN")
+    Map.put(synchronization, :status, status)
+  end
+
+  defp synchronization_projection({:error, reason}), do: %{status: "UNAVAILABLE", error: inspect(reason)}
+
+  defp safe_read(read) do
+    read.()
+  rescue
+    error -> {:error, Exception.message(error)}
+  catch
+    :exit, reason -> {:error, inspect(reason)}
   end
 
   defp project_runs(runs, tasks_by_run, issue_by_run, handoffs) do

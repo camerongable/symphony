@@ -5,6 +5,7 @@ defmodule SymphonyElixir.Factory.Supervisor do
 
   use Supervisor
 
+  alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.Config
   alias SymphonyElixir.Factory.{Controller, ControlServer, Policy, Store}
 
@@ -31,7 +32,7 @@ defmodule SymphonyElixir.Factory.Supervisor do
   def init(settings) do
     factory = settings.factory
 
-    case Policy.validate(factory) do
+    case validate_startup(factory) do
       :ok ->
         controller_options = [
           settings: settings,
@@ -53,7 +54,21 @@ defmodule SymphonyElixir.Factory.Supervisor do
         Supervisor.init(children, strategy: :one_for_one)
 
       {:error, reason} ->
-        {:stop, {:invalid_factory_policy, reason}}
+        exit({:invalid_factory_policy, reason})
+    end
+  end
+
+  defp validate_startup(factory) do
+    with :ok <- Policy.validate(factory) do
+      policy = Map.get(factory, "ticket_supervisor", Map.get(factory, :ticket_supervisor, %{}))
+      enabled = Map.get(policy, "enabled", Map.get(policy, :enabled, false))
+
+      if enabled do
+        root = Map.get(policy, "parent_output_root", Map.get(policy, :parent_output_root))
+        AppServer.check_ticket_runtime(root)
+      else
+        :ok
+      end
     end
   end
 

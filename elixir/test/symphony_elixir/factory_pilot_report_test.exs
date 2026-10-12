@@ -70,6 +70,7 @@ defmodule SymphonyElixir.FactoryPilotReportTest do
   end
 
   test "reports elapsed stages, handoff waits, exact identity and receipts", %{store: store} do
+    Store.query!(store, "UPDATE factory_tasks SET created_at = ?, updated_at = ? WHERE task_key = 'verify'", ["2026-10-01T00:00:30Z", "2026-10-01T00:01:30Z"])
     report = PilotReport.snapshot(store, issue: "PPL-123", now: ~U[2026-10-01 00:02:00Z])
     assert [run] = report.runs
     assert run.identity["candidate_sha"] == String.duplicate("a", 40)
@@ -79,13 +80,19 @@ defmodule SymphonyElixir.FactoryPilotReportTest do
     assert [task] = run.tasks
     assert task["role"] == "change-verifier"
     assert task["model"] == "gpt-6-sol"
+    assert task["lifecycle_elapsed_seconds"] == 90
+    assert task["lifecycle_elapsed_through"] == "report_observed_at"
+    assert task["lifecycle_semantics"] =~ "not active-model time"
+    assert run.checkout_evidence.recorded_intents == 0
+    assert run.checkout_evidence.physical_checkouts.status == "UNKNOWN"
     assert [%{"requested_role" => "change-verifier", "model" => "gpt-6-sol", "task_id" => "verify"}] = run.model_routes
     assert run.latest_unresolved_request["failure_code"] == "CREATE_THREAD_INVALID_ARGUMENTS"
     assert run.latest_unresolved_request["queue_elapsed_seconds"] == 10
     assert run.latest_unresolved_request["in_flight_elapsed_seconds"] == 50
     assert [%{event_type: "NATIVE_CREATE_REQUEST_RESUMED"}] = run.recovery_receipts
     assert [%{event_type: "WORKTREE_HIBERNATED", payload: %{"result" => "HIBERNATED"}}] = run.cleanup_receipts
-    assert report.unavailable.tokens == "Not stored per run"
+    assert report.unavailable.tokens == "Not stored per run or turn"
+    assert report.unavailable.costs =~ "Not stored"
     assert report.unavailable.human_interventions =~ "not intervention totals"
   end
 

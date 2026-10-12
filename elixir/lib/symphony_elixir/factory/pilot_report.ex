@@ -6,6 +6,7 @@ defmodule SymphonyElixir.Factory.PilotReport do
   @terminal_states ~w(READY_FOR_REVIEW DELIVERED CANCELLED FAILED)
   @settled_requests ~w(SUCCEEDED FAILED)
   @request_attention ~w(PENDING CREATE_UNCERTAIN FOLLOWUP_UNCERTAIN THREAD_RECORDED RECONCILE_REQUIRED)
+  @active_task_statuses ~w(STARTING RUNNING WAITING_FOR_BROKER WAITING_FOR_WRITER RETRY_PENDING STALE)
 
   @spec snapshot(Store.connection(), keyword()) :: map()
   def snapshot(store, opts \\ []) do
@@ -17,8 +18,13 @@ defmodule SymphonyElixir.Factory.PilotReport do
       observed_at: DateTime.to_iso8601(now),
       source: "local SQLite ledger",
       duration_semantics:
-        "Wall-clock intervals between recorded state snapshots may include unrecorded transitions; not proven stage residency or active agent time. Queue and in-flight waits may overlap across tasks.",
-      unavailable: %{tokens: "Not stored per run", human_interventions: "Not stored; recovery events are not intervention totals", disk_growth_bytes: "Not stored"},
+        "Run intervals are wall-clock gaps between recorded state snapshots and may include unrecorded transitions. Task lifecycle elapsed time runs from creation to its last recorded update, or report observation while active; neither proves active model time. Queue and in-flight waits may overlap across tasks.",
+      unavailable: %{
+        tokens: "Not stored per run or turn",
+        costs: "Not stored per run or turn",
+        human_interventions: "Not stored; recovery events are not intervention totals",
+        disk_growth_bytes: "Not stored"
+      },
       runs: Enum.map(runs, &project_run(store, &1, now))
     }
   end
@@ -72,7 +78,11 @@ defmodule SymphonyElixir.Factory.PilotReport do
       },
       stages: stages,
       stage_history: stage_history,
-      tasks: Enum.map(tasks, &Map.take(&1, ~w(task_key stage role status model_provider model reasoning_effort failure_code created_at updated_at))),
+      tasks: Enum.map(tasks, &project_task(&1, now)),
+      checkout_evidence: %{
+        recorded_intents: Store.one!(store, "SELECT COUNT(*) AS total FROM ticket_checkout_intents WHERE run_id = ?", [run["run_id"]])["total"],
+        physical_checkouts: %{status: "UNKNOWN", count: nil, reason: "An intent receipt does not prove a physical checkout exists."}
+      },
       model_routes:
         rows(
           store,
@@ -84,6 +94,17 @@ defmodule SymphonyElixir.Factory.PilotReport do
       recovery_receipts: Enum.map(recovery_events, &receipt/1),
       cleanup_receipts: events |> Enum.filter(&Regex.match?(~r/CLEANUP|HIBERN|WORKTREE_REMOVED/, &1["event_type"])) |> Enum.map(&receipt/1)
     }
+  end
+
+  defp project_task(task, now) do
+    active? = task["status"] in @active_task_statuses
+    ended_at = if active?, do: DateTime.to_iso8601(now), else: task["updated_at"]
+
+    task
+    |> Map.take(~w(task_key stage role status model_provider model reasoning_effort failure_code created_at updated_at))
+    |> Map.put("lifecycle_elapsed_seconds", seconds(task["created_at"], ended_at))
+    |> Map.put("lifecycle_elapsed_through", if(active?, do: "report_observed_at", else: "last_recorded_update"))
+    |> Map.put("lifecycle_semantics", "Recorded task wall-clock lifecycle, not active-model time.")
   end
 
   defp state_changes(events) do

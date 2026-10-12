@@ -1,5 +1,5 @@
 defmodule SymphonyElixir.FactorySchedulerTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   alias SymphonyElixir.Factory.{
     Contract,
@@ -103,6 +103,17 @@ defmodule SymphonyElixir.FactorySchedulerTest do
       send(self(), {:review_issue_connector, Keyword.get(opts, :connector)})
       {:ok, Process.get(:review_issue)}
     end
+  end
+
+  defmodule FakeQueueJiraReader do
+    @spec search(String.t(), keyword()) :: {:ok, [map()]}
+    def search(jql, _opts) do
+      send(self(), {:jira_search_jql, jql})
+      {:ok, Process.get(:factory_queue_snapshots, [])}
+    end
+
+    @spec issue(String.t(), keyword()) :: {:ok, map()}
+    def issue(key, opts), do: FakeReviewJiraReader.issue(key, opts)
   end
 
   defmodule FakeReviewGitLabReader do
@@ -210,6 +221,10 @@ defmodule SymphonyElixir.FactorySchedulerTest do
       send(self(), {:hibernate, run_id})
       {:ok, %{result: "SKIPPED", run_id: run_id, reason: "test"}}
     end
+  end
+
+  defmodule RejectUnexpectedCapacity do
+    def ensure_capacity(_store, _policy, _repo, _opts), do: raise("capacity invoked before parent preflight")
   end
 
   defmodule FakeWorktree do
@@ -369,7 +384,7 @@ defmodule SymphonyElixir.FactorySchedulerTest do
     %{context: context, store: store, root: root}
   end
 
-  test "unsupported stored execution modes fence every tick before feedback, recovery, intake, or cleanup", %{
+  test "V1 rows stay inert while an unrelated LEGACY run advances and unknown modes remain fail-closed", %{
     context: context,
     store: store,
     root: root
@@ -391,6 +406,58 @@ defmodule SymphonyElixir.FactorySchedulerTest do
                snapshot_json: Jason.encode!(snapshot(["spec-needed", "repo-grail"]))
              })
 
+    legacy_questions_sha = String.duplicate("c", 64)
+
+    legacy_snapshot =
+      snapshot(["spec-needed", "repo-grail"])
+      |> Map.put("key", "PPL-702")
+      |> Map.put("comments", [
+        %{"id" => "answer-702", "text" => Contract.input_marker("PPL-702", legacy_questions_sha) <> "\nKeep old clients compatible."}
+      ])
+
+    assert {:ok, _same_issue_legacy} =
+             RunLedger.register(store, %{
+               run_id: "older-legacy-ppl-700",
+               issue_key: "PPL-700",
+               kind: "SPECIFICATION",
+               state: "FAILED",
+               dispatcher_id: "dispatcher-1",
+               repo_key: "grail"
+             })
+
+    assert {:ok, _stale_task} =
+             TaskLedger.register(
+               store,
+               %{
+                 task_key: "older-legacy-ppl-700:author",
+                 run_id: "older-legacy-ppl-700",
+                 stage: "SPEC_WRITING",
+                 role: "specification-author",
+                 status: "RUNNING",
+                 model_provider: "codex",
+                 model_class: "standard",
+                 model: "gpt-6-sol",
+                 reasoning_effort: "high",
+                 routing_reason: "role-policy",
+                 prompt_sha256: String.duplicate("d", 64)
+               },
+               now: ~U[2000-01-01 00:00:00Z]
+             )
+
+    assert {:ok, _legacy} =
+             RunLedger.register(store, %{
+               run_id: "legacy-awaiting-input",
+               issue_key: "PPL-702",
+               kind: "SPECIFICATION",
+               state: "AWAITING_SPEC_INPUT",
+               dispatcher_id: "dispatcher-1",
+               repo_key: "grail",
+               snapshot_json: Jason.encode!(legacy_snapshot),
+               last_input_marker: legacy_questions_sha,
+               factory_owned: 0,
+               runtime: "codex-desktop-broker"
+             })
+
     assert {:ok, _delivery} =
              RunLedger.register(store, %{
                run_id: "z-unsupported-failed-delivery",
@@ -402,7 +469,7 @@ defmodule SymphonyElixir.FactorySchedulerTest do
                snapshot_json: Jason.encode!(snapshot(["ai-running", "repo-grail"]))
              })
 
-    assert {:ok, :recorded} =
+    assert {:error, :feedback_run_quarantined} =
              MrFeedbackLedger.record_candidate(store, %{
                feedback_key: "feedback-pending-mode-fence",
                run_id: "a-unsupported-spec",
@@ -414,6 +481,14 @@ defmodule SymphonyElixir.FactorySchedulerTest do
                author_id: 17,
                body_sha256: String.duplicate("a", 64)
              })
+
+    Store.query!(store, """
+    INSERT INTO mr_feedback_notes (feedback_key, run_id, project, mr_iid, discussion_id, note_id,
+      note_updated_at, author_id, body_sha256, status, created_at, updated_at)
+    VALUES ('feedback-pending-mode-fence', 'a-unsupported-spec', 'grailbio/grail', 700,
+      'discussion-700', 701, '2026-10-01T00:00:00Z', 17, '#{String.duplicate("a", 64)}',
+      'PENDING', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z')
+    """)
 
     Store.query!(store, "UPDATE mr_feedback_notes SET status = 'CLAIMED', request_key = 'feedback-request-700'")
 
@@ -431,13 +506,22 @@ defmodule SymphonyElixir.FactorySchedulerTest do
 
     changed_jira_snapshot =
       snapshot(["ai-running", "repo-grail"])
+      |> Map.put("key", "PPL-700")
       |> Map.put("summary", "Jira changed after failed delivery")
       |> Map.put("updated", "2026-10-01T01:00:00Z")
 
-    Process.put(:factory_controller_response, %{"snapshot_json" => Jason.encode!([changed_jira_snapshot])})
+    changed_failed_delivery_snapshot =
+      snapshot(["ai-running", "repo-grail"])
+      |> Map.put("key", "PPL-701")
+      |> Map.put("summary", "Jira changed after failed V1 delivery")
+      |> Map.put("updated", "2026-10-01T01:00:00Z")
 
-    initial_runs = Store.query!(store, "SELECT * FROM runs ORDER BY run_id").rows
-    initial_events = Store.query!(store, "SELECT * FROM events ORDER BY id").rows
+    Process.put(:factory_controller_response, %{"status" => "PASS", "snapshot_json" => Jason.encode!([changed_jira_snapshot, changed_failed_delivery_snapshot, legacy_snapshot])})
+    Process.put(:factory_queue_snapshots, [changed_jira_snapshot, changed_failed_delivery_snapshot, legacy_snapshot])
+
+    initial_v1_runs = Store.query!(store, "SELECT * FROM runs WHERE execution_mode = 'TICKET_SUPERVISOR_V1' ORDER BY run_id").rows
+    initial_v1_events = Store.query!(store, "SELECT * FROM events WHERE run_id IN ('a-unsupported-spec', 'z-unsupported-failed-delivery') ORDER BY id").rows
+    initial_stale_task = Store.query!(store, "SELECT * FROM factory_tasks WHERE task_key = 'older-legacy-ppl-700:author'").rows
     initial_feedback = Store.query!(store, "SELECT * FROM mr_feedback_notes ORDER BY feedback_key").rows
     initial_requests = Store.query!(store, "SELECT * FROM desktop_requests ORDER BY request_key").rows
     initial_file = File.read!(marker_path)
@@ -445,49 +529,46 @@ defmodule SymphonyElixir.FactorySchedulerTest do
     database_rows = fn ->
       Store.query!(store, "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name").rows
       |> Enum.map(fn [table] -> {table, Store.query!(store, "SELECT * FROM #{table} ORDER BY rowid").rows} end)
+      |> Enum.reject(fn {table, _rows} -> table == "intake_snapshots" end)
     end
 
     initial_database_rows = database_rows.()
 
-    for transport <- ["app_server", "desktop_broker"], _attempt <- 1..2 do
-      factory =
-        context.factory
-        |> Map.put(:task_transport, transport)
-        |> Map.put(:review_feedback, %{"enabled" => true, "required_apps" => ["polaris-app"]})
+    factory =
+      context.factory
+      |> Map.put(:task_transport, "desktop_broker")
+      |> Map.put(:review_feedback, %{"enabled" => true, "required_apps" => ["polaris-app"]})
 
-      assert {:error, :ticket_supervisor_runtime_capability_unproven} =
-               Scheduler.tick(%{context | factory: factory, workspace_root: workspace_root},
-                 controller_task: FakeControllerTask,
-                 jira_connector: FakeJiraConnector,
-                 jira_reader: FakeReviewJiraReader,
-                 gitlab_reader: FakeReviewGitLabReader,
-                 feedback_consumer: FakeReviewConsumer,
-                 task_launcher: FakeTaskLauncher,
-                 cleanup: FakeCleanup,
-                 worktree: FakeWorktree
-               )
+    assert {:ok, _tick} =
+             Scheduler.tick(%{context | factory: factory, workspace_root: workspace_root},
+               controller_task: FakeControllerTask,
+               jira_connector: FakeJiraConnector,
+               jira_reader: FakeQueueJiraReader,
+               gitlab_reader: FakeReviewGitLabReader,
+               feedback_consumer: FakeReviewConsumer,
+               task_launcher: FakeTaskLauncher,
+               cleanup: FakeCleanup,
+               worktree: FakeWorktree
+             )
 
-      assert Store.query!(store, "SELECT * FROM runs ORDER BY run_id").rows == initial_runs
-      assert Store.query!(store, "SELECT * FROM events ORDER BY id").rows == initial_events
-      assert Store.query!(store, "SELECT * FROM mr_feedback_notes ORDER BY feedback_key").rows == initial_feedback
-      assert Store.query!(store, "SELECT * FROM desktop_requests ORDER BY request_key").rows == initial_requests
-      assert database_rows.() == initial_database_rows
-      assert File.read!(marker_path) == initial_file
-      refute File.exists?(workspace_root)
-      refute_received {:jira_search_jql, _jql}
-      refute_received {:jira_write_options, _options}
-      refute_received {:controller_prompt, _prompt}
-      refute_received {:controller_options, _options}
-      refute_received {:review_issue_read, _issue_key}
-      refute_received {:review_mr_read, _run_id}
-      refute_received :review_consumer_called
-      refute_received {:stage_launch, _run_id, _workspace, _prompt, _opts}
-      refute_received {:cleanup_candidates_requested, _repo_key}
-      refute_received {:removed_detached, _path}
-      refute_received {:ensure_writer, _route, _issue_key, _run_id}
-      refute_received {:create_detached, _stage, _sha}
-      refute_received {:validate_native, _path, _opts}
-    end
+    assert {:ok, %{"state" => "SPEC_DRAFTING", "last_input_marker" => "answer-702"}} = RunLedger.get(store, "legacy-awaiting-input")
+    assert Store.query!(store, "SELECT * FROM runs WHERE execution_mode = 'TICKET_SUPERVISOR_V1' ORDER BY run_id").rows == initial_v1_runs
+    assert Store.query!(store, "SELECT * FROM events WHERE run_id IN ('a-unsupported-spec', 'z-unsupported-failed-delivery') ORDER BY id").rows == initial_v1_events
+    assert Store.query!(store, "SELECT * FROM mr_feedback_notes ORDER BY feedback_key").rows == initial_feedback
+    assert Store.query!(store, "SELECT * FROM desktop_requests ORDER BY request_key").rows == initial_requests
+    assert Store.query!(store, "SELECT * FROM factory_tasks WHERE task_key = 'older-legacy-ppl-700:author'").rows == initial_stale_task
+    assert database_rows.() != initial_database_rows
+    assert File.read!(marker_path) == initial_file
+    assert File.dir?(workspace_root)
+    refute_received {:jira_write_options, _options}
+    refute_received {:review_issue_read, _issue_key}
+    refute_received {:review_mr_read, _run_id}
+    refute_received :review_consumer_called
+    refute_received {:cleanup_candidates_requested, _repo_key}
+    refute_received {:removed_detached, _path}
+    refute_received {:ensure_writer, _route, _issue_key, _run_id}
+    refute_received {:create_detached, _stage, _sha}
+    refute_received {:validate_native, _path, _opts}
 
     Store.query!(store, "UPDATE runs SET execution_mode = 'UNKNOWN'")
     unknown_mode_rows = Store.query!(store, "SELECT * FROM runs ORDER BY run_id").rows
@@ -499,7 +580,7 @@ defmodule SymphonyElixir.FactorySchedulerTest do
     assert Store.query!(store, "SELECT * FROM runs ORDER BY run_id").rows == unknown_mode_rows
     assert Store.query!(store, "SELECT * FROM events ORDER BY id").rows == unknown_mode_events
     assert File.read!(marker_path) == initial_file
-    refute File.exists?(workspace_root)
+    assert File.dir?(workspace_root)
     refute_received {:cleanup_candidates_requested, _repo_key}
   end
 
@@ -562,7 +643,7 @@ defmodule SymphonyElixir.FactorySchedulerTest do
 
     Store.query!(store, "UPDATE mr_feedback_notes SET status = 'SUPERSEDED'")
 
-    assert {:error, :queue_offline} =
+    assert {:ok, %{launches: [], events: [], routing_required: []}} =
              Scheduler.tick(%{context | factory: factory},
                jira_reader: FakeReviewJiraReader,
                gitlab_reader: FakeReviewGitLabReader,
@@ -571,6 +652,7 @@ defmodule SymphonyElixir.FactorySchedulerTest do
              )
 
     Store.query!(store, "UPDATE mr_feedback_notes SET status = 'COMPLETE'")
+    Store.query!(store, "UPDATE desktop_requests SET status = 'SUCCEEDED' WHERE request_key = 'feedback-request'")
 
     assert {:error, :queue_offline} =
              Scheduler.tick(%{context | factory: factory},
@@ -579,6 +661,105 @@ defmodule SymphonyElixir.FactorySchedulerTest do
                feedback_consumer: FakeReviewConsumer,
                cleanup: FakeCleanup
              )
+  end
+
+  test "possibly-issued and mixed V1 Controller requests fence LEGACY while V1 pending and ticket-parent requests do not", %{context: context, store: store} do
+    questions_sha = String.duplicate("e", 64)
+
+    snapshot =
+      snapshot(["spec-needed", "repo-grail"])
+      |> Map.put("key", "PPL-890")
+      |> Map.put("comments", [%{"id" => "answer-890", "text" => Contract.input_marker("PPL-890", questions_sha) <> "\nKeep old clients compatible."}])
+
+    assert {:ok, _legacy} =
+             RunLedger.register(store, %{
+               run_id: "legacy-890",
+               issue_key: "PPL-890",
+               kind: "SPECIFICATION",
+               state: "AWAITING_SPEC_INPUT",
+               dispatcher_id: "dispatcher-1",
+               repo_key: "grail",
+               snapshot_json: Jason.encode!(snapshot),
+               last_input_marker: questions_sha,
+               factory_owned: 0,
+               runtime: "codex-desktop-broker"
+             })
+
+    assert {:ok, _v1} = RunLedger.register(store, %{run_id: "supervisor-900", issue_key: "PPL-900", kind: "DELIVERY", state: "READY_FOR_REVIEW", execution_mode: "TICKET_SUPERVISOR_V1"})
+
+    Store.query!(store, """
+    INSERT INTO desktop_requests (request_key, target_kind, target_key, action, status, payload_sha256,
+      codex_project_id, model, reasoning_effort, thread_id, turn_id, title, prompt, schema_json,
+      cwd, metadata_json, created_at, updated_at)
+    VALUES ('controller-v1-uncertain', 'CONTROLLER', 'assigned-jira-work', 'FOLLOWUP', 'FOLLOWUP_UNCERTAIN',
+      '#{String.duplicate("f", 64)}', 'projectless', 'gpt-test', 'medium', 'observed-thread', 'observed-turn',
+      'Controller', 'Feedback', '{}', '/tmp/controller', '{}', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z')
+    """)
+
+    Store.query!(store, """
+    INSERT INTO mr_feedback_notes (feedback_key, run_id, project, mr_iid, discussion_id, note_id, note_updated_at,
+      author_id, body_sha256, status, request_key, created_at, updated_at)
+    VALUES ('v1-note-900', 'supervisor-900', 'grailbio/grail', 900, 'discussion-900', 901,
+      '2026-10-01T00:00:00Z', 12, '#{String.duplicate("a", 64)}', 'CLAIMED', 'controller-v1-uncertain',
+      '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z')
+    """)
+
+    Process.put(:factory_queue_snapshots, [snapshot])
+    factory = Map.put(context.factory, :task_transport, "desktop_broker")
+    tick_opts = [jira_reader: FakeQueueJiraReader, cleanup: FakeCleanup, worktree: FakeWorktree]
+    before_run = Store.query!(store, "SELECT * FROM runs WHERE run_id = 'legacy-890'").rows
+
+    assert {:ok, %{launches: [], events: [], routing_required: []}} = Scheduler.tick(%{context | factory: factory}, tick_opts)
+    assert Store.query!(store, "SELECT * FROM runs WHERE run_id = 'legacy-890'").rows == before_run
+
+    assert {:ok, _other_legacy} = RunLedger.register(store, %{run_id: "legacy-901", issue_key: "PPL-901", kind: "DELIVERY", state: "READY_FOR_REVIEW"})
+    Store.query!(store, "UPDATE desktop_requests SET status = 'PENDING', thread_id = NULL, turn_id = NULL WHERE request_key = 'controller-v1-uncertain'")
+
+    Store.query!(store, """
+    INSERT INTO mr_feedback_notes (feedback_key, run_id, project, mr_iid, discussion_id, note_id, note_updated_at,
+      author_id, body_sha256, status, request_key, created_at, updated_at)
+    VALUES ('legacy-note-901', 'legacy-901', 'grailbio/grail', 901, 'discussion-901', 902,
+      '2026-10-01T00:00:00Z', 12, '#{String.duplicate("b", 64)}', 'PENDING', 'controller-v1-uncertain',
+      '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z')
+    """)
+
+    assert {:ok, %{launches: [], events: [], routing_required: []}} = Scheduler.tick(%{context | factory: factory}, tick_opts)
+    assert Store.query!(store, "SELECT * FROM runs WHERE run_id = 'legacy-890'").rows == before_run
+
+    Store.query!(store, "DELETE FROM mr_feedback_notes WHERE feedback_key = 'legacy-note-901'")
+    Store.query!(store, "UPDATE desktop_requests SET status = 'PENDING', thread_id = NULL, turn_id = NULL WHERE request_key = 'controller-v1-uncertain'")
+    assert {:ok, _advanced} = Scheduler.tick(%{context | factory: factory}, tick_opts)
+    assert {:ok, %{"state" => "SPEC_DRAFTING"}} = RunLedger.get(store, "legacy-890")
+
+    parent_snapshot =
+      snapshot(["spec-needed", "repo-grail"])
+      |> Map.put("key", "PPL-891")
+      |> Map.put("comments", [%{"id" => "answer-891", "text" => Contract.input_marker("PPL-891", questions_sha) <> "\nKeep old clients compatible."}])
+
+    assert {:ok, _parent_legacy} =
+             RunLedger.register(store, %{
+               run_id: "legacy-891",
+               issue_key: "PPL-891",
+               kind: "SPECIFICATION",
+               state: "AWAITING_SPEC_INPUT",
+               dispatcher_id: "dispatcher-1",
+               repo_key: "grail",
+               snapshot_json: Jason.encode!(parent_snapshot),
+               last_input_marker: questions_sha,
+               factory_owned: 0,
+               runtime: "codex-desktop-broker"
+             })
+
+    Store.query!(
+      store,
+      "INSERT INTO desktop_requests (request_key, target_kind, target_key, action, status, payload_sha256, model, reasoning_effort, title, prompt, schema_json, cwd, metadata_json, created_at, updated_at) VALUES ('ticket-parent-pending', 'TICKET_CHAT', 'PPL-891', 'CREATE', 'PENDING', ?, 'gpt-test', 'medium', 'Ticket parent', 'Parent request', '{}', '/tmp/ticket', '{}', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z')",
+      [String.duplicate("c", 64)]
+    )
+
+    Process.put(:factory_queue_snapshots, [snapshot, parent_snapshot])
+
+    assert {:ok, _parent_progress} = Scheduler.tick(%{context | factory: factory}, tick_opts)
+    assert {:ok, %{"state" => "SPEC_DRAFTING"}} = RunLedger.get(store, "legacy-891")
   end
 
   test "verified review rework pushes the existing MR branch and queues exact-thread replies", %{context: context, store: store, root: root} do
@@ -2143,6 +2324,208 @@ defmodule SymphonyElixir.FactorySchedulerTest do
         GenServer.stop(store)
       end
     end
+  end
+
+  test "allowlisted ordinary admission atomically registers one V1 delivery and parent without source effects", ctx do
+    context = ticket_registration_context(ctx)
+    Store.query!(ctx.store, "CREATE TABLE runtime_probe_marks (observed INTEGER NOT NULL)")
+    database = Path.join(ctx.root, "factory.sqlite")
+    command = "/usr/bin/sqlite3 '#{database}' 'INSERT INTO runtime_probe_marks VALUES (1)' || exit 1"
+    trace = SymphonyElixir.TicketChatFixture.runtime_fixture(ctx.root, :supported, command)
+    contract = Contract.bind("PPL-123", 1, "## Manual Validation\n- Required: no")
+    ready = authorized_snapshot(contract, ["ai-ready", "repo-grail"])
+    Process.put(:factory_controller_response, intake_response(ready))
+    assert {:ok, result} = tick(context)
+    assert result.launches == []
+    [run] = RunLedger.list(ctx.store)
+    assert run["execution_mode"] == "TICKET_SUPERVISOR_V1"
+    assert run["state"] == "ADMITTING_WRITER"
+    assert run["manual_validation_required"] == 0
+    assert run["contract_sha256"] == contract.sha256
+    assert run["factory_owned"] == 1
+    assert run["worktree"] == nil
+    assert run["candidate_sha"] == nil
+    assert Store.one!(ctx.store, "SELECT COUNT(*) AS count FROM ticket_chats")["count"] == 1
+    assert Store.one!(ctx.store, "SELECT COUNT(*) AS count FROM desktop_requests WHERE target_kind = 'TICKET_CHAT' AND action = 'CREATE'")["count"] == 1
+    parent = Store.one!(ctx.store, "SELECT * FROM ticket_chats")
+    assert parent["model"] == "gpt-6-luna"
+    assert parent["reasoning_effort"] == "low"
+    assert Jason.decode!(parent["context_reader_json"])["run_id"] == run["run_id"]
+    assert Store.query!(ctx.store, "SELECT * FROM factory_tasks").rows == []
+    assert Store.query!(ctx.store, "SELECT * FROM workspace_access").rows == []
+    assert {:ok, _} = tick(context)
+    assert RunLedger.list(ctx.store) == [run]
+    assert Store.one!(ctx.store, "SELECT COUNT(*) AS count FROM desktop_requests")["count"] == 1
+    assert Store.query!(ctx.store, "SELECT observed FROM runtime_probe_marks").rows == [[1]]
+    assert length(File.read!(trace) |> String.split("\n", trim: true)) == 1
+    refute_received {:stage_launch, _, _, _, _}
+    refute_received {:jira_write_options, _}
+  end
+
+  test "unsupported registration runtime leaves delivery and parent metadata untouched", ctx do
+    context = ticket_registration_context(ctx)
+    SymphonyElixir.TicketChatFixture.runtime_fixture(ctx.root, %{})
+    contract = Contract.bind("PPL-123", 1, "## Manual Validation\n- Required: no")
+    Process.put(:factory_controller_response, intake_response(authorized_snapshot(contract, ["ai-ready", "repo-grail"])))
+    assert {:error, {:delivery_registration_failed, :worker_runtime_identity_unproven}} = tick(context)
+    assert RunLedger.list(ctx.store) == []
+    assert Store.query!(ctx.store, "SELECT * FROM ticket_chats").rows == []
+    assert Store.query!(ctx.store, "SELECT * FROM desktop_requests").rows == []
+    refute_received {:stage_launch, _, _, _, _}
+    refute_received {:jira_write_options, _}
+  end
+
+  test "V1 required validation or reader failure writes no delivery, parent or request", ctx do
+    context = ticket_registration_context(ctx)
+    required = Contract.bind("PPL-123", 1, "## Manual Validation\n- Required: yes\n- Environment: cpp-test")
+    Process.put(:factory_controller_response, intake_response(authorized_snapshot(required, ["ai-ready", "repo-grail"])))
+    assert {:error, {:delivery_registration_failed, :ticket_manual_validation_not_supported}} = tick(context)
+    assert RunLedger.list(ctx.store) == []
+
+    for contract <- [
+          Contract.bind("PPL-123", 1, "An ordinary scope without a manual-validation declaration."),
+          Contract.bind("PPL-123", 1, "## Manual Validation\n- Required: maybe")
+        ] do
+      Process.put(:factory_controller_response, intake_response(authorized_snapshot(contract, ["ai-ready", "repo-grail"])))
+      assert {:error, {:delivery_registration_failed, _reason}} = tick(context)
+      assert RunLedger.list(ctx.store) == []
+      assert_no_ticket_admission_effects(ctx.store)
+    end
+
+    ordinary = Contract.bind("PPL-123", 1, "## Manual Validation\n- Required: no")
+    Process.put(:factory_controller_response, intake_response(authorized_snapshot(ordinary, ["ai-ready", "repo-grail"])))
+    rejected = %{context | ticket_options: Keyword.delete(context.ticket_options, :ticket_cli_root)}
+    assert {:error, {:delivery_registration_failed, :ticket_context_reader_unavailable}} = tick(rejected)
+    assert RunLedger.list(ctx.store) == []
+    assert Store.query!(ctx.store, "SELECT * FROM ticket_chats").rows == []
+    assert Store.query!(ctx.store, "SELECT * FROM desktop_requests").rows == []
+    refute_received {:stage_launch, _, _, _, _}
+  end
+
+  test "failed parent insertion rolls back V1 run and registration event", ctx do
+    context = ticket_registration_context(ctx)
+    contract = Contract.bind("PPL-123", 1, "## Manual Validation\n- Required: no")
+    Process.put(:factory_controller_response, intake_response(authorized_snapshot(contract, ["ai-ready", "repo-grail"])))
+    Store.query!(ctx.store, "CREATE TRIGGER reject_ticket_parent BEFORE INSERT ON ticket_chats BEGIN SELECT RAISE(ABORT, 'fixture parent failure'); END")
+    assert_raise Exqlite.Error, fn -> tick(context) end
+    assert RunLedger.list(ctx.store) == []
+    assert Store.query!(ctx.store, "SELECT * FROM ticket_chats").rows == []
+    assert Store.query!(ctx.store, "SELECT * FROM desktop_requests").rows == []
+    assert Store.query!(ctx.store, "SELECT * FROM events WHERE event_type = 'RUN_REGISTERED'").rows == []
+  end
+
+  test "invalid parent broker, model or source directory rejects before capacity cleanup", ctx do
+    context = ticket_registration_context(ctx)
+    contract = Contract.bind("PPL-123", 1, "## Manual Validation\n- Required: no")
+    ready = authorized_snapshot(contract, ["ai-ready", "repo-grail"])
+    bad_model = put_in(context, [:factory, :models, "providers", "codex", "fast"], "unsupported-model")
+
+    cases = [
+      {%{context | ticket_options: Keyword.put(context.ticket_options, :broker_thread_id, "not-a-thread")}, :parent_broker_identity_invalid},
+      {bad_model, :unsupported_create_thread_model},
+      {%{context | ticket_options: Keyword.put(context.ticket_options, :parent_output_root, context.factory.repositories["grail"]["path"])}, :ticket_chat_source_directory_forbidden}
+    ]
+
+    for {rejected, reason} <- cases do
+      Process.put(:factory_controller_response, intake_response(ready))
+
+      assert {:error, {:delivery_registration_failed, ^reason}} =
+               Scheduler.tick(rejected,
+                 controller_task: FakeControllerTask,
+                 jira_connector: FakeJiraConnector,
+                 task_launcher: FakeTaskLauncher,
+                 cleanup: RejectUnexpectedCapacity,
+                 worktree: FakeWorktree
+               )
+
+      assert RunLedger.list(ctx.store) == []
+      assert Store.query!(ctx.store, "SELECT * FROM ticket_chats").rows == []
+      assert Store.query!(ctx.store, "SELECT * FROM desktop_requests").rows == []
+    end
+  end
+
+  test "normal tick binds parent inputs from factory policy without injected ticket options", ctx do
+    configured = ticket_registration_context(ctx)
+    fields = Map.new(configured.ticket_options, fn {key, value} -> {Atom.to_string(key), value} end)
+    policy = Map.merge(configured.factory.ticket_supervisor, fields)
+    context = configured |> Map.delete(:ticket_options) |> put_in([:factory, :ticket_supervisor], policy)
+    contract = Contract.bind("PPL-123", 1, "## Manual Validation\n- Required: no")
+    Process.put(:factory_controller_response, intake_response(authorized_snapshot(contract, ["ai-ready", "repo-grail"])))
+    assert {:ok, result} = tick(context)
+    assert result.launches == []
+    [run] = RunLedger.list(ctx.store)
+    parent = Store.one!(ctx.store, "SELECT * FROM ticket_chats")
+    reader = Jason.decode!(parent["context_reader_json"])
+    assert reader["workflow"] == fields["ticket_workflow"]
+    assert reader["cwd"] == fields["ticket_cli_root"]
+    assert reader["run_id"] == run["run_id"]
+    assert parent["broker_thread_id"] == fields["broker_thread_id"]
+    assert Path.dirname(parent["cwd"]) == fields["parent_output_root"]
+  end
+
+  test "explicit null factory parent input remains a rejection instead of falling back", ctx do
+    configured = ticket_registration_context(ctx)
+    fields = Map.new(configured.ticket_options, fn {key, value} -> {Atom.to_string(key), value} end)
+    policy = Map.merge(configured.factory.ticket_supervisor, fields) |> Map.put("ticket_workflow", nil)
+    context = configured |> Map.delete(:ticket_options) |> put_in([:factory, :ticket_supervisor], policy)
+    contract = Contract.bind("PPL-123", 1, "## Manual Validation\n- Required: no")
+    Process.put(:factory_controller_response, intake_response(authorized_snapshot(contract, ["ai-ready", "repo-grail"])))
+    assert {:error, {:delivery_registration_failed, :ticket_context_reader_unavailable}} = tick(context)
+    assert RunLedger.list(ctx.store) == []
+    assert Store.query!(ctx.store, "SELECT * FROM ticket_chats").rows == []
+  end
+
+  for {name, policy} <- [{"disabled", %{"enabled" => false, "pilot_issue_keys" => ["PPL-123"]}}, {"not allowlisted", %{"enabled" => true, "pilot_issue_keys" => ["PPL-456"]}}] do
+    @registration_policy policy
+    test "#{name} ticket-supervisor selection preserves legacy registration", ctx do
+      context = %{ctx.context | factory: Map.put(ctx.context.factory, :ticket_supervisor, @registration_policy)}
+      contract = Contract.bind("PPL-123", 1, "## Manual Validation\n- Required: no")
+      Process.put(:factory_controller_response, intake_response(authorized_snapshot(contract, ["ai-ready", "repo-grail"])))
+      assert {:ok, _} = tick(context)
+      [run] = RunLedger.list(ctx.store)
+      assert run["execution_mode"] == "LEGACY"
+      assert run["runtime"] == "codex-app-server"
+      assert run["contract_sha256"] == contract.sha256
+      assert Store.query!(ctx.store, "SELECT * FROM ticket_chats").rows == []
+      assert Store.query!(ctx.store, "SELECT * FROM desktop_requests").rows == []
+    end
+  end
+
+  defp ticket_registration_context(ctx) do
+    {:ok, root} = SymphonyElixir.PathSafety.canonicalize(ctx.root)
+    SymphonyElixir.TicketChatFixture.runtime_fixture(root)
+    repo = Path.join(root, "ticket-source")
+    parents = Path.join(root, "ticket-parents")
+    File.mkdir_p!(repo)
+    File.mkdir_p!(parents)
+    workflow = Path.join(root, "ticket-workflow.md")
+    File.write!(workflow, "---\ntracker:\n  kind: memory\nfactory:\n  database: #{Path.join(root, "factory.sqlite")}\n---\nFixture")
+
+    models = %{
+      "default_provider" => "codex",
+      "providers" => %{"codex" => %{"fast" => "gpt-6-luna"}},
+      "roles" => %{"orchestrator-intake" => %{"provider" => "codex", "model_class" => "fast", "reasoning_effort" => "low"}}
+    }
+
+    factory =
+      ctx.context.factory
+      |> Map.put(:ticket_supervisor, %{"enabled" => true, "pilot_issue_keys" => ["PPL-123"]})
+      |> Map.put(:task_transport, "desktop_broker")
+      |> Map.put(:models, models)
+      |> put_in([:repositories, "grail", "path"], repo)
+
+    options = [parent_output_root: parents, broker_thread_id: "019fa5b7-27fa-7660-ab47-7c3abb867c91", ticket_cli_root: File.cwd!(), ticket_workflow: workflow]
+    Map.merge(ctx.context, %{factory: factory, ticket_options: options})
+  end
+
+  defp assert_no_ticket_admission_effects(store) do
+    for table <- ~w(ticket_chats ticket_chat_runs desktop_requests factory_tasks workspace_access ticket_checkout_intents ticket_jira_effects) do
+      assert Store.query!(store, "SELECT * FROM #{table}").rows == []
+    end
+
+    assert Store.query!(store, "SELECT * FROM events WHERE event_type = 'RUN_REGISTERED'").rows == []
+    refute_received {:stage_launch, _, _, _, _}
+    refute_received {:jira_write_options, _}
   end
 
   test "a newer unconfirmed contract blocks delivery despite the ai-ready label", %{context: context, store: store} do

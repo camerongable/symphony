@@ -1,3 +1,6 @@
 ExUnit.start()
 Code.require_file("support/snapshot_support.exs", __DIR__)
 Code.require_file("support/test_support.exs", __DIR__)
+Code.require_file("support/ticket_chat_fixture.ex", __DIR__)
+Code.require_file("support/ticket_worker_fixture.ex", __DIR__)
+Code.require_file("support/desktop_ticket_lifecycle_fixture.ex", __DIR__)

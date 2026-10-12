@@ -758,10 +758,18 @@ defmodule SymphonyElixir.FactoryDesktopRequestTest do
     assert {:ok, _task} =
              TaskLedger.update(store, "native-run:author", %{status: "RETRY_PENDING", output_json: nil})
 
+    assert {:ok, _v1} = RunLedger.register(store, %{run_id: "newer-supervisor", issue_key: "PPL-456", kind: "DELIVERY", state: "READY_FOR_REVIEW", execution_mode: "TICKET_SUPERVISOR_V1"})
+    quarantined_task = Store.query!(store, "SELECT * FROM factory_tasks WHERE task_key = 'native-run:author'").rows
+    quarantined_request = Store.query!(store, "SELECT * FROM desktop_requests WHERE request_key = ?", [followup.request_key]).rows
+
     assert :ok = DesktopRequest.reconcile_native_successes(store)
 
     assert {:ok, %{"status" => "RETRY_PENDING", "turn_id" => "turn-2", "output_json" => nil}} =
              TaskLedger.get(store, "native-run:author")
+
+    assert Store.query!(store, "SELECT * FROM factory_tasks WHERE task_key = 'native-run:author'").rows == quarantined_task
+    assert Store.query!(store, "SELECT * FROM desktop_requests WHERE request_key = ?", [followup.request_key]).rows == quarantined_request
+    Store.query!(store, "UPDATE runs SET issue_key = 'PPL-457' WHERE run_id = 'newer-supervisor'")
 
     assert {:ok, _task} =
              TaskLedger.update(store, "native-run:author", %{
@@ -995,6 +1003,117 @@ defmodule SymphonyElixir.FactoryDesktopRequestTest do
 
     assert {:ok, %{"model" => "gpt-6-luna", "reasoning_effort" => "low"}} =
              DesktopRequest.enqueue(store, next_role)
+  end
+
+  test "an unissued V1 feedback controller request is hidden from and rejected by the broker", %{store: store} do
+    assert {:ok, _v1} = RunLedger.register(store, %{run_id: "supervisor", issue_key: "PPL-900", kind: "DELIVERY", state: "READY_FOR_REVIEW", execution_mode: "TICKET_SUPERVISOR_V1"})
+
+    request = %{
+      request_key: "v1-feedback-request",
+      target_kind: "CONTROLLER",
+      target_key: "assigned-jira-work",
+      action: "CREATE",
+      codex_project_id: "project-factory",
+      model: "gpt-6-sol",
+      reasoning_effort: "medium",
+      title: "Feedback",
+      prompt: "Read feedback",
+      schema: %{"type" => "object"},
+      cwd: "/tmp/factory-controller",
+      metadata: %{"issue_key" => "PPL-900"}
+    }
+
+    assert {:ok, _pending} = DesktopRequest.enqueue(store, request)
+
+    Store.query!(store, """
+    INSERT INTO mr_feedback_notes (feedback_key, run_id, project, mr_iid, discussion_id, note_id,
+      note_updated_at, author_id, body_sha256, status, request_key, created_at, updated_at)
+    VALUES ('v1-note', 'supervisor', 'grailbio/grail', 900, 'discussion-900', 901,
+      '2026-10-01T00:00:00Z', 12, '#{String.duplicate("a", 64)}', 'CLAIMED',
+      'v1-feedback-request', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z')
+    """)
+
+    assert DesktopRequest.list_pending(store) == []
+    assert {:error, :request_run_quarantined} = DesktopRequest.claim(store, "v1-feedback-request")
+    assert {:ok, %{"status" => "PENDING"}} = DesktopRequest.get(store, "v1-feedback-request")
+    assert not DesktopRequest.controller_busy?(store, "assigned-jira-work")
+
+    Store.query!(store, "UPDATE desktop_requests SET status = 'FOLLOWUP_UNCERTAIN' WHERE request_key = ?", [request.request_key])
+    assert_quarantined_mutations(store, request.request_key, request.codex_project_id)
+    Store.query!(store, "UPDATE desktop_requests SET status = 'PENDING' WHERE request_key = ?", [request.request_key])
+
+    for {field, value} <- [
+          {"status", "FOLLOWUP_UNCERTAIN"},
+          {"thread_id", "observed-thread"},
+          {"turn_id", "observed-turn"},
+          {"target_observation_json", "{}"},
+          {"verified_cwd", "/tmp/observed"},
+          {"output_json", "{}"}
+        ] do
+      Store.query!(store, "UPDATE desktop_requests SET #{field} = ? WHERE request_key = ?", [value, request.request_key])
+      assert DesktopRequest.controller_busy?(store, "assigned-jira-work")
+      assert not DesktopRequest.controller_busy?(store, "other-scope")
+      reset = if field == "status", do: "PENDING", else: nil
+      Store.query!(store, "UPDATE desktop_requests SET #{field} = ? WHERE request_key = ?", [reset, request.request_key])
+    end
+
+    Store.query!(store, "UPDATE mr_feedback_notes SET run_id = 'run-1' WHERE feedback_key = 'v1-note'")
+    assert DesktopRequest.controller_busy?(store)
+    Store.query!(store, "DELETE FROM mr_feedback_notes WHERE feedback_key = 'v1-note'")
+    assert DesktopRequest.controller_busy?(store)
+  end
+
+  test "V1 task requests are hidden from all broker queues and direct claims", %{store: store} do
+    assert {:ok, _run} =
+             RunLedger.register(store, %{
+               run_id: "supervisor-task-run",
+               issue_key: "PPL-901",
+               kind: "SPECIFICATION",
+               state: "DRAFTING",
+               execution_mode: "TICKET_SUPERVISOR_V1"
+             })
+
+    assert {:ok, _task} =
+             TaskLedger.register(store, %{
+               task_key: "supervisor-task-run:author",
+               run_id: "supervisor-task-run",
+               stage: "DRAFTING",
+               role: "specification-author",
+               status: "WAITING_FOR_BROKER",
+               model_provider: "codex",
+               model_class: "standard",
+               model: "gpt-6-sol",
+               reasoning_effort: "high",
+               routing_reason: "role-policy",
+               codex_project_id: "project-grail",
+               prompt_sha256: String.duplicate("c", 64)
+             })
+
+    request = %{task_request() | request_key: "supervisor-task-run:author:create", target_key: "supervisor-task-run:author", metadata: %{"issue_key" => "PPL-901"}}
+    assert {:ok, _pending} = DesktopRequest.enqueue(store, request)
+    assert DesktopRequest.list_pending(store) == []
+    assert {:error, :request_run_quarantined} = DesktopRequest.claim(store, request.request_key)
+
+    Store.query!(store, "UPDATE desktop_requests SET status = 'CREATE_UNCERTAIN' WHERE request_key = ?", [request.request_key])
+    assert DesktopRequest.list_reconciliation(store) == []
+    assert {:ok, %{"status" => "CREATE_UNCERTAIN"}} = DesktopRequest.get(store, request.request_key)
+    assert_quarantined_mutations(store, request.request_key, request.codex_project_id)
+  end
+
+  defp assert_quarantined_mutations(store, request_key, project_id) do
+    tables = ~w(runs factory_tasks desktop_requests mr_feedback_notes events)
+    before = Enum.map(tables, &Store.query!(store, "SELECT * FROM #{&1} ORDER BY rowid").rows)
+    assert {:error, :request_run_quarantined} = DesktopRequest.record_thread(store, request_key, "new-thread", project_id)
+
+    assert {:error, :request_run_quarantined} =
+             DesktopRequest.complete(store, request_key, %{
+               thread_id: "new-thread",
+               turn_id: "new-turn",
+               output: broker_output(%{"status" => "DRAFTED"})
+             })
+
+    assert {:error, :request_run_quarantined} = DesktopRequest.fail(store, request_key, "BROKER_INTERRUPTED")
+    assert Enum.map(tables, &Store.query!(store, "SELECT * FROM #{&1} ORDER BY rowid").rows) == before
   end
 
   test "a bound controller request can complete a proven turn after output reconciliation", %{store: store} do

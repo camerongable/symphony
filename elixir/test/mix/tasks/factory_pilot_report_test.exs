@@ -29,7 +29,7 @@ defmodule Mix.Tasks.Factory.PilotReportTest do
       |> Jason.decode!()
 
     assert [%{"identity" => %{"run_id" => "run"}}] = report["runs"]
-    assert report["unavailable"]["tokens"] == "Not stored per run"
+    assert report["unavailable"]["tokens"] == "Not stored per run or turn"
     assert Store.one!(store, "SELECT COUNT(*) AS count FROM factory_schema_migrations WHERE version = 15")["count"] == 0
     assert Store.one!(store, "SELECT COUNT(*) AS count FROM events")["count"] == 1
   end

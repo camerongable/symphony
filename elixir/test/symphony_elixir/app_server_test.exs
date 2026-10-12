@@ -1,5 +1,713 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
+  alias SymphonyElixir.Factory.TicketChatCommands
+  alias SymphonyElixir.TicketChatFixture
+
+  test "internal review workers use named scoped profiles, explicit turns and no controller connectors" do
+    for {mode, profile} <- [{"REVIEW", "symphony_ticket_review_v1"}] do
+      handler = """
+      case "$line" in
+        *'"method":"initialize"'*) printf '%s\\n' "$*" >> "$trace_file.args" ;;
+        *'"method":"config/read"'*) printf '%s\\n' '{"id":15,"result":{"config":{"mcp_servers":{"Jira":{},"AI Toolkit Skills":{}},"plugins":{"test-plugin@provider":{}}}}}' ;;
+        *'"method":"account/read"'*) printf '%s\\n' '{"id":17,"result":{"account":{"type":"chatgpt"}}}' ;;
+        *'"method":"thread/start"'*) printf '{"id":2,"result":{"thread":{"id":"worker","cwd":"%s"},"cwd":"%s","runtimeWorkspaceRoots":["%s"],"reasoningEffort":"medium","activePermissionProfile":{"id":"#{profile}"},"approvalPolicy":"never","model":"gpt-6-luna"}}\\n' "$(pwd -P)" "$(pwd -P)" "$(pwd -P)" ;;
+        *'"method":"mcpServerStatus/list"'*) printf '%s\\n' '{"id":16,"result":{"data":[{"name":"Jira","tools":{},"resources":[],"resourceTemplates":[],"toolsError":null,"runtimeStatus":"disabled"},{"name":"openai-api-key-local-confirmation","tools":{},"resources":[],"resourceTemplates":[],"toolsError":null,"runtimeStatus":"connected"}],"nextCursor":null}}' ;;
+        *'"method":"turn/start"'*)
+          request_id=$(printf '%s\\n' "$line" | sed -n 's/.*"id":"\\([^\"]*\\)".*/\\1/p')
+          printf '{"id":"%s","result":{"turn":{"id":"turn"}}}\\n' "$request_id"
+          printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"worker","turn":{"id":"turn","status":"completed","items":[]}}}' ;;
+        *'"method":"thread/unsubscribe"'*) printf '%s\\n' '{"id":6,"result":{"status":"unsubscribed"}}' ;;
+      esac
+      """
+
+      with_thread_listing_server("worker-#{mode}", handler, fn workspace, trace ->
+        assert {:ok, session} = AppServer.start_session(workspace, worker_access: mode, model: "gpt-6-luna", reasoning_effort: "medium")
+        assert session.approval_policy == "never" and session.worker_policy["mode"] == mode
+        issue = %Issue{identifier: "PPL-123", title: "Fixture"}
+        assert {:ok, %{turn_id: "turn"}} = AppServer.run_turn(session, "Local role work", issue, event_scope: :exact_turn)
+        AppServer.stop_session(session)
+        args = File.read!(trace <> ".args")
+        assert args =~ "default_permissions=\"#{profile}\""
+        assert args =~ "mcp_servers.Jira.enabled=false"
+        assert args =~ "mcp_servers.AI Toolkit Skills.enabled=false"
+        assert args =~ "plugins.test-plugin@provider.enabled=false"
+        refute args =~ "mcp_servers.\"Jira\""
+        assert args =~ "network.enabled=false"
+        environment = session.worker_policy["shell_environment"]
+        assert environment["inherit"] == "core"
+        assert environment["set"]["GIT_CONFIG_GLOBAL"] == "/dev/null"
+        assert environment["set"]["GIT_CONFIG_SYSTEM"] == "/dev/null"
+        assert environment["set"]["GIT_OPTIONAL_LOCKS"] == "0"
+        assert environment["set"]["PATH"] |> String.starts_with?("/Library/Developer/CommandLineTools/usr/bin:")
+        assert args =~ "shell_environment_policy={inherit=\"core\",set={"
+        assert args =~ "\"GIT_CONFIG_GLOBAL\"=\"/dev/null\""
+        assert args =~ "\"GIT_CONFIG_SYSTEM\"=\"/dev/null\""
+        messages = File.read!(trace) |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!(String.trim_leading(&1, "JSON:")))
+        start = Enum.find(messages, &(&1["method"] == "thread/start"))["params"]
+        turn = Enum.find(messages, &(&1["method"] == "turn/start"))["params"]
+        assert start["dynamicTools"] == [] and start["permissions"] == profile
+        assert start["runtimeWorkspaceRoots"] == [session.workspace]
+        assert start["allowProviderModelFallback"] == false
+        assert turn["permissions"] == profile and turn["model"] == "gpt-6-luna" and turn["effort"] == "medium"
+        refute Map.has_key?(turn, "sandboxPolicy")
+      end)
+    end
+  end
+
+  test "V1 workers reject unqualified runtime identity before thread creation", _ctx do
+    supported = fixture_runtime()
+
+    for {name, response, reason} <- [
+          {"missing", %{}, :worker_runtime_identity_unproven},
+          {"null", nil, :worker_runtime_identity_unproven},
+          {"malformed-home", Map.put(supported, "codexHome", []), :worker_runtime_identity_unproven},
+          {"version", Map.put(supported, "userAgent", "symphony-orchestrator/0.161.0 (fixture)"), :worker_runtime_unsupported},
+          {"candidate-version-lookalike", Map.put(supported, "userAgent", "symphony-orchestrator/0.162.0-alpha.20 (fixture)"), :worker_runtime_unsupported},
+          {"agent", Map.put(supported, "userAgent", "other/0.160.0 (fixture)"), :worker_runtime_unsupported},
+          {"platform", Map.put(supported, "platformOs", "linux"), :worker_runtime_unsupported},
+          {"home", Map.put(supported, "codexHome", System.tmp_dir!()), :worker_runtime_home_mismatch}
+        ] do
+      handler = """
+      case "$line" in
+        *'"method":"config/read"'*) printf '%s\\n' '{"id":15,"result":{"config":{}}}' ;;
+        *'"method":"account/read"'*) printf '%s\\n' '{"id":17,"result":{"account":{"type":"chatgpt"}}}' ;;
+        *'"method":"thread/start"'*) printf '{"id":2,"result":{"thread":{"id":"worker","cwd":"%s"},"cwd":"%s","runtimeWorkspaceRoots":["%s"],"reasoningEffort":null,"activePermissionProfile":{"id":"symphony_ticket_review_v1"},"approvalPolicy":"never","model":"gpt-6-luna"}}\\n' "$(pwd -P)" "$(pwd -P)" "$(pwd -P)" ;;
+        *'"method":"thread/unsubscribe"'*) printf '%s\\n' '{"id":6,"result":{"status":"unsubscribed"}}' ;;
+      esac
+      """
+
+      handler = handler <> "\ncase \"$line\" in *'\"method\":\"mcpServerStatus/list\"'*) printf '%s\\n' '{\"id\":16,\"result\":{\"data\":[],\"nextCursor\":null}}' ;; esac\n"
+
+      with_thread_listing_server(
+        "runtime-#{name}",
+        handler,
+        fn workspace, trace ->
+          result = AppServer.start_session(workspace, worker_access: "REVIEW", model: "gpt-6-luna")
+          if match?({:ok, _}, result), do: AppServer.stop_session(elem(result, 1))
+          assert result == {:error, reason}
+          refute File.read!(trace) =~ ~s("method":"thread/start")
+          refute File.read!(trace) =~ ~s("method":"thread/resume")
+          refute File.read!(trace) =~ ~s("method":"turn/start")
+        end,
+        response
+      )
+    end
+  end
+
+  test "ticket runtime probes initialize only and observe process exit on success and rejection" do
+    candidate_runtime = Map.put(fixture_runtime(), "userAgent", "symphony-orchestrator/0.162.0-alpha.2 (fixture)")
+
+    for {name, response, expected} <- [
+          {"supported", fixture_runtime(), :ok},
+          {"installed-candidate-version", candidate_runtime, :ok},
+          {"unsupported", %{}, {:error, :worker_runtime_identity_unproven}}
+        ] do
+      with_thread_listing_server(
+        "probe-#{name}",
+        "",
+        fn workspace, trace ->
+          owned = fn -> Enum.filter(Port.list(), &(Port.info(&1, :connected) == {:connected, self()})) end
+          before = owned.()
+          assert AppServer.check_ticket_runtime(workspace) == expected
+          assert owned.() == before
+          assert File.read!(trace <> ".terminated") == "terminated\n"
+          pid = trace |> Kernel.<>(".pid") |> File.read!() |> String.trim()
+          assert {_output, status} = System.cmd("/bin/kill", ["-0", pid], stderr_to_stdout: true)
+          assert status != 0
+          requests = File.read!(trace) |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!(String.trim_leading(&1, "JSON:")))
+          assert Enum.map(requests, & &1["method"]) == ["initialize"]
+        end,
+        response
+      )
+    end
+
+    with_thread_listing_server("probe-cwd", "", fn workspace, trace ->
+      for cwd <- [nil, "", "relative", Path.join(workspace, "absent")] do
+        assert {:error, :ticket_runtime_cwd_unproven} = AppServer.check_ticket_runtime(cwd)
+      end
+
+      refute File.exists?(trace)
+    end)
+
+    for status <- [0, 1] do
+      with_thread_listing_server("probe-exited-#{status}", "exit #{status}", fn workspace, _trace ->
+        assert {:error, _reason} = AppServer.check_ticket_runtime(workspace)
+      end)
+    end
+
+    with_thread_listing_server("probe-early-exit", "", fn workspace, trace ->
+      File.write!(Path.join(Path.dirname(trace), "fake-codex"), "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$SYMP_TEST_CODEx_TRACE.pid\"\nexit 0\n")
+      assert {:error, _reason} = AppServer.check_ticket_runtime(workspace)
+      pid = trace |> Kernel.<>(".pid") |> File.read!() |> String.trim()
+      assert {_output, status} = System.cmd("/bin/kill", ["-0", pid], stderr_to_stdout: true)
+      assert status != 0
+    end)
+  end
+
+  test "native source admission and retained source sessions are fenced before process or model side effects" do
+    with_thread_listing_server("unsafe-source-fenced", "", fn workspace, trace ->
+      options = [worker_access: "SOURCE", model: "gpt-6-luna", reasoning_effort: "low"]
+      assert {:error, :worker_source_containment_unproven} = AppServer.start_session(workspace, options)
+      refute File.exists?(trace)
+      refute File.exists?(trace <> ".args")
+      session = %{worker_policy: AppServer.worker_policy("SOURCE", workspace)}
+      assert {:error, :worker_source_containment_unproven} = AppServer.run_turn(session, "No source turn", %Issue{})
+    end)
+  end
+
+  test "native history reads initialize and read only, without loading or waking a parent" do
+    with_thread_listing_server(
+      "native-read",
+      """
+      case "$line" in
+        *'"method":"thread/read"'*)
+          printf '%s\\n' '{"id":9,"result":{"thread":{"id":"parent","projectId":null,"cwd":"/parent","turns":[]}}}' ;;
+      esac
+      """,
+      fn workspace, trace ->
+        assert {:ok, %{"id" => "parent", "turns" => []}} = AppServer.read_native_thread("parent", workspace: workspace)
+        requests = File.read!(trace) |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!(String.trim_leading(&1, "JSON:")))
+        assert Enum.map(requests, & &1["method"]) == ["initialize", "initialized", "thread/read"]
+        assert List.last(requests)["params"] == %{"threadId" => "parent", "includeTurns" => true}
+        assert AppServer.read_native_thread(nil) == {:error, :invalid_native_thread_id}
+      end
+    )
+  end
+
+  test "controller catalog reads use the existing thread and never start a model turn" do
+    tools = %{"get_pipeline" => %{"name" => "get_pipeline", "inputSchema" => %{"type" => "object"}}}
+    catalog = Jason.encode!(%{"data" => [%{"name" => "GitLab", "tools" => tools, "toolsError" => nil}], "nextCursor" => nil})
+
+    with_thread_listing_server(
+      "scoped-controller-catalog",
+      """
+      case "$line" in
+        *'"method":"thread/start"'*) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"controller-catalog"}}}' ;;
+        *'"method":"mcpServerStatus/list"'*) printf '%s\\n' '{"id":18,"result":#{catalog}}' ;;
+        *'"method":"thread/unsubscribe"'*) printf '%s\\n' '{"id":6,"result":{}}' ;;
+      esac
+      """,
+      fn workspace, trace ->
+        assert {:ok, session} = AppServer.start_session(workspace, ephemeral: true)
+        assert {:ok, ^tools} = AppServer.mcp_tool_catalog_in_session(session, "GitLab")
+        assert :ok = AppServer.stop_session(session)
+        messages = File.read!(trace) |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!(String.trim_leading(&1, "JSON:")))
+        request = Enum.find(messages, &(&1["method"] == "mcpServerStatus/list"))
+        assert request["params"] == %{"threadId" => session.thread_id, "serverName" => "GitLab", "detail" => "toolsAndAuthOnly", "limit" => 1}
+        refute Enum.any?(messages, &(&1["method"] in ["turn/start", "thread/resume", "mcpServer/tool/call"]))
+      end
+    )
+  end
+
+  test "ephemeral connector scope never resumes a controller or starts a model and always closes" do
+    scopes = [{"GitLab", &AppServer.with_gitlab_read_session/2}, {"Jira", &AppServer.with_jira_controller_session/2}]
+
+    for {server, scope} <- scopes,
+        outcome <- [:ok, :error, :raise] do
+      with_thread_listing_server(
+        "connector-#{server}-#{outcome}",
+        """
+        case "$line" in
+          *'"method":"thread/start"'*)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"ephemeral-reader"}}}'
+            printf '%s\\n' '{"method":"mcpServer/startupStatus/updated","params":{"name":"#{server}","status":"ready"}}' ;;
+          *'"method":"thread/unsubscribe"'*) printf '%s\\n' '{"id":6,"result":{}}' ;;
+          *'"method":"mcpServer/tool/call"'*) printf '%s\\n' '{"id":14,"result":{"content":[]}}' ;;
+        esac
+        """,
+        fn workspace, trace ->
+          operation = fn session ->
+            assert session.thread_id == "ephemeral-reader"
+            assert {:ok, expected_workspace} = SymphonyElixir.PathSafety.canonicalize(workspace)
+            assert session.workspace == expected_workspace
+            assert session.worker_policy == nil
+            send(self(), {:reader_port, session.port})
+
+            case outcome do
+              :ok ->
+                for _ <- 1..2 do
+                  assert {:ok, %{"content" => []}} = AppServer.call_mcp_tool_in_session(session, server, "fixture_tool", %{"fixture" => true})
+                end
+
+                {:ok, :readback}
+
+              :error ->
+                {:error, :changed_mr}
+
+              :raise ->
+                raise "read failed"
+            end
+          end
+
+          case outcome do
+            :ok -> assert {:ok, :readback} = scope.(workspace, operation)
+            :error -> assert {:error, :changed_mr} = scope.(workspace, operation)
+            :raise -> assert_raise RuntimeError, "read failed", fn -> scope.(workspace, operation) end
+          end
+
+          assert_received {:reader_port, port}
+          assert :erlang.port_info(port) == :undefined
+          messages = File.read!(trace) |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!(String.trim_leading(&1, "JSON:")))
+          start = Enum.find(messages, &(&1["method"] == "thread/start"))["params"]
+          assert {:ok, expected_workspace} = SymphonyElixir.PathSafety.canonicalize(workspace)
+          assert start["ephemeral"] == true and start["cwd"] == expected_workspace
+          refute Enum.any?(~w(model projectId resumeThreadId), &Map.has_key?(start, &1))
+          refute Enum.any?(messages, &(&1["method"] in ~w(turn/start thread/resume thread/fork)))
+          assert Enum.count(messages, &(&1["method"] == "thread/unsubscribe")) == 1
+          assert Enum.count(messages, &(&1["method"] == "mcpServer/tool/call")) == if(outcome == :ok, do: 2, else: 0)
+        end
+      )
+    end
+  end
+
+  test "ephemeral connector startup failure never invokes the collector" do
+    scopes = [{"GitLab", &AppServer.with_gitlab_read_session/2}, {"Jira", &AppServer.with_jira_controller_session/2}]
+
+    for {server, scope} <- scopes do
+      with_thread_listing_server(
+        "connector-#{server}-startup-failure",
+        """
+        case "$line" in
+          *'"method":"thread/start"'*) printf '%s\\n' '{"id":2,"error":{"code":-1,"message":"unavailable"}}' ;;
+        esac
+        """,
+        fn workspace, trace ->
+          assert {:error, _} = scope.(workspace, fn _ -> flunk("collector invoked") end)
+          refute File.read!(trace) =~ "turn/start"
+        end
+      )
+    end
+  end
+
+  test "native queue collection distinguishes proven empty from partial or malformed pages" do
+    for {name, page, expected} <- [
+          {"empty", %{"data" => [], "nextCursor" => nil}, true},
+          {"busy", %{"data" => [%{"id" => "input"}], "nextCursor" => nil}, false},
+          {"partial", %{"data" => [], "nextCursor" => "more"}, false},
+          {"missing-cursor", %{"data" => []}, :native_queue_page_invalid},
+          {"bad-item", %{"data" => [nil], "nextCursor" => nil}, :native_queue_page_invalid},
+          {"bad-cursor", %{"data" => [], "nextCursor" => 1}, :native_queue_page_invalid}
+        ] do
+      response = Jason.encode!(%{"id" => 20, "result" => page})
+
+      with_thread_listing_server(
+        "queue-#{name}",
+        """
+        case "$line" in
+          *'"method":"thread/read"'*) printf '%s\\n' '{"id":9,"result":{"thread":{"id":"parent"}}}' ;;
+          *'"method":"thread/queue/list"'*) printf '%s\\n' '#{response}' ;;
+        esac
+        """,
+        fn workspace, trace ->
+          if is_boolean(expected) do
+            assert {:ok, thread} =
+                     AppServer.read_native_thread("parent", workspace: workspace, include_turns: false, include_queue: true)
+
+            assert thread["queue_observation"]["empty_complete"] == expected
+            assert thread["queue_observation"]["thread_id"] == "parent"
+            refute Map.has_key?(thread["queue_observation"], "data")
+            assert thread["queue_observation"]["raw_response"] == page
+          else
+            assert {:error, ^expected} =
+                     AppServer.read_native_thread("parent", workspace: workspace, include_turns: false, include_queue: true)
+          end
+
+          requests = File.read!(trace) |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!(String.trim_leading(&1, "JSON:")))
+          assert Enum.map(requests, & &1["method"]) == ["initialize", "initialized", "thread/read", "thread/queue/list"]
+          assert Enum.at(requests, 2)["params"]["includeTurns"] == false
+        end
+      )
+    end
+  end
+
+  test "latest native turn collection reads one descending page and rechecks history without waking a model" do
+    with_thread_listing_server(
+      "latest-native-turn",
+      """
+      case "$line" in
+        *'"method":"thread/read"'*) printf '%s\\n' '{"id":9,"result":{"thread":{"id":"parent","updatedAt":42}}}' ;;
+        *'"method":"thread/turns/list"'*) printf '%s\\n' '{"id":19,"result":{"data":[{"id":"latest","status":"completed","items":[]}],"nextCursor":"older"}}' ;;
+      esac
+      """,
+      fn workspace, trace ->
+        assert {:ok, thread} =
+                 AppServer.read_native_thread("parent", workspace: workspace, include_turns: false, include_latest_turn: true)
+
+        assert thread["latest_turn_observation"]["raw_response"]["data"] |> hd() |> Map.get("id") == "latest"
+        requests = File.read!(trace) |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!(String.trim_leading(&1, "JSON:")))
+        assert Enum.map(requests, & &1["method"]) == ["initialize", "initialized", "thread/read", "thread/turns/list", "thread/read"]
+        assert Enum.at(requests, 3)["params"] == %{"threadId" => "parent", "limit" => 1, "sortDirection" => "desc", "itemsView" => "full"}
+      end
+    )
+  end
+
+  test "a human turn completing during queue collection invalidates latest-turn guard evidence" do
+    for {name, version, turn, expected} <- [
+          {"changed-version", 43, "original", :native_history_changed_during_read},
+          {"coarse-version", 42, "human", :native_latest_turn_changed_during_read},
+          {"unchanged", 42, "original", :accepted}
+        ] do
+      with_thread_listing_server(
+        "latest-queue-race-#{name}",
+        """
+        case "$line" in
+          *'"method":"thread/read"'*) printf '{"id":9,"result":{"thread":{"id":"parent","updatedAt":%s}}}\\n' "${version:-42}" ;;
+          *'"method":"thread/turns/list"'*) printf '{"id":19,"result":{"data":[{"id":"%s","status":"completed","items":[]}],"nextCursor":null}}\\n' "${latest:-original}" ;;
+          *'"method":"thread/queue/list"'*) version=#{version}; latest=#{turn}; printf '%s\\n' '{"id":20,"result":{"data":[],"nextCursor":null}}' ;;
+        esac
+        """,
+        fn workspace, _trace ->
+          opts = [workspace: workspace, include_turns: false, include_latest_turn: true, include_queue: true]
+          result = AppServer.read_native_thread("parent", opts)
+
+          if expected == :accepted do
+            assert {:ok, thread} = result
+            assert thread["latest_turn_observation"]["confirmation"]["raw_response"]["data"] == thread["latest_turn_observation"]["raw_response"]["data"]
+          else
+            assert {:error, ^expected} = result
+          end
+        end
+      )
+    end
+  end
+
+  test "latest turn collection rejects missing identity and changing native history" do
+    for {name, page, error} <- [
+          {"empty", %{"data" => [], "nextCursor" => nil}, :native_latest_turn_invalid},
+          {"missing-cursor", %{"data" => [%{"id" => "latest", "items" => []}]}, :native_latest_turn_invalid},
+          {"missing-items", %{"data" => [%{"id" => "latest"}], "nextCursor" => nil}, :native_history_items_missing},
+          {"changing", %{"data" => [%{"id" => "latest", "items" => []}], "nextCursor" => nil}, :native_history_changed_during_read}
+        ] do
+      response = Jason.encode!(%{"id" => 19, "result" => page})
+      changing = if name == "changing", do: 1, else: 0
+
+      with_thread_listing_server(
+        name,
+        """
+        case "$line" in
+          *'"method":"thread/read"'*)
+            read_count=$(( ${read_count:-0} + #{changing} ))
+            printf '{"id":9,"result":{"thread":{"id":"parent","updatedAt":%s}}}\\n' "$read_count" ;;
+          *'"method":"thread/turns/list"'*) printf '%s\\n' '#{response}' ;;
+        esac
+        """,
+        fn workspace, _trace ->
+          opts = [workspace: workspace, include_turns: false, include_latest_turn: true]
+          assert {:error, ^error} = AppServer.read_native_thread("parent", opts)
+        end
+      )
+    end
+  end
+
+  test "complete native history pages full items without loading or waking the parent" do
+    with_thread_listing_server(
+      "paged-native-read",
+      """
+      case "$line" in
+        *'"method":"thread/read"'*) printf '%s\\n' '{"id":9,"result":{"thread":{"id":"parent","projectId":null,"cwd":"/parent","updatedAt":42,"turns":[]}}}' ;;
+        *'"method":"thread/turns/list"'*)
+          case "$line" in
+            *'"cursor":"older"'*) printf '%s\\n' '{"id":19,"result":{"data":[{"id":"second","status":"completed","items":[]}],"nextCursor":null}}' ;;
+            *) printf '%s\\n' '{"id":19,"result":{"data":[{"id":"first","status":"completed","items":[]}],"nextCursor":"older"}}' ;;
+          esac ;;
+      esac
+      """,
+      fn workspace, trace ->
+        assert {:ok, thread} = AppServer.read_native_thread("parent", workspace: workspace, complete_history: true)
+        assert Enum.map(thread["turns"], & &1["id"]) == ["first", "second"]
+        assert thread["history_observation"] == %{"mode" => "PAGED_FULL", "next_cursor" => nil, "turn_count" => 2, "updated_at" => 42}
+        requests = File.read!(trace) |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!(String.trim_leading(&1, "JSON:")))
+        assert Enum.map(requests, & &1["method"]) == ["initialize", "initialized", "thread/read", "thread/turns/list", "thread/turns/list", "thread/read"]
+        for request <- Enum.filter(requests, &(&1["method"] == "thread/turns/list")), do: assert(request["params"]["itemsView"] == "full")
+      end
+    )
+  end
+
+  test "incomplete, repeated-cursor or duplicate native pages retain readback uncertainty" do
+    for {name, page, error} <- [
+          {"missing-items", %{"data" => [%{"id" => "first"}], "nextCursor" => nil}, :native_history_items_missing},
+          {"cursor-cycle", %{"data" => [], "nextCursor" => "repeat"}, :native_history_cursor_invalid},
+          {"duplicate-turn", %{"data" => [%{"id" => "first", "items" => []}, %{"id" => "first", "items" => []}], "nextCursor" => nil}, :native_history_turn_conflict},
+          {"malformed", %{"data" => []}, :native_history_page_invalid}
+        ] do
+      response = Jason.encode!(%{"id" => 19, "result" => page})
+
+      with_thread_listing_server(
+        name,
+        """
+        case "$line" in
+          *'"method":"thread/read"'*) printf '%s\\n' '{"id":9,"result":{"thread":{"id":"parent","updatedAt":42,"turns":[]}}}' ;;
+          *'"method":"thread/turns/list"'*) printf '%s\\n' '#{response}' ;;
+        esac
+        """,
+        fn workspace, _trace ->
+          assert {:error, ^error} = AppServer.read_native_thread("parent", workspace: workspace, complete_history: true)
+        end
+      )
+    end
+  end
+
+  test "native history changing during paged collection is not accepted" do
+    with_thread_listing_server(
+      "changed-native-history",
+      """
+      case "$line" in
+        *'"method":"thread/read"'*)
+          read_count=$(( ${read_count:-0} + 1 ))
+          printf '{"id":9,"result":{"thread":{"id":"parent",'
+          printf '"updatedAt":%s,"turns":[]}}}\\n' "$read_count" ;;
+        *'"method":"thread/turns/list"'*) printf '%s\\n' '{"id":19,"result":{"data":[],"nextCursor":null}}' ;;
+      esac
+      """,
+      fn workspace, _trace ->
+        assert {:error, :native_history_changed_during_read} =
+                 AppServer.read_native_thread("parent", workspace: workspace, complete_history: true)
+      end
+    )
+  end
+
+  test "controller catalog rejects unavailable, ambiguous, malformed and interactive inventory" do
+    tool = %{"get_pipeline" => %{"name" => "get_pipeline", "inputSchema" => %{"type" => "object"}}}
+    server = %{"name" => "GitLab", "tools" => tool, "toolsError" => nil}
+    complete = %{"data" => [server], "nextCursor" => nil}
+
+    for {name, result, expected} <- [
+          {"empty", %{"data" => [], "nextCursor" => nil}, :mcp_tool_catalog_unavailable},
+          {"pagination", Map.put(complete, "nextCursor", "more"), :mcp_tool_catalog_unavailable},
+          {"missing-cursor", Map.delete(complete, "nextCursor"), :mcp_tool_catalog_unavailable},
+          {"wrong-server", %{complete | "data" => [Map.put(server, "name", "Jira")]}, :mcp_tool_catalog_unavailable},
+          {"two-servers", %{complete | "data" => [server, server]}, :mcp_tool_catalog_unavailable},
+          {"tool-error", %{complete | "data" => [Map.put(server, "toolsError", "unavailable")]}, :mcp_tool_catalog_unavailable},
+          {"empty-tools", %{complete | "data" => [Map.put(server, "tools", %{})]}, :mcp_tool_catalog_unavailable},
+          {"bad-schema", %{complete | "data" => [Map.put(server, "tools", %{"get_pipeline" => %{"name" => "get_pipeline", "inputSchema" => []}})]}, :mcp_tool_catalog_invalid},
+          {"wrong-tool-name", %{complete | "data" => [Map.put(server, "tools", %{"get_pipeline" => %{"name" => "mutate", "inputSchema" => %{"type" => "object"}}})]}, :mcp_tool_catalog_invalid}
+        ] do
+      response = Jason.encode!(%{"id" => 18, "result" => result})
+
+      with_thread_listing_server(
+        "catalog-reject-#{name}",
+        """
+        case "$line" in
+          *'"method":"thread/start"'*) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"controller-catalog"}}}' ;;
+          *'"method":"mcpServerStatus/list"'*) printf '%s\\n' '#{response}' ;;
+          *'"method":"thread/unsubscribe"'*) printf '%s\\n' '{"id":6,"result":{}}' ;;
+        esac
+        """,
+        fn workspace, trace ->
+          assert {:ok, session} = AppServer.start_session(workspace, ephemeral: true)
+          assert {:error, ^expected} = AppServer.mcp_tool_catalog_in_session(session, "GitLab")
+          assert :ok = AppServer.stop_session(session)
+          refute File.read!(trace) =~ ~s("method":"mcpServer/tool/call")
+        end
+      )
+    end
+  end
+
+  test "catalog access rejects restricted, invalid and foreign-owned sessions before sending" do
+    restricted = %{worker_policy: %{"mode" => "REVIEW"}}
+    malformed = %{worker_policy: "malformed"}
+    assert {:error, :worker_connector_catalog_forbidden} = AppServer.mcp_tool_catalog_in_session(restricted, "GitLab")
+    assert {:error, :worker_connector_catalog_forbidden} = AppServer.mcp_tool_catalog_in_session(malformed, "GitLab")
+    assert {:error, :invalid_mcp_catalog_session} = AppServer.mcp_tool_catalog_in_session(%{}, "GitLab")
+
+    with_thread_listing_server(
+      "catalog-ownership",
+      """
+      case "$line" in
+        *'"method":"thread/start"'*) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"controller-catalog"}}}' ;;
+        *'"method":"thread/unsubscribe"'*) printf '%s\\n' '{"id":6,"result":{}}' ;;
+      esac
+      """,
+      fn workspace, trace ->
+        assert {:ok, session} = AppServer.start_session(workspace, ephemeral: true)
+        task = Task.async(fn -> AppServer.mcp_tool_catalog_in_session(session, "GitLab") end)
+        assert {:error, :mcp_catalog_session_not_owned} = Task.await(task)
+        assert :ok = AppServer.stop_session(session)
+        refute File.read!(trace) =~ ~s("method":"mcpServerStatus/list")
+      end
+    )
+  end
+
+  test "same-owner catalog reads cannot consume notifications from an active turn" do
+    catalog =
+      Jason.encode!(%{"data" => [%{"name" => "GitLab", "toolsError" => nil, "tools" => %{"get_pipeline" => %{"name" => "get_pipeline", "inputSchema" => %{"type" => "object"}}}}], "nextCursor" => nil})
+
+    with_thread_listing_server(
+      "catalog-active-turn",
+      """
+      case "$line" in
+        *'"method":"thread/start"'*) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"controller-catalog"}}}' ;;
+        *'"method":"turn/start"'*)
+          request_id=$(printf '%s\\n' "$line" | sed -n 's/.*"id":"\\([^\"]*\\)".*/\\1/p')
+          printf '{"id":"%s","result":{"turn":{"id":"catalog-turn"}}}\\n' "$request_id"
+          printf '%s\\n' '{"method":"turn/completed","params":{"threadId":"controller-catalog","turn":{"id":"catalog-turn","status":"completed","items":[]}}}' ;;
+        *'"method":"mcpServerStatus/list"'*) printf '%s\\n' '{"id":18,"result":#{catalog}}' ;;
+        *'"method":"thread/unsubscribe"'*) printf '%s\\n' '{"id":6,"result":{}}' ;;
+      esac
+      """,
+      fn workspace, trace ->
+        assert {:ok, session} = AppServer.start_session(workspace, ephemeral: true)
+
+        callback = fn
+          %{event: :session_started} ->
+            result = AppServer.mcp_tool_catalog_in_session(session, "GitLab")
+            send(self(), {:active_catalog, result})
+
+          _event ->
+            :ok
+        end
+
+        options = [event_scope: :exact_turn, on_message: callback]
+
+        try do
+          assert {:ok, %{turn_id: "catalog-turn"}} = AppServer.run_turn(session, "Transport fixture only", %Issue{}, options)
+          assert_received {:active_catalog, {:error, :mcp_catalog_session_busy}}
+          refute File.read!(trace) =~ ~s("method":"mcpServerStatus/list")
+        after
+          AppServer.stop_session(session)
+        end
+      end
+    )
+  end
+
+  test "worker policy drift, API-key accounts and unexpected catalogs reject before any model turn" do
+    for {name, profile, account, catalog, expected} <- [
+          {"profile", "wrong-profile", "chatgpt", ~s({"data":[],"nextCursor":null}), :worker_effective_policy_mismatch},
+          {"auth", "symphony_ticket_review_v1", "apiKey", ~s({"data":[],"nextCursor":null}), :worker_chatgpt_account_required},
+          {"catalog", "symphony_ticket_review_v1", "chatgpt", ~s({"data":[{"name":"unexpected","tools":{"mutate":{}}}],"nextCursor":null}), :worker_connector_catalog_not_empty},
+          {"empty-live", "symphony_ticket_review_v1", "chatgpt", ~s({"data":[{"name":"unexpected","tools":{},"resources":[],"resourceTemplates":[],"runtimeStatus":"connected"}],"nextCursor":null}),
+           :worker_connector_catalog_not_empty},
+          {"disabled-with-resource", "symphony_ticket_review_v1", "chatgpt",
+           ~s({"data":[{"name":"Jira","tools":{},"resources":[{}],"resourceTemplates":[],"runtimeStatus":"disabled"}],"nextCursor":null}), :worker_connector_catalog_not_empty},
+          {"paginated", "symphony_ticket_review_v1", "chatgpt", ~s({"data":[],"nextCursor":"more"}), :worker_connector_catalog_not_empty}
+        ] do
+      handler = """
+      case "$line" in
+        *'"method":"config/read"'*) printf '%s\\n' '{"id":15,"result":{"config":{}}}' ;;
+        *'"method":"account/read"'*) printf '%s\\n' '{"id":17,"result":{"account":{"type":"#{account}"}}}' ;;
+        *'"method":"thread/start"'*) printf '{"id":2,"result":{"thread":{"id":"worker","cwd":"%s"},"cwd":"%s","runtimeWorkspaceRoots":["%s"],"reasoningEffort":null,"activePermissionProfile":{"id":"#{profile}"},"approvalPolicy":"never","model":"gpt-6-luna"}}\\n' "$(pwd -P)" "$(pwd -P)" "$(pwd -P)" ;;
+        *'"method":"mcpServerStatus/list"'*) printf '%s\\n' '{"id":16,"result":#{catalog}}' ;;
+        *'"method":"thread/unsubscribe"'*) printf '%s\\n' '{"id":6,"result":{"status":"unsubscribed"}}' ;;
+      esac
+      """
+
+      with_thread_listing_server("reject-#{name}", handler, fn workspace, trace ->
+        assert {:error, ^expected} = AppServer.start_session(workspace, worker_access: "REVIEW", model: "gpt-6-luna")
+        refute File.read!(trace) =~ ~s("method":"turn/start")
+        restricted = [worker_access: "REVIEW", project_id: "project"]
+        assert {:error, :worker_capability_configuration_rejected} = AppServer.start_session(workspace, restricted)
+        assert {:error, :worker_access_profile_unsupported} = AppServer.start_session(workspace, worker_access: "UNKNOWN")
+      end)
+    end
+  end
+
+  test "native observer rejects server approvals, tool requests and wrong thread history" do
+    for {name, response, expected} <- [
+          {"approval", ~s({"id":99,"method":"item/commandExecution/requestApproval","params":{}}), :native_read_requests_unsupported},
+          {"tool", ~s({"id":9,"method":"item/tool/call","result":{}}), :native_read_requests_unsupported},
+          {"wrong-id", ~s({"id":9,"result":{"thread":{"id":"other","turns":[]}}}), :native_read_identity_or_history_mismatch}
+        ] do
+      with_thread_listing_server(
+        "native-#{name}",
+        """
+        case "$line" in
+          *'"method":"thread/read"'*) printf '%s\\n' '#{response}' ;;
+        esac
+        """,
+        fn workspace, trace ->
+          assert {:error, ^expected} = AppServer.read_native_thread("parent", workspace: workspace)
+          refute File.read!(trace) =~ ~s("method":"turn/start")
+          refute File.read!(trace) =~ ~s("decision":"accept")
+        end
+      )
+    end
+  end
+
+  test "effective runtime roots, cwd and effort must match, not just the nested thread", _ctx do
+    for name <- ~w(cwd roots effort) do
+      cwd = if name == "cwd", do: "/elsewhere", else: "actual"
+      roots = if name == "roots", do: "/elsewhere", else: "actual"
+      effort = if name == "effort", do: "high", else: "medium"
+
+      handler = """
+      case "$line" in
+        *'"method":"config/read"'*) printf '%s\\n' '{"id":15,"result":{"config":{}}}' ;;
+        *'"method":"account/read"'*) printf '%s\\n' '{"id":17,"result":{"account":{"type":"chatgpt"}}}' ;;
+        *'"method":"thread/start"'*)
+          actual=$(pwd -P)
+          effective='#{cwd}'
+          roots='#{roots}'
+          [ "$effective" != actual ] || effective=$actual
+          [ "$roots" != actual ] || roots=$actual
+          printf '{"id":2,"result":{"thread":{"id":"worker","cwd":"%s"},"cwd":"%s","runtimeWorkspaceRoots":["%s"],"reasoningEffort":"#{effort}","activePermissionProfile":{"id":"symphony_ticket_review_v1"},"approvalPolicy":"never","model":"gpt-6-luna"}}\\n' "$actual" "$effective" "$roots" ;;
+      esac
+      """
+
+      with_thread_listing_server("effective-#{name}", handler, fn workspace, trace ->
+        options = [worker_access: "REVIEW", model: "gpt-6-luna", reasoning_effort: "medium"]
+        assert {:error, :worker_effective_policy_mismatch} = AppServer.start_session(workspace, options)
+        refute File.read!(trace) =~ ~s("method":"turn/start")
+      end)
+    end
+  end
+
+  test "a startup observer exception closes the actual owned port before returning", _ctx do
+    handler = """
+    case "$line" in
+      *'"method":"config/read"'*) printf '%s\\n' '{"id":15,"result":{"config":{}}}' ;;
+      *'"method":"account/read"'*) printf '%s\\n' '{"id":17,"result":{"account":{"type":"chatgpt"}}}' ;;
+      *'"method":"thread/start"'*) printf '{"id":2,"result":{"thread":{"id":"worker","cwd":"%s"},"cwd":"%s","runtimeWorkspaceRoots":["%s"],"reasoningEffort":null,"activePermissionProfile":{"id":"symphony_ticket_review_v1"},"approvalPolicy":"never","model":"gpt-6-luna"}}\\n' "$(pwd -P)" "$(pwd -P)" "$(pwd -P)" ;;
+    esac
+    """
+
+    with_thread_listing_server("startup-observer-error", handler, fn workspace, _trace ->
+      owned_ports = fn -> Enum.filter(Port.list(), &(Port.info(&1, :connected) == {:connected, self()})) end
+      before = owned_ports.()
+
+      assert_raise RuntimeError, "observer failed", fn ->
+        AppServer.start_session(workspace, worker_access: "REVIEW", model: "gpt-6-luna", on_thread_created: fn _ -> raise "observer failed" end)
+      end
+
+      assert owned_ports.() == before
+    end)
+  end
+
+  test "connector names ambiguous in the CLI path grammar are rejected before restricted startup", _ctx do
+    handler = """
+    case "$line" in
+      *'"method":"config/read"'*) printf '%s\\n' '{"id":15,"result":{"config":{"mcp_servers":{"name.with.dots":{}}}}}' ;;
+    esac
+    """
+
+    with_thread_listing_server("ambiguous-configuration-key", handler, fn workspace, trace ->
+      assert {:error, :worker_configuration_unavailable} = AppServer.start_session(workspace, worker_access: "REVIEW")
+      refute File.read!(trace) =~ ~s("method":"thread/start")
+    end)
+  end
+
+  test "ticket collector consumes only completed native user input through a mechanical history read" do
+    ctx = TicketChatFixture.setup_fixture(%{})
+    body = "Rework the current candidate."
+    {:ok, _} = TicketChatFixture.stage(ctx, "collector", body, [%{"operation" => "request_rework"}])
+    native = TicketChatFixture.native(ctx, [body])
+    response = Jason.encode!(%{"id" => 9, "result" => %{"thread" => native}})
+
+    with_thread_listing_server(
+      "ticket-collector",
+      """
+      case "$line" in
+        *'"method":"thread/read"'*) printf '%s\\n' '#{response}' ;;
+      esac
+      """,
+      fn _workspace, trace ->
+        assert {:ok, %{receipts: [%{"status" => "ACCEPTED"}], worker_started: false}} =
+                 TicketChatCommands.collect(ctx.store, "run")
+
+        refute File.read!(trace) =~ ~s("method":"turn/start")
+        refute File.read!(trace) =~ ~s("method":"thread/resume")
+      end
+    )
+  end
 
   test "thread lookup finds one exact named task across source kinds and archived pages" do
     with_thread_listing_server(
@@ -467,6 +1175,25 @@ defmodule SymphonyElixir.AppServerTest do
                  AppServer.run_turn(session, "Review", issue, event_scope: :exact_turn, tool_executor: executor)
 
         refute_received :tool_executed
+      end
+    )
+  end
+
+  test "an arity-three legacy executor does not grant exact-turn file-worker capabilities" do
+    with_exact_turn_session(
+      """
+      printf '%s\\n' '{"id":77,"method":"item/tool/call","params":{"threadId":"thread-720","turnId":"turn-720","callId":"call","tool":"repo_write","arguments":{}}}'
+      """,
+      fn session, issue ->
+        executor = fn _tool, _args, _identity ->
+          send(self(), :unexpected_tool)
+          %{"success" => true}
+        end
+
+        assert {:error, :worker_request_attribution_unsupported} =
+                 AppServer.run_turn(session, "Review", issue, event_scope: :exact_turn, tool_executor: executor)
+
+        refute_received :unexpected_tool
       end
     )
   end
@@ -3101,7 +3828,16 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
-  defp with_thread_listing_server(test_name, list_handler, callback) do
+  defp fixture_runtime do
+    %{
+      "codexHome" => System.get_env("CODEX_HOME") || Path.join(System.user_home!(), ".codex"),
+      "platformFamily" => "unix",
+      "platformOs" => "macos",
+      "userAgent" => "symphony-orchestrator/0.160.0 (fixture)"
+    }
+  end
+
+  defp with_thread_listing_server(test_name, list_handler, callback, runtime \\ fixture_runtime()) do
     test_root =
       Path.join(System.tmp_dir!(), "symphony-thread-lookup-#{test_name}-#{System.unique_integer([:positive])}")
 
@@ -3118,10 +3854,12 @@ defmodule SymphonyElixir.AppServerTest do
       File.write!(codex_binary, """
       #!/bin/sh
       trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/symphony-thread-lookup.trace}"
+      printf '%s\\n' "$$" > "$trace_file.pid"
+      trap 'printf "terminated\\n" > "$trace_file.terminated"; exit 143' TERM
       while IFS= read -r line; do
         printf 'JSON:%s\\n' "$line" >> "$trace_file"
         case "$line" in
-          *'"method":"initialize"'*) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          *'"method":"initialize"'*) printf '%s\\n' '#{Jason.encode!(%{"id" => 1, "result" => runtime})}' ;;
         esac
         #{list_handler}
       done

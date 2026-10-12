@@ -307,13 +307,160 @@ source-bootstrap reference for command/attachment evidence requirements.
 ## Ticket supervisor execution-mode foundation (disabled)
 
 `factory.ticket_supervisor` defaults to `{"enabled": false, "pilot_issue_keys": []}`.
-This setting and the immutable `runs.execution_mode` column only prepare durable
-mode recording; they do not create ticket-supervisor chats, workers, or a
-runtime route. Historical runs keep a null mode and continue using legacy
-transport behavior. Until a compatible supervisor runner passes its acceptance
-gate, the scheduler stops before side effects if it encounters any non-legacy
-recorded mode. Changing the global transport does not enable that mode or
-rewrite existing runs.
+The dashboard exposes this flag separately from `factory.enabled`; a disabled
+projection performs no ledger initialization. Parent-summary status is separate
+from recorded source/delivery status. Read-only `factory.ticket replay` opens an
+existing current-schema ledger and returns bounded evidence/cursors, never action
+execution. Unknown attributed usage and physical checkout counts remain unknown.
+Keep rollout default-off until final acceptance and separately approved deployment.
+Pause/disable is not an owned-worker shutdown receipt; retain reconciliation of
+already-issued work and keep native-maintenance authorization separate.
+Static Policy validation remains side-effect-free. When this route is enabled,
+startup qualifies the actual configured runtime once in the explicit
+`parent_output_root` before factory children start. Unsupported runtime or cwd
+fails startup; existing per-effect and owned-worker checks remain required.
+Listing/formatting/readback do not probe. This does not enable the production
+configuration or replace rollout acceptance. Historical runs keep a null mode and continue using
+legacy transport behavior. Disabled V1 runs are quarantined while unrelated
+legacy work continues; unknown execution modes still stop the tick. Changing
+global transport does not enable V1 or rewrite existing runs.
+
+Parent admission inputs under this section are `parent_output_root`,
+`broker_thread_id`, `ticket_cli_root` and `ticket_workflow`. The first three are
+explicit and never inferred from controller identity or source directories.
+An absent workflow uses the loaded workflow's absolute path; explicit null
+remains invalid. Internal context options and then tick options override these
+configuration values. Configuring inputs alone is not runtime acceptance.
+
+Schema version 19 adds disabled shared-checkout reservations and exact internal
+worker receipts. SOURCE ownership spans edits through controller adoption;
+REVIEW pins a clean candidate or the planner's immutable pre-candidate base;
+MAINTENANCE conflicts with both. An elapsed lease or missing PID never releases
+the checkout. Worker model/effort are explicit, and SOURCE/REVIEW have no
+controller connectors or network access. These APIs do not activate dispatch.
+Mandatory live validation remains rejected on this route until its separately
+authorized executor is integrated. Native acceptance must also prove background
+command shutdown, not only the app-server's exit.
+Until that gate passes, native SOURCE admission and retained SOURCE turns return
+`worker_source_containment_unproven` before process/model side effects. This is
+not a change to legacy nil-access transport or read-only REVIEW behavior.
+
+Schema version 20 introduces FILE_SOURCE as a controller-executed file adapter,
+not a writable process profile. Logical SOURCE ownership still spans controller
+adoption. The worker process stays read-only with shell, unified execution,
+delegation, hooks, apps and network disabled; its exact scoped repository tools
+are explicitly supplied on startup and resume. Controller file edits are
+SHA-checked, synchronous, and persist intent before writing. Lost responses
+reconcile by exact-file readback; unresolved edits prevent consumption/release.
+The initial adapter supports bounded text reads, single-directory listings,
+replacement/new files in existing directories, and exact-hash deletion of one
+regular source file, plus single-directory creation under an existing parent.
+Directory creation binds a fixed macOS extended attribute to its precommitted
+invocation nonce and the actual directory identity. It adds no source marker;
+replay and recovery require the same inode, tag and durable child receipt.
+Arbitrary commands, recursive creation and directory removal remain unsupported.
+Binary read/write tools use canonical base64, retain the 262,144-byte file bound,
+page reads by 8,192 raw bytes and share the same hash-checked mutation/recovery
+path. Text reads still reject binary data rather than silently converting it.
+Required checks and live validation are not
+replaced by edit receipts. Dispatch remains disabled pending native acceptance
+and controller-owned check/validation integration.
+The disabled check catalog currently exposes only the controller-selected
+`git-diff-check` action, not worker-provided commands. Schema-24 receipts bind
+candidate/base/contract/reservation and retain actual owned-process outcomes.
+An uncertain response is read back without rerunning creation. Pending or
+corrupt checks prevent checkout release. There is no new workflow switch and
+no build/test or live-validation action is enabled by this addition.
+The disabled CI binder requires an independent numeric GitLab project pin and
+exact MR/candidate/job scope. A merged-result pipeline additionally requires its
+own merge commit's source-parent proof; a current MR head alone is insufficient.
+The selected pipeline must match the observed MR `head_pipeline` projection;
+missing visibility rejects the observation rather than silently assuming no CI.
+It validates supplied data only and neither collects CI nor advances delivery.
+CI-first integration must reuse the existing authorized `ci_preflight: draft_mr`
+route, not infer push/MR authorization from this binder or bypass fresh review.
+Controller catalog discovery requires an existing idle, caller-owned MCP
+session and exact, unpaginated inventory. It cannot wake a model or authorize
+calls based on advertised schemas. No Jira credential fallback or new native
+dispatch route is enabled by this addition.
+Native FILE_SOURCE startup and retained turns currently return
+`worker_file_mutation_containment_unproven` before side effects. Adversarial
+fixtures proved pathname I/O can race a parent swap. The replacement controller
+backend uses a fixed descriptor-relative helper, hash-pinned outside source,
+with no-follow directory traversal, physical root identity and bounded frames.
+Read operations use a non-writing sandbox. Full containment remains unaccepted.
+
+Schema version 21 retains helper invocation/exit receipts and commits a pending
+marker before possible mutation. An observed exact helper exit clears that
+marker; a timeout, Port close or matching file content cannot do so. Pending
+helpers prevent edit replay/reconciliation and worker result consumption. Older
+pending edits lacking receipts migrate to quarantine. Automatic helper shutdown
+recovery and hardened controller check/validation execution are still required;
+the later proven-unchanged cancellation below does not enable dispatch.
+
+Schema 22 adds `io_invocation` and immutable `io_binding_json` to mutating edit
+intent. Only a fixed controller companion may execute these edits: it verifies
+the precommitted SQLite/WAL row and source reservation, uses one exclusive
+invocation claim, and records an owned child exit plus bounded response before
+stdout. Restart recovery reads the same journal; it never repeats a claimed
+invocation. Normal and signaled exits are distinct evidence. Missing or changed
+binding/claim/receipt stays quarantined. Current invocations also bind the exact
+path and before/after effect digests. A stopped replace/delete attempt may be
+ABORTED only after exact stop evidence, unchanged target, current program/effect
+binding and absence of its deterministic `.symphony-<invocation>` temporary.
+This retains SOURCE, refuses the old call and allows a new logical retry. Failed
+temporary creation never authorizes deleting a pre-existing file. Unprovable
+temporaries remain protected; no filename-only reclamation is added.
+
+Replacement bytes are gated on an exact creator-event ACK. The companion checks
+the helper self-PID and observes the original temp/root/parent identities before
+fsyncing the raw `.creator` event and acknowledging it. After actual original
+child exit, the same source reservation covers fixed cleanup of only that inode,
+with current authorization and before/after target checks. Cleanup self-PID/exit
+evidence is saved separately before a composite final receipt; missing creator
+or cleanup evidence rejects both journal and cached readback. If the final
+receipt alone is absent, complete matching artifacts may be read back without
+rerunning helpers or publishing a replacement receipt. The explicit recovery
+marker requires fresh status proof before cached replay/adoption. A matching
+late producer receipt may replace it only after comparison; failed comparisons
+retain the prior evidence. Invalid existing final receipts, unattested/replaced
+files and incomplete terminal artifacts remain quarantined.
+The companion is trusted controller
+code, not a model worker; model sandbox permissions are unchanged. Journal
+authority must not overlap any source workspace. Native admission is still
+fenced until complete transport, recovery, source and check/validation acceptance.
+
+Native checkout identity uses a fixed, environment-isolated read-only Git
+inspection. It disables hooks/fsmonitor, optional locks and lazy fetch and
+cannot spawn a configured clean filter to perform side effects. Local Git
+repository/worktree configuration is retained; filter-dependent repositories
+may be refused as dirty/error. Identity failure never falls back to ambient Git.
+Controller write and credentialed remote operations are unchanged.
+
+Schema version 17 also reserves Desktop-owned, projectless parent identities
+under route `desktop_owned_ticket_chat_v1`. Identity is scoped by dispatcher,
+immutable Jira issue ID and repository key, with separate run links. Only the
+new `TICKET_CHAT` request kind accepts a null Project; legacy TASK/CONTROLLER
+requests retain their original payload hashes and Project constraints. This
+foundation keeps the runtime fence: no native ticket requests can be claimed or
+issued through the broker CLI yet. Readback and replay are tested offline, not
+permission to dispatch real tickets or enable native worktree cleanup.
+
+Schema version 18 adds local bounded context, digest-pinned artifact paging,
+native input observations and typed staged-command receipts. The parent can
+stage an interpretation while active, but only completed independent native
+readback can admit it. Successful native CLI staging-frame correlation is
+transport evidence; human authorization still comes from the exact direct input
+and current question/contract/candidate binding. Caller-supplied origin JSON,
+assistant updates and quoted artifacts are not authority. Mechanical history
+reads issue no `thread/resume`, `thread/start` or `turn/start`.
+
+Default context is at most 16 KB and prose summary at most 2 KB. Older tasks,
+questions, commands, events and receipts have bounded local paging rather than
+silent truncation. Accepted intents do not launch workers or change Jira;
+controller application/readback remains a later gate. Presentation failures and
+supersession are independent of delivery. This layer leaves the issuance fence
+and native cleanup flag unchanged.
 
 ## Workpad template
 

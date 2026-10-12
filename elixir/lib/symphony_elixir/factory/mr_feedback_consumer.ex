@@ -9,7 +9,6 @@ defmodule SymphonyElixir.Factory.MrFeedbackConsumer do
   alias SymphonyElixir.Factory.{Control, ControllerTask, DesktopRequest, DesktopStageRunner, GitLabMcpConnector}
   alias SymphonyElixir.Factory.{JiraMcpReader, MrFeedback}
   alias SymphonyElixir.Factory.{MrFeedbackLedger, MrFeedbackMcpReader, Prompt, RunLedger, StageSchemas}
-  alias SymphonyElixir.Factory.Store
   alias SymphonyElixir.Tracker.Issue
 
   @stale_source_errors ~w(
@@ -93,11 +92,7 @@ defmodule SymphonyElixir.Factory.MrFeedbackConsumer do
   end
 
   defp controller_busy?(store, scope) do
-    Store.one!(
-      store,
-      "SELECT request_key FROM desktop_requests WHERE target_kind = 'CONTROLLER' AND target_key = ? AND status IN ('PENDING', 'CREATE_UNCERTAIN', 'FOLLOWUP_UNCERTAIN', 'THREAD_RECORDED', 'RECONCILE_REQUIRED') LIMIT 1",
-      [scope]
-    ) != nil
+    DesktopRequest.controller_busy?(store, scope)
   end
 
   defp process_receipt(context, receipt, opts) do

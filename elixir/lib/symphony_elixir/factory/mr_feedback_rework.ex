@@ -47,7 +47,8 @@ defmodule SymphonyElixir.Factory.MrFeedbackRework do
 
     controller_scope = Map.get(evidence, :controller_scope)
 
-    with true <- (run["kind"] == "DELIVERY" and run["state"] == "READY_FOR_REVIEW") or {:error, :delivery_not_review_ready},
+    with true <- (run["execution_mode"] in [nil, "LEGACY"] and not v1_issue_owned?(store, run["issue_key"])) or {:error, :run_quarantined},
+         true <- (run["kind"] == "DELIVERY" and run["state"] == "READY_FOR_REVIEW") or {:error, :delivery_not_review_ready},
          true <- run["candidate_sha"] == verified_writer_sha or {:error, :review_writer_head_mismatch},
          :ok <- MrFeedback.eligible?(run, route, jira, mr),
          {:ok, notes} <- verified_notes(run, receipts, route, jira, mr, discussions, allowed_authors, bot_id) do
@@ -61,12 +62,13 @@ defmodule SymphonyElixir.Factory.MrFeedbackRework do
   def complete_push(store, run_id, batch_key, candidate_sha)
       when is_binary(run_id) and is_binary(batch_key) and is_binary(candidate_sha) do
     Store.transaction!(store, fn transaction ->
-      run = Store.one!(transaction, "SELECT state, candidate_sha, review_feedback_json FROM runs WHERE run_id = ?", [run_id])
+      run = Store.one!(transaction, "SELECT state, candidate_sha, review_feedback_json, execution_mode, issue_key FROM runs WHERE run_id = ?", [run_id])
 
       receipts =
         Store.query!(transaction, "SELECT feedback_key FROM mr_feedback_notes WHERE run_id = ? AND review_batch_key = ? AND status = 'REWORKING' ORDER BY created_at, feedback_key", [run_id, batch_key])
 
-      with %{"state" => "REVIEW_PUSHING", "candidate_sha" => ^candidate_sha, "review_feedback_json" => json} <- run,
+      with %{"state" => "REVIEW_PUSHING", "candidate_sha" => ^candidate_sha, "review_feedback_json" => json, "execution_mode" => mode, "issue_key" => issue_key} <- run,
+           true <- mode in [nil, "LEGACY"] and not v1_issue_owned?(transaction, issue_key),
            {:ok, notes} when is_list(notes) <- Jason.decode(json),
            keys <- Enum.map(notes, & &1["feedback_key"]),
            true <- keys != [] and Enum.sort(keys) == Enum.sort(Enum.map(receipts.rows, &hd/1)) do
@@ -92,9 +94,10 @@ defmodule SymphonyElixir.Factory.MrFeedbackRework do
   def quarantine(store, run_id, batch_key, reason)
       when is_binary(run_id) and is_binary(batch_key) and is_atom(reason) do
     Store.transaction!(store, fn transaction ->
-      run = Store.one!(transaction, "SELECT state FROM runs WHERE run_id = ?", [run_id])
+      run = Store.one!(transaction, "SELECT state, execution_mode, issue_key FROM runs WHERE run_id = ?", [run_id])
 
-      if run == %{"state" => "REVIEW_PUSHING"} do
+      if is_map(run) and run["state"] == "REVIEW_PUSHING" and run["execution_mode"] in [nil, "LEGACY"] and
+           not v1_issue_owned?(transaction, run["issue_key"]) do
         now = DateTime.utc_now() |> DateTime.to_iso8601()
         code = Atom.to_string(reason)
 
@@ -118,11 +121,14 @@ defmodule SymphonyElixir.Factory.MrFeedbackRework do
     SELECT note.run_id
     FROM mr_feedback_notes AS note
     LEFT JOIN desktop_requests AS request ON request.request_key = note.request_key
-    WHERE (note.status = 'CHANGE_REQUEST' AND request.target_key = ?)
+    JOIN runs AS run ON run.run_id = note.run_id
+    WHERE COALESCE(run.execution_mode, 'LEGACY') = 'LEGACY'
+      AND NOT EXISTS (SELECT 1 FROM runs AS supervisor WHERE supervisor.issue_key = run.issue_key AND supervisor.execution_mode = 'TICKET_SUPERVISOR_V1')
+      AND ((note.status = 'CHANGE_REQUEST' AND request.target_key = ?)
       OR (note.status = 'RECONCILE_REQUIRED' AND note.reply_phase = 2
         AND instr(note.last_error, 'FOLLOWUP_TURN_REPLAYED') > 0
         AND request.status = 'RECONCILE_REQUIRED' AND request.failure_code = 'FOLLOWUP_TURN_REPLAYED'
-        AND request.target_kind = 'CONTROLLER' AND request.action = 'FOLLOWUP' AND request.target_key = ?)
+        AND request.target_kind = 'CONTROLLER' AND request.action = 'FOLLOWUP' AND request.target_key = ?))
     ORDER BY note.created_at, note.feedback_key LIMIT 1
     """
   end
@@ -132,7 +138,10 @@ defmodule SymphonyElixir.Factory.MrFeedbackRework do
     SELECT note.*
     FROM mr_feedback_notes AS note
     LEFT JOIN desktop_requests AS request ON request.request_key = note.request_key
-    WHERE note.run_id = ? AND ((note.status = 'CHANGE_REQUEST' AND request.target_key = ?)
+    JOIN runs AS run ON run.run_id = note.run_id
+    WHERE note.run_id = ? AND COALESCE(run.execution_mode, 'LEGACY') = 'LEGACY'
+      AND NOT EXISTS (SELECT 1 FROM runs AS supervisor WHERE supervisor.issue_key = run.issue_key AND supervisor.execution_mode = 'TICKET_SUPERVISOR_V1')
+      AND ((note.status = 'CHANGE_REQUEST' AND request.target_key = ?)
       OR (note.status = 'RECONCILE_REQUIRED' AND note.reply_phase = 2
         AND instr(note.last_error, 'FOLLOWUP_TURN_REPLAYED') > 0
         AND request.status = 'RECONCILE_REQUIRED' AND request.failure_code = 'FOLLOWUP_TURN_REPLAYED'
@@ -259,15 +268,18 @@ defmodule SymphonyElixir.Factory.MrFeedbackRework do
   end
 
   defp persist_admission_transaction(transaction, run, receipts, notes, batch_key, controller_scope) do
-    current = Store.one!(transaction, "SELECT state, candidate_sha, worktree FROM runs WHERE run_id = ?", [run["run_id"]])
+    current = Store.one!(transaction, "SELECT state, candidate_sha, worktree, execution_mode, issue_key FROM runs WHERE run_id = ?", [run["run_id"]])
     writer_key = "#{run["run_id"]}:feature-writer"
     writer = Store.one!(transaction, "SELECT status, workspace, workspace_sha, thread_id FROM factory_tasks WHERE task_key = ?", [writer_key])
 
     cond do
+      current["execution_mode"] not in [nil, "LEGACY"] or v1_issue_owned?(transaction, current["issue_key"]) ->
+        {:error, :run_quarantined}
+
       NativeWorkspaceMaintenance.ensure_available(transaction, run["run_id"]) != :ok ->
         {:error, :native_workspace_maintenance_reserved}
 
-      current != %{"state" => "READY_FOR_REVIEW", "candidate_sha" => run["candidate_sha"], "worktree" => run["worktree"]} ->
+      Map.take(current, ["state", "candidate_sha", "worktree"]) != %{"state" => "READY_FOR_REVIEW", "candidate_sha" => run["candidate_sha"], "worktree" => run["worktree"]} ->
         {:error, :review_run_changed}
 
       not reusable_writer?(writer, run) ->
@@ -279,6 +291,10 @@ defmodule SymphonyElixir.Factory.MrFeedbackRework do
       true ->
         write_admission(transaction, run, receipts, notes, batch_key, writer_key, controller_scope)
     end
+  end
+
+  defp v1_issue_owned?(store, issue_key) do
+    Store.one!(store, "SELECT run_id FROM runs WHERE issue_key = ? AND execution_mode = 'TICKET_SUPERVISOR_V1' LIMIT 1", [issue_key]) != nil
   end
 
   defp write_admission(transaction, run, receipts, notes, batch_key, writer_key, controller_scope) do

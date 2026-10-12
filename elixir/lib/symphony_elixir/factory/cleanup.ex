@@ -28,6 +28,8 @@ defmodule SymphonyElixir.Factory.Cleanup do
                  branch, candidate_sha, mr_url, mr_iid, state
           FROM runs
           WHERE repo_key = ? AND state IN (#{placeholders})
+            AND COALESCE(execution_mode, 'LEGACY') = 'LEGACY'
+            AND NOT EXISTS (SELECT 1 FROM runs AS supervisor WHERE supervisor.issue_key = runs.issue_key AND supervisor.execution_mode = 'TICKET_SUPERVISOR_V1')
             AND factory_owned = 1 AND cleaned_at IS NULL
             AND worktree IS NOT NULL AND branch IS NOT NULL
             AND candidate_sha IS NOT NULL
@@ -50,6 +52,7 @@ defmodule SymphonyElixir.Factory.Cleanup do
 
     with true <- value(cleanup, "enabled", false) or {:error, :cleanup_disabled},
          {:ok, run} <- RunLedger.get(connection, run_id),
+         :ok <- require_legacy_issue(connection, run),
          true <- run["state"] in value(cleanup, "allowed_run_states", []) or {:error, :run_not_terminal},
          true <- run["factory_owned"] == 1 or {:error, :not_factory_owned},
          true <-
@@ -80,6 +83,12 @@ defmodule SymphonyElixir.Factory.Cleanup do
     end
   end
 
+  defp require_legacy_issue(connection, run) do
+    if run["execution_mode"] in [nil, "LEGACY"] and not v1_issue_owned?(connection, run["issue_key"]),
+      do: :ok,
+      else: {:error, :run_quarantined}
+  end
+
   @doc "Returns the preflight result for one authorized cleanup candidate."
   @spec preflight(Store.connection(), map(), map(), keyword()) :: map()
   def preflight(connection, policy, run, opts \\ []) do
@@ -90,6 +99,8 @@ defmodule SymphonyElixir.Factory.Cleanup do
     repo = expanded(run["repo_path"])
 
     reasons = require_flag(reasons, run["cleanup_authorized"] == 1, "cleanup is not authorized")
+    reasons = require_flag(reasons, run["execution_mode"] in [nil, "LEGACY"], "run is quarantined")
+    reasons = require_flag(reasons, not v1_issue_owned?(connection, run["issue_key"]), "issue is quarantined")
 
     reasons =
       require_flag(
@@ -152,6 +163,8 @@ defmodule SymphonyElixir.Factory.Cleanup do
   @spec apply(Store.connection(), map(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
   def apply(connection, policy, run_id, opts \\ []) do
     with {:ok, run} <- RunLedger.get(connection, run_id),
+         true <- run["execution_mode"] in [nil, "LEGACY"] or {:error, :run_quarantined},
+         true <- not v1_issue_owned?(connection, run["issue_key"]) or {:error, :run_quarantined},
          :ok <- already_cleaned(run),
          %{eligible: true} = check <- resumable_preflight(connection, policy, run, opts),
          :ok <- remove_worktree(connection, run, check, opts),
@@ -669,6 +682,10 @@ defmodule SymphonyElixir.Factory.Cleanup do
   defp normalize_lower(value), do: value |> to_string() |> String.trim() |> String.downcase()
   defp present?(value) when is_binary(value), do: String.trim(value) != ""
   defp present?(_value), do: false
+
+  defp v1_issue_owned?(connection, issue_key) do
+    Store.one!(connection, "SELECT run_id FROM runs WHERE issue_key = ? AND execution_mode = 'TICKET_SUPERVISOR_V1' LIMIT 1", [issue_key]) != nil
+  end
 
   defp value(map, key, default \\ nil) when is_map(map) do
     Map.get(map, key, default)

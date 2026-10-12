@@ -34,7 +34,6 @@ defmodule SymphonyElixir.Factory.Policy do
     cond do
       not is_boolean(enabled) -> {:error, :invalid_ticket_supervisor_policy}
       not valid_string_list?(pilot_issue_keys) -> {:error, :invalid_ticket_supervisor_policy}
-      enabled -> {:error, :ticket_supervisor_runtime_capability_unproven}
       true -> :ok
     end
   end

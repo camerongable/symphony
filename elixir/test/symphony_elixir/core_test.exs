@@ -1029,6 +1029,7 @@ defmodule SymphonyElixir.CoreTest do
   end
 
   test "normal worker exit schedules active-state continuation retry" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
     issue_id = "issue-resume"
     ref = make_ref()
     orchestrator_name = Module.concat(__MODULE__, :ContinuationOrchestrator)
@@ -1151,6 +1152,7 @@ defmodule SymphonyElixir.CoreTest do
   end
 
   test "stale retry timer messages do not consume newer retry entries" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
     issue_id = "issue-stale-retry"
     orchestrator_name = Module.concat(__MODULE__, :StaleRetryOrchestrator)
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
@@ -2227,22 +2229,21 @@ defmodule SymphonyElixir.CoreTest do
       File.write!(codex_binary, """
       #!/bin/sh
       trace_file="${SYMP_TEST_CODex_TRACE:-/tmp/codex-custom-args.trace}"
-      count=0
       printf 'ARGV:%s\\n' \"$*\" >> \"$trace_file\"
 
       while IFS= read -r line; do
-        count=$((count + 1))
-        case \"$count\" in
-          1)
+        printf 'INPUT:%s\\n' \"$line\" >> \"$trace_file\"
+        case \"$line\" in
+          *'"method":"initialize"'*)
             printf '%s\\n' '{\"id\":1,\"result\":{}}'
             ;;
-          2)
+          *'"method":"initialized"'*)
+            ;;
+          *'"method":"thread/start"'*)
             printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-88\"}}}'
             ;;
-          3)
+          *'"method":"turn/start"'*)
             printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-88\"}}}'
-            ;;
-          4)
             printf '%s\\n' '{\"method\":\"turn/completed\"}'
             exit 0
             ;;
@@ -2274,6 +2275,13 @@ defmodule SymphonyElixir.CoreTest do
 
       trace = File.read!(trace_file)
       lines = String.split(trace, "\n", trim: true)
+
+      methods =
+        for "INPUT:" <> payload <- lines do
+          Jason.decode!(payload)["method"]
+        end
+
+      assert methods == ["initialize", "initialized", "thread/start", "turn/start"]
 
       assert argv_line = Enum.find(lines, fn line -> String.starts_with?(line, "ARGV:") end)
       assert String.contains?(argv_line, "--config model=\"gpt-5.5\" app-server")

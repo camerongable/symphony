@@ -8,6 +8,27 @@ defmodule SymphonyElixir.Factory.StageSchemas do
 
   @string_list %{"type" => "array", "items" => %{"type" => "string"}}
 
+  @doc "Requires every declared producer field without changing durable output validation."
+  @spec for_provider(map()) :: map()
+  def for_provider(schema) when is_map(schema), do: normalize_provider_schema(schema)
+
+  defp normalize_provider_schema(value) when is_map(value) do
+    normalized = Map.new(value, fn {key, child} -> {key, normalize_provider_schema(child)} end)
+
+    case normalized do
+      %{"type" => "object", "properties" => properties} when is_map(properties) ->
+        required = Map.get(normalized, "required", [])
+        missing = properties |> Map.keys() |> Enum.reject(&(&1 in required)) |> Enum.sort()
+        Map.put(normalized, "required", required ++ missing)
+
+      _ ->
+        normalized
+    end
+  end
+
+  defp normalize_provider_schema(value) when is_list(value), do: Enum.map(value, &normalize_provider_schema/1)
+  defp normalize_provider_schema(value), do: value
+
   @doc "Returns the strict structured-output schema for a factory stage."
   @spec for_stage(atom()) :: map()
   def for_stage(:specification_author) do

@@ -150,6 +150,19 @@ defmodule SymphonyElixir.FactoryCleanupTest do
     assert rehydrated.head == context.candidate
   end
 
+  test "a V1 issue owner quarantines cleanup of an older LEGACY run", context do
+    assert {:ok, _v1} = RunLedger.register(context.store, %{run_id: "newer-supervisor", issue_key: "PPL-123", kind: "DELIVERY", state: "READY_FOR_REVIEW", execution_mode: "TICKET_SUPERVISOR_V1"})
+    assert {:ok, legacy_before} = RunLedger.get(context.store, "run-cleanup")
+    files_before = File.ls!(context.writer.path)
+
+    assert Cleanup.authorization_candidates(context.store, context.policy, "grail") == []
+    assert {:error, :run_quarantined} = Cleanup.authorize(context.store, context.policy, "run-cleanup", "DONE", "merged")
+    assert {:error, :run_quarantined} = Cleanup.apply(context.store, context.policy, "run-cleanup")
+    assert {:ok, legacy_after} = RunLedger.get(context.store, "run-cleanup")
+    assert legacy_after == legacy_before
+    assert File.ls!(context.writer.path) == files_before
+  end
+
   test "refuses to hibernate dirty writer state", context do
     policy =
       Map.put(context.policy, "hibernation", %{

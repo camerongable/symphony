@@ -46,6 +46,45 @@ defmodule SymphonyElixir.FactoryDesktopStageRunnerTest do
     %{store: store}
   end
 
+  test "existing request readback never enqueues, waits, reports a thread or weakens stored tool requirements", %{store: store} do
+    owner = self()
+
+    options =
+      opts(store, owner)
+      |> Keyword.put(:wait_timeout_ms, 0)
+      |> Keyword.put(:required_tool_calls, [%{server: "GitLab", tool: "get_merge_request"}])
+      |> Keyword.put(:on_thread_created, fn thread -> send(owner, {:unexpected_callback, thread}) end)
+
+    key = options[:request_key]
+    readback = fn supplied -> DesktopStageRunner.read_request_result(store, key, @schema, supplied) end
+    assert {:error, {:desktop_request_pending, "PENDING", ^key}} = DesktopStageRunner.run("/tmp/grail", issue(), "Receipt-only fixture", @schema, options)
+    pending = Store.query!(store, "SELECT * FROM desktop_requests").rows
+    assert {:error, {:desktop_request_pending, "PENDING", ^key}} = readback.(options)
+    assert Store.query!(store, "SELECT * FROM desktop_requests").rows == pending
+    assert {:ok, _} = DesktopRequest.claim(store, key)
+    assert {:error, {:desktop_request_pending, "CREATE_UNCERTAIN", ^key}} = readback.(options)
+    assert {:ok, _} = DesktopRequest.record_thread(store, key, "thread-1", "project-grail")
+    output = %{"result" => %{"status" => "DRAFTED"}, "completed_tool_calls" => [%{"server" => "GitLab", "tool" => "get_merge_request", "status" => "completed"}]}
+    assert {:ok, completed} = DesktopRequest.complete(store, key, %{thread_id: "thread-1", turn_id: "turn-1", output: output})
+    original = Store.query!(store, "SELECT * FROM desktop_requests").rows
+
+    assert {:ok, %{thread_id: "thread-1", turn_id: "turn-1", output: %{"status" => "DRAFTED"}}} = readback.(options)
+    assert Store.query!(store, "SELECT * FROM desktop_requests").rows == original
+    refute_receive {:thread_started, _}
+    refute_receive {:unexpected_callback, _}
+    assert {:error, {:required_tool_calls_missing, _}} = readback.(required_tool_calls: [%{server: "GitLab", tool: "extra_required_call"}])
+    assert {:error, :desktop_result_schema_mismatch} = DesktopStageRunner.read_request_result(store, key, Map.put(@schema, "additionalProperties", true))
+    Store.query!(store, "UPDATE desktop_requests SET output_json = ? WHERE request_key = ?", [Jason.encode!(%{output | "completed_tool_calls" => []}), key])
+    assert {:error, {:required_tool_calls_missing, _}} = readback.(required_tool_calls: [])
+    Store.query!(store, "UPDATE desktop_requests SET output_json = '{}' WHERE request_key = ?", [key])
+    assert {:error, :desktop_result_incomplete} = DesktopStageRunner.read_request_result(store, key, @schema)
+    Store.query!(store, "UPDATE desktop_requests SET output_json = NULL WHERE request_key = ?", [key])
+    assert {:error, :desktop_result_incomplete} = DesktopStageRunner.read_request_result(store, key, @schema)
+    Store.query!(store, "UPDATE desktop_requests SET output_json = ?, prompt = 'corrupt' WHERE request_key = ?", [completed["output_json"], key])
+    assert {:error, :request_payload_corrupt} = DesktopStageRunner.read_request_result(store, key, @schema)
+    assert Store.one!(store, "SELECT COUNT(*) AS count FROM desktop_requests")["count"] == 1
+  end
+
   test "one native task creation is persisted and its result is validated", %{store: store} do
     parent = self()
     runner = Task.async(fn -> DesktopStageRunner.run("/tmp/grail", issue(), "Specify", @schema, opts(store, parent)) end)

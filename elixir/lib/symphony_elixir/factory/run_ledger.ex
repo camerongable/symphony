@@ -551,11 +551,20 @@ defmodule SymphonyElixir.Factory.RunLedger do
   def update(connection, run_id, attrs, opts \\ []) do
     normalized_attrs = stringify_keys(attrs)
 
-    if Map.has_key?(normalized_attrs, "execution_mode") do
-      {:error, :execution_mode_immutable}
-    else
-      update_fields(connection, run_id, normalized_attrs, opts)
+    cond do
+      Map.has_key?(normalized_attrs, "execution_mode") ->
+        {:error, :execution_mode_immutable}
+
+      Map.has_key?(normalized_attrs, "candidate_handoff") and ticket_push_owned?(connection, run_id) ->
+        {:error, :candidate_handoff_controller_owned}
+
+      true ->
+        update_fields(connection, run_id, normalized_attrs, opts)
     end
+  end
+
+  defp ticket_push_owned?(connection, run_id) do
+    match?({:ok, %{"execution_mode" => "TICKET_SUPERVISOR_V1"}}, get(connection, run_id))
   end
 
   defp update_fields(connection, run_id, attrs, opts) do

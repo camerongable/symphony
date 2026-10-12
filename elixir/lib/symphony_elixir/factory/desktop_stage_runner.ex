@@ -35,6 +35,34 @@ defmodule SymphonyElixir.Factory.DesktopStageRunner do
     "desktop:" <> digest
   end
 
+  @doc "Reads an existing terminal receipt without enqueueing, waiting or invoking callbacks."
+  @spec read_request_result(Store.connection(), String.t(), map(), keyword()) ::
+          {:ok, result()} | {:error, term()}
+  def read_request_result(store, request_key, schema, opts \\ []) do
+    with {:ok, request} <- DesktopRequest.get(store, request_key),
+         true <- DesktopRequest.payload_intact?(request) or {:error, :request_payload_corrupt},
+         {:ok, stored_schema} <- Jason.decode(request["schema_json"]),
+         true <- stored_schema == schema or {:error, :desktop_result_schema_mismatch},
+         {:ok, metadata} when is_map(metadata) <- Jason.decode(request["metadata_json"]),
+         required = Map.get(metadata, "required_tool_calls", []),
+         supplied = Keyword.get(opts, :required_tool_calls, []),
+         true <- (is_list(required) and is_list(supplied)) or {:error, :invalid_required_tool_calls} do
+      options = opts |> Keyword.drop([:on_thread_started, :on_thread_created]) |> Keyword.put(:required_tool_calls, required ++ supplied)
+      read_result_status(request, schema, options)
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :desktop_result_incomplete}
+    end
+  end
+
+  defp read_result_status(%{"status" => "SUCCEEDED"} = request, schema, opts), do: verified_result(request, schema, opts, nil)
+
+  defp read_result_status(%{"status" => "FAILED", "failure_code" => reason}, _schema, _opts),
+    do: {:error, {:desktop_request_failed, reason}}
+
+  defp read_result_status(request, _schema, _opts),
+    do: {:error, {:desktop_request_pending, request["status"], request["request_key"]}}
+
   @doc "Enqueues and waits for one native task turn with an exact stable request key."
   @spec run(Path.t(), Issue.t(), String.t(), map(), keyword()) ::
           {:ok, result()} | {:error, term()}
@@ -481,7 +509,9 @@ defmodule SymphonyElixir.Factory.DesktopStageRunner do
     end
   end
 
-  defp request_attrs(workspace, prompt, schema, opts, request_key, thread_id) do
+  @doc "Builds the normal Desktop payload without enqueueing or issuing a turn."
+  @spec request_attrs(Path.t(), String.t(), map(), keyword(), String.t(), String.t() | nil) :: map()
+  def request_attrs(workspace, prompt, schema, opts, request_key, thread_id) do
     binding = if present?(thread_id), do: NativeSourceBinding.get(Keyword.fetch!(opts, :store), Keyword.fetch!(opts, :target_key))
     stage_prompt_digest = :sha256 |> :crypto.hash(prompt) |> Base.encode16(case: :lower)
     prompt = source_bound_prompt(prompt, binding)
@@ -533,6 +563,7 @@ defmodule SymphonyElixir.Factory.DesktopStageRunner do
       end
 
     metadata = if binding, do: Map.put(metadata, "control_workspace", binding["control_workspace"]), else: metadata
+    metadata = if Keyword.has_key?(opts, :delivery_operation), do: Map.put(metadata, "delivery_operation", opts[:delivery_operation]), else: metadata
     %{attrs | metadata: metadata}
   end
 
@@ -574,9 +605,9 @@ defmodule SymphonyElixir.Factory.DesktopStageRunner do
     end
   end
 
-  defp verified_result(request, schema, opts, reported_thread_id) do
+  defp verified_result(%{"output_json" => raw} = request, schema, opts, reported_thread_id) when is_binary(raw) do
     with {:ok, %{"result" => output, "completed_tool_calls" => calls}} <-
-           Jason.decode(request["output_json"]),
+           Jason.decode(raw),
          true <- is_map(output) and is_list(calls),
          :ok <- StageSchemas.validate(output, schema),
          :ok <- verify_tool_calls(Keyword.get(opts, :required_tool_calls, []), calls),
@@ -586,8 +617,11 @@ defmodule SymphonyElixir.Factory.DesktopStageRunner do
     else
       false -> {:error, :desktop_result_incomplete}
       {:error, reason} -> {:error, reason}
+      _ -> {:error, :desktop_result_incomplete}
     end
   end
+
+  defp verified_result(_request, _schema, _opts, _reported_thread_id), do: {:error, :desktop_result_incomplete}
 
   defp verify_tool_calls(required, calls) do
     missing =

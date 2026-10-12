@@ -41,8 +41,11 @@ defmodule SymphonyElixir.Factory.MrFeedbackPoller do
       AND r.run_id = (
         SELECT latest.run_id FROM runs AS latest
         WHERE latest.kind = 'DELIVERY' AND latest.issue_key = r.issue_key
+          AND COALESCE(latest.execution_mode, 'LEGACY') = 'LEGACY'
+          AND NOT EXISTS (SELECT 1 FROM runs AS supervisor WHERE supervisor.issue_key = latest.issue_key AND supervisor.execution_mode = 'TICKET_SUPERVISOR_V1')
         ORDER BY latest.created_at DESC, latest.rowid DESC LIMIT 1
       )
+      AND COALESCE(r.execution_mode, 'LEGACY') = 'LEGACY'
     ORDER BY r.created_at, r.run_id
     """)
     |> then(fn result -> Enum.map(result.rows, &Map.new(Enum.zip(result.columns, &1))) end)

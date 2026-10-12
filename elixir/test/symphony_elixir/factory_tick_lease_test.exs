@@ -40,6 +40,34 @@ defmodule SymphonyElixir.FactoryTickLeaseTest do
              Control.status(context.store, context.factory.scope)
   end
 
+  defmodule NoQueueRead do
+    def search(_query, _opts), do: raise("recovery must not poll the queue")
+    def issue(_key, _opts), do: raise("an empty recovery set must not read Jira")
+  end
+
+  test "paused recovery runs only the fixed readback entrypoint and releases without activating", context do
+    recovery_context = %{store: context.store, factory: context.factory}
+    options = [control_server: context.control_name, scheduler_options: [jira_reader: NoQueueRead]]
+    assert {:ran, {:ok, %{launches: [], events: []}}} = TickLease.reconcile(recovery_context, options)
+    assert %{"status" => "PAUSED", "tick_id" => nil} = ControlServer.status(context.control_name)
+    assert {:skipped, "PAUSED"} = TickLease.run(context.factory, fn -> raise "must not run" end, control_server: context.control_name, recovery_only: true)
+  end
+
+  test "recovery obeys dispatcher identity and excludes competing leases while paused", context do
+    wrong = %{store: context.store, factory: %{context.factory | dispatcher_id: "other"}}
+    assert {:skipped, "DISPATCHER_CONFLICT"} = TickLease.reconcile(wrong, control_server: context.control_name)
+    assert %{result: "ACQUIRED", tick_id: tick} = ControlServer.acquire_recovery_tick("dispatcher-a", context.control_name)
+    assert %{result: "LEASE_HELD"} = ControlServer.acquire_recovery_tick("dispatcher-a", context.control_name)
+    assert %{result: "LEASE_MISMATCH"} = ControlServer.renew_recovery_tick("other", tick, context.control_name)
+    assert %{result: "LEASE_RENEWED"} = ControlServer.renew_recovery_tick("dispatcher-a", tick, context.control_name)
+    recovery_context = %{store: context.store, factory: context.factory}
+    assert {:skipped, "LEASE_HELD"} = TickLease.reconcile(recovery_context, control_server: context.control_name)
+    assert {:error, :live_tick_lease} = ControlServer.activate("dispatcher-a", context.control_name)
+    assert %{result: "RELEASED"} = ControlServer.release_tick("dispatcher-a", tick, context.control_name)
+    assert %{result: "LEASE_MISMATCH"} = ControlServer.renew_recovery_tick("dispatcher-a", tick, context.control_name)
+    assert %{"status" => "PAUSED", "tick_id" => nil} = ControlServer.status(context.control_name)
+  end
+
   test "releases the lease when the bounded tick raises", context do
     assert {:ok, _active} = ControlServer.activate("dispatcher-a", context.control_name)
 

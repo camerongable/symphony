@@ -4,6 +4,8 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
   """
 
   alias SymphonyElixir.Factory.{DesktopStageRunner, ModelRouter, RunLedger, StageRunner, Store, TaskLedger}
+  alias SymphonyElixir.Factory.{StageSchemas, TicketChat, TicketWorkerRunner, WorkerEvidence, WorkspaceAccess}
+  alias SymphonyElixir.Factory.{TicketChatCommands, TicketContractAmendment, TicketPush}
 
   @in_flight_states ~w(STARTING RUNNING WAITING_FOR_BROKER WAITING_FOR_WRITER STALE RETRY_PENDING)
   alias SymphonyElixir.Tracker.Issue
@@ -20,17 +22,11 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
           {:ok, launch_result()} | {:already_terminal, map()} | {:already_running, map()} | {:error, term()}
   def launch(store, task_supervisor, run, %Issue{} = issue, workspace, prompt, output_schema, opts)
       when is_binary(workspace) and is_binary(prompt) and is_map(output_schema) do
-    role = Keyword.fetch!(opts, :role)
-    model_policy = Keyword.fetch!(opts, :model_policy)
     project_id = Keyword.fetch!(opts, :project_id)
     section_id = Keyword.get(opts, :section_id)
     codex_assignment = %{project_id: project_id, section_id: section_id}
 
-    with {:ok, route} <-
-           ModelRouter.resolve(model_policy, role,
-             risk: Keyword.get(opts, :risk),
-             risk_signals: Keyword.get(opts, :risk_signals, [])
-           ),
+    with {:ok, route} <- launch_route(store, run, prompt, opts),
          :ok <- validate_run_route(run, issue, Keyword.fetch!(opts, :project_root)) do
       locked_launch(%{
         store: store,
@@ -48,12 +44,52 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
     end
   end
 
+  defp launch_route(store, %{"execution_mode" => "TICKET_SUPERVISOR_V1"}, prompt, opts) do
+    case TaskLedger.get(store, Keyword.fetch!(opts, :task_key)) do
+      {:ok, task} ->
+        if task["status"] != "CONSUMED" or task["prompt_sha256"] == digest(prompt),
+          do: {:ok, stored_route(task, Keyword.fetch!(opts, :role))},
+          else: resolve_route(opts)
+
+      _ ->
+        resolve_route(opts)
+    end
+  end
+
+  defp launch_route(_store, _run, _prompt, opts), do: resolve_route(opts)
+
+  defp resolve_route(opts) do
+    ModelRouter.resolve(Keyword.fetch!(opts, :model_policy), Keyword.fetch!(opts, :role), risk: Keyword.get(opts, :risk), risk_signals: Keyword.get(opts, :risk_signals, []))
+  end
+
+  defp stored_route(task, role) do
+    %{
+      result: "RESOLVED",
+      requested_role: role,
+      resolved_role: task["role"],
+      provider: task["model_provider"],
+      model_class: task["model_class"],
+      model: task["model"],
+      reasoning_effort: task["reasoning_effort"],
+      routing_reason: task["routing_reason"]
+    }
+  end
+
   defp locked_launch(launch) do
     lock = {{__MODULE__, :launch, Keyword.fetch!(launch.opts, :task_key)}, self()}
 
     case :global.trans(lock, fn -> launch_claimed_task(launch) end) do
       :aborted -> {:error, :factory_task_launch_lock_unavailable}
       result -> result
+    end
+  end
+
+  defp launch_claimed_task(%{run: %{"execution_mode" => "TICKET_SUPERVISOR_V1"}} = launch) do
+    task_key = Keyword.fetch!(launch.opts, :task_key)
+
+    case TaskLedger.get(launch.store, task_key) do
+      {:error, :unknown_task} -> begin_ticket_task(launch)
+      {:ok, task} -> existing_ticket_task(launch, task)
     end
   end
 
@@ -88,6 +124,619 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
       {:already_terminal, task} -> {:already_terminal, task}
       {:already_running, task} -> {:already_running, task}
       {:error, _reason} = error -> error
+    end
+  end
+
+  defp recover_ticket_task(store, task) do
+    attempts = WorkerEvidence.pending(store, task["run_id"]) |> Enum.filter(&(&1["task_key"] == task["task_key"])) |> Enum.map(&[&1["request_key"]])
+
+    case attempts do
+      [[key]] ->
+        case WorkerEvidence.adopt_completed(store, key) do
+          {:ok, adopted} -> {:already_terminal, adopted}
+          {:error, _} = error -> error
+        end
+
+      [] ->
+        recover_consumed_ticket_task(store, task)
+
+      _ ->
+        {:error, :worker_attempt_reconciliation_required}
+    end
+  end
+
+  defp existing_ticket_task(launch, task) do
+    cond do
+      live_task?(task["task_key"]) ->
+        {:already_running, task}
+
+      is_map(launch.opts[:blocked_resume]) ->
+        begin_ticket_task(launch)
+
+      task["run_id"] != launch.run["run_id"] or task["role"] != launch.route.requested_role ->
+        {:error, :factory_task_route_mismatch}
+
+      new_ticket_pass?(launch, task) ->
+        begin_ticket_task(launch)
+
+      {task["stage"], task["prompt_sha256"]} != {launch.stage, digest(launch.prompt)} ->
+        {:error, :worker_inputs_changed}
+
+      ticket_attempt_unissued?(launch.store, task) ->
+        begin_ticket_task(launch)
+
+      true ->
+        recover_ticket_task(launch.store, task)
+    end
+  end
+
+  defp new_ticket_pass?(launch, task),
+    do:
+      task["status"] == "CONSUMED" and task["prompt_sha256"] != digest(launch.prompt) and
+        Keyword.get(launch.opts, :resume_terminal, false)
+
+  defp ticket_attempt_unissued?(store, task) do
+    rows = WorkerEvidence.pending(store, task["run_id"]) |> Enum.filter(&(&1["task_key"] == task["task_key"])) |> Enum.map(&[&1["status"]])
+    task["status"] in @in_flight_states and rows in [[], [["RESERVED"]]]
+  end
+
+  defp begin_ticket_task(launch) do
+    admitted_run = if is_map(launch.opts[:ready_rework]), do: Map.put(launch.run, "state", "REVIEW_WRITING"), else: launch.run
+
+    with :ok <- TicketChat.ordinary_delivery_eligibility(admitted_run),
+         :ok <- TicketWorkerRunner.validate_authorization(admitted_run, launch.opts[:authorization]),
+         {:ok, _} <- TicketChat.ready_for_run(launch.store, launch.run["run_id"]),
+         :ok <- TicketWorkerRunner.admitted_stage(admitted_run, launch.route.requested_role),
+         true <- launch.stage == admitted_run["state"] or {:error, :ticket_worker_stage_changed},
+         {:ok, packet} <- TicketWorkerRunner.packet(launch.store, launch.run["run_id"], launch.route.requested_role, launch.opts[:review_base_sha]),
+         true <-
+           ((packet == launch.prompt or launch.opts[:blocked_resume_prompt] == launch.prompt or
+               (is_map(launch.opts[:ready_rework]) and launch.opts[:ready_rework][:prompt] == launch.prompt)) and
+              launch.output_schema == ticket_schema(launch.route.requested_role)) or
+             {:error, :ticket_worker_packet_mismatch},
+         true <- launch.workspace == launch.run["worktree"] or {:error, :ticket_worker_scope_mismatch},
+         {:ok, prepared} <- prepare_ticket_task(launch),
+         {:ok, pid} <- start_task(launch.store, launch.task_supervisor, prepared) do
+      {:ok, %{pid: pid, ref: Process.monitor(pid), task_key: prepared.task["task_key"], route: prepared.route}}
+    end
+  end
+
+  defp ticket_schema("feature-writer"), do: StageSchemas.for_stage(:native_feature_writer)
+  defp ticket_schema("feature-planner"), do: StageSchemas.for_stage(:feature_planner)
+  defp ticket_schema("change-verifier"), do: StageSchemas.for_stage(:change_verifier)
+  defp ticket_schema(_role), do: nil
+
+  defp prepare_ticket_task(launch) do
+    result =
+      Exqlite.transaction(launch.store, fn tx ->
+        case prepare_ticket_task_transaction(tx, launch) do
+          {:error, reason} -> Exqlite.rollback(tx, reason)
+          success -> success
+        end
+      end)
+
+    case result do
+      {:ok, prepared} -> prepared
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp prepare_ticket_task_transaction(store, launch) do
+    cond do
+      is_map(launch.opts[:blocked_resume]) -> prepare_blocked_resume_transaction(store, launch)
+      is_map(launch.opts[:ready_rework]) and launch.opts[:ready_rework][:prepared] -> reuse_prepared_ready_rework_transaction(store, launch)
+      is_map(launch.opts[:ready_rework]) -> prepare_ready_rework_transaction(store, launch)
+      true -> prepare_ordinary_ticket_task_transaction(store, launch)
+    end
+  end
+
+  defp reuse_prepared_ready_rework_transaction(store, launch) do
+    ready = launch.opts[:ready_rework]
+    key = Keyword.fetch!(launch.opts, :task_key)
+
+    with {:ok, current} <- RunLedger.get(store, launch.run["run_id"]),
+         :ok <- current_ticket_launch(current, launch.run),
+         :ok <- TicketWorkerRunner.validate_authorization(current, launch.opts[:authorization]),
+         {:ok, %{receipt: receipt, input: input}} <-
+           TicketChatCommands.validate_ready_rework_replay(store, ready.command_key),
+         true <-
+           {input["input_key"], input["body"], receipt["candidate_sha"]} ==
+             {ready.input_key, ready.input_body, current["candidate_sha"]} or {:error, :ready_rework_input_changed},
+         {:ok, task} <- TaskLedger.get(store, key),
+         {:ok, assignment} <- ready_rework_assignment(task, launch.opts),
+         true <- (task["status"] == "STARTING" and task["prompt_sha256"] == digest(launch.prompt)) or {:error, :ready_rework_task_changed},
+         request = receipt["request_key"],
+         reservation = receipt["reservation_key"],
+         true <- DesktopStageRunner.request_key(key, task["turn_id"], launch.prompt) == request or {:error, :ready_rework_request_changed},
+         {:ok, access} <- WorkspaceAccess.get(store, reservation),
+         true <- (access["generation"] == receipt["reservation_generation"] and access["request_key"] == request) or {:error, :ready_rework_access_changed},
+         validation = WorkspaceAccess.validate(store, reservation, access["generation"], clean: true, candidate_adopted: true),
+         {:ok, _} <- validation,
+         {:ok, %{"status" => "RESERVED", "task_key" => ^key, "reservation_key" => ^reservation} = attempt} <- WorkerEvidence.get(store, request),
+         true <- attempt["binding_sha256"] == digest(attempt["binding_json"]) or {:error, :ready_rework_attempt_changed} do
+      worker_opts =
+        Keyword.merge(launch.opts,
+          project_id: assignment.project_id,
+          section_id: assignment.section_id,
+          request_key: request,
+          reservation_key: reservation,
+          owner_id: "owner:" <> request,
+          resume_thread_id: task["thread_id"],
+          model: task["model"],
+          reasoning_effort: task["reasoning_effort"]
+        )
+
+      {:ok, %{launch | opts: worker_opts} |> Map.merge(%{task: task, resume_thread_id: task["thread_id"]})}
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :ready_rework_prepared_state_unproven}
+    end
+  end
+
+  defp prepare_ready_rework_transaction(store, launch) do
+    ready = launch.opts[:ready_rework]
+    key = Keyword.fetch!(launch.opts, :task_key)
+
+    with {:ok, current} <- RunLedger.get(store, launch.run["run_id"]),
+         :ok <- current_ticket_launch(current, launch.run),
+         :ok <- TicketWorkerRunner.validate_authorization(Map.put(current, "state", "REVIEW_WRITING"), launch.opts[:authorization]),
+         {:ok, plan} <- TicketChatCommands.validate_ready_rework(store, ready.command_key),
+         true <- {plan.input["input_key"], plan.input["body"], ready.prompt} == {ready.input_key, ready.input_body, launch.prompt} or {:error, :ready_rework_input_changed},
+         :ok <- WorkspaceAccess.source_capacity(store, current, Keyword.take(launch.opts, [:capacity_policy, :free_bytes])),
+         {:ok, task} <- TaskLedger.get(store, key),
+         {:ok, assignment} <- ready_rework_assignment(task, launch.opts),
+         {:ok, prior} <- ready_rework_predecessor(store, task, current),
+         {:ok, %{run: changed_run}} <- RunLedger.update(store, current["run_id"], %{state: "REVIEW_WRITING"}),
+         route = %{launch.route | resolved_role: launch.route.requested_role},
+         {:ok, refreshed, resume} <- prepare_task(store, changed_run, key, "REVIEW_WRITING", launch.prompt, route, assignment, Keyword.put(launch.opts, :resume_terminal, true)),
+         request = DesktopStageRunner.request_key(key, refreshed["turn_id"], launch.prompt),
+         reservation = "workspace:" <> request,
+         {:ok, access} <-
+           WorkspaceAccess.acquire(
+             store,
+             %{
+               "reservation_key" => reservation,
+               "run_id" => current["run_id"],
+               "task_key" => key,
+               "request_key" => request,
+               "mode" => "SOURCE",
+               "allowed_root" => launch.opts[:workspace_root],
+               "expected_sha" => current["candidate_sha"]
+             },
+             Keyword.take(launch.opts, [:capacity_policy, :free_bytes])
+           ),
+         true <-
+           {access["canonical_path"], access["git_dir"], access["common_dir"]} == {prior.access["canonical_path"], prior.access["git_dir"], prior.access["common_dir"]} or
+             {:error, :ready_rework_checkout_changed},
+         {:ok, _attempt} <-
+           WorkerEvidence.reserve(store, %{
+             "request_key" => request,
+             "task_key" => key,
+             "reservation_key" => reservation,
+             "input_sha256" => digest(launch.prompt),
+             "owner_id" => "owner:" <> request,
+             "schema" => launch.output_schema,
+             "policy" => TicketWorkerRunner.policy("SOURCE", access["canonical_path"])
+           }),
+         {:ok, _application} <-
+           TicketChatCommands.record_ready_rework(store, ready.command_key, %{
+             "command_key" => ready.command_key,
+             "input_key" => ready.input_key,
+             "candidate_sha" => current["candidate_sha"],
+             "request_key" => request,
+             "reservation_key" => reservation,
+             "reservation_generation" => access["generation"],
+             "prior_request_key" => prior.evidence["request_key"],
+             "prior_evidence_sha256" => digest(Jason.encode!(prior.evidence)),
+             "prior_access_sha256" => digest(Jason.encode!(prior.access)),
+             "prior_evidence_json" => Jason.encode!(prior.evidence),
+             "prior_access_json" => Jason.encode!(prior.access),
+             "prior_run_json" => prior.run_json,
+             "prior_run_sha256" => digest(prior.run_json),
+             "prior_verifier_task_json" => Jason.encode!(prior.verifier_task),
+             "prior_verifier_evidence_json" => Jason.encode!(prior.verifier_evidence),
+             "prior_candidate_handoff" => prior.candidate_handoff,
+             "prior_push_envelope_sha256" => prior.push_proof.envelope_sha256
+           }) do
+      worker_opts =
+        Keyword.merge(launch.opts,
+          project_id: assignment.project_id,
+          section_id: assignment.section_id,
+          request_key: request,
+          reservation_key: reservation,
+          owner_id: "owner:" <> request,
+          resume_thread_id: refreshed["thread_id"],
+          model: refreshed["model"],
+          reasoning_effort: refreshed["reasoning_effort"]
+        )
+
+      {:ok,
+       %{launch | run: changed_run, opts: worker_opts, workspace: access["canonical_path"], route: route}
+       |> Map.merge(%{task: refreshed, resume_thread_id: resume})}
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :ready_rework_preparation_unproven}
+    end
+  end
+
+  @doc false
+  @spec ready_rework_assignment(map(), keyword()) ::
+          {:ok, %{project_id: String.t() | nil, section_id: String.t() | nil}}
+          | {:error, :ready_rework_placement_changed}
+  def ready_rework_assignment(task, opts) do
+    assignment = %{project_id: task["codex_project_id"], section_id: task["codex_section_id"]}
+
+    if Enum.all?([:project_id, :section_id], fn key ->
+         is_nil(Keyword.get(opts, key)) or Keyword.get(opts, key) == Map.fetch!(assignment, key)
+       end),
+       do: {:ok, assignment},
+       else: {:error, :ready_rework_placement_changed}
+  end
+
+  defp ready_rework_predecessor(store, task, run) do
+    evidence =
+      Store.one!(
+        store,
+        "SELECT * FROM worker_evidence WHERE task_key = ? AND run_id = ? AND status = 'CONSUMED' ORDER BY created_at DESC LIMIT 1",
+        [task["task_key"], run["run_id"]]
+      )
+
+    with true <-
+           (task["status"] == "CONSUMED" and is_map(evidence) and evidence["output_json"] == task["output_json"]) or
+             {:error, :ready_rework_predecessor_changed},
+         true <-
+           WorkerEvidence.owner_stopped?(store, evidence) or
+             {:error, :ready_rework_predecessor_owner_not_stopped},
+         {:ok, access} <- WorkspaceAccess.get(store, evidence["reservation_key"]),
+         true <- (not is_nil(access["released_at"]) and access["request_key"] == evidence["request_key"]) or {:error, :ready_rework_predecessor_changed},
+         {:ok, output} <- Jason.decode(evidence["output_json"]),
+         true <- complete_candidate_output?(output, run) or {:error, :ready_rework_predecessor_not_complete},
+         {:ok, verifier} <- ready_rework_verifier_predecessor(store, run) do
+      prior_run = Map.take(run, ~w(run_id issue_key state spec_revision contract_sha256 candidate_sha verifier_round repo_path worktree branch base_branch candidate_handoff mr_iid mr_url mr_state))
+
+      {:ok,
+       %{
+         evidence: evidence,
+         access: access,
+         run_json: Jason.encode!(prior_run),
+         verifier_task: verifier.task,
+         verifier_evidence: verifier.evidence,
+         candidate_handoff: run["candidate_handoff"],
+         push_proof: verifier.push_proof
+       }}
+    else
+      {:error, _} = error -> error
+    end
+  end
+
+  defp complete_candidate_output?(output, run) do
+    output["status"] == "COMPLETE" and (is_nil(output["commit_sha"]) or output["commit_sha"] == run["candidate_sha"])
+  end
+
+  defp ready_rework_verifier_predecessor(store, run) do
+    verifier_key = run["run_id"] <> ":change-verifier:" <> Integer.to_string(run["verifier_round"])
+
+    with {:ok, verifier_task} <- TaskLedger.get(store, verifier_key),
+         {:ok, verifier_evidence} <- WorkerEvidence.verifier_receipt(store, run, verifier_task),
+         {:ok, push_proof} <- TicketPush.completed_proof(store, run["run_id"]),
+         true <-
+           (is_binary(run["candidate_handoff"]) and push_proof.envelope == run["candidate_handoff"]) or
+             {:error, :ready_rework_delivery_history_missing} do
+      {:ok, %{task: verifier_task, evidence: verifier_evidence, push_proof: push_proof}}
+    end
+  end
+
+  defp prepare_ordinary_ticket_task_transaction(store, launch) do
+    key = Keyword.fetch!(launch.opts, :task_key)
+    route = %{launch.route | resolved_role: launch.route.requested_role}
+    assignment = %{project_id: nil, section_id: nil}
+
+    with {:ok, current} <- RunLedger.get(store, launch.run["run_id"]),
+         :ok <- current_ticket_launch(current, launch.run),
+         :ok <- TicketWorkerRunner.validate_authorization(current, launch.opts[:authorization]),
+         {:ok, _task, resume} <- prepare_task(store, launch.run, key, launch.stage, launch.prompt, route, assignment, launch.opts),
+         {:ok, task} <- TaskLedger.update(store, key, %{workspace: launch.workspace, workspace_sha: launch.opts[:expected_sha]}),
+         request = DesktopStageRunner.request_key(key, task["turn_id"], launch.prompt),
+         reservation = "workspace:" <> request,
+         mode = if(task["role"] == "feature-writer", do: "SOURCE", else: "REVIEW"),
+         {:ok, _} <-
+           WorkspaceAccess.acquire(
+             store,
+             %{
+               "reservation_key" => reservation,
+               "run_id" => launch.run["run_id"],
+               "task_key" => key,
+               "request_key" => request,
+               "mode" => mode,
+               "allowed_root" => launch.opts[:workspace_root],
+               "expected_sha" => launch.opts[:expected_sha]
+             },
+             Keyword.take(launch.opts, [:capacity_policy, :free_bytes])
+           ) do
+      worker_opts = Keyword.merge(launch.opts, request_key: request, reservation_key: reservation, owner_id: "owner:" <> request, model: task["model"], reasoning_effort: task["reasoning_effort"])
+      {:ok, %{launch | opts: worker_opts, route: route} |> Map.merge(%{task: task, resume_thread_id: resume})}
+    end
+  end
+
+  defp prepare_blocked_resume_transaction(store, launch) do
+    if launch.opts[:blocked_resume]["prepared"],
+      do: reuse_prepared_blocked_resume(store, launch),
+      else: create_blocked_resume(store, launch)
+  end
+
+  defp create_blocked_resume(store, launch) do
+    key = Keyword.fetch!(launch.opts, :task_key)
+    resume = launch.opts[:blocked_resume]
+
+    with {:ok, current} <- RunLedger.get(store, launch.run["run_id"]),
+         :ok <- current_ticket_launch(current, launch.run),
+         :ok <- TicketWorkerRunner.validate_authorization(current, launch.opts[:authorization]),
+         :ok <- WorkspaceAccess.source_capacity(store, current, Keyword.take(launch.opts, [:capacity_policy, :free_bytes])),
+         {:ok, task} <- TaskLedger.get(store, key),
+         request = DesktopStageRunner.request_key(key, task["turn_id"], launch.prompt),
+         reservation = "workspace:" <> request,
+         true <- blocked_source_task?(task, resume) or {:error, :blocked_resume_task_not_stopped},
+         {:ok, completed, _amendment_receipt} <- blocked_resume_result(store, task, current, resume),
+         {:ok, expected_sha} <- blocked_resume_expected_sha(completed, resume, current, launch.opts),
+         evidence = completed.evidence,
+         true <- completed.output["status"] == "BLOCKED" or {:error, :blocked_resume_result_invalid},
+         true <- launch.prompt == launch.opts[:blocked_resume_prompt] or {:error, :blocked_resume_prompt_mismatch},
+         :ok <- TicketChatCommands.preflight_rework_transfer(store, resume["command_key"]),
+         proof =
+           Map.merge(resume, %{
+             "request_key" => evidence["request_key"],
+             "output_sha256" => evidence["output_sha256"],
+             "task_key" => key,
+             "reservation_key" => evidence["reservation_key"],
+             "reservation_generation" => Jason.decode!(evidence["binding_json"])["reservation_generation"],
+             "new_prompt_sha256" => digest(launch.prompt),
+             "amendment_command_key" => resume["amendment_command_key"],
+             "checkout_head_sha" => expected_sha
+           }),
+         attrs = %{
+           "reservation_key" => reservation,
+           "run_id" => current["run_id"],
+           "task_key" => key,
+           "request_key" => request,
+           "mode" => "SOURCE",
+           "allowed_root" => launch.opts[:workspace_root],
+           "expected_sha" => expected_sha
+         },
+         {:ok, access} <- WorkspaceAccess.transfer_blocked_source(store, evidence["reservation_key"], proof["reservation_generation"], attrs, proof),
+         {:ok, prepared_task} <-
+           TaskLedger.update(store, key, %{
+             stage: launch.stage,
+             status: "STARTING",
+             prompt_sha256: digest(launch.prompt),
+             workspace: access["canonical_path"],
+             workspace_sha: expected_sha,
+             output_json: nil,
+             failure_code: nil
+           }),
+         policy = TicketWorkerRunner.policy("SOURCE", access["canonical_path"]),
+         {:ok, _attempt} <-
+           WorkerEvidence.reserve(store, %{
+             "request_key" => request,
+             "task_key" => key,
+             "reservation_key" => reservation,
+             "input_sha256" => digest(launch.prompt),
+             "owner_id" => "owner:" <> request,
+             "schema" => launch.output_schema,
+             "policy" => policy
+           }),
+         transfer = %{
+           "kind" => "BLOCKED_SOURCE_TRANSFER",
+           "old_request_key" => evidence["request_key"],
+           "old_reservation_key" => evidence["reservation_key"],
+           "new_request_key" => request,
+           "new_reservation_key" => reservation,
+           "new_generation" => access["generation"],
+           "disposition_key" => resume["disposition_key"],
+           "output_sha256" => evidence["output_sha256"],
+           "amendment_command_key" => resume["amendment_command_key"],
+           "checkout_head_sha" => expected_sha
+         },
+         {:ok, _command} <- TicketChatCommands.record_rework_transfer(store, resume["command_key"], transfer) do
+      worker_opts =
+        Keyword.merge(launch.opts,
+          request_key: request,
+          reservation_key: reservation,
+          expected_sha: expected_sha,
+          owner_id: "owner:" <> request,
+          resume_thread_id: prepared_task["thread_id"],
+          blocked_resume: resume,
+          model: prepared_task["model"],
+          reasoning_effort: prepared_task["reasoning_effort"]
+        )
+
+      {:ok,
+       %{launch | opts: worker_opts, route: %{launch.route | resolved_role: prepared_task["role"]}, workspace: access["canonical_path"]}
+       |> Map.merge(%{task: prepared_task, resume_thread_id: prepared_task["thread_id"]})}
+    else
+      {:error, _} = error -> error
+    end
+  end
+
+  defp blocked_source_task?(task, resume),
+    do: task["status"] == "COMPLETE" and task["role"] == "feature-writer" and task["thread_id"] == resume["thread_id"]
+
+  defp completed_result_matches?(completed, task, run, resume),
+    do: completed.task == task and completed.run == run and completed.access["request_key"] == resume["request_key"]
+
+  defp blocked_resume_result(store, task, run, %{"amendment_command_key" => command_key} = resume) do
+    with {:ok, receipt} <- TicketContractAmendment.blocked_predecessor_for_request(store, resume["request_key"]),
+         true <- receipt["command_key"] == command_key or {:error, :blocked_resume_amendment_link_mismatch},
+         :ok <- WorkspaceAccess.validate_blocked_amendment_predecessor(store, receipt),
+         {:ok, predecessor} <- Jason.decode(receipt["blocked_predecessor_json"]),
+         {:ok, evidence} when is_map(evidence) <- Jason.decode(predecessor["evidence_json"]),
+         {:ok, held_task} when is_map(held_task) <- Jason.decode(predecessor["task_json"]),
+         {:ok, access} when is_map(access) <- Jason.decode(predecessor["access_json"]),
+         {:ok, binding} when is_map(binding) <- Jason.decode(evidence["binding_json"]),
+         {:ok, output} when is_map(output) <- Jason.decode(evidence["output_json"]),
+         true <- (held_task == task and output["status"] == "BLOCKED") or {:error, :blocked_resume_predecessor_changed} do
+      {:ok,
+       %{
+         run: run,
+         task: held_task,
+         evidence: evidence,
+         binding: binding,
+         output: output,
+         access: access,
+         checkout_head_sha: predecessor["checkout_head_sha"]
+       }, receipt}
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :blocked_resume_predecessor_unproven}
+    end
+  end
+
+  defp blocked_resume_result(store, task, run, resume) do
+    with {:ok, completed} <- WorkerEvidence.completed_result(store, resume["request_key"]),
+         true <- completed_result_matches?(completed, task, run, resume) or {:error, :blocked_resume_result_changed} do
+      {:ok, completed, nil}
+    else
+      {:error, _} = error -> error
+    end
+  end
+
+  defp blocked_resume_expected_sha(completed, %{"amendment_command_key" => command_key} = resume, %{"candidate_sha" => nil}, _opts)
+       when is_binary(command_key) do
+    expected = resume["checkout_head_sha"]
+
+    if valid_sha?(expected) and
+         (is_nil(Map.get(completed, :checkout_head_sha)) or Map.get(completed, :checkout_head_sha) == expected) do
+      {:ok, expected}
+    else
+      {:error, :blocked_resume_expected_sha_unproven}
+    end
+  end
+
+  defp blocked_resume_expected_sha(_completed, _resume, %{"candidate_sha" => nil}, _opts),
+    do: {:error, :blocked_resume_expected_sha_unproven}
+
+  defp blocked_resume_expected_sha(completed, _resume, current, opts) do
+    expected = Map.get(completed, :checkout_head_sha) || current["candidate_sha"] || opts[:expected_sha]
+    if valid_sha?(expected), do: {:ok, expected}, else: {:error, :blocked_resume_expected_sha_unproven}
+  end
+
+  defp valid_sha?(sha), do: is_binary(sha) and Regex.match?(~r/\A[0-9a-f]{40}\z/, sha)
+
+  defp reuse_prepared_blocked_resume(store, launch) do
+    resume = launch.opts[:blocked_resume]
+    key = Keyword.fetch!(launch.opts, :task_key)
+    request = resume["prepared_request_key"]
+    reservation = resume["prepared_reservation_key"]
+
+    with {:ok, current} <- RunLedger.get(store, launch.run["run_id"]),
+         :ok <- current_ticket_launch(current, launch.run),
+         :ok <- TicketWorkerRunner.validate_authorization(current, launch.opts[:authorization]),
+         :ok <- WorkspaceAccess.source_capacity(store, current, Keyword.take(launch.opts, [:capacity_policy, :free_bytes])),
+         {:ok, task} <- TaskLedger.get(store, key),
+         true <- prepared_task_matches?(task, launch, resume) or {:error, :blocked_resume_prepared_task_mismatch},
+         {:ok, access} <- WorkspaceAccess.validate(store, reservation, resume["prepared_reservation_generation"]),
+         :ok <- prepared_resume_head_current(access, resume),
+         true <-
+           prepared_access_matches?(access, request, key, current["run_id"]) or
+             {:error, :blocked_resume_prepared_access_mismatch},
+         {:ok, evidence} <- WorkerEvidence.get(store, request),
+         true <-
+           prepared_attempt_matches?(evidence, key, reservation, request) or
+             {:error, :blocked_resume_prepared_attempt_mismatch},
+         policy = TicketWorkerRunner.policy("SOURCE", access["canonical_path"]),
+         {:ok, attempt} <-
+           WorkerEvidence.reserve(store, %{
+             "request_key" => request,
+             "task_key" => key,
+             "reservation_key" => reservation,
+             "input_sha256" => digest(launch.prompt),
+             "owner_id" => "owner:" <> request,
+             "schema" => launch.output_schema,
+             "policy" => policy
+           }),
+         true <-
+           WorkerEvidence.superseded_blocked_attempt?(store, Store.one!(store, "SELECT * FROM worker_evidence WHERE request_key = ?", [resume["request_key"]])) or
+             {:error, :blocked_resume_supersession_unproven},
+         {:ok, %{"status" => "APPLIED", "application_receipt_json" => receipt_json}} <- TicketChatCommands.get(store, resume["command_key"]),
+         :ok <- TicketChatCommands.validate_rework_replay(store, resume["command_key"]),
+         {:ok, receipt} <- Jason.decode(receipt_json),
+         true <-
+           (receipt["request_key"] == request and receipt["prior_request_key"] == resume["request_key"] and receipt["disposition_key"] == resume["disposition_key"]) or
+             {:error, :blocked_resume_command_link_mismatch} do
+      worker_opts =
+        Keyword.merge(launch.opts,
+          request_key: request,
+          reservation_key: reservation,
+          owner_id: attempt["owner_id"],
+          resume_thread_id: task["thread_id"],
+          blocked_resume: resume,
+          model: task["model"],
+          reasoning_effort: task["reasoning_effort"]
+        )
+
+      {:ok, %{launch | opts: worker_opts, route: %{launch.route | resolved_role: task["role"]}} |> Map.merge(%{task: task, resume_thread_id: task["thread_id"]})}
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :blocked_resume_prepared_attempt_unproven}
+    end
+  end
+
+  defp prepared_resume_head_current(access, %{"amendment_command_key" => command_key, "checkout_head_sha" => expected})
+       when is_binary(command_key) and is_binary(expected) do
+    with true <- valid_sha?(expected),
+         {:ok, %{"expected_sha" => ^expected}} <- Jason.decode(access["binding_json"]) do
+      case WorkerEvidence.checkout_head(access) do
+        {:ok, ^expected} -> :ok
+        _ -> {:error, :blocked_resume_checkout_head_changed}
+      end
+    else
+      {:error, _reason} -> {:error, :blocked_resume_checkout_head_unproven}
+      _ -> {:error, :blocked_resume_checkout_head_unproven}
+    end
+  end
+
+  defp prepared_resume_head_current(_access, %{"amendment_command_key" => command_key}) when is_binary(command_key),
+    do: {:error, :blocked_resume_checkout_head_unproven}
+
+  defp prepared_resume_head_current(_access, _resume), do: :ok
+
+  defp prepared_task_matches?(task, launch, resume),
+    do: task["status"] == "STARTING" and task["prompt_sha256"] == digest(launch.prompt) and task["thread_id"] == resume["thread_id"]
+
+  defp prepared_access_matches?(access, request, task_key, run_id),
+    do: {access["request_key"], access["task_key"], access["run_id"], access["mode"]} == {request, task_key, run_id, "SOURCE"}
+
+  defp prepared_attempt_matches?(evidence, task_key, reservation, request),
+    do: {evidence["status"], evidence["task_key"], evidence["reservation_key"], evidence["owner_id"]} == {"RESERVED", task_key, reservation, "owner:" <> request}
+
+  defp current_ticket_launch(current, expected) do
+    fields = ~w(issue_key state execution_mode manual_validation_required contract_sha256 spec_revision
+      contract_markdown snapshot_json worktree branch candidate_sha implementation_iteration verifier_round)
+    if Map.take(current, fields) == Map.take(expected, fields), do: :ok, else: {:error, :ticket_worker_inputs_changed}
+  end
+
+  defp recover_consumed_ticket_task(store, task) do
+    rows =
+      Store.query!(
+        store,
+        """
+        SELECT request_key FROM worker_evidence WHERE task_key = ? AND status = 'CONSUMED'
+          AND thread_id = ? AND turn_id = ?
+        """,
+        [task["task_key"], task["thread_id"], task["turn_id"]]
+      ).rows
+
+    case rows do
+      [[key]] ->
+        case WorkerEvidence.adopt_completed(store, key) do
+          {:ok, adopted} -> {:already_terminal, adopted}
+          error -> error
+        end
+
+      [] ->
+        {:error, :ticket_worker_launch_not_integrated}
+
+      _ ->
+        {:error, :worker_attempt_reconciliation_required}
     end
   end
 
@@ -217,6 +866,35 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
 
       {:error, _reason} = error ->
         error
+    end
+  end
+
+  defp run_child(store, %{run: %{"execution_mode" => "TICKET_SUPERVISOR_V1"}} = launch, caller, claim_ref) do
+    key = launch.task["task_key"]
+
+    if :global.register_name(task_registration(key), self()) == :no do
+      send(caller, {:factory_task_claimed, claim_ref, :already_running})
+    else
+      send(caller, {:factory_task_claimed, claim_ref, :ok})
+      recipient = Keyword.fetch!(launch.opts, :recipient)
+
+      started = fn thread ->
+        TaskLedger.update_if_current(store, key, digest(launch.prompt), @in_flight_states, %{status: "RUNNING", thread_id: thread})
+        send(recipient, {:factory_task_started, key, thread})
+      end
+
+      opts = Keyword.merge(launch.opts, store: store, target_key: key, on_thread_started: started)
+      result = TicketWorkerRunner.run(launch.workspace, launch.issue, launch.prompt, launch.output_schema, opts)
+
+      case result do
+        {:ok, _} ->
+          persist_result(store, key, digest(launch.prompt), result)
+
+        {:error, reason} ->
+          TaskLedger.update_if_current(store, key, digest(launch.prompt), @in_flight_states, %{status: "STALE", failure_code: inspect(reason)})
+      end
+
+      send(recipient, {:factory_task_finished, key, result})
     end
   end
 

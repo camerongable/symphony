@@ -3,6 +3,136 @@ defmodule SymphonyElixir.FactoryContractTest do
 
   alias SymphonyElixir.Factory.Contract
 
+  @validation_markdown """
+  ## Manual Validation
+  - Required: yes
+  - MV-1: Submit a synthetic vote; expect two agreeing judges.
+  - MV-2: Repeat without an override; expect the configured threshold.
+  - Environment: cpp-test
+  - Services: doc-extract, doc-extract-worker
+  - Setup and deploy: Deploy the exact candidate using the approved controller action.
+  - Test data: Synthetic non-PHI/PII fixture with cleanup identifier fixture-1.
+  - Evidence: Keep the response and exact deployed image digest.
+  - Teardown: Restore the previously observed images.
+  - Database migrations: none
+  ### Rollout
+  - Services: not part of validation
+  """
+
+  test "required validation retains the exact declared cases and procedure without granting execution" do
+    assert {:ok, definition} = Contract.manual_validation_definition(@validation_markdown)
+
+    assert definition == %{
+             "environment" => "cpp-test",
+             "services" => ["doc-extract", "doc-extract-worker"],
+             "cases" => [
+               %{"id" => "MV-1", "expectation" => "Submit a synthetic vote; expect two agreeing judges."},
+               %{"id" => "MV-2", "expectation" => "Repeat without an override; expect the configured threshold."}
+             ],
+             "setup_and_deploy" => "Deploy the exact candidate using the approved controller action.",
+             "test_data" => "Synthetic non-PHI/PII fixture with cleanup identifier fixture-1.",
+             "evidence" => "Keep the response and exact deployed image digest.",
+             "teardown" => "Restore the previously observed images.",
+             "database_migrations" => "none"
+           }
+  end
+
+  test "ambiguous, hidden or incomplete required validation cannot yield partial declarations" do
+    invalid = [
+      String.replace(@validation_markdown, "- Services: doc-extract, doc-extract-worker", "- Services: doc-extract\n- services: doc-extract-worker"),
+      String.replace(@validation_markdown, "- Evidence: Keep the response and exact deployed image digest.", "- Evidence: \r"),
+      String.replace(@validation_markdown, "- MV-2:", "- MV-01:"),
+      String.replace(@validation_markdown, "- MV-2:", "- MV-1:"),
+      String.replace(@validation_markdown, "- MV-1:", "- MV-0:"),
+      String.replace(@validation_markdown, "- MV-2:", "- MV-foo:"),
+      String.replace(@validation_markdown, "- Services:", "  - Services:"),
+      String.replace(@validation_markdown, "- Test data:", "```\n- Test data:"),
+      String.replace(@validation_markdown, "- Teardown:", "    continue a prior declaration\n- Teardown:"),
+      "```markdown\n" <> @validation_markdown <> "```\n",
+      "~~~~markdown\n" <> @validation_markdown <> "~~~~\n",
+      String.replace(@validation_markdown, "- Required: yes", "- Required: yes\n- Unknown action: deploy somewhere else")
+    ]
+
+    for markdown <- invalid do
+      assert {:error, _} = Contract.manual_validation_definition(markdown)
+    end
+  end
+
+  test "rejects a required validation section hidden inside an HTML comment" do
+    commented = "<!--\n" <> String.trim(@validation_markdown)
+    commented = String.replace(commented, "- Database migrations: none", "- Database migrations: none -->")
+
+    assert {:error, :manual_validation_format_unsupported} = Contract.manual_validation_required(commented)
+    assert {:error, _} = Contract.manual_validation_definition(commented)
+  end
+
+  test "rejects HTML comments that hide later validation fields" do
+    commented =
+      @validation_markdown
+      |> String.replace("- Evidence: Keep the response and exact deployed image digest.", "- Evidence: Keep the response and exact deployed image digest. <!--")
+      |> String.replace("- Database migrations: none", "- Database migrations: none -->")
+
+    assert {:error, :manual_validation_format_unsupported} = Contract.manual_validation_required(commented)
+    assert {:error, _} = Contract.manual_validation_definition(commented)
+  end
+
+  test "validation declarations bound environments, services and payload sizes before compilation" do
+    for environment <- ["production", "cpp-prod", "staging", "cpp-test; deploy elsewhere"] do
+      markdown = String.replace(@validation_markdown, "- Environment: cpp-test", "- Environment: #{environment}")
+      assert {:error, :manual_validation_environment_not_supported} = Contract.manual_validation_definition(markdown)
+    end
+
+    for services <- ["", "doc-extract,", "doc-extract, doc-extract", "../doc-extract", "--help", "doc extract", String.duplicate("a", 65)] do
+      markdown = String.replace(@validation_markdown, "doc-extract, doc-extract-worker", services)
+      assert {:error, _} = Contract.manual_validation_definition(markdown)
+    end
+
+    oversized = String.replace(@validation_markdown, "Keep the response and exact deployed image digest.", String.duplicate("a", 4097))
+    assert {:error, {:manual_validation_field_invalid, "evidence"}} = Contract.manual_validation_definition(oversized)
+    oversized_section = String.replace(@validation_markdown, "### Rollout", String.duplicate("\n", 16_385) <> "### Rollout")
+    assert {:error, :manual_validation_definition_too_large} = Contract.manual_validation_definition(oversized_section)
+  end
+
+  test "explicit case references must match the actual declarations, without requiring contiguous numbering" do
+    markdown = String.replace(@validation_markdown, "- MV-2:", "- MV-7:")
+    referenced = String.replace(markdown, "- Required: yes", "- Required: yes\n- Cases: MV-1, MV-7")
+    assert {:ok, definition} = Contract.manual_validation_definition(referenced)
+    assert Enum.map(definition["cases"], & &1["id"]) == ["MV-1", "MV-7"]
+
+    for value <- ["MV-1, MV-2", "MV-7, MV-1", "MV-1, MV-7, MV-7", ""] do
+      changed = String.replace(referenced, "- Cases: MV-1, MV-7", "- Cases: #{value}")
+      assert {:error, :manual_validation_cases_invalid} = Contract.manual_validation_definition(changed)
+    end
+  end
+
+  test "optional validation preserves the legacy skip while malformed required input never compiles" do
+    assert {:ok, nil} = Contract.manual_validation_definition("## Manual Validation\n- Required: no\n- Reason: unit tests suffice")
+
+    for markdown <- [nil, <<255>>, String.duplicate("a", 1_048_577), "no declaration", "## Manual Validation\n- Required: perhaps", "## Manual Validation\n- Required: no\n- Required: yes"] do
+      assert {:error, _} = Contract.manual_validation_definition(markdown)
+    end
+
+    for environment <- ["cpp-dev", "cpp-sandbox", "cpp-test"] do
+      changed = String.replace(@validation_markdown, "cpp-test", environment)
+      assert {:ok, %{"environment" => ^environment}} = Contract.manual_validation_definition(changed)
+    end
+
+    for label <- ["Environment", "Services", "Setup and deploy", "Test data", "Evidence", "Teardown", "Database migrations"] do
+      absent = Regex.replace(~r/^- #{Regex.escape(label)}:.*\n/m, @validation_markdown, "")
+      assert {:error, _} = Contract.manual_validation_definition(absent)
+    end
+
+    without_cases = Regex.replace(~r/^- MV-[0-9]+:.*\n/m, @validation_markdown, "")
+    assert {:error, :manual_validation_cases_invalid} = Contract.manual_validation_definition(without_cases)
+    blank_case = String.replace(@validation_markdown, "Submit a synthetic vote; expect two agreeing judges.", "")
+    assert {:error, :manual_validation_cases_invalid} = Contract.manual_validation_definition(blank_case)
+    nul_case = String.replace(@validation_markdown, "Submit a synthetic vote; expect two agreeing judges.", <<0>>)
+    assert {:error, :manual_validation_cases_invalid} = Contract.manual_validation_definition(nul_case)
+    assert {:ok, _} = Contract.manual_validation_definition(String.replace(@validation_markdown, "\n", "\r\n"))
+    prefix = "<!-- example -->\n## Examples\n````text\n```\n~~~~\n<!-- a literal HTML-comment example -->\n````\n"
+    assert {:ok, _} = Contract.manual_validation_definition(prefix <> @validation_markdown)
+  end
+
   test "binds an exact contract through draft, confirmation, and authorization markers" do
     contract = Contract.bind("PPL-123", 2, "# Delivery contract\n\n- AC-1: works\n")
     draft = Contract.draft_comment(contract)

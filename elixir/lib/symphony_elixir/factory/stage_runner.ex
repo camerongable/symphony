@@ -1,9 +1,10 @@
 defmodule SymphonyElixir.Factory.StageRunner do
   @moduledoc """
-  Runs one named, durable Codex factory task and returns its structured result.
+  Runs one named Codex factory task and returns its structured result.
 
-  Every task is a non-ephemeral Codex thread. A caller may resume the same
-  thread ID after a restart or for another bounded pass.
+  Sessions are durable by default, so a caller may resume the same thread ID
+  after a restart or for another bounded pass. Callers may opt into ephemeral
+  sessions when that lifecycle is appropriate.
   """
 
   alias SymphonyElixir.Codex.AppServer
@@ -21,7 +22,7 @@ defmodule SymphonyElixir.Factory.StageRunner do
           required(:tool) => String.t()
         }
 
-  @doc "Runs one structured stage turn in a durable Codex task."
+  @doc "Runs one structured stage turn; sessions are durable unless explicitly ephemeral."
   @spec run(Path.t(), Issue.t(), String.t(), map(), keyword()) ::
           {:ok, result()} | {:error, term()}
   def run(workspace, %Issue{} = issue, prompt, output_schema, opts \\ [])
@@ -37,6 +38,9 @@ defmodule SymphonyElixir.Factory.StageRunner do
       |> Keyword.take([
         :allowed_mcp_tool_approvals,
         :approval_policy,
+        :ephemeral,
+        :worker_access,
+        :worker_files,
         :fork_on_active_writer,
         :model,
         :mcp_startup_timeout_ms,
@@ -56,15 +60,49 @@ defmodule SymphonyElixir.Factory.StageRunner do
       |> Keyword.put_new(:thread_source, "symphonyFactory")
       |> Keyword.put(:on_thread_created, Keyword.get(opts, :on_thread_created, Keyword.get(opts, :on_thread_started)))
 
-    case app_server.start_session(workspace, session_opts) do
-      {:ok, session} ->
-        Agent.update(collector, &Map.put(&1, :expected_thread_id, session.thread_id))
-        run_session(app_server, session, issue, prompt, output_schema, on_message, collector, opts)
+    try do
+      case app_server.start_session(workspace, session_opts) do
+        {:ok, session} ->
+          Agent.update(collector, &Map.put(&1, :expected_thread_id, session.thread_id))
 
-      {:error, reason} ->
-        Agent.stop(collector)
-        {:error, reason}
+          if Keyword.get(opts, :include_evidence, false),
+            do: run_owned_session(app_server, session, issue, prompt, output_schema, on_message, collector, opts),
+            else: run_session(app_server, session, issue, prompt, output_schema, on_message, collector, opts)
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    after
+      if Process.alive?(collector), do: Agent.stop(collector)
     end
+  end
+
+  defp run_owned_session(app_server, session, issue, prompt, schema, on_message, collector, opts) do
+    context = %{on_message: on_message, collector: collector, required_tool_calls: Keyword.get(opts, :required_tool_calls, []), format_repair_attempts: 0, event_scope: :exact_turn}
+
+    try do
+      if is_function(opts[:on_session_ready], 1), do: opts[:on_session_ready].(session)
+      result = run_structured_turn(app_server, session, issue, prompt, schema, context)
+      stopped = app_server.stop_session(session)
+      owned_result(result, stopped, session, collector)
+    catch
+      kind, reason ->
+        app_server.stop_session(session)
+        :erlang.raise(kind, reason, __STACKTRACE__)
+    after
+      Agent.stop(collector)
+    end
+  end
+
+  defp owned_result({:ok, turn, output}, {:ok, stop}, session, collector) do
+    {:ok, %{thread_id: session.thread_id, turn_id: turn.turn_id, output: output, item_id: Agent.get(collector, & &1.item_id), policy: session.worker_policy, owner_stop: stop}}
+  end
+
+  defp owned_result({:error, _} = error, _stopped, _session, _collector), do: error
+
+  defp owned_result({:ok, turn, output}, stopped, session, collector) do
+    observed = %{thread_id: session.thread_id, turn_id: turn.turn_id, output: output, item_id: Agent.get(collector, & &1.item_id), policy: session.worker_policy}
+    {:error, {:worker_shutdown_unproven, stopped, observed}}
   end
 
   defp run_session(app_server, session, issue, prompt, output_schema, on_message, collector, opts) do
@@ -79,7 +117,9 @@ defmodule SymphonyElixir.Factory.StageRunner do
     with :ok <- maybe_archive_forked_thread(app_server, session, opts),
          {:ok, turn, output} <-
            run_structured_turn(app_server, session, issue, prompt, output_schema, turn_context) do
-      {:ok, %{thread_id: session.thread_id, turn_id: turn.turn_id, output: output}}
+      result = %{thread_id: session.thread_id, turn_id: turn.turn_id, output: output}
+      result = if Keyword.get(opts, :include_evidence, false), do: Map.merge(result, %{item_id: Agent.get(collector, & &1.item_id), policy: Map.get(session, :worker_policy)}), else: result
+      {:ok, result}
     end
   after
     app_server.stop_session(session)
@@ -90,7 +130,7 @@ defmodule SymphonyElixir.Factory.StageRunner do
     with {:ok, turn} <-
            app_server.run_turn(session, prompt, issue,
              on_message: context.on_message,
-             output_schema: output_schema,
+             output_schema: StageSchemas.for_provider(output_schema),
              event_scope: context.event_scope
            ) do
       returned_identity = {session.thread_id, turn.turn_id}
@@ -145,6 +185,7 @@ defmodule SymphonyElixir.Factory.StageRunner do
       Agent.start_link(fn ->
         %{
           output: nil,
+          item_id: nil,
           completed_tool_calls: [],
           event_scope: event_scope,
           identity: nil,
@@ -183,13 +224,16 @@ defmodule SymphonyElixir.Factory.StageRunner do
     state = Agent.get(collector, & &1)
 
     case collector_payload_scope(payload, state) do
-      :matching -> collect_item_payload(collector, payload)
+      :matching -> maybe_collect_completed(collector, payload, state)
       :missing -> record_missing_collector_identity(collector, state)
       :foreign -> :ok
     end
   end
 
   defp maybe_collect_output(_collector, _message), do: :ok
+
+  defp maybe_collect_completed(_collector, %{"method" => method}, %{event_scope: :exact_turn}) when method != "item/completed", do: :ok
+  defp maybe_collect_completed(collector, payload, _state), do: collect_item_payload(collector, payload)
 
   defp collector_payload_scope(_payload, %{event_scope: :legacy}), do: :matching
   defp collector_payload_scope(_payload, %{identity: nil}), do: :missing
@@ -208,8 +252,8 @@ defmodule SymphonyElixir.Factory.StageRunner do
       %{"type" => "agentMessage", "phase" => "commentary"} ->
         :ok
 
-      %{"type" => "agentMessage", "text" => text} when is_binary(text) ->
-        Agent.update(collector, &Map.put(&1, :output, text))
+      %{"type" => "agentMessage", "text" => text} = item when is_binary(text) ->
+        Agent.update(collector, &Map.merge(&1, %{output: text, item_id: item["id"]}))
 
       %{} = item ->
         collect_tool_call(collector, payload, item)

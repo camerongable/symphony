@@ -343,7 +343,8 @@ defmodule SymphonyElixir.FactoryNativeSourceBindingTest do
     ]
 
     runner = Task.async(fn -> DesktopStageRunner.run(ctx.repo, %Issue{}, "Implement", %{"type" => "object"}, opts) end)
-    setup_request = wait_request(ctx.store, "stage:bootstrap")
+    wait_timeout_ms = Keyword.fetch!(opts, :wait_timeout_ms)
+    setup_request = wait_for_stage_request(ctx.store, "stage:bootstrap", runner, wait_timeout_ms)
     assert setup_request["model"] == "gpt-6-luna"
     assert setup_request["reasoning_effort"] == "low"
     assert {:ok, _} = DesktopRequest.claim(ctx.store, "stage:bootstrap")
@@ -354,7 +355,7 @@ defmodule SymphonyElixir.FactoryNativeSourceBindingTest do
     Process.sleep(20)
     assert {:ok, ^recorded} = DesktopRequest.get(ctx.store, "stage:bootstrap")
     assert {:ok, _} = DesktopRequest.complete(ctx.store, "stage:bootstrap", bootstrap_completion(ctx.sha))
-    source_request = wait_request(ctx.store, "stage")
+    source_request = wait_for_stage_request(ctx.store, "stage", runner, wait_timeout_ms)
     assert source_request["model"] == "gpt-6.1-sol"
     assert source_request["reasoning_effort"] == "medium"
     assert source_request["cwd"] == ctx.source
@@ -384,17 +385,34 @@ defmodule SymphonyElixir.FactoryNativeSourceBindingTest do
     assert NativeSourceBinding.get(ctx.store, "run:feature-writer")["source_workspace"] == ctx.source
   end
 
-  defp wait_request(store, key, attempts \\ 200)
-  defp wait_request(_store, key, 0), do: flunk("request missing: #{key}")
+  defp wait_for_stage_request(store, key, runner, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    wait_for_stage_request(store, key, runner, deadline, timeout_ms)
+  end
 
-  defp wait_request(store, key, attempts) do
+  defp wait_for_stage_request(store, key, runner, deadline, timeout_ms) do
     case DesktopRequest.get(store, key) do
       {:ok, request} ->
         request
 
       _other ->
-        Process.sleep(5)
-        wait_request(store, key, attempts - 1)
+        poll_stage_request(store, key, runner, deadline, timeout_ms)
+    end
+  end
+
+  defp poll_stage_request(store, key, runner, deadline, timeout_ms) do
+    case Task.yield(runner, 0) do
+      {:ok, result} ->
+        flunk("request missing: #{key}; stage runner completed before publishing the request: #{inspect(result)}")
+
+      {:exit, reason} ->
+        flunk("request missing: #{key}; stage runner exited before publishing the request: #{inspect(reason)}")
+
+      nil ->
+        remaining = deadline - System.monotonic_time(:millisecond)
+        if remaining <= 0, do: flunk("request missing: #{key} after #{timeout_ms}ms while stage runner remained active")
+        Process.sleep(min(5, remaining))
+        wait_for_stage_request(store, key, runner, deadline, timeout_ms)
     end
   end
 

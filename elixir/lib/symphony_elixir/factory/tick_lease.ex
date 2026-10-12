@@ -5,7 +5,7 @@ defmodule SymphonyElixir.Factory.TickLease do
 
   require Logger
 
-  alias SymphonyElixir.Factory.ControlServer
+  alias SymphonyElixir.Factory.{ControlServer, Scheduler}
 
   @doc """
   Runs a function when factory control is disabled or when the exact dispatcher
@@ -15,17 +15,26 @@ defmodule SymphonyElixir.Factory.TickLease do
         when result: var
   def run(factory, fun, opts \\ []) when is_function(fun, 0) do
     if Map.get(factory, :enabled, false) do
-      run_controlled(factory, fun, opts)
+      run_controlled(factory, fun, Keyword.delete(opts, :recovery_only))
     else
       {:ran, fun.()}
     end
+  end
+
+  @doc "Runs only the bounded Jira readback entrypoint under an exclusive lease, including while paused."
+  @spec reconcile(map(), keyword()) :: {:ran, term()} | {:skipped, String.t()}
+  def reconcile(context, opts \\ []) do
+    callback = fn -> Scheduler.reconcile_ticket_jira(context, Keyword.get(opts, :scheduler_options, [])) end
+    run_controlled(context.factory, callback, Keyword.put(opts, :recovery_only, true))
   end
 
   defp run_controlled(factory, fun, opts) do
     control_server = Keyword.get(opts, :control_server, ControlServer)
     dispatcher_id = Map.fetch!(factory, :dispatcher_id)
 
-    case call_control(fn -> ControlServer.acquire_tick(dispatcher_id, control_server) end) do
+    acquire = if opts[:recovery_only], do: &ControlServer.acquire_recovery_tick/2, else: &ControlServer.acquire_tick/2
+
+    case call_control(fn -> acquire.(dispatcher_id, control_server) end) do
       %{result: "ACQUIRED", tick_id: tick_id} ->
         try do
           run_with_renewal(factory, fun, control_server, dispatcher_id, tick_id, opts)
@@ -67,14 +76,14 @@ defmodule SymphonyElixir.Factory.TickLease do
     renewal_interval_ms =
       Keyword.get(opts, :renewal_interval_ms, max(div(lease_seconds * 1_000, 3), 100))
 
+    renewer = fn -> renew_tick(control_server, dispatcher_id, tick_id, opts[:recovery_only] == true) end
+
     await_result(
       pid,
       monitor_ref,
       result_ref,
       renewal_interval_ms,
-      control_server,
-      dispatcher_id,
-      tick_id
+      renewer
     )
   end
 
@@ -83,9 +92,7 @@ defmodule SymphonyElixir.Factory.TickLease do
          monitor_ref,
          result_ref,
          renewal_interval_ms,
-         control_server,
-         dispatcher_id,
-         tick_id
+         renewer
        ) do
     receive do
       {^result_ref, {:returned, result}} ->
@@ -100,16 +107,14 @@ defmodule SymphonyElixir.Factory.TickLease do
         exit(reason)
     after
       renewal_interval_ms ->
-        case renew_tick(control_server, dispatcher_id, tick_id) do
+        case renewer.() do
           %{result: "LEASE_RENEWED"} ->
             await_result(
               pid,
               monitor_ref,
               result_ref,
               renewal_interval_ms,
-              control_server,
-              dispatcher_id,
-              tick_id
+              renewer
             )
 
           reason ->
@@ -120,8 +125,9 @@ defmodule SymphonyElixir.Factory.TickLease do
     end
   end
 
-  defp renew_tick(control_server, dispatcher_id, tick_id) do
-    call_control(fn -> ControlServer.renew_tick(dispatcher_id, tick_id, control_server) end)
+  defp renew_tick(control_server, dispatcher_id, tick_id, recovery) do
+    renew = if recovery, do: &ControlServer.renew_recovery_tick/3, else: &ControlServer.renew_tick/3
+    call_control(fn -> renew.(dispatcher_id, tick_id, control_server) end)
   end
 
   defp await_down(monitor_ref, pid) do

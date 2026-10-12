@@ -1,0 +1,13 @@
+{
+  "name": "symphony-gitlab-ci-provider",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node prepare.mjs",
+    "test": "node --test provider.test.mjs"
+  },
+  "dependencies": {
+    "@zereight/mcp-gitlab": "2.1.68"
+  }
+}

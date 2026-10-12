@@ -293,6 +293,17 @@ defmodule SymphonyElixir.FactoryControllerTaskTest do
     assert ControlServer.status(context.control_name)["controller_thread_id"] == "existing-thread"
     assert ControlServer.status(context.control_name)["controller_turn_id"] == "next-controller-turn"
     assert [] == DesktopRequest.list_pending(context.store)
+    ControlServer.record_controller_task("existing-thread", "later-controller-turn", %{}, context.control_name)
+    control_before = ControlServer.status(context.control_name)
+    requests_before = Store.query!(context.store, "SELECT * FROM desktop_requests").rows
+
+    assert {:ok, %{"status" => "PASS"}} = ControllerTask.read_request_result(factory, request["request_key"], schema, store: context.store)
+    assert ControlServer.status(context.control_name) == control_before
+    assert Store.query!(context.store, "SELECT * FROM desktop_requests").rows == requests_before
+    assert {:error, :controller_receipt_scope_mismatch} = ControllerTask.read_request_result(%{factory | scope: "another-scope"}, request["request_key"], schema, store: context.store)
+
+    assert {:error, :controller_receipt_scope_mismatch} =
+             ControllerTask.read_request_result(%{factory | controller_codex_project_id: "another-project"}, request["request_key"], schema, store: context.store)
   end
 
   test "desktop transport will not create an unbound replacement controller", context do

@@ -1,8 +1,10 @@
 defmodule SymphonyElixir.FactoryPolicyTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.Factory.Policy
+  alias SymphonyElixir.Factory.Supervisor, as: FactorySupervisor
+  alias SymphonyElixir.TicketChatFixture
 
   test "fails closed before startup when required routing or model roles are missing" do
     factory = %{
@@ -70,7 +72,7 @@ defmodule SymphonyElixir.FactoryPolicyTest do
     assert {:error, :native_archive_restore_capability_unproven} = Policy.validate(factory)
   end
 
-  test "ticket supervisor policy is disabled by default and never bypasses the capability fence" do
+  test "ticket supervisor static policy is disabled by default and accepts a well-shaped enabled route" do
     factory = valid_factory() |> put_in([:manual_validation, "required_apps"], ["polaris-app"])
     assert :ok = Policy.validate(factory)
     assert :ok = Policy.validate(Map.put(factory, :ticket_supervisor, %{}))
@@ -78,8 +80,70 @@ defmodule SymphonyElixir.FactoryPolicyTest do
     assert :ok =
              Policy.validate(Map.put(factory, :ticket_supervisor, %{"enabled" => false, "pilot_issue_keys" => ["PPL-123"]}))
 
-    assert {:error, :ticket_supervisor_runtime_capability_unproven} =
+    assert :ok =
              Policy.validate(Map.put(factory, :ticket_supervisor, %{"enabled" => true, "pilot_issue_keys" => ["PPL-123"]}))
+  end
+
+  test "enabled startup qualifies the actual runtime before returning factory child specs for either policy key form" do
+    root = startup_root()
+    trace = TicketChatFixture.runtime_fixture(root)
+
+    for policy <- [
+          %{"enabled" => true, "pilot_issue_keys" => ["PPL-123"], "parent_output_root" => root},
+          %{enabled: true, pilot_issue_keys: ["PPL-123"], parent_output_root: root}
+        ] do
+      factory = startup_factory(root, policy)
+      assert :ok = Policy.validate(factory)
+      assert {:ok, {_flags, children}} = FactorySupervisor.init(%{factory: factory})
+
+      expected = [
+        FactorySupervisor.store_name(),
+        FactorySupervisor.control_name(),
+        FactorySupervisor.task_supervisor_name(),
+        SymphonyElixir.Factory.Controller
+      ]
+
+      assert Enum.map(children, & &1.id) == expected
+    end
+
+    factory = startup_factory(root, %{"enabled" => true, "pilot_issue_keys" => ["PPL-123"], "parent_output_root" => root})
+    factory = Map.put(Map.delete(factory, :ticket_supervisor), "ticket_supervisor", factory.ticket_supervisor)
+    assert {:ok, _} = FactorySupervisor.init(%{factory: factory})
+
+    messages = File.read!(trace) |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!/1)
+    assert Enum.map(messages, & &1["method"]) == ["initialize", "initialize", "initialize"]
+    refute File.exists?(Path.join(root, "factory.sqlite"))
+  end
+
+  test "unsupported enabled startup stops before factory storage or controller children exist" do
+    root = startup_root()
+    TicketChatFixture.runtime_fixture(root, %{})
+    factory = startup_factory(root, %{"enabled" => true, "pilot_issue_keys" => ["PPL-123"], "parent_output_root" => root})
+    assert catch_exit(FactorySupervisor.init(%{factory: factory})) == {:invalid_factory_policy, :worker_runtime_identity_unproven}
+    Process.flag(:trap_exit, true)
+
+    assert {:error, {:invalid_factory_policy, :worker_runtime_identity_unproven}} =
+             FactorySupervisor.start_link(settings: %{factory: factory}, name: SymphonyElixir.FactoryStartupProbe)
+
+    assert Process.whereis(SymphonyElixir.FactoryStartupProbe) == nil
+    refute File.exists?(factory.database)
+    missing = put_in(factory, [:ticket_supervisor, "parent_output_root"], Path.join(root, "absent"))
+    assert catch_exit(FactorySupervisor.init(%{factory: missing})) == {:invalid_factory_policy, :ticket_runtime_cwd_unproven}
+  end
+
+  test "disabled startup and repeated static policy checks never probe the configured runtime" do
+    root = startup_root()
+    trace = TicketChatFixture.runtime_fixture(root, %{})
+    factory = startup_factory(root, %{"enabled" => false, "pilot_issue_keys" => ["PPL-123"]})
+
+    for _ <- 1..3 do
+      assert :ok = Policy.validate(factory)
+      assert {:ok, _} = FactorySupervisor.init(%{factory: factory})
+    end
+
+    refute File.exists?(trace)
+    refute File.exists?(factory.database)
+    assert :ignore = FactorySupervisor.start_link(settings: %{factory: %{factory | enabled: false}})
   end
 
   test "ticket supervisor policy rejects malformed values" do
@@ -199,6 +263,20 @@ defmodule SymphonyElixir.FactoryPolicyTest do
         "allow_database_ddl" => false
       }
     }
+  end
+
+  defp startup_root do
+    root = Path.join(System.tmp_dir!(), "factory-startup-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+    {:ok, root} = SymphonyElixir.PathSafety.canonicalize(root)
+    on_exit(fn -> File.rm_rf!(root) end)
+    root
+  end
+
+  defp startup_factory(root, policy) do
+    valid_factory()
+    |> put_in([:manual_validation, "required_apps"], ["polaris-app"])
+    |> Map.merge(%{enabled: true, database: Path.join(root, "factory.sqlite"), ticket_supervisor: policy})
   end
 
   defp validate_parsed_factory(factory_attrs) do

@@ -96,11 +96,16 @@ defmodule SymphonyElixir.FactoryMrFeedbackTest do
   end
 
   test "records one receipt per note body and keeps edited versions", context do
+    assert {:error, :unknown_feedback} = MrFeedbackLedger.requeue_clarification(context.store, "missing-feedback")
+    assert Store.query!(context.store, "SELECT * FROM mr_feedback_notes").rows == []
     assert {:ok, first} = candidate(context)
     assert {:ok, :recorded} = MrFeedbackLedger.record_candidate(context.store, first)
     assert {:ok, :already_recorded} = MrFeedbackLedger.record_candidate(context.store, first)
     assert [%{"feedback_key" => first_key, "status" => "PENDING"}] = MrFeedbackLedger.pending(context.store)
     assert first_key == first.feedback_key
+    before_requeue = Store.query!(context.store, "SELECT * FROM mr_feedback_notes").rows
+    assert {:error, :feedback_not_change_request} = MrFeedbackLedger.requeue_clarification(context.store, first_key)
+    assert Store.query!(context.store, "SELECT * FROM mr_feedback_notes").rows == before_requeue
 
     edited_note = %{context.note | "updated_at" => "2026-09-30T10:01:00Z", "body" => "@Symphony please change this"}
     assert {:ok, edited} = candidate(%{context | note: edited_note})
@@ -112,6 +117,63 @@ defmodule SymphonyElixir.FactoryMrFeedbackTest do
              "SUPERSEDED"
 
     assert Store.one!(context.store, "SELECT COUNT(*) AS count FROM events WHERE event_type = 'MR_FEEDBACK_DISCOVERED'")["count"] == 2
+
+    assert {:ok, claimed} = MrFeedbackLedger.claim(context.store, edited.feedback_key, "owned-request", nil)
+    assert {:error, :feedback_claim_mismatch} = MrFeedbackLedger.finish(context.store, edited.feedback_key, "different-request", "COMPLETE")
+    assert Store.one!(context.store, "SELECT * FROM mr_feedback_notes WHERE feedback_key = ?", [edited.feedback_key]) == claimed
+    assert :ok = MrFeedbackLedger.finish(context.store, edited.feedback_key, "owned-request", "COMPLETE")
+    assert Store.one!(context.store, "SELECT status FROM mr_feedback_notes WHERE feedback_key = ?", [edited.feedback_key])["status"] == "COMPLETE"
+  end
+
+  test "quarantines V1 feedback from selectors and direct ledger mutations", context do
+    v1_run = Map.put(context.run, "run_id", "supervisor-v1") |> Map.put("execution_mode", "TICKET_SUPERVISOR_V1")
+    assert {:ok, _} = RunLedger.register(context.store, v1_run)
+    assert {:ok, base_candidate} = candidate(context)
+    candidate = Map.put(base_candidate, :run_id, "supervisor-v1")
+
+    assert {:error, :feedback_run_quarantined} = MrFeedbackLedger.record_candidate(context.store, candidate)
+
+    Store.query!(context.store, """
+    INSERT INTO mr_feedback_notes (feedback_key, run_id, project, mr_iid, discussion_id, note_id,
+      note_updated_at, author_id, body_sha256, status, created_at, updated_at)
+    VALUES ('v1-receipt', 'supervisor-v1', 'grailbio/grail', 123, 'discussion-1', 51,
+      '2026-09-30T10:00:00Z', 12, '#{String.duplicate("a", 64)}', 'PENDING',
+      '2026-09-30T10:00:00Z', '2026-09-30T10:00:00Z')
+    """)
+
+    assert MrFeedbackLedger.pending(context.store) == []
+    assert MrFeedbackLedger.next(context.store) == nil
+    assert {:error, :feedback_run_quarantined} = MrFeedbackLedger.dismiss(context.store, "v1-receipt", :stale)
+    assert {:error, :feedback_run_quarantined} = MrFeedbackLedger.claim(context.store, "v1-receipt", "request", nil)
+
+    assert :ok = MrFeedbackLedger.supersede_changed(context.store, "grailbio/grail", 123, "discussion-1", 51, "edited body")
+    assert Store.one!(context.store, "SELECT status FROM mr_feedback_notes WHERE feedback_key = 'v1-receipt'")["status"] == "PENDING"
+    assert Store.one!(context.store, "SELECT COUNT(*) AS count FROM events WHERE event_type = 'MR_FEEDBACK_DISCOVERED'")["count"] == 0
+  end
+
+  test "a V1 owner quarantines feedback attached to an older LEGACY run for the same issue", context do
+    assert {:ok, legacy_receipt} = candidate(context)
+    assert {:ok, :recorded} = MrFeedbackLedger.record_candidate(context.store, legacy_receipt)
+    Store.query!(context.store, "UPDATE mr_feedback_notes SET status = 'CLAIMED', request_key = 'old-controller-turn' WHERE feedback_key = ?", [legacy_receipt.feedback_key])
+
+    assert {:ok, _v1} =
+             RunLedger.register(context.store, %{run_id: "newer-supervisor", issue_key: context.run["issue_key"], kind: "DELIVERY", state: "READY_FOR_REVIEW", execution_mode: "TICKET_SUPERVISOR_V1"})
+
+    before = Store.query!(context.store, "SELECT * FROM mr_feedback_notes ORDER BY feedback_key").rows
+
+    assert MrFeedbackLedger.pending(context.store) == []
+    assert MrFeedbackLedger.next(context.store) == nil
+    assert {:error, :feedback_run_quarantined} = MrFeedbackLedger.finish(context.store, legacy_receipt.feedback_key, "old-controller-turn", "COMPLETE")
+    receipts = [%{"feedback_key" => legacy_receipt.feedback_key}]
+
+    assert {:error, :feedback_batch_claim_mismatch} =
+             MrFeedbackLedger.finish_batch(context.store, receipts, "old-controller-turn", [%{"feedback_key" => legacy_receipt.feedback_key, "status" => "REPLIED"}], %{})
+
+    assert {:error, :feedback_batch_claim_mismatch} =
+             MrFeedbackLedger.reconcile_batch(context.store, receipts, "old-controller-turn", "uncertain")
+
+    assert :ok = MrFeedbackLedger.supersede_changed(context.store, "grailbio/grail", 123, "discussion-1", 51, "changed note body")
+    assert Store.query!(context.store, "SELECT * FROM mr_feedback_notes ORDER BY feedback_key").rows == before
   end
 
   test "rejects missing note and discussion identities without persisting them", context do

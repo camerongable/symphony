@@ -11,18 +11,22 @@ defmodule SymphonyElixir.Factory.Scheduler do
 
   alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.Config
+  alias SymphonyElixir.PathSafety
+  alias SymphonyElixir.Workflow
 
   alias SymphonyElixir.Factory.{
     Capacity,
     Cleanup,
     Contract,
     ContractChat,
+    Control,
     ControllerTask,
     DesktopRequest,
     IntakeLedger,
     JiraMcpConnector,
     JiraMcpReader,
     JiraMcpWriter,
+    ModelRouter,
     MrFeedbackConsumer,
     MrFeedbackLedger,
     MrFeedbackPoller,
@@ -36,6 +40,22 @@ defmodule SymphonyElixir.Factory.Scheduler do
     Store,
     TaskLauncher,
     TaskLedger,
+    TicketAmendmentCritic,
+    TicketAmendmentJiraOperation,
+    TicketChat,
+    TicketChatCommands,
+    TicketChatOutbox,
+    TicketCheckout,
+    TicketContextReader,
+    TicketContractAmendment,
+    TicketJiraFinalization,
+    TicketJiraJournal,
+    TicketJiraOperation,
+    TicketMrOperation,
+    TicketPush,
+    TicketWorkerRunner,
+    WorkerEvidence,
+    WorkspaceAccess,
     Worktree
   }
 
@@ -43,6 +63,798 @@ defmodule SymphonyElixir.Factory.Scheduler do
 
   @terminal_states ~w(READY_FOR_REVIEW DELIVERED AWAITING_VALIDATION CANCELLED FAILED)
   @type context :: map()
+
+  @doc "Reserves/reuses one parent for an ordinary run; does not dispatch native or source work."
+  @spec ticket_parent_step(context(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def ticket_parent_step(context, run_id, opts \\ []) do
+    lock = {{__MODULE__, :ticket_stage, run_id}, self()}
+
+    case :global.trans(lock, fn -> ticket_parent_step_locked(context, run_id, opts) end) do
+      :aborted -> {:error, :ticket_stage_lock_unavailable}
+      result -> result
+    end
+  end
+
+  defp ticket_parent_step_locked(context, run_id, opts) do
+    with {:ok, run} <- RunLedger.get(context.store, run_id),
+         {:ok, attrs} <- prepare_ticket_parent(context, run, opts),
+         :ok <- check_new_parent_runtime(context.store, run_id, opts[:parent_output_root]) do
+      reserve_ticket_parent(context, run, attrs)
+    end
+  end
+
+  defp check_new_parent_runtime(store, run_id, root) do
+    case TicketChat.for_run(store, run_id) do
+      {:ok, _chat} -> :ok
+      {:error, :unknown_ticket_chat} -> AppServer.check_ticket_runtime(root)
+    end
+  end
+
+  defp prepare_ticket_parent(context, run, opts) do
+    run_id = run["run_id"]
+
+    with :ok <- TicketChat.ordinary_delivery_eligibility(run),
+         :ok <- parent_admission_policy(context.factory.ticket_supervisor, run["issue_key"]),
+         {:ok, root} <- parent_output_root(opts[:parent_output_root]),
+         true <- is_binary(opts[:broker_thread_id]) or {:error, :parent_broker_identity_invalid},
+         {:ok, model} <- ModelRouter.resolve(context.factory.models, "orchestrator-intake"),
+         {:ok, reader} <- TicketContextReader.bind(context.store, run_id, opts),
+         snapshot <- Jason.decode!(run["snapshot_json"]),
+         cwd <- Path.join(root, TicketChat.directory_name(context.factory.scope, snapshot["id"], run["repo_key"])),
+         attrs = %{
+           scope_key: context.factory.scope,
+           issue_id: snapshot["id"],
+           issue_key: run["issue_key"],
+           repo_key: run["repo_key"],
+           route: "desktop_owned_ticket_chat_v1",
+           cwd: cwd,
+           broker_thread_id: opts[:broker_thread_id],
+           context_reader_json: reader,
+           model: model.model,
+           reasoning_effort: model.reasoning_effort,
+           title: "#{run["issue_key"]} · Ticket",
+           prompt:
+             TicketContextReader.instructions(reader) <>
+               " This chat presents ticket progress and user questions; the controller owns all source and delivery actions."
+         },
+         :ok <- TicketChat.preflight(context.store, run, attrs) do
+      {:ok, attrs}
+    end
+  end
+
+  defp reserve_ticket_parent(context, run, attrs) do
+    with {:ok, reserved} <- TicketChat.reserve(context.store, run["run_id"], attrs, run) do
+      parent_admission_result(context.store, run["run_id"], reserved)
+    end
+  end
+
+  defp parent_admission_policy(%{"enabled" => true, "pilot_issue_keys" => issues}, issue) when is_list(issues) do
+    if issue in issues, do: :ok, else: {:error, :ticket_chat_not_allowlisted}
+  end
+
+  defp parent_admission_policy(_policy, _issue), do: {:error, :ticket_chat_runtime_not_integrated}
+
+  defp parent_output_root(root) when is_binary(root) do
+    with true <- Path.type(root) == :absolute or {:error, :ticket_parent_output_root_required},
+         {:ok, canonical} <- PathSafety.canonicalize(root),
+         true <- (canonical == root and File.dir?(root)) or {:error, :ticket_parent_output_root_invalid} do
+      {:ok, root}
+    end
+  end
+
+  defp parent_output_root(_root), do: {:error, :ticket_parent_output_root_required}
+
+  defp parent_admission_result(store, run_id, %{chat: chat, request: request}) do
+    {status, reason} =
+      case TicketChat.ready_for_run(store, run_id) do
+        {:ok, _} -> {"PARENT_READY", nil}
+        {:error, reason} -> {"PARENT_PENDING", reason}
+      end
+
+    {:ok,
+     %{
+       status: status,
+       chat_key: chat["chat_key"],
+       request_key: request["request_key"],
+       request_status: request["status"],
+       thread_id: chat["thread_id"],
+       reason: reason,
+       model_invoked: false
+     }}
+  end
+
+  @doc "Runs one admitted ordinary ticket role; production polling remains quarantined until parent integration."
+  @spec ticket_step(context(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def ticket_step(context, run_id, opts \\ []) do
+    lock = {{__MODULE__, :ticket_stage, run_id}, self()}
+
+    case :global.trans(lock, fn -> ticket_step_locked(context, run_id, opts) end) do
+      :aborted -> {:error, :ticket_stage_lock_unavailable}
+      result -> result
+    end
+  end
+
+  defp ticket_step_locked(context, run_id, opts) do
+    with {:ok, run} <- RunLedger.get(context.store, run_id),
+         :ok <- TicketChat.ordinary_delivery_eligibility(run),
+         {:ok, _} <- TicketChat.ready_for_run(context.store, run_id) do
+      opts =
+        opts
+        |> Keyword.put_new(:workspace_root, context.workspace_root)
+        |> Keyword.put_new_lazy(:capacity_policy, fn -> factory_policy(context) end)
+
+      result =
+        case current_ticket_attempts(context.store, run) do
+          [] -> ticket_unreserved_step(context, run, opts)
+          [[_key, "RESERVED"]] -> launch_ticket_stage(context, run, opts)
+          [[key, _]] -> adopt_ticket_stage(context, key)
+          _ -> {:error, :worker_attempt_reconciliation_required}
+        end
+
+      presentation = publish_ticket_progress(context.store, run_id)
+
+      case result do
+        {:ok, response} -> {:ok, Map.put(response, :presentation, presentation)}
+        error -> error
+      end
+    end
+  end
+
+  defp current_ticket_attempts(store, run) do
+    pending = WorkerEvidence.pending(store, run["run_id"])
+    current_blocked_request = current_amendment_blocked_request(store, run)
+
+    pending
+    |> Enum.reject(fn evidence ->
+      evidence["request_key"] != current_blocked_request and
+        applied_blocked_predecessor?(store, evidence["request_key"])
+    end)
+    |> Enum.map(&[&1["request_key"], &1["status"]])
+  end
+
+  defp applied_blocked_predecessor?(store, request_key) do
+    match?({:ok, %{"application_kind" => "BLOCKED_WRITER_HELD"}}, TicketContractAmendment.blocked_predecessor_for_request(store, request_key))
+  end
+
+  defp current_amendment_blocked_request(store, run) do
+    with {:ok, %{receipt: receipt}} <- TicketContractAmendment.blocked_predecessor_for_installed_run(store, run),
+         {:ok, predecessor} <- Jason.decode(receipt["blocked_predecessor_json"]),
+         {:ok, evidence} <- Jason.decode(predecessor["evidence_json"]) do
+      evidence["request_key"]
+    else
+      _ -> nil
+    end
+  end
+
+  defp ticket_unreserved_step(context, %{"state" => "ADMITTING_WRITER"} = run, opts) do
+    with {:ok, authorization} <- ticket_authorization(context, run, opts) do
+      if is_nil(run["worktree"]) do
+        ticket_initial_checkout(context.store, run, authorization, opts)
+      else
+        admit_ticket_writer(context, run, opts)
+      end
+    end
+  end
+
+  defp ticket_unreserved_step(context, run, opts), do: launch_ticket_stage(context, run, opts)
+
+  defp admit_ticket_writer(context, run, opts) do
+    with {:ok, chat} <- TicketChat.ready_for_run(context.store, run["run_id"]) do
+      TicketJiraOperation.start_implementation(context.store, run["run_id"], Keyword.put(opts, :workspace, chat["cwd"]))
+    end
+  end
+
+  defp ticket_initial_checkout(store, run, authorization, opts) do
+    case TicketCheckout.get(store, run["run_id"]) do
+      {:ok, %{"phase" => "PREPARED", "owner_nonce" => nil} = intent} ->
+        create_ticket_checkout(store, run, authorization, pinned_checkout_opts(intent, opts))
+
+      {:ok, intent} ->
+        TicketCheckout.reconcile(store, run["run_id"], authorization, pinned_checkout_opts(intent, opts))
+
+      {:error, :ticket_checkout_intent_missing} ->
+        base = Store.one!(store, "SELECT base_sha FROM ticket_review_bases WHERE run_id = ?", [run["run_id"]])
+
+        case initial_ticket_base(run, base, opts) do
+          {:ok, sha} -> create_ticket_checkout(store, run, authorization, Keyword.put(opts, :base_sha, sha))
+          error -> error
+        end
+    end
+  end
+
+  defp create_ticket_checkout(store, run, authorization, opts) do
+    with {:ok, chat} <- TicketChat.ready_for_run(store, run["run_id"]),
+         :ok <- AppServer.check_ticket_runtime(chat["cwd"]) do
+      TicketCheckout.create(store, run["run_id"], authorization, Keyword.put(opts, :expected_run, run))
+    end
+  end
+
+  defp initial_ticket_base(run, base, opts) do
+    case Keyword.fetch(opts, :base_sha) do
+      {:ok, sha} -> {:ok, sha}
+      :error -> if(base, do: {:ok, base["base_sha"]}, else: TicketWorkerRunner.observed_base(run))
+    end
+  end
+
+  defp pinned_checkout_opts(intent, opts),
+    do: Keyword.put(opts, :base_sha, Jason.decode!(intent["binding_json"])["base_sha"])
+
+  defp publish_ticket_progress(store, run_id) do
+    case TicketChatOutbox.publish(store, run_id) do
+      {:ok, receipt} -> receipt
+      {:error, reason} -> %{status: "SYNC_ERROR", reason: inspect(reason), model_invoked: false}
+    end
+  rescue
+    error -> %{status: "SYNC_ERROR", reason: Exception.message(error), model_invoked: false}
+  catch
+    :exit, reason -> %{status: "SYNC_ERROR", reason: inspect(reason), model_invoked: false}
+  end
+
+  defp launch_ticket_stage(context, run, opts) do
+    base = Store.one!(context.store, "SELECT base_sha FROM ticket_review_bases WHERE run_id = ?", [run["run_id"]])
+
+    with %{"base_sha" => base_sha} <- base,
+         {:ok, stage} <- ticket_stage(run, context.factory),
+         {:ok, authorization} <- ticket_authorization(context, run, opts),
+         {:ok, base_prompt} <- TicketWorkerRunner.packet(context.store, run["run_id"], stage.role, base_sha),
+         {:ok, prompt, blocked_resume} <- launch_prompt(context.store, run, stage, base_prompt, opts) do
+      launch_ticket_stage_task(context, run, opts, stage, base_sha, authorization, prompt, blocked_resume)
+    else
+      nil -> {:error, :ticket_review_base_missing}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp launch_ticket_stage_task(context, run, opts, stage, base_sha, authorization, prompt, blocked_resume) do
+    launch_opts =
+      Keyword.merge(opts,
+        authorization: authorization,
+        task_key: stage.key,
+        stage: run["state"],
+        role: stage.role,
+        model_policy: context.factory.models,
+        risk: run["risk"],
+        risk_signals: decode_json(run["risk_signals_json"], []),
+        project_id: nil,
+        project_root: run["repo_path"],
+        recipient: context.recipient,
+        thread_name: task_name(run["issue_key"], stage.role),
+        review_base_sha: base_sha,
+        expected_sha: run["candidate_sha"] || base_sha,
+        resume_terminal: stage.role == "feature-writer"
+      )
+
+    launch_opts = apply_resume_launch_options(launch_opts, blocked_resume, prompt, run, base_sha)
+
+    case TaskLauncher.launch(
+           context.store,
+           context.task_supervisor,
+           run,
+           issue_from_snapshot(decode_json!(run["snapshot_json"])),
+           run["worktree"],
+           prompt,
+           StageSchemas.for_stage(stage.schema),
+           launch_opts
+         ) do
+      {:ok, launch} -> {:ok, %{status: "LAUNCHED", launch: launch}}
+      {:already_running, task} -> {:ok, %{status: "RUNNING", task: task}}
+      {:already_terminal, task} -> {:ok, %{status: "RECOVERED", task: task}}
+      error -> error
+    end
+  end
+
+  defp apply_resume_launch_options(launch_opts, %{kind: :blocked} = resume, prompt, run, base_sha) do
+    Keyword.merge(launch_opts,
+      blocked_resume: resume,
+      blocked_resume_prompt: prompt,
+      expected_sha: resume["checkout_head_sha"] || run["candidate_sha"] || base_sha
+    )
+  end
+
+  defp apply_resume_launch_options(launch_opts, %{kind: :ready} = resume, _prompt, _run, _base_sha) do
+    Keyword.put(launch_opts, :ready_rework, resume)
+  end
+
+  defp apply_resume_launch_options(launch_opts, _resume, _prompt, _run, _base_sha), do: launch_opts
+
+  defp launch_prompt(store, run, stage, base_prompt, opts) do
+    case Keyword.get(opts, :blocked_resume) do
+      nil ->
+        launch_prompt_without_resume(store, run, stage, base_prompt, opts)
+
+      resume ->
+        with {:ok, prompt, _} <- blocked_resume_prompt(store, run, stage, base_prompt, resume) do
+          {:ok, prompt, Map.put(resume, :kind, :blocked)}
+        end
+    end
+  end
+
+  defp launch_prompt_without_resume(store, run, stage, base_prompt, opts) do
+    case recover_prepared_ready_rework(store, run, stage, base_prompt) do
+      {:ok, nil} -> launch_prompt_after_ready_rework(store, run, stage, base_prompt, opts)
+      {:ok, prepared} -> {:ok, prepared.prompt, prepared}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp launch_prompt_after_ready_rework(store, run, stage, base_prompt, opts) do
+    case recover_prepared_blocked_resume(store, run, stage) do
+      {:ok, nil} -> {:ok, base_prompt, nil}
+      {:ok, resume} -> launch_prompt(store, run, stage, base_prompt, Keyword.put(opts, :blocked_resume, resume))
+      {:error, _} = error -> error
+    end
+  end
+
+  defp recover_prepared_ready_rework(store, %{"state" => "REVIEW_WRITING"} = run, %{role: "feature-writer"}, base_prompt) do
+    rows = Store.query!(store, "SELECT command_key FROM ticket_chat_commands WHERE run_id = ? AND status = 'APPLIED' ORDER BY updated_at DESC", [run["run_id"]]).rows
+
+    Enum.reduce_while(rows, {:ok, nil}, fn [key], acc ->
+      recover_prepared_ready_rework_row(store, run, base_prompt, key, acc)
+    end)
+  end
+
+  defp recover_prepared_ready_rework(_store, _run, _stage, _base_prompt), do: {:ok, nil}
+
+  defp recover_prepared_ready_rework_row(store, run, base_prompt, key, _acc) do
+    case TicketChatCommands.validate_ready_rework_replay(store, key) do
+      {:ok, %{receipt: receipt, input: input}} ->
+        if receipt["candidate_sha"] == run["candidate_sha"],
+          do: recover_prepared_ready_rework_evidence(store, run, base_prompt, key, receipt, input),
+          else: {:cont, {:ok, nil}}
+
+      _ ->
+        {:cont, {:ok, nil}}
+    end
+  end
+
+  defp recover_prepared_ready_rework_evidence(store, run, base_prompt, key, receipt, input) do
+    case WorkerEvidence.get(store, receipt["request_key"]) do
+      {:ok, evidence} ->
+        recover_prepared_ready_rework_status(run, base_prompt, key, input, evidence)
+
+      _ ->
+        {:cont, {:ok, nil}}
+    end
+  end
+
+  defp recover_prepared_ready_rework_status(run, base_prompt, key, input, evidence) do
+    cond do
+      evidence["run_id"] != run["run_id"] ->
+        {:cont, {:ok, nil}}
+
+      evidence["status"] == "RESERVED" ->
+        prompt = TicketWorkerRunner.ready_rework_packet(base_prompt, key, input["body"])
+
+        prepared = %{
+          kind: :ready,
+          prepared: true,
+          command_key: key,
+          input_key: input["input_key"],
+          input_body: input["body"],
+          prompt: prompt
+        }
+
+        {:halt, {:ok, prepared}}
+
+      evidence["status"] in ~w(START_SENT RESULT_RECORDED RECONCILE_REQUIRED) ->
+        {:halt, {:error, {:ready_rework_attempt_reconciliation_required, evidence["request_key"]}}}
+
+      true ->
+        {:cont, {:ok, nil}}
+    end
+  end
+
+  defp blocked_resume_prompt(store, run, %{role: "feature-writer"}, base_prompt, resume) do
+    with true <- is_map(resume) or {:error, :ticket_blocked_rework_not_current},
+         input when is_map(input) <- Store.one!(store, "SELECT * FROM ticket_chat_inputs WHERE input_key = ?", [resume["input_key"]]),
+         disposition when is_map(disposition) <- current_blocked_writer_disposition(store, run["run_id"], run["run_id"] <> ":feature-writer"),
+         true <- resume_disposition_matches?(disposition, resume) or {:error, :ticket_blocked_rework_not_current} do
+      prompt = TicketWorkerRunner.blocked_resume_packet(base_prompt, input["body"], disposition)
+      {:ok, prompt, resume}
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :ticket_blocked_rework_not_current}
+    end
+  end
+
+  defp blocked_resume_prompt(_store, _run, _stage, _base_prompt, _resume), do: {:error, :blocked_rework_requires_feature_writer}
+
+  defp resume_disposition_matches?(disposition, resume),
+    do: disposition["disposition_key"] == resume["disposition_key"] and disposition["request_key"] == resume["request_key"]
+
+  defp recover_prepared_blocked_resume(store, run, %{role: "feature-writer", key: task_key}) do
+    pending = WorkerEvidence.pending(store, run["run_id"]) |> Enum.filter(&(&1["task_key"] == task_key and &1["status"] == "RESERVED"))
+
+    case pending do
+      [attempt] ->
+        case blocked_transfer_for_reserved_attempt(store, run["run_id"], task_key, attempt["request_key"]) do
+          {:ok, nil} ->
+            {:ok, nil}
+
+          {:ok, transfer} ->
+            command = prepared_resume_command(store, run["run_id"], attempt["request_key"])
+            recover_prepared_blocked_resume(store, run, attempt, command, transfer)
+
+          {:error, _} = error ->
+            error
+        end
+
+      [] ->
+        {:ok, nil}
+
+      _ ->
+        {:error, :worker_attempt_reconciliation_required}
+    end
+  end
+
+  defp recover_prepared_blocked_resume(_store, _run, _stage), do: {:ok, nil}
+
+  defp blocked_transfer_for_reserved_attempt(store, run_id, task_key, request_key) do
+    %{columns: columns, rows: rows} =
+      Store.query!(
+        store,
+        "SELECT * FROM workspace_access WHERE run_id = ? AND task_key = ? AND released_at IS NOT NULL",
+        [run_id, task_key]
+      )
+
+    transfers =
+      rows
+      |> Enum.map(&Map.new(Enum.zip(columns, &1)))
+      |> Enum.flat_map(&transfer_receipt_for(&1, request_key))
+
+    case transfers do
+      [] -> {:ok, nil}
+      [transfer] -> {:ok, transfer}
+      _ -> {:error, :blocked_resume_transfer_claim_ambiguous}
+    end
+  end
+
+  defp transfer_receipt_for(access, request_key) do
+    case Jason.decode(access["release_receipt_json"] || "null") do
+      {:ok, %{"kind" => "BLOCKED_SOURCE_TRANSFER", "new_request_key" => ^request_key} = transfer} -> [transfer]
+      _ -> []
+    end
+  end
+
+  defp prepared_resume_command(store, run_id, request_key) do
+    %{columns: columns, rows: rows} =
+      Store.query!(store, "SELECT * FROM ticket_chat_commands WHERE run_id = ? AND status = 'APPLIED' ORDER BY updated_at DESC", [run_id])
+
+    rows
+    |> Enum.map(&Map.new(Enum.zip(columns, &1)))
+    |> Enum.find(fn command -> applied_resume_command?(command, request_key) end)
+  end
+
+  defp applied_resume_command?(command, request_key) do
+    case Jason.decode(command["application_receipt_json"] || "null") do
+      {:ok, %{"kind" => "BLOCKED_WRITER_RESUMED", "request_key" => ^request_key}} -> true
+      _ -> false
+    end
+  end
+
+  defp recover_prepared_blocked_resume(_store, _run, _attempt, nil, _transfer), do: {:error, :blocked_resume_preparation_unproven}
+
+  defp recover_prepared_blocked_resume(store, run, attempt, command, transfer) do
+    with {:ok, receipt} <- Jason.decode(command["application_receipt_json"]),
+         true <- prepared_receipt_matches?(receipt, attempt) or {:error, :blocked_resume_preparation_mismatch},
+         true <-
+           transfer_claim_matches?(transfer, command, receipt, attempt) or
+             {:error, :blocked_resume_transfer_claim_mismatch},
+         {:ok, old} <- WorkerEvidence.get(store, receipt["prior_request_key"]),
+         true <-
+           WorkerEvidence.superseded_blocked_attempt?(store, old) or
+             {:error, :blocked_resume_supersession_unproven} do
+      prepared_resume_descriptor(store, run, attempt, command, receipt, old)
+    else
+      {:error, _} = error -> error
+    end
+  end
+
+  defp transfer_claim_matches?(transfer, command, receipt, attempt) do
+    transfer["command_key"] == command["command_key"] and transfer["input_key"] == command["input_key"] and
+      transfer["old_request_key"] == receipt["prior_request_key"] and transfer["new_request_key"] == attempt["request_key"] and
+      transfer["new_reservation_key"] == receipt["reservation_key"] and transfer["disposition_key"] == receipt["disposition_key"] and
+      transfer["output_sha256"] == receipt["output_sha256"] and
+      transfer["checkout_head_sha"] == receipt["checkout_head_sha"]
+  end
+
+  defp prepared_receipt_matches?(receipt, attempt),
+    do: receipt["reservation_key"] == attempt["reservation_key"] and receipt["request_key"] == attempt["request_key"]
+
+  defp prepared_resume_descriptor(store, run, attempt, command, receipt, old) do
+    input = Store.one!(store, "SELECT * FROM ticket_chat_inputs WHERE input_key = ?", [command["input_key"]])
+    disposition = current_blocked_writer_disposition(store, run["run_id"], attempt["task_key"])
+
+    if is_map(input) and is_map(disposition) and disposition["disposition_key"] == receipt["disposition_key"] do
+      {:ok,
+       %{
+         "command_key" => command["command_key"],
+         "input_key" => input["input_key"],
+         "request_key" => old["request_key"],
+         "disposition_key" => receipt["disposition_key"],
+         "thread_id" => old["thread_id"],
+         "prepared" => true,
+         "prepared_request_key" => attempt["request_key"],
+         "prepared_reservation_key" => attempt["reservation_key"],
+         "prepared_reservation_generation" => receipt["reservation_generation"],
+         "amendment_command_key" => receipt["amendment_command_key"],
+         "checkout_head_sha" => receipt["checkout_head_sha"]
+       }}
+    else
+      {:error, :blocked_resume_preparation_unproven}
+    end
+  end
+
+  defp ticket_stage(%{"state" => "PLANNING"} = run, _factory),
+    do: {:ok, %{key: run["run_id"] <> ":feature-planner", role: "feature-planner", schema: :feature_planner}}
+
+  defp ticket_stage(%{"state" => state} = run, factory) when state in ~w(WRITING REPAIRING REVIEW_WRITING) do
+    if run["implementation_iteration"] < factory.maximum_implementation_iterations,
+      do: {:ok, %{key: run["run_id"] <> ":feature-writer", role: "feature-writer", schema: :native_feature_writer}},
+      else: {:error, :implementation_iteration_limit}
+  end
+
+  defp ticket_stage(%{"state" => "VERIFYING"} = run, _factory),
+    do: {:ok, %{key: "#{run["run_id"]}:change-verifier:#{run["verifier_round"]}", role: "change-verifier", schema: :change_verifier}}
+
+  defp ticket_stage(_run, _factory), do: {:error, :ticket_role_stage_not_admitted}
+
+  defp ticket_authorization(context, run, opts) do
+    reader = Keyword.get(opts, :jira_reader, JiraMcpReader)
+    read_opts = [workspace: context.workspace_root, store: context.store, connector: Map.get(context, :jira_connector) || JiraMcpConnector, app_server: Map.get(context, :jira_app_server, AppServer)]
+
+    with {:ok, snapshot} <- reader.issue(run["issue_key"], read_opts) do
+      observed_at = DateTime.utc_now()
+      ticket_opts = Keyword.put(Map.get(context, :ticket_options, []), :workspace_root, context.workspace_root)
+      TicketWorkerRunner.delivery_authorization(context.store, run, snapshot, observed_at, ticket_opts)
+    end
+  end
+
+  defp adopt_ticket_stage(context, key) do
+    case current_amendment_blocked_receipt(context.store, key) do
+      {:ok, receipt} ->
+        adopted_amendment_blocked_result(context, key, receipt)
+
+      :not_current ->
+        case blocked_writer_attempt(context.store, key) do
+          {:ok, _evidence, _task} -> adopt_blocked_writer(context, key)
+          :not_blocked -> adopt_recorded_ticket_stage(context, key)
+        end
+    end
+  end
+
+  defp current_amendment_blocked_receipt(store, key) do
+    run_id = Store.one!(store, "SELECT run_id FROM worker_evidence WHERE request_key = ?", [key])["run_id"]
+
+    with {:ok, run} <- RunLedger.get(store, run_id),
+         {:ok, %{receipt: receipt}} <- TicketContractAmendment.blocked_predecessor_for_installed_run(store, run),
+         {:ok, predecessor} <- Jason.decode(receipt["blocked_predecessor_json"]),
+         {:ok, evidence} <- Jason.decode(predecessor["evidence_json"]),
+         true <- evidence["request_key"] == key do
+      {:ok, receipt}
+    else
+      _ -> :not_current
+    end
+  end
+
+  defp adopt_blocked_writer(context, key) do
+    case TicketContractAmendment.blocked_predecessor_for_request(context.store, key) do
+      {:ok, receipt} -> adopted_amendment_blocked_result(context, key, receipt)
+      {:error, :blocked_amendment_predecessor_not_found} -> adopt_unamended_blocked_writer(context, key)
+    end
+  end
+
+  defp adopt_unamended_blocked_writer(context, key) do
+    with {:ok, completed} <- WorkerEvidence.completed_result(context.store, key),
+         %{"role" => "feature-writer"} = task <- completed.task,
+         %{"status" => "BLOCKED"} = output <- completed.output do
+      record_ticket_writer_blocked(context, key, completed, task, output)
+    else
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :ticket_writer_block_disposition_not_current}
+    end
+  end
+
+  defp adopted_amendment_blocked_result(context, key, receipt) do
+    with :ok <- WorkspaceAccess.validate_blocked_amendment_predecessor(context.store, receipt),
+         {:ok, predecessor} <- Jason.decode(receipt["blocked_predecessor_json"]),
+         {:ok, disposition} <- Jason.decode(predecessor["disposition_json"]),
+         {:ok, run} <- RunLedger.get(context.store, receipt["run_id"]),
+         true <- disposition["request_key"] == key and run["state"] == "WRITING" do
+      {:ok,
+       %{
+         status: "BLOCKED",
+         run: run,
+         request_key: key,
+         blockers: disposition["blockers"],
+         next_action: disposition["next_action"],
+         model_invoked: false
+       }}
+    else
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :blocked_amendment_predecessor_unproven}
+    end
+  end
+
+  defp adopt_recorded_ticket_stage(context, key) do
+    with {:ok, adopted} <- TicketWorkerRunner.adoption(context.store, key) do
+      case Exqlite.transaction(context.store, &ticket_adoption_transaction(%{context | store: &1}, adopted, key)) do
+        {:ok, result} -> result
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  end
+
+  defp blocked_writer_attempt(store, key) do
+    with {:ok, evidence} <- WorkerEvidence.get(store, key),
+         {:ok, task} <- TaskLedger.get(store, evidence["task_key"]),
+         {:ok, %{"status" => "BLOCKED"}} <- Jason.decode(evidence["output_json"] || "null"),
+         true <- task["role"] == "feature-writer" do
+      {:ok, evidence, task}
+    else
+      _ -> :not_blocked
+    end
+  end
+
+  defp record_ticket_writer_blocked(context, key, completed, task, output) do
+    run = completed.run
+    evidence = completed.evidence
+    binding = completed.binding
+    raw_output = evidence["output_json"]
+    output_sha = evidence["output_sha256"]
+    disposition_key = digest(Jason.encode!([run["run_id"], key, output_sha]))
+    next_action = "Review the recorded blockers, then explicitly authorize a separate resume; no source work will resume automatically."
+
+    payload = %{
+      "disposition_key" => disposition_key,
+      "request_key" => key,
+      "task_key" => task["task_key"],
+      "output_json" => raw_output,
+      "output_sha256" => output_sha,
+      "blockers" => output["blockers"],
+      "next_action" => next_action,
+      "run_binding" => Map.take(run, ~w(run_id state spec_revision contract_sha256 candidate_sha implementation_iteration worktree branch)),
+      "task" => Map.take(task, ~w(task_key role stage status thread_id turn_id updated_at)),
+      "reservation_key" => evidence["reservation_key"],
+      "reservation_generation" => binding["reservation_generation"],
+      "task_status" => task["status"]
+    }
+
+    # ticket_step holds the per-run lock; the immediate transaction serializes disposition lookup and insertion.
+    transaction_result =
+      Exqlite.transaction(context.store, fn tx ->
+        record_ticket_writer_blocked_transaction(tx, key, completed, payload, next_action)
+        |> transaction_result(tx)
+      end)
+
+    case transaction_result do
+      {:ok, result} -> result
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp transaction_result({:error, reason}, transaction), do: Exqlite.rollback(transaction, reason)
+  defp transaction_result(result, _transaction), do: result
+
+  defp record_ticket_writer_blocked_transaction(tx, key, completed, payload, next_action) do
+    with {:ok, run} <- RunLedger.get(tx, completed.run["run_id"]),
+         true <- run == completed.run or {:error, :ticket_writer_block_binding_changed},
+         :ok <- TicketChat.ordinary_delivery_eligibility(run),
+         {:ok, _} <- TicketChat.ready_for_run(tx, run["run_id"]),
+         {:ok, task} <- TaskLedger.get(tx, completed.task["task_key"]),
+         true <- task_binding_current?(task, completed.task, run) or {:error, :ticket_writer_block_task_changed},
+         {:ok, evidence} <- WorkerEvidence.get(tx, key),
+         :ok <- validate_blocked_evidence(tx, evidence, completed.evidence),
+         {:ok, access} <- WorkspaceAccess.get(tx, evidence["reservation_key"]),
+         true <- access == completed.access or {:error, :ticket_writer_block_reservation_changed},
+         {:ok, _} <- WorkspaceAccess.validate(tx, access["reservation_key"], payload["reservation_generation"]),
+         result <- store_ticket_writer_block_event(tx, run["run_id"], payload) do
+      case result do
+        :ok ->
+          {:ok,
+           %{
+             status: "BLOCKED",
+             run: run,
+             request_key: key,
+             blockers: payload["blockers"],
+             next_action: next_action,
+             model_invoked: false
+           }}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    else
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp task_binding_current?(task, expected, run), do: task == expected and task["stage"] == run["state"]
+
+  defp validate_blocked_evidence(store, evidence, expected) do
+    if evidence == expected and WorkerEvidence.owner_stopped?(store, evidence) do
+      :ok
+    else
+      {:error, :ticket_writer_block_evidence_changed}
+    end
+  end
+
+  defp store_ticket_writer_block_event(store, run_id, payload) do
+    raw = Jason.encode!(payload)
+
+    existing =
+      Store.query!(store, "SELECT payload_json FROM events WHERE run_id = ? AND event_type = 'TICKET_NATIVE_WRITER_BLOCKED'", [run_id]).rows
+      |> Enum.map(fn [value] -> value end)
+      |> Enum.filter(fn value ->
+        case Jason.decode(value) do
+          {:ok, %{"disposition_key" => key}} -> key == payload["disposition_key"]
+          _ -> false
+        end
+      end)
+
+    case existing do
+      [] ->
+        Store.query!(store, "INSERT INTO events(event_type, run_id, payload_json, occurred_at) VALUES ('TICKET_NATIVE_WRITER_BLOCKED', ?, ?, ?)", [
+          run_id,
+          raw,
+          DateTime.utc_now() |> DateTime.to_iso8601()
+        ])
+
+        :ok
+
+      [^raw] ->
+        :ok
+
+      _ ->
+        {:error, :ticket_writer_block_disposition_conflict}
+    end
+  end
+
+  defp ticket_adoption_transaction(context, adopted, key) do
+    tx = context.store
+
+    with {:ok, run} <- RunLedger.get(tx, adopted.run["run_id"]),
+         true <- run == adopted.run or {:error, :ticket_adoption_run_changed},
+         :ok <- TicketChat.ordinary_delivery_eligibility(run),
+         {:ok, _} <- TicketChat.ready_for_run(tx, run["run_id"]),
+         {:ok, task} <- WorkerEvidence.adopt_completed(tx, key),
+         :ok <- TicketWorkerRunner.admitted_stage(run, task["role"]),
+         true <- task["stage"] == run["state"] or {:error, :ticket_worker_stage_changed},
+         :ok <- ticket_role_transition(context, run, task, adopted.output, key),
+         {:ok, _} <- TaskLedger.update(tx, task["task_key"], %{status: "CONSUMED"}),
+         {:ok, _} <- WorkerEvidence.consume(tx, key),
+         {:ok, current} <- RunLedger.get(tx, run["run_id"]) do
+      {:ok, %{status: "ADOPTED", run: current, request_key: key}}
+    else
+      {:error, reason} -> Exqlite.rollback(tx, reason)
+    end
+  end
+
+  defp ticket_role_transition(_context, run, %{"status" => "CONSUMED"}, _output, _request_key) do
+    if run["state"] in ~w(PLANNING WRITING REPAIRING REVIEW_WRITING VERIFYING), do: {:error, :ticket_consumed_task_without_stage_adoption}, else: :ok
+  end
+
+  defp ticket_role_transition(context, %{"state" => "PLANNING"} = run, %{"role" => "feature-planner"}, %{"status" => "PLANNED", "plan_markdown" => plan}, _request_key) do
+    {:ok, _} = RunLedger.update(context.store, run["run_id"], %{state: "ADMITTING_WRITER", plan_markdown: plan})
+    :ok
+  end
+
+  defp ticket_role_transition(context, %{"state" => "VERIFYING"} = run, %{"role" => "change-verifier"}, output, _request_key) do
+    case consume_change_verifier_output(context, run, output, %{events: []}) do
+      {:ok, _} -> :ok
+      error -> error
+    end
+  end
+
+  defp ticket_role_transition(context, %{"state" => state} = run, %{"role" => "feature-writer"} = task, %{"status" => status}, request_key)
+       when state in ~w(WRITING REPAIRING REVIEW_WRITING) and status in ~w(CONTINUE COMPLETE) do
+    rework? = ready_rework_for_request?(context.store, run, task, request_key)
+    preflight? = ci_preflight?(route_for_run(context, run)) and not review_rework?(run) and not rework?
+    {:ok, _} = write_native_writer_slice(context.store, run, task["task_key"], status, run["candidate_sha"], preflight?)
+    :ok
+  end
+
+  defp ticket_role_transition(_context, _run, _task, _output, _request_key), do: {:error, :ticket_role_output_not_adoptable}
 
   @doc "Runs one serialized reconciliation and dispatch tick."
   @spec tick(context(), keyword()) :: {:ok, map()} | {:error, term()}
@@ -52,6 +864,251 @@ defmodule SymphonyElixir.Factory.Scheduler do
     with :ok <- validate_stored_execution_modes(context.store) do
       run_tick(context)
     end
+  end
+
+  @doc "Reads back at most one issued ticket operation; never dispatches or prepares replacement work."
+  @spec reconcile_ticket_jira(context(), keyword()) :: {:ok, map()} | {:error, term()}
+  def reconcile_ticket_jira(context, opts \\ []) do
+    context = dependencies(context, opts)
+
+    case reconcile_ticket_jira_context(context) do
+      {:ok, result} -> {:ok, Map.delete(result, :recovery_run_id)}
+      error -> error
+    end
+  end
+
+  defp reconcile_ticket_jira_context(context, mode \\ :readback) do
+    acc = %{launches: [], events: [], routing_required: []}
+
+    with :ok <- validate_stored_execution_modes(context.store) do
+      run =
+        Store.one!(
+          context.store,
+          """
+          WITH recovery AS (
+            SELECT operation.run_id, operation.operation, operation.operation_key, operation.created_at
+            FROM ticket_jira_effects AS operation JOIN runs ON runs.run_id = operation.run_id
+            LEFT JOIN workspace_access AS access ON access.reservation_key = operation.operation_key
+            WHERE ((operation.operation = 'REVIEW_READY' AND runs.state = 'MR_CREATING')
+                OR (operation.operation = 'START_IMPLEMENTATION' AND runs.state = 'ADMITTING_WRITER'))
+              AND access.released_at IS NULL
+              AND operation.phase IN ('FIRST_UNCERTAIN','SECOND_PENDING','SECOND_UNCERTAIN','COMPLETE')
+              AND NOT (operation.phase = 'SECOND_PENDING'
+                AND runs.issue_key IN (SELECT value FROM json_each(?)))
+            UNION ALL
+            SELECT intent.run_id, 'CHECKOUT',
+              'ticket-checkout:' || intent.run_id || ':' || intent.binding_sha256 || ':' || intent.owner_nonce,
+              runs.created_at
+            FROM ticket_checkout_intents AS intent JOIN runs ON runs.run_id = intent.run_id
+            WHERE runs.state = 'ADMITTING_WRITER' AND runs.worktree IS NULL
+              AND intent.phase IN ('MUTATING_UNCERTAIN','RECONCILE_REQUIRED') AND intent.owner_nonce IS NOT NULL
+            UNION ALL
+            SELECT push.run_id, 'PUSH',
+              'ticket-push:' || json_extract(push.envelope, '$.binding_sha256') || ':' || json_extract(push.envelope, '$.owner_nonce'),
+              push.created_at
+            FROM (SELECT run_id, created_at,
+              CASE WHEN json_valid(candidate_handoff) THEN candidate_handoff ELSE '{}' END AS envelope
+              FROM runs WHERE state IN ('PUSHING','CI_PUSHING')) AS push
+            WHERE json_type(push.envelope, '$.version') = 'integer' AND json_extract(push.envelope, '$.version') = 1
+              AND json_extract(push.envelope, '$.kind') = 'TICKET_PUSH'
+              AND json_extract(push.envelope, '$.phase') = 'PUSH_UNCERTAIN'
+              AND json_type(push.envelope, '$.binding_sha256') = 'text' AND length(json_extract(push.envelope, '$.binding_sha256')) > 0
+              AND json_type(push.envelope, '$.owner_nonce') = 'text' AND length(json_extract(push.envelope, '$.owner_nonce')) > 0
+            UNION ALL
+            SELECT runs.run_id, 'MR_RESULT', request.request_key, request.created_at
+            FROM (SELECT *, CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END AS metadata
+              FROM desktop_requests WHERE status = 'SUCCEEDED' AND target_kind = 'CONTROLLER' AND action = 'FOLLOWUP') AS request
+            JOIN runs ON runs.run_id = json_extract(request.metadata, '$.delivery_operation.run_id')
+            JOIN ticket_chat_runs AS link ON link.run_id = runs.run_id
+            JOIN ticket_chats AS chat ON chat.chat_key = link.chat_key
+            WHERE runs.state IN ('MR_CREATING','CI_MR_CREATING')
+              AND runs.mr_iid IS NULL AND runs.mr_url IS NULL AND runs.mr_state IS NULL
+              AND request.target_key = chat.scope_key
+              AND json_type(request.metadata, '$.delivery_operation') = 'object'
+              AND json_type(request.metadata, '$.delivery_operation.version') = 'integer'
+              AND json_extract(request.metadata, '$.delivery_operation.version') IN (1, 2)
+              AND json_extract(request.metadata, '$.delivery_operation.operation') = 'CREATE_OR_REUSE_DRAFT_MR'
+              AND json_extract(request.metadata, '$.delivery_operation.issue_key') = runs.issue_key
+              AND json_extract(request.metadata, '$.delivery_operation.stage') = runs.state
+              AND json_extract(request.metadata, '$.delivery_operation.candidate_sha') = runs.candidate_sha
+              AND json_extract(request.metadata, '$.delivery_operation.contract_sha256') = runs.contract_sha256
+              AND json_type(request.metadata, '$.delivery_operation.spec_revision') = 'integer'
+              AND json_extract(request.metadata, '$.delivery_operation.spec_revision') = runs.spec_revision
+              AND json_type(request.metadata, '$.delivery_operation.ci_preflight') =
+                CASE WHEN runs.state = 'CI_MR_CREATING' THEN 'true' ELSE 'false' END
+              AND json_extract(request.metadata, '$.delivery_operation.scope') = chat.scope_key
+          )
+          SELECT runs.*, recovery.operation AS recovery_operation, recovery.operation_key AS recovery_key
+          FROM recovery JOIN runs ON runs.run_id = recovery.run_id
+          JOIN ticket_chat_runs AS link ON link.run_id = runs.run_id
+          JOIN ticket_chats AS chat ON chat.chat_key = link.chat_key
+          WHERE runs.execution_mode = 'TICKET_SUPERVISOR_V1' AND chat.scope_key = ?
+          ORDER BY (SELECT COALESCE(MAX(events.id), 0) FROM events
+            WHERE events.run_id = runs.run_id AND events.event_type = 'TICKET_RECOVERY_ATTEMPT'
+              AND json_extract(CASE WHEN json_valid(events.payload_json) THEN events.payload_json ELSE '{}' END,
+                '$.operation_key') = recovery.operation_key),
+            recovery.created_at, recovery.operation_key LIMIT 1
+          """,
+          [Jason.encode!(normal_ticket_advance_keys(context, mode)), context.factory.scope]
+        )
+
+      case run do
+        nil ->
+          {:ok, acc}
+
+        selected ->
+          reconcile_selected_ticket(context, selected, acc)
+      end
+    end
+  end
+
+  defp normal_ticket_advance_keys(context, :before_dispatch) do
+    with %{enabled: true, task_transport: "desktop_broker"} <- context.factory,
+         %{"enabled" => true, "pilot_issue_keys" => keys} when is_list(keys) <- Map.get(context.factory, :ticket_supervisor),
+         %{"status" => "ACTIVE"} <- Control.status(context.store, context.factory.scope) do
+      keys
+    else
+      _ -> []
+    end
+  end
+
+  defp normal_ticket_advance_keys(_context, _mode), do: []
+
+  defp reconcile_selected_ticket(context, selected, acc) do
+    with {:ok, result} <- reconcile_ticket_jira_run(context, selected, acc) do
+      {:ok, Map.put(result, :recovery_run_id, selected["run_id"])}
+    end
+  end
+
+  defp reconcile_ticket_jira_run(context, run, acc) do
+    lock = {{__MODULE__, :ticket_stage, run["run_id"]}, self()}
+    record_ticket_recovery_attempt(context.store, run)
+
+    result =
+      :global.trans(lock, fn ->
+        with {:ok, current} <- RunLedger.get(context.store, run["run_id"]),
+             true <- current == Map.drop(run, ~w(recovery_operation recovery_key)) or {:error, :ticket_recovery_run_changed},
+             :ok <- ticket_recovery_operation(context.store, current, run),
+             {:ok, chat} <- TicketChat.ready_for_run(context.store, run["run_id"]),
+             true <- chat["scope_key"] == context.factory.scope or {:error, :ticket_recovery_scope_changed} do
+          options =
+            context.ticket_options
+            |> Keyword.put(:workspace, chat["cwd"])
+            |> Keyword.put_new(:workspace_root, context.workspace_root)
+            |> Keyword.put(:jira_reader, context.jira_reader)
+            |> Keyword.put_new(:jira_connector, context.jira_connector || JiraMcpConnector)
+            |> Keyword.put_new(:jira_app_server, context.jira_app_server)
+
+          reconcile_jira_operation(context, run, options)
+        end
+      end)
+
+    case result do
+      {:ok, %{status: status}} -> {:ok, add_event(acc, run["issue_key"], "TICKET_" <> status, run["run_id"])}
+      {:error, reason} -> {:ok, add_event(acc, run["issue_key"], "TICKET_DEFERRED", failure_code(reason))}
+      :aborted -> {:error, :ticket_stage_lock_unavailable}
+    end
+  rescue
+    error ->
+      detail = failure_code({:ticket_step_exception, error.__struct__})
+      {:ok, add_event(acc, run["issue_key"], "TICKET_DEFERRED", detail)}
+  end
+
+  defp reconcile_jira_operation(context, %{"recovery_operation" => "START_IMPLEMENTATION"} = run, options),
+    do: TicketJiraOperation.reconcile(context.store, run["run_id"], options)
+
+  defp reconcile_jira_operation(context, %{"recovery_operation" => "REVIEW_READY"} = run, options),
+    do: TicketJiraFinalization.reconcile(context.store, run["run_id"], context.factory, options)
+
+  defp reconcile_jira_operation(context, %{"recovery_operation" => "CHECKOUT"} = run, options) do
+    with {:ok, intent} <- TicketCheckout.get(context.store, run["run_id"]),
+         true <- ticket_checkout_recovery_key(intent) == run["recovery_key"] or {:error, :ticket_recovery_operation_changed},
+         {:ok, authorization} <- ticket_authorization(context, run, options) do
+      pinned = intent |> pinned_checkout_opts(options) |> Keyword.put(:expected_intent, intent)
+      TicketCheckout.reconcile(context.store, run["run_id"], authorization, pinned)
+    end
+  end
+
+  defp reconcile_jira_operation(context, %{"recovery_operation" => "PUSH"} = run, options) do
+    options =
+      options
+      |> Keyword.put(:ci_preflight_authorized, ci_preflight?(route_for_run(context, run)))
+      |> Keyword.put(:expected_envelope, run["candidate_handoff"])
+
+    with {:ok, authorization} <- ticket_authorization(context, run, options) do
+      TicketPush.reconcile(context.store, run["run_id"], authorization, options)
+    end
+  end
+
+  defp reconcile_jira_operation(context, %{"recovery_operation" => "MR_RESULT"} = run, options) do
+    options =
+      options
+      |> Keyword.put(:ci_preflight_authorized, ci_preflight?(route_for_run(context, run)))
+      |> Keyword.put(:ticket_mr_ephemeral_read, true)
+      |> Keyword.put(:expected_request_key, run["recovery_key"])
+
+    with {:ok, authorization} <- ticket_authorization(context, run, options) do
+      TicketMrOperation.adopt_result(context.store, run["run_id"], authorization, context.factory, options)
+    end
+  end
+
+  defp ticket_recovery_operation(store, current, %{"recovery_operation" => "CHECKOUT"} = selected) do
+    with {:ok, intent} <- TicketCheckout.get(store, current["run_id"]),
+         true <- intent["phase"] in ~w(MUTATING_UNCERTAIN RECONCILE_REQUIRED) or {:error, :ticket_recovery_operation_changed},
+         key = ticket_checkout_recovery_key(intent),
+         true <- key == selected["recovery_key"] or {:error, :ticket_recovery_operation_changed} do
+      :ok
+    end
+  end
+
+  defp ticket_recovery_operation(store, current, %{"recovery_operation" => "MR_RESULT"} = selected) do
+    with {:ok, %{"status" => "SUCCEEDED", "target_kind" => "CONTROLLER", "action" => "FOLLOWUP"}} <-
+           DesktopRequest.get(store, selected["recovery_key"]),
+         true <- current["state"] in ~w(MR_CREATING CI_MR_CREATING) or {:error, :ticket_recovery_operation_changed} do
+      :ok
+    else
+      _ -> {:error, :ticket_recovery_operation_changed}
+    end
+  end
+
+  defp ticket_recovery_operation(_store, current, %{"recovery_operation" => "PUSH"} = selected) do
+    with {:ok, %{"version" => 1, "kind" => "TICKET_PUSH", "phase" => "PUSH_UNCERTAIN"} = intent} <- Jason.decode(current["candidate_handoff"]),
+         key = Enum.join(["ticket-push", intent["binding_sha256"], intent["owner_nonce"]], ":"),
+         true <- key == selected["recovery_key"] or {:error, :ticket_recovery_operation_changed} do
+      :ok
+    else
+      _ -> {:error, :ticket_recovery_operation_changed}
+    end
+  end
+
+  defp ticket_recovery_operation(store, current, selected) do
+    case selected["recovery_operation"] do
+      "REVIEW_READY" ->
+        with {:ok, selection} <- TicketJiraJournal.select_review_operation(store, current["run_id"]),
+             true <- selection.operation_key == selected["recovery_key"] or {:error, :ticket_recovery_operation_changed} do
+          :ok
+        else
+          _ -> {:error, :ticket_recovery_operation_changed}
+        end
+
+      operation ->
+        if TicketJiraJournal.identity_key(current, operation) == selected["recovery_key"],
+          do: :ok,
+          else: {:error, :ticket_recovery_operation_changed}
+    end
+  end
+
+  defp ticket_checkout_recovery_key(intent),
+    do: Enum.join(["ticket-checkout", intent["run_id"], intent["binding_sha256"], intent["owner_nonce"]], ":")
+
+  defp record_ticket_recovery_attempt(store, run) do
+    payload = Jason.encode!(%{operation_key: run["recovery_key"], operation: run["recovery_operation"]})
+
+    Store.query!(store, "INSERT INTO events(occurred_at, event_type, run_id, payload_json) VALUES (?, 'TICKET_RECOVERY_ATTEMPT', ?, ?)", [
+      DateTime.to_iso8601(DateTime.utc_now()),
+      run["run_id"],
+      payload
+    ])
   end
 
   defp run_tick(context) do
@@ -83,22 +1140,19 @@ defmodule SymphonyElixir.Factory.Scheduler do
     rows =
       Store.query!(
         store,
-        "SELECT execution_mode FROM runs WHERE execution_mode IS NOT NULL AND execution_mode != 'LEGACY' ORDER BY run_id",
+        "SELECT execution_mode FROM runs WHERE execution_mode IS NOT NULL AND execution_mode NOT IN ('LEGACY', 'TICKET_SUPERVISOR_V1') ORDER BY run_id",
         []
       ).rows
 
-    case rows do
-      [] -> :ok
-      [["TICKET_SUPERVISOR_V1"] | _rest] -> {:error, :ticket_supervisor_runtime_capability_unproven}
-      [[_unsupported] | _rest] -> {:error, :invalid_execution_mode}
-    end
+    if rows == [], do: :ok, else: {:error, :invalid_execution_mode}
   end
 
   defp run_factory_tick(context, workspace) do
     retry_rejected_verifier_creation(context)
 
     result =
-      with :ok <- DesktopRequest.reconcile_native_successes(context.store),
+      with {:ok, recovery} <- reconcile_ticket_jira_context(context, :before_dispatch),
+           :ok <- DesktopRequest.reconcile_native_successes(context.store),
            :ok <- reconcile_stale_tasks(context),
            {:ok, jql} <- Queue.jql(context.factory.queue),
            {:ok, queued_snapshots} <- fetch_queue(context, workspace, jql),
@@ -106,10 +1160,11 @@ defmodule SymphonyElixir.Factory.Scheduler do
              IntakeLedger.replace(context.store, context.factory.scope, queued_snapshots),
            {:ok, snapshots} <- fetch_active_snapshots(context, workspace, queued_snapshots),
            {:ok, intake} <- reconcile_intake(context, snapshots),
-           {:ok, advance_result} <- advance_runs(context, workspace, intake) do
+           {:ok, legacy_result} <- advance_runs(context, workspace, intake),
+           {:ok, advance_result} <- advance_ticket_runs(context, legacy_result, recovery[:recovery_run_id]) do
         :ok = sweep_one_cleanup_candidate(context)
         NativeWorkspaceMaintenance.reconcile(context.store, context.factory)
-        {:ok, advance_result}
+        {:ok, %{advance_result | events: recovery.events ++ advance_result.events}}
       end
 
     result
@@ -126,6 +1181,8 @@ defmodule SymphonyElixir.Factory.Scheduler do
         WHERE request.status = 'RECONCILE_REQUIRED' AND request.failure_code = 'CREATE_THREAD_INVALID_ARGUMENTS'
           AND request.thread_id IS NULL AND task.role = 'change-verifier' AND task.status = 'WAITING_FOR_BROKER'
           AND run.state = 'VERIFYING' AND task.task_key = run.run_id || ':change-verifier:' || run.verifier_round
+          AND COALESCE(run.execution_mode, 'LEGACY') = 'LEGACY'
+          AND NOT EXISTS (SELECT 1 FROM runs AS supervisor WHERE supervisor.issue_key = run.issue_key AND supervisor.execution_mode = 'TICKET_SUPERVISOR_V1')
           AND NOT EXISTS (SELECT id FROM events WHERE event_type = 'REJECTED_NATIVE_CREATE_REARMED'
             AND json_extract(payload_json, '$.request_key') = request.request_key)
         ORDER BY request.created_at ASC
@@ -142,11 +1199,11 @@ defmodule SymphonyElixir.Factory.Scheduler do
   end
 
   defp feedback_controller_in_flight?(store) do
-    Store.one!(store, "SELECT feedback_key FROM mr_feedback_notes WHERE status = 'CLAIMED' LIMIT 1") != nil or
-      Store.one!(
-        store,
-        "SELECT note.feedback_key FROM mr_feedback_notes AS note JOIN desktop_requests AS request ON request.request_key = note.request_key WHERE note.status = 'CLAIMED' AND request.target_kind = 'CONTROLLER' AND request.status IN ('PENDING', 'CREATE_UNCERTAIN', 'FOLLOWUP_UNCERTAIN', 'THREAD_RECORDED', 'RECONCILE_REQUIRED') LIMIT 1"
-      ) != nil
+    Store.one!(
+      store,
+      "SELECT note.feedback_key FROM mr_feedback_notes AS note JOIN runs AS run ON run.run_id = note.run_id WHERE note.status = 'CLAIMED' AND COALESCE(run.execution_mode, 'LEGACY') = 'LEGACY' AND NOT EXISTS (SELECT 1 FROM runs AS supervisor WHERE supervisor.issue_key = run.issue_key AND supervisor.execution_mode = 'TICKET_SUPERVISOR_V1') LIMIT 1"
+    ) != nil or
+      DesktopRequest.native_controller_busy?(store)
   end
 
   defp maybe_consume_review_feedback(context, workspace) do
@@ -337,6 +1394,25 @@ defmodule SymphonyElixir.Factory.Scheduler do
     |> Map.put(:gitlab_connector, Keyword.get(opts, :gitlab_connector, SymphonyElixir.Factory.GitLabMcpConnector))
     |> Map.put(:gitlab_app_server, Keyword.get(opts, :gitlab_app_server, SymphonyElixir.Codex.AppServer))
     |> Map.put(:feedback_consumer, Keyword.get(opts, :feedback_consumer, MrFeedbackConsumer))
+    |> Map.put(:ticket_options, configured_ticket_options(context, opts))
+  end
+
+  defp configured_ticket_options(context, opts) do
+    policy = Map.get(context.factory, :ticket_supervisor, %{})
+    fields = ~w(parent_output_root broker_thread_id ticket_cli_root ticket_workflow)a
+
+    configured =
+      Enum.flat_map(fields, fn key ->
+        case Map.fetch(policy, Atom.to_string(key)) do
+          {:ok, value} -> [{key, value}]
+          :error -> []
+        end
+      end)
+
+    configured
+    |> Keyword.put_new(:ticket_workflow, Path.expand(Workflow.workflow_file_path()))
+    |> Keyword.merge(Map.get(context, :ticket_options, []))
+    |> Keyword.merge(Keyword.get(opts, :ticket_options, []))
   end
 
   defp reconcile_stale_tasks(context) do
@@ -349,8 +1425,10 @@ defmodule SymphonyElixir.Factory.Scheduler do
       Store.query!(
         context.store,
         """
-        SELECT task_key FROM factory_tasks
-        WHERE status IN ('STARTING', 'RUNNING') AND updated_at < ?
+        SELECT task.task_key FROM factory_tasks AS task JOIN runs AS run ON run.run_id = task.run_id
+        WHERE task.status IN ('STARTING', 'RUNNING') AND task.updated_at < ?
+          AND COALESCE(run.execution_mode, 'LEGACY') = 'LEGACY'
+          AND NOT EXISTS (SELECT 1 FROM runs AS supervisor WHERE supervisor.issue_key = run.issue_key AND supervisor.execution_mode = 'TICKET_SUPERVISOR_V1')
         """,
         [cutoff]
       )
@@ -449,7 +1527,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
 
     store
     |> Store.query!(
-      "SELECT DISTINCT issue_key FROM runs WHERE state NOT IN (#{placeholders}) ORDER BY issue_key",
+      "SELECT DISTINCT issue_key FROM runs WHERE state NOT IN (#{placeholders}) AND COALESCE(execution_mode, 'LEGACY') = 'LEGACY' AND NOT EXISTS (SELECT 1 FROM runs AS supervisor WHERE supervisor.issue_key = runs.issue_key AND supervisor.execution_mode = 'TICKET_SUPERVISOR_V1') ORDER BY issue_key",
       @terminal_states
     )
     |> Map.fetch!(:rows)
@@ -458,7 +1536,10 @@ defmodule SymphonyElixir.Factory.Scheduler do
 
   defp recoverable_delivery_issue_keys(store) do
     store
-    |> Store.query!("SELECT DISTINCT issue_key FROM runs WHERE kind = 'DELIVERY' AND state IN ('FAILED', 'CANCELLED') ORDER BY issue_key", [])
+    |> Store.query!(
+      "SELECT DISTINCT issue_key FROM runs WHERE kind = 'DELIVERY' AND state IN ('FAILED', 'CANCELLED') AND COALESCE(execution_mode, 'LEGACY') = 'LEGACY' AND NOT EXISTS (SELECT 1 FROM runs AS supervisor WHERE supervisor.issue_key = runs.issue_key AND supervisor.execution_mode = 'TICKET_SUPERVISOR_V1') ORDER BY issue_key",
+      []
+    )
     |> Map.fetch!(:rows)
     |> Enum.map(fn [issue_key] -> issue_key end)
     |> Enum.filter(fn issue_key ->
@@ -503,19 +1584,26 @@ defmodule SymphonyElixir.Factory.Scheduler do
     issue_key = snapshot_value(snapshot, "key")
 
     if present?(issue_key) do
-      update_active_snapshot(context.store, issue_key, snapshot)
-
-      case active_run_for_issue(context.store, issue_key) do
-        %{} = active ->
-          reconcile_reopened_delivery_label(context, snapshot, active, acc)
-
-        nil ->
-          reconcile_inactive_snapshot(context, snapshot, acc)
+      if v1_issue?(context.store, issue_key) do
+        {:ok, acc}
+      else
+        update_active_snapshot(context.store, issue_key, snapshot)
+        reconcile_known_issue_snapshot(context, snapshot, acc, issue_key)
       end
     else
       {:error, :jira_snapshot_missing_key}
     end
   end
+
+  defp reconcile_known_issue_snapshot(context, snapshot, acc, issue_key) do
+    case active_run_for_issue(context.store, issue_key) do
+      %{} = active -> reconcile_reopened_delivery_label(context, snapshot, active, acc)
+      nil -> reconcile_inactive_snapshot(context, snapshot, acc)
+    end
+  end
+
+  defp v1_issue?(store, issue_key),
+    do: Store.one!(store, "SELECT run_id FROM runs WHERE issue_key = ? AND execution_mode = 'TICKET_SUPERVISOR_V1' LIMIT 1", [issue_key]) != nil
 
   defp reconcile_inactive_snapshot(context, snapshot, acc) do
     issue_key = snapshot_value(snapshot, "key")
@@ -910,28 +1998,29 @@ defmodule SymphonyElixir.Factory.Scheduler do
          {:ok, manual_required} <- Contract.manual_validation_required(contract.markdown),
          {:ok, manual_environment} <- Contract.manual_validation_environment(contract.markdown),
          :ok <- validate_manual_policy(context.factory.manual_validation, manual_required, manual_environment),
+         attrs = %{
+           run_id: run_id,
+           issue_key: issue_key,
+           kind: "DELIVERY",
+           state: "ADMITTING_WRITER",
+           dispatcher_id: context.factory.dispatcher_id,
+           spec_revision: contract.revision,
+           contract_sha256: contract.sha256,
+           contract_markdown: contract.markdown,
+           risk: risk,
+           risk_signals_json: Jason.encode!(risk_signals),
+           manual_validation_required: manual_required,
+           repo_key: route["repo_key"],
+           repo_path: route["path"],
+           base_branch: route["base_branch"],
+           branch: branch,
+           snapshot_json: Jason.encode!(snapshot),
+           factory_owned: not native_transport?(context),
+           runtime: if(native_transport?(context), do: "codex-desktop-broker", else: "codex-app-server")
+         },
+         {:ok, prepared, parent_opts} <- prepare_delivery_registration(context, attrs),
          {:ok, _capacity} <- ensure_writer_capacity(context, route["repo_key"]),
-         {:ok, %{run: run}} <-
-           RunLedger.register(context.store, %{
-             run_id: run_id,
-             issue_key: issue_key,
-             kind: "DELIVERY",
-             state: "ADMITTING_WRITER",
-             dispatcher_id: context.factory.dispatcher_id,
-             spec_revision: contract.revision,
-             contract_sha256: contract.sha256,
-             contract_markdown: contract.markdown,
-             risk: risk,
-             risk_signals_json: Jason.encode!(risk_signals),
-             manual_validation_required: manual_required,
-             repo_key: route["repo_key"],
-             repo_path: route["path"],
-             base_branch: route["base_branch"],
-             branch: branch,
-             snapshot_json: Jason.encode!(snapshot),
-             factory_owned: not native_transport?(context),
-             runtime: if(native_transport?(context), do: "codex-desktop-broker", else: "codex-app-server")
-           }) do
+         {:ok, %{run: run}} <- register_prepared_delivery(context, prepared, parent_opts) do
       {:ok, add_event(acc, run["issue_key"], "DELIVERY_REGISTERED", run["run_id"])}
     else
       {:error, :routing_required} ->
@@ -951,6 +2040,47 @@ defmodule SymphonyElixir.Factory.Scheduler do
 
       {:error, reason} ->
         {:error, {:delivery_registration_failed, reason}}
+    end
+  end
+
+  defp prepare_delivery_registration(context, attrs) do
+    policy = Map.get(context.factory, :ticket_supervisor, %{})
+    selected = policy["enabled"] == true and attrs.issue_key in (policy["pilot_issue_keys"] || [])
+    if selected, do: prepare_ticket_registration(context, attrs), else: {:ok, attrs, nil}
+  end
+
+  defp prepare_ticket_registration(context, attrs) do
+    options = Map.get(context, :ticket_options, [])
+    attrs = Map.merge(attrs, %{execution_mode: "TICKET_SUPERVISOR_V1", factory_owned: true, runtime: "codex-app-server"})
+    ordinary = Map.new(attrs, fn {key, value} -> {to_string(key), value} end) |> Map.put("manual_validation_required", 0)
+
+    with true <- native_transport?(context) or {:error, :ticket_chat_desktop_transport_required},
+         true <- attrs.manual_validation_required == false or {:error, :ticket_manual_validation_not_supported},
+         {:ok, _parent} <- prepare_ticket_parent(context, ordinary, options),
+         :ok <- AppServer.check_ticket_runtime(options[:parent_output_root]) do
+      {:ok, attrs, options}
+    end
+  end
+
+  defp register_prepared_delivery(context, attrs, nil), do: RunLedger.register(context.store, attrs)
+
+  defp register_prepared_delivery(context, attrs, options) do
+    operation = fn tx -> rollback_registration(tx, register_ticket_delivery(%{context | store: tx}, attrs, options)) end
+
+    case Exqlite.transaction(context.store, operation) do
+      {:ok, result} -> result
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp rollback_registration(tx, {:error, reason}), do: Exqlite.rollback(tx, reason)
+  defp rollback_registration(_tx, result), do: result
+
+  defp register_ticket_delivery(context, attrs, options) do
+    with {:ok, %{run: run} = registered} <- RunLedger.register(context.store, attrs),
+         {:ok, parent} <- prepare_ticket_parent(context, run, options),
+         {:ok, _} <- reserve_ticket_parent(context, run, parent) do
+      {:ok, registered}
     end
   end
 
@@ -984,7 +2114,8 @@ defmodule SymphonyElixir.Factory.Scheduler do
     Enum.reduce(snapshots, acc, fn snapshot, current ->
       issue_key = snapshot_value(snapshot, "key")
 
-      if "ai-testing" in normalized_labels(snapshot) and is_nil(active_run_for_issue(context.store, issue_key)) do
+      if not v1_issue?(context.store, issue_key) and "ai-testing" in normalized_labels(snapshot) and
+           is_nil(active_run_for_issue(context.store, issue_key)) do
         maybe_register_validation(context, snapshot, current)
       else
         current
@@ -1043,8 +2174,600 @@ defmodule SymphonyElixir.Factory.Scheduler do
     result
   end
 
+  defp advance_ticket_runs(context, acc, recovery_run_id) do
+    result =
+      Store.query!(
+        context.store,
+        "SELECT * FROM runs WHERE execution_mode = 'TICKET_SUPERVISOR_V1' AND state NOT IN ('DELIVERED', 'AWAITING_VALIDATION', 'CANCELLED', 'FAILED') ORDER BY created_at, run_id"
+      )
+
+    runs =
+      result.rows
+      |> Enum.map(&Map.new(Enum.zip(result.columns, &1)))
+      |> Enum.reject(&(&1["run_id"] == recovery_run_id))
+
+    {:ok, Enum.reduce(runs, acc, &advance_ticket_run(context, &1, &2))}
+  end
+
+  defp advance_ticket_run(context, run, acc) do
+    policy = Map.get(context.factory, :ticket_supervisor, %{})
+
+    if policy["enabled"] == true and run["issue_key"] in (policy["pilot_issue_keys"] || []) do
+      options = Keyword.put(context.ticket_options, :jira_reader, context.jira_reader)
+      ticket_tick_result(context, run, options, acc)
+    else
+      acc
+    end
+  rescue
+    error -> add_event(acc, run["issue_key"], "TICKET_DEFERRED", failure_code({:ticket_step_exception, error.__struct__}))
+  end
+
+  defp ticket_tick_result(context, run, options, acc) do
+    result =
+      case TicketChat.ready_for_run(context.store, run["run_id"]) do
+        {:ok, _} ->
+          if run["state"] in ~w(ADMITTING_WRITER PLANNING WRITING REPAIRING REVIEW_WRITING VERIFYING READY_FOR_REVIEW),
+            do: ticket_ready_parent_step(context, run, options),
+            else: ticket_delivery_pending(context, run, options)
+
+        {:error, _} ->
+          ticket_parent_step(context, run["run_id"], options)
+      end
+
+    case result do
+      {:ok, %{status: "LAUNCHED", launch: launch}} ->
+        add_event(%{acc | launches: [launch | acc.launches]}, run["issue_key"], "TICKET_LAUNCHED", run["run_id"])
+
+      {:ok, %{status: "COMMAND_RESUMED", launch: launch}} ->
+        add_event(%{acc | launches: [launch | acc.launches]}, run["issue_key"], "TICKET_COMMAND_RESUMED", run["run_id"])
+
+      {:ok, %{status: "AMENDMENT_DEFERRED", reason: reason}} ->
+        add_event(acc, run["issue_key"], "TICKET_AMENDMENT_DEFERRED", inspect(reason))
+
+      {:ok, %{status: status}} ->
+        add_event(acc, run["issue_key"], "TICKET_" <> status, run["run_id"])
+
+      {:error, reason} ->
+        add_event(acc, run["issue_key"], "TICKET_DEFERRED", failure_code(reason))
+    end
+  end
+
+  defp ticket_ready_parent_step(context, expected_run, options) do
+    lock = {{__MODULE__, :ticket_stage, expected_run["run_id"]}, self()}
+
+    case :global.trans(lock, fn -> ticket_ready_parent_locked(context, expected_run, options) end) do
+      :aborted -> {:error, :ticket_stage_lock_unavailable}
+      result -> result
+    end
+  end
+
+  defp ticket_ready_parent_locked(context, expected_run, options) do
+    run_id = expected_run["run_id"]
+
+    with {:ok, run} <- RunLedger.get(context.store, run_id),
+         true <- run["state"] in ~w(ADMITTING_WRITER PLANNING WRITING REPAIRING REVIEW_WRITING VERIFYING READY_FOR_REVIEW) or {:error, :ticket_command_run_state_changed},
+         :ok <- TicketChat.ordinary_delivery_eligibility(run),
+         {:ok, chat} <- TicketChat.ready_for_run(context.store, run_id),
+         previous <- command_statuses(context.store, chat["chat_key"], run_id),
+         {:ok, collected} <- TicketChatCommands.collect(context.store, run_id, native_reader: Keyword.get(options, :ticket_chat_reader, AppServer)),
+         :ok <- no_new_native_rejections(context.store, run, chat, previous, collected.receipts),
+         {:ok, current_run} <- RunLedger.get(context.store, run_id),
+         {:ok, current_chat} <- TicketChat.ready_for_run(context.store, run_id),
+         :ok <- validate_ticket_binding(run, chat, current_run, current_chat) do
+      apply_or_advance_ticket(context, current_run, current_chat, options)
+    else
+      {:error, {:answer_recovered, receipt}} -> {:ok, %{status: "ANSWER_RECOVERED", receipt: receipt, source_advanced: false}}
+      {:error, reason} -> {:error, {:ticket_command_readback_deferred, reason}}
+    end
+  end
+
+  defp validate_ticket_binding(run, chat, current_run, current_chat) do
+    if current_ticket_binding(run, chat) == current_ticket_binding(current_run, current_chat),
+      do: :ok,
+      else: {:error, :ticket_command_binding_changed}
+  end
+
+  defp command_statuses(store, chat_key, run_id) do
+    Store.query!(store, "SELECT command_key, status FROM ticket_chat_commands WHERE chat_key = ? AND run_id = ?", [chat_key, run_id]).rows
+    |> Map.new(fn [key, status] -> {key, status} end)
+  end
+
+  defp no_new_native_rejections(store, run, chat, previous, receipts) do
+    rejected =
+      Enum.filter(receipts, &new_native_rejection?(store, previous, &1))
+
+    case rejected do
+      [%{"command_key" => key}] ->
+        handle_single_native_rejection(store, run, chat, key)
+
+      [first | _] ->
+        {:error, {:native_command_rejected, first["command_key"]}}
+
+      [] ->
+        :ok
+    end
+  end
+
+  defp new_native_rejection?(store, previous, receipt) do
+    receipt["status"] == "REJECTED" and
+      (previous[receipt["command_key"]] != "REJECTED" or recoverable_answer_rejection?(store, receipt["command_key"]))
+  end
+
+  defp handle_single_native_rejection(store, run, chat, key) do
+    if recovered_answer_exists?(store, key) do
+      case TicketChatCommands.recover_declared_answer(store, key, ticket_command_context(run, chat)) do
+        {:ok, _receipt} -> :ok
+        _ -> {:error, {:native_command_rejected, key}}
+      end
+    else
+      case TicketChatCommands.recover_declared_answer(store, key, ticket_command_context(run, chat)) do
+        {:ok, receipt} -> {:error, {:answer_recovered, receipt}}
+        _ -> {:error, {:native_command_rejected, key}}
+      end
+    end
+  end
+
+  defp recoverable_answer_rejection?(store, key) do
+    case Store.one!(store, "SELECT receipt_json, application_receipt_json FROM ticket_chat_commands WHERE command_key = ?", [key]) do
+      %{"receipt_json" => receipt, "application_receipt_json" => nil} ->
+        case Jason.decode(receipt || "null") do
+          {:ok, %{"reason" => "native_intent_mismatch"}} -> true
+          _ -> false
+        end
+
+      _ ->
+        false
+    end
+  end
+
+  defp recovered_answer_exists?(store, key),
+    do: Store.one!(store, "SELECT recovery_key FROM ticket_chat_answer_recoveries WHERE predecessor_command_key = ?", [key]) != nil
+
+  defp current_ticket_binding(run, chat),
+    do: {Map.take(run, ~w(run_id state spec_revision contract_sha256 candidate_sha implementation_iteration worktree branch)), Map.take(chat, ~w(chat_key generation thread_id cwd))}
+
+  defp apply_or_advance_ticket(context, run, chat, options) do
+    commands = accepted_ticket_commands(context.store, run, chat)
+
+    case amendment_command(context.store, commands) || List.first(commands) do
+      nil -> ticket_idle_or_advance(context, run, options)
+      key -> dispatch_accepted_ticket_command(context, run, chat, options, key)
+    end
+  end
+
+  defp accepted_ticket_commands(store, run, chat) do
+    Store.query!(store, "SELECT command_key FROM ticket_chat_commands WHERE chat_key = ? AND run_id = ? AND status = 'ACCEPTED' ORDER BY created_at, command_key", [
+      chat["chat_key"],
+      run["run_id"]
+    ]).rows
+    |> Enum.map(fn [key] -> key end)
+  end
+
+  defp ticket_idle_or_advance(context, run, options) do
+    cond do
+      run["state"] == "READY_FOR_REVIEW" ->
+        {:ok, %{status: "READY_IDLE", model_invoked: false}}
+
+      run["state"] == "WRITING" ->
+        case installed_blocked_source_status(context.store, run) do
+          :held -> {:ok, %{status: "SOURCE_HELD", model_invoked: false}}
+          :resumed -> ticket_step_locked(context, run["run_id"], options)
+          :not_held -> ticket_step_locked(context, run["run_id"], options)
+          {:error, reason} -> {:error, reason}
+        end
+
+      true ->
+        ticket_step_locked(context, run["run_id"], options)
+    end
+  end
+
+  defp installed_blocked_source_status(store, run) do
+    case TicketContractAmendment.blocked_predecessor_for_installed_run(store, run) do
+      {:error, :blocked_amendment_predecessor_not_found} ->
+        :not_held
+
+      {:ok, %{receipt: receipt}} ->
+        installed_blocked_source_receipt_status(store, receipt)
+    end
+  end
+
+  defp installed_blocked_source_receipt_status(store, receipt) do
+    with {:ok, predecessor} <- Jason.decode(receipt["blocked_predecessor_json"]),
+         {:ok, evidence_snapshot} <- Jason.decode(predecessor["evidence_json"]),
+         {:ok, evidence} <- WorkerEvidence.get(store, evidence_snapshot["request_key"]) do
+      if WorkerEvidence.superseded_blocked_attempt?(store, evidence),
+        do: :resumed,
+        else: live_blocked_source_status(store, receipt)
+    else
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp live_blocked_source_status(store, receipt) do
+    case WorkspaceAccess.validate_blocked_amendment_predecessor(store, receipt) do
+      :ok -> :held
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp dispatch_accepted_ticket_command(context, run, chat, options, key) do
+    case TicketChatCommands.get(context.store, key) do
+      {:ok, %{"status" => "ACCEPTED", "payload_json" => payload}} ->
+        dispatch_ticket_payload(context, run, chat, options, key, payload)
+
+      _ ->
+        apply_ordinary_ticket_command(context, run, chat, key)
+    end
+  end
+
+  defp dispatch_ticket_payload(context, run, chat, options, key, payload) do
+    case Jason.decode(payload) do
+      {:ok, operations} when is_list(operations) ->
+        dispatch_ticket_operations(context, run, chat, options, key, payload, operations)
+
+      _ ->
+        apply_ordinary_ticket_command(context, run, chat, key)
+    end
+  end
+
+  defp dispatch_ticket_operations(context, run, chat, options, key, payload, operations) do
+    if TicketChatCommands.rework_payload?(operations) do
+      if run["state"] == "READY_FOR_REVIEW",
+        do: launch_ready_ticket_rework(context, run, options, key),
+        else: resume_blocked_ticket_command(context, run, chat, options, key)
+    else
+      dispatch_non_rework_ticket_payload(context, run, chat, options, key, payload)
+    end
+  end
+
+  defp launch_ready_ticket_rework(context, run, options, command_key) do
+    with {:ok, %{input: input}} <- TicketChatCommands.validate_ready_rework(context.store, command_key),
+         review_run = Map.put(run, "state", "REVIEW_WRITING"),
+         {:ok, authorization} <- ready_rework_authorization(context, run, options),
+         :ok <- TicketWorkerRunner.validate_authorization(review_run, authorization),
+         {:ok, stage} <- ticket_stage(review_run, context.factory),
+         {:ok, base_prompt} <-
+           TicketWorkerRunner.packet(context.store, run["run_id"], stage.role, Store.one!(context.store, "SELECT base_sha FROM ticket_review_bases WHERE run_id = ?", [run["run_id"]])["base_sha"]),
+         prompt = TicketWorkerRunner.ready_rework_packet(base_prompt, command_key, input["body"]),
+         opts = ready_rework_launch_options(context, run, stage, authorization, command_key, input, prompt, options),
+         result <-
+           TaskLauncher.launch(
+             context.store,
+             context.task_supervisor,
+             run,
+             issue_from_snapshot(decode_json!(run["snapshot_json"])),
+             run["worktree"],
+             prompt,
+             StageSchemas.for_stage(stage.schema),
+             opts
+           ) do
+      case result do
+        {:ok, launch} -> {:ok, %{status: "LAUNCHED", launch: launch}}
+        {:already_running, task} -> {:ok, %{status: "RUNNING", task: task}}
+        {:already_terminal, task} -> {:ok, %{status: "RECOVERED", task: task}}
+        error -> error
+      end
+    else
+      {:error, reason} -> {:error, {:ready_rework_admission_failed, reason}}
+    end
+  end
+
+  defp ready_rework_authorization(context, run, options) do
+    reader = Keyword.get(options, :jira_reader, JiraMcpReader)
+    read_opts = [workspace: context.workspace_root, store: context.store, connector: Map.get(context, :jira_connector) || JiraMcpConnector, app_server: Map.get(context, :jira_app_server, AppServer)]
+
+    with {:ok, snapshot} <- reader.issue(run["issue_key"], read_opts) do
+      TicketWorkerRunner.ready_rework_authorization(run, snapshot, DateTime.utc_now())
+    end
+  end
+
+  defp ready_rework_launch_options(context, run, stage, authorization, command_key, input, prompt, options) do
+    Keyword.merge(options,
+      authorization: authorization,
+      task_key: stage.key,
+      stage: "REVIEW_WRITING",
+      role: stage.role,
+      model_policy: context.factory.models,
+      risk: run["risk"],
+      risk_signals: decode_json(run["risk_signals_json"], []),
+      project_id: nil,
+      project_root: run["repo_path"],
+      recipient: context.recipient,
+      thread_name: task_name(run["issue_key"], "Feature Writer"),
+      review_base_sha: Store.one!(context.store, "SELECT base_sha FROM ticket_review_bases WHERE run_id = ?", [run["run_id"]])["base_sha"],
+      expected_sha: run["candidate_sha"],
+      resume_terminal: true,
+      ready_rework: %{command_key: command_key, input_key: input["input_key"], input_body: input["body"], prompt: prompt}
+    )
+  end
+
+  defp dispatch_non_rework_ticket_payload(context, run, chat, options, key, payload) do
+    case Jason.decode(payload) do
+      {:ok, operations} when is_list(operations) and operations != [] ->
+        if match?(%{"operation" => "propose_contract_revision"}, List.last(operations)) do
+          consume_ticket_amendment(context, run, chat, options, key)
+        else
+          apply_ordinary_ticket_command(context, run, chat, key)
+        end
+
+      _ ->
+        apply_ordinary_ticket_command(context, run, chat, key)
+    end
+  end
+
+  defp apply_ordinary_ticket_command(context, run, chat, key) do
+    controller_context = ticket_command_context(run, chat)
+    command_application_result(TicketChatCommands.apply_accepted(context.store, key, controller_context), key)
+  end
+
+  defp amendment_command(store, commands) do
+    first = List.first(commands)
+
+    correction =
+      Enum.find(commands, fn key ->
+        case accepted_contract_proposal(store, key) do
+          {:ok, %{supersedes: %{predecessor_command_key: ^first}}} when key != first -> true
+          _ -> false
+        end
+      end)
+
+    correction || if(first && match?({:ok, _}, accepted_contract_proposal(store, first)), do: first)
+  end
+
+  defp accepted_contract_proposal(store, key) do
+    case TicketChatCommands.get(store, key) do
+      {:ok, %{"status" => "ACCEPTED", "payload_json" => payload}} ->
+        if contract_proposal_payload?(payload),
+          do: TicketChatCommands.validate_contract_amendment(store, key),
+          else: {:error, :unsupported_command_operations}
+
+      _ ->
+        {:error, :ticket_command_not_accepted}
+    end
+  end
+
+  defp contract_proposal_payload?(payload) do
+    case Jason.decode(payload) do
+      {:ok, operations} when is_list(operations) and operations != [] ->
+        match?(%{"operation" => "propose_contract_revision"}, List.last(operations))
+
+      _ ->
+        false
+    end
+  end
+
+  defp ticket_command_context(run, chat) do
+    %{
+      "chat_key" => chat["chat_key"],
+      "run_id" => run["run_id"],
+      "binding" => Map.take(run, ~w(spec_revision contract_sha256 candidate_sha)) |> Map.put("generation", chat["generation"])
+    }
+  end
+
+  defp consume_ticket_amendment(context, run, chat, options, key) do
+    controller_context = ticket_command_context(run, chat)
+    model_policy = context.factory.models
+    workspace = controller_workspace(context)
+    jira_options = amendment_jira_options(context, options, workspace)
+
+    with {:ok, _amendment} <- TicketContractAmendment.reserve(context.store, key, controller_context),
+         {:ok, _draft} <- TicketAmendmentJiraOperation.publish_draft(context.store, key, controller_context, jira_options),
+         {:ok, draft} <- TicketAmendmentJiraOperation.readback(context.store, key),
+         {:ok, critique} <- prepare_or_reuse_amendment_critic(context.store, key, controller_context, draft, workspace, model_policy, options),
+         true <- critique["qualifies"] == true or {:error, :amendment_critic_non_authorizing},
+         {:ok, _authorization} <- TicketAmendmentJiraOperation.publish_authorization(context.store, key, controller_context, model_policy, jira_options),
+         {:ok, _applied} <- TicketContractAmendment.apply_authorized(context.store, key, controller_context, model_policy) do
+      {:ok, %{status: "AMENDMENT_APPLIED", command_key: key, model_invoked: true}}
+    else
+      {:error, reason} -> {:ok, %{status: "AMENDMENT_DEFERRED", command_key: key, reason: reason, model_invoked: false}}
+    end
+  end
+
+  defp prepare_or_reuse_amendment_critic(store, key, controller_context, draft, workspace, model_policy, options) do
+    case TicketContractAmendment.get_critic_attempt(store, key, model_policy) do
+      {:ok, _recorded_or_prepared} ->
+        execute_amendment_critic(store, key, controller_context, workspace, model_policy, options)
+
+      {:error, :critic_attempt_not_prepared} ->
+        with {:ok, _attempt} <-
+               TicketContractAmendment.prepare_critic(
+                 store,
+                 key,
+                 controller_context,
+                 draft["readback_json"],
+                 model_policy
+               ) do
+          execute_amendment_critic(store, key, controller_context, workspace, model_policy, options)
+        end
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  defp execute_amendment_critic(store, key, controller_context, workspace, model_policy, options) do
+    TicketAmendmentCritic.execute(
+      store,
+      key,
+      controller_context,
+      workspace,
+      model_policy,
+      critic_options(options)
+    )
+  end
+
+  defp amendment_jira_options(context, options, workspace) do
+    [
+      workspace: workspace,
+      jira_reader: Keyword.get(options, :jira_reader, context.jira_reader),
+      jira_connector: Keyword.get(options, :jira_connector, context.jira_connector || JiraMcpConnector),
+      app_server: context.jira_app_server || AppServer,
+      jira_session: Keyword.get(options, :jira_session, &AppServer.with_jira_controller_session/2)
+    ]
+  end
+
+  defp critic_options(options), do: Keyword.take(options, [:stage_runner, :app_server])
+
+  defp resume_blocked_ticket_command(context, run, chat, options, command_key) do
+    command = TicketChatCommands.get(context.store, command_key)
+
+    with {:ok, %{"status" => "ACCEPTED", "input_key" => input_key}} <- command,
+         input when is_map(input) <- Store.one!(context.store, "SELECT * FROM ticket_chat_inputs WHERE input_key = ?", [input_key]),
+         {:ok, task} <- TaskLedger.get(context.store, run["run_id"] <> ":feature-writer"),
+         disposition when is_map(disposition) <- current_blocked_writer_disposition(context.store, run["run_id"], task["task_key"]) do
+      resume = %{
+        "command_key" => command_key,
+        "input_key" => input_key,
+        "request_key" => disposition["request_key"],
+        "disposition_key" => disposition["disposition_key"],
+        "thread_id" => task["thread_id"]
+      }
+
+      resume =
+        case TicketContractAmendment.blocked_predecessor_for_request(context.store, disposition["request_key"]) do
+          {:ok, receipt} ->
+            predecessor = Jason.decode!(receipt["blocked_predecessor_json"])
+
+            resume
+            |> Map.put("amendment_command_key", receipt["command_key"])
+            |> Map.put("checkout_head_sha", predecessor["checkout_head_sha"])
+
+          _ ->
+            resume
+        end
+
+      launch_ticket_stage(context, run, Keyword.put(options, :blocked_resume, resume))
+      |> case do
+        {:ok, %{status: "LAUNCHED", launch: launch}} -> {:ok, command_resumed(launch, command_key, input["body"], chat)}
+        other -> other
+      end
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :ticket_blocked_rework_not_current}
+    end
+  end
+
+  defp command_resumed(launch, command_key, input_body, chat),
+    do: %{status: "COMMAND_RESUMED", launch: launch, command_key: command_key, input_body: input_body, chat: chat}
+
+  defp current_blocked_writer_disposition(store, run_id, task_key) do
+    Store.query!(store, "SELECT payload_json FROM events WHERE run_id = ? AND event_type = 'TICKET_NATIVE_WRITER_BLOCKED' ORDER BY id DESC", [run_id]).rows
+    |> Enum.map(fn [raw] -> Jason.decode!(raw) end)
+    |> Enum.find(&(&1["task_key"] == task_key))
+  end
+
+  defp command_application_result({:ok, %{"status" => "APPLIED"} = command}, key),
+    do: {:ok, %{status: "COMMAND_APPLIED", command_key: key, application_receipt_json: command["application_receipt_json"], model_invoked: false}}
+
+  defp command_application_result({:ok, %{"status" => "REJECTED"} = command}, key),
+    do: {:ok, %{status: "COMMAND_REJECTED", command_key: key, application_receipt_json: command["application_receipt_json"], model_invoked: false}}
+
+  defp command_application_result({:ok, %{"status" => "ACCEPTED"}}, key),
+    do: {:ok, %{status: "COMMAND_DEFERRED", command_key: key, reason: :unsupported_command_operations, model_invoked: false}}
+
+  defp command_application_result({:ok, command}, key),
+    do: {:ok, %{status: "COMMAND_DEFERRED", command_key: key, reason: command["status"], model_invoked: false}}
+
+  defp command_application_result({:error, reason}, _key), do: {:error, {:ticket_command_application_deferred, reason}}
+
+  defp ticket_delivery_pending(context, %{"state" => state} = run, options) when state in ~w(PUSHING MR_CREATING CI_PUSHING CI_MR_CREATING CI_WAITING) do
+    options = options |> Keyword.put_new(:workspace_root, context.workspace_root) |> Keyword.put(:ci_preflight_authorized, ci_preflight?(route_for_run(context, run)))
+
+    lock = {{__MODULE__, :ticket_stage, run["run_id"]}, self()}
+
+    case :global.trans(lock, fn -> ticket_delivery_step(context, run, options) end) do
+      :aborted -> {:error, :ticket_stage_lock_unavailable}
+      result -> result
+    end
+  end
+
+  defp ticket_delivery_pending(_context, _run, _options), do: {:ok, %{status: "DELIVERY_JOIN_PENDING"}}
+
+  defp ticket_delivery_step(context, %{"state" => state} = run, options) when state in ~w(PUSHING CI_PUSHING) do
+    with {:ok, authorization} <- ticket_authorization(context, run, options) do
+      TicketPush.step(context.store, run["run_id"], authorization, options)
+    end
+  end
+
+  defp ticket_delivery_step(context, %{"state" => "MR_CREATING", "mr_iid" => iid, "mr_url" => url} = run, options)
+       when is_integer(iid) and iid > 0 and is_binary(url) and url != "" do
+    with {:ok, authorization} <- ticket_authorization(context, run, options) do
+      adopted_mr_delivery_step(context, run, options, authorization)
+    end
+  end
+
+  defp ticket_delivery_step(context, %{"state" => state} = run, options) when state in ~w(MR_CREATING CI_MR_CREATING) do
+    with {:ok, authorization} <- ticket_authorization(context, run, options) do
+      options = Keyword.put(options, :ticket_mr_ephemeral_read, true)
+
+      case TicketMrOperation.adopt_result(context.store, run["run_id"], authorization, context.factory, options) do
+        {:error, :unknown_request} ->
+          TicketMrOperation.prepare(context.store, run["run_id"], authorization, context.factory, controller_workspace(context), mr_description(run), options)
+
+        result ->
+          result
+      end
+    end
+  end
+
+  defp ticket_delivery_step(context, %{"state" => "CI_WAITING"} = run, options) do
+    if ci_poll_due?(run["ci_last_checked_at"]) do
+      with {:ok, authorization} <- ticket_authorization(context, run, options) do
+        TicketMrOperation.adopt_ci(context.store, run["run_id"], authorization, context.factory, Keyword.put(options, :ticket_mr_ephemeral_read, true))
+      end
+    else
+      {:ok, %{status: "CI_POLL_WAIT"}}
+    end
+  end
+
+  defp ticket_delivery_step(context, run, options) do
+    with {:ok, authorization} <- ticket_authorization(context, run, options),
+         {:ok, _} <- TicketWorkerRunner.delivery_admission(context.store, run, authorization, options) do
+      {:ok, %{status: "DELIVERY_JOIN_PENDING"}}
+    end
+  end
+
+  defp adopted_mr_delivery_step(context, run, options, authorization) do
+    ephemeral_read_options = Keyword.put(options, :ticket_mr_ephemeral_read, true)
+
+    case TicketMrOperation.adopt_result(context.store, run["run_id"], authorization, context.factory, ephemeral_read_options) do
+      {:error, :unknown_request} ->
+        TicketMrOperation.prepare(context.store, run["run_id"], authorization, context.factory, controller_workspace(context), mr_description(run), options)
+
+      {:ok, %{status: "MR_WAITING_FOR_RESULT"}} = waiting ->
+        waiting
+
+      {:ok, %{status: status}} when status in ~w(MR_ADOPTED MR_ALREADY_ADOPTED) ->
+        finalize_adopted_mr_delivery(context, run, options)
+
+      other ->
+        other
+    end
+  end
+
+  defp finalize_adopted_mr_delivery(context, run, options) do
+    with {:ok, _receipt} <- TicketMrOperation.current_delivery_receipt(context.store, run["run_id"], context.factory, options),
+         {:ok, chat} <- TicketChat.ready_for_run(context.store, run["run_id"]) do
+      finalization_options =
+        options
+        |> Keyword.put(:workspace, chat["cwd"])
+        |> Keyword.put_new(:jira_connector, Map.get(context, :jira_connector) || JiraMcpConnector)
+        |> Keyword.put_new(:jira_app_server, Map.get(context, :jira_app_server, AppServer))
+
+      case TicketJiraFinalization.finish(context.store, run["run_id"], context.factory, finalization_options) do
+        {:ok, _} = result -> result
+        {:error, _} = error -> error
+      end
+    else
+      {:error, _} = error -> error
+    end
+  end
+
   defp advance_run(context, workspace, run, acc) do
     case validate_run_transport(context, run) do
+      :quarantined ->
+        {:ok, acc}
+
       :ok ->
         case validate_run_snapshot(context, run) do
           :ok -> advance_valid_run(context, workspace, run, acc)
@@ -1053,7 +2776,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
         end
 
       {:error, reason} ->
-        if reason in [:ticket_supervisor_runtime_capability_unproven, :invalid_execution_mode],
+        if reason == :invalid_execution_mode,
           do: {:error, reason},
           else: block_run(context, workspace, run, reason, acc)
     end
@@ -1063,7 +2786,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
     case run["execution_mode"] do
       nil -> validate_legacy_run_transport(context, run)
       "LEGACY" -> validate_legacy_run_transport(context, run)
-      "TICKET_SUPERVISOR_V1" -> {:error, :ticket_supervisor_runtime_capability_unproven}
+      "TICKET_SUPERVISOR_V1" -> :quarantined
       _other -> {:error, :invalid_execution_mode}
     end
   end
@@ -2250,7 +3973,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
   end
 
   defp consume_feature_writer(context, run, iteration, %{"status" => "COMPLETE", "commit_sha" => commit_sha}, acc) do
-    preflight? = ci_preflight?(route_for_run(context, run)) and not review_rework?(run)
+    preflight? = ci_preflight?(route_for_run(context, run)) and not review_rework?(run) and not ready_rework_active?(context.store, run)
 
     with {:ok, head} <- context.worktree.candidate(run["worktree"], run["base_branch"]),
          true <- commit_sha == head or {:error, :writer_sha_mismatch},
@@ -2270,6 +3993,45 @@ defmodule SymphonyElixir.Factory.Scheduler do
     do: {:error, {:writer_blocked, blockers}}
 
   defp consume_feature_writer(_context, _run, _iteration, _output, _acc), do: {:error, :invalid_feature_writer_output}
+
+  defp ready_rework_active?(store, run) do
+    rows =
+      Store.query!(
+        store,
+        "SELECT command_key FROM ticket_chat_commands WHERE run_id = ? AND status = 'APPLIED' ORDER BY updated_at DESC",
+        [run["run_id"]]
+      ).rows
+
+    Enum.any?(rows, fn [key] ->
+      case TicketChatCommands.validate_ready_rework_replay(store, key) do
+        {:ok, %{receipt: receipt}} -> receipt["candidate_sha"] == run["candidate_sha"]
+        _ -> false
+      end
+    end)
+  end
+
+  defp ready_rework_for_request?(store, run, task, request_key) do
+    rows =
+      Store.query!(
+        store,
+        "SELECT command_key FROM ticket_chat_commands WHERE run_id = ? AND status = 'APPLIED' ORDER BY updated_at DESC",
+        [run["run_id"]]
+      ).rows
+
+    Enum.any?(rows, fn [key] -> ready_rework_request_matches?(store, run, task, request_key, key) end)
+  end
+
+  defp ready_rework_request_matches?(store, run, task, request_key, command_key) do
+    with {:ok, %{receipt: receipt}} <- TicketChatCommands.validate_ready_rework_replay(store, command_key),
+         {:ok, evidence} <- WorkerEvidence.get(store, request_key),
+         {:ok, binding} <- Jason.decode(evidence["binding_json"]) do
+      receipt["request_key"] == request_key and receipt["candidate_sha"] == binding["expected_sha"] and
+        evidence["request_key"] == request_key and evidence["run_id"] == run["run_id"] and
+        evidence["task_key"] == task["task_key"] and task["role"] == "feature-writer"
+    else
+      _ -> false
+    end
+  end
 
   defp advance_verifier(context, run, acc) do
     route = route_for_run(context, run)
@@ -2341,6 +4103,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
     state =
       cond do
         review_rework?(run) -> "REVIEW_PUSHING"
+        run["execution_mode"] == "TICKET_SUPERVISOR_V1" -> "PUSHING"
         preflight_verified?(context, run) -> "MR_CREATING"
         true -> "PUSHING"
       end
@@ -3765,7 +5528,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
     result =
       Store.query!(
         store,
-        "SELECT * FROM runs WHERE state NOT IN (#{placeholders}) ORDER BY created_at ASC",
+        "SELECT * FROM runs WHERE state NOT IN (#{placeholders}) AND COALESCE(execution_mode, 'LEGACY') = 'LEGACY' AND NOT EXISTS (SELECT 1 FROM runs AS supervisor WHERE supervisor.issue_key = runs.issue_key AND supervisor.execution_mode = 'TICKET_SUPERVISOR_V1') ORDER BY created_at ASC",
         @terminal_states
       )
 
@@ -3777,7 +5540,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
 
     Store.one!(
       store,
-      "SELECT * FROM runs WHERE issue_key = ? AND state NOT IN (#{placeholders}) ORDER BY created_at DESC LIMIT 1",
+      "SELECT * FROM runs WHERE issue_key = ? AND state NOT IN (#{placeholders}) AND COALESCE(execution_mode, 'LEGACY') = 'LEGACY' AND NOT EXISTS (SELECT 1 FROM runs AS supervisor WHERE supervisor.issue_key = runs.issue_key AND supervisor.execution_mode = 'TICKET_SUPERVISOR_V1') ORDER BY created_at DESC LIMIT 1",
       [issue_key | @terminal_states]
     )
   end
@@ -3793,7 +5556,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
   defp latest_issue_run(store, issue_key) do
     Store.one!(
       store,
-      "SELECT * FROM runs WHERE issue_key = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+      "SELECT * FROM runs WHERE issue_key = ? AND COALESCE(execution_mode, 'LEGACY') = 'LEGACY' AND NOT EXISTS (SELECT 1 FROM runs AS supervisor WHERE supervisor.issue_key = runs.issue_key AND supervisor.execution_mode = 'TICKET_SUPERVISOR_V1') ORDER BY created_at DESC, rowid DESC LIMIT 1",
       [issue_key]
     )
   end
@@ -3801,7 +5564,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
   defp latest_delivery_run(store, issue_key) do
     Store.one!(
       store,
-      "SELECT * FROM runs WHERE issue_key = ? AND kind = 'DELIVERY' ORDER BY created_at DESC, rowid DESC LIMIT 1",
+      "SELECT * FROM runs WHERE issue_key = ? AND kind = 'DELIVERY' AND COALESCE(execution_mode, 'LEGACY') = 'LEGACY' AND NOT EXISTS (SELECT 1 FROM runs AS supervisor WHERE supervisor.issue_key = runs.issue_key AND supervisor.execution_mode = 'TICKET_SUPERVISOR_V1') ORDER BY created_at DESC, rowid DESC LIMIT 1",
       [issue_key]
     )
   end
@@ -4099,4 +5862,5 @@ defmodule SymphonyElixir.Factory.Scheduler do
   defp safe(value), do: String.replace(value, ~r/[^a-zA-Z0-9._-]/, "_")
   defp present?(value) when is_binary(value), do: String.trim(value) != ""
   defp present?(_value), do: false
+  defp digest(raw), do: :crypto.hash(:sha256, raw) |> Base.encode16(case: :lower)
 end

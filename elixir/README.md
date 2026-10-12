@@ -1,5 +1,67 @@
 # Symphony Elixir
 
+### Disabled ticket-parent context integration
+
+The internal `ticket_parent_step` requires absolute, canonical `ticket_cli_root`
+and `ticket_workflow` locators in addition to its output root and broker identity.
+The workflow database must be absolute and match the connected ledger. These
+locators are immutable for an existing parent; historical missing bindings are
+not automatically upgraded. Generated parent instructions direct the chat to the
+bounded context reader and command staging. These are behavioral instructions,
+not an OS-enforced read-only sandbox: the parent is a trusted operator interface.
+Controller admission still requires independently read native input and receipts.
+
+`mix factory.ticket` read actions open an existing current-schema SQLite ledger
+readonly and never create or migrate it. `stage` remains a separate writable
+proposal operation and grants no execution authority. Native read-command
+acceptance and the complete quality gate remain required before enabling this
+ticket-parent route.
+
+### Ticket status and read-only diagnosis
+
+The dashboard separates the operator-facing ticket parent from diagnostic role
+workers and separates parent-summary synchronization from delivery state. A failed
+summary does not invalidate the recorded candidate or verifier result. Disabled
+factory and disabled ordinary-ticket routing are visible configuration states,
+not proof that existing workers have stopped.
+
+From `elixir/`, inspect an existing ledger without replaying actions:
+
+```sh
+mise exec -- mix factory.ticket replay RUN_ID --workflow WORKFLOW.local.md
+```
+
+Replay reports current binding, candidate, questions, next action, synchronization
+and bounded journal/receipt pages. Follow the returned fixed high-water cursors
+with `journal` or `records`; inspect digest-pinned artifacts with `details`.
+Missing, symlinked or incomplete-schema ledgers reject without initialization or
+repair. Replay never publishes a summary or executes a recorded action. The
+underlying `TicketContext.replay/2` is callable without Mix; its plain-VM check
+does not prove execution under a deployed broker's restricted profile.
+
+Factory-role tokens and cost remain explicitly unknown where no attributed
+receipt exists. Direct-session totals are not factory-role usage. Reported task
+lifecycle intervals are recorded wall time, not active model time. Recorded
+checkout intents are not physical or historical checkout counts.
+
+`Scheduler.ticket_parent_step/3` is a disabled-integration entrypoint for an existing
+ordinary V1 run. It accepts explicit controller `parent_output_root` and
+`broker_thread_id` bindings, reserves/reuses one parent, and returns pending/ready
+without invoking a model or source worker. New parent identities retain the broker
+immutably; historical missing bindings remain missing. These options do not prove
+native capability or enable production. Evidence:
+`../plans/receipts/006-U7C-parent-admission.md`.
+
+Disabled ticket-parent integration now includes `claim-ticket-followup REQUEST_KEY
+--source-thread-id BROKER_THREAD_ID --payload-base64 OWNER_OBSERVATION`. The owner
+observation is an object containing `source: "codex_app/read_thread"`, ISO-8601
+`observed_at`, and the unmodified owning-Desktop `response`. The controller reads
+the native queue without a model turn, requires fresh quiet owner and empty queue
+facts, and transactionally retains the guard receipt with the uncertain claim.
+This command does not enable the production route; changing only its config boolean
+still fails startup capability validation. See
+`../plans/receipts/006-U7C-parent-guard.md` for evidence and remaining acceptance.
+
 ### Attachment-backed source bootstrap (disabled pilot)
 
 `factory.native_source_attachment_enabled` defaults to `false`. When explicitly
@@ -65,13 +127,370 @@ Codex tasks. The controller retains Git push and draft-MR ownership.
 Configuration, safety boundaries, recovery, and cutover are documented in
 [Local factory control plane](../docs/factory-control-plane.md).
 
-The `factory.ticket_supervisor` setting is a default-off foundation only:
+The `factory.ticket_supervisor` setting remains default-off:
 `{"enabled": false, "pilot_issue_keys": []}`. New run registrations record an
 immutable execution mode, while historical rows remain `NULL` and continue to
-follow the legacy route. No ticket-supervisor chat or worker runtime is enabled;
-the scheduler refuses to tick if it finds a recorded non-legacy mode until a
-compatible runner passes its acceptance gate. Existing runs and global transport
-behavior are otherwise unchanged.
+follow the legacy route. Static Policy validation checks configuration shape without
+spawning a process. Enabled startup qualifies the actual configured CLI once in the
+explicit canonical `parent_output_root` before storage/controller children start;
+unsupported runtime or cwd stops startup with a typed error. Per-effect claims and
+owned worker sessions retain their own checks. Listing, formatting and readback do
+not probe. This checkout has not enabled production or completed rollout acceptance.
+Disabled V1 runs are quarantined without stopping unrelated
+legacy work; unknown execution modes remain rejected.
+
+Parent admission reads `parent_output_root`, `broker_thread_id`, `ticket_cli_root`
+and `ticket_workflow` from `factory.ticket_supervisor`. Only an absent workflow
+defaults to the loaded workflow's absolute path; explicit null values are not
+replaced. Internal context options, then tick options, override configuration.
+Parent, broker and CLI roots are never inferred. These inputs do not enable the
+runtime or replace its acceptance gate.
+
+Internal V1 MR requests pin a positive `repositories.*.gitlab_project_id` at
+preparation. Adoption qualifies the original successful request against fresh
+read-only GitLab data. The scheduler owns a short-lived ephemeral GitLab connector
+session outside the source checkout, without a model turn or controller resume.
+The reader is transport only: the original request still pins its controller and
+candidate. Supplied-session callers retain the controller-bound read seam.
+Adoption never resends MR creation or performs Jira finalization.
+Unpinned historical requests remain intact and rejected rather than being
+silently rewritten. Ordinary adoption records MR identity only; CI preflight
+adoption advances to `CI_WAITING`. Native send wiring and runtime
+acceptance are still pending, and this does not enable the route.
+
+The internal V1 scheduler prepares an exact typed MR request after the completed
+push. Broker discovery requires the validated factory policy; discovery is not
+claim authority. `factory.desktop claim-ticket-mr-interactive` reads Jira directly,
+retains authorization only in its CLI process, and emits one
+`OWNER_OBSERVATION_REQUIRED` JSON line. Submit one correlated owning-Desktop
+observation on stdin; the command then reads native latest-turn/queue facts and
+returns compact send arguments only after an atomic uncertain claim. Input is
+bounded to 64 KiB and 40 seconds. Existing ten-second guard and sixty-second Jira
+freshness checks remain unchanged. A lost final reply requires readback, not a new
+claim. Production policy still rejects this route before readiness or connectors.
+
+V1 preflight CI reads are catalog-qualified and model-free. WAIT/BLOCK retain
+`CI_WAITING`; an exact PASS atomically enters `VERIFYING` and increments its round
+once. The fresh blind verifier receives candidate-bound CI evidence, then PASS
+proceeds through normal exact push proof rollover. This is local integration, not
+live connector acceptance or Jira review-ready finalization.
+
+Schema 27 adds a two-effect V1 Jira journal. Initial implementation records the
+observed `In Dev` transition and factory-label delta; finalization records the
+exact candidate/MR comment and `ai-review` delta. The journal itself is storage
+infrastructure: only the initial scheduler hook described below currently uses it;
+review-ready finalization is not wired. Journal claims alone do not authorize
+external writes or source work. The same semantic operation cannot acquire another
+comment claim after checkout, verifier or push-metadata drift. Uncertain effects
+require fresh post-claim issue readback; complete receipts remain readable without
+applying today's freshness deadline to historical evidence.
+
+The staged `integrations/jira-mcp` launch adapter adds only bounded factory-label
+add/remove operations to the existing authenticated provider, avoiding whole-label
+replacement. It is not installed or enabled. The model-free Jira controller session
+owns and closes its transport, including error paths. Connector acknowledgements
+are not mutation completion proof. Review-ready effect wiring, shared recovery
+fencing, actual provider installation and native acceptance remain required before
+live use.
+
+The local Jira-maintenance prerequisites separate read-only writer/delivery facts
+from actual admission. Inspecting these facts grants no dispatch authority; ordinary
+delivery admission still rejects `ai-review` labels. Actual writer admission cannot
+use a held maintenance reservation to bypass checkout exclusivity. Initial
+maintenance may reserve the immutable pinned base only for an ordinary V1
+`ADMITTING_WRITER` run, without inventing a candidate SHA. Its disk/concurrency
+budget stays held through failed/cancelled states until explicit release.
+`release_jira` accepts only the exact complete journal and matching generation,
+checkout identity and receipts. It does not change delivery status. Release and the
+later local state update must share the controller's final transaction.
+
+The internal V1 existing-checkout `ADMITTING_WRITER` tick now uses
+`TicketJiraOperation.start_implementation`. Its owned model-free connector runs in
+the proven non-source ticket-parent directory. Fresh authority, a unique advertised
+`In Dev` transition and current tool capability precede each one-shot effect claim.
+Lost responses are reconciled by direct issue readback, never blind resend. Already
+`In Dev`/`ai-running` issues require no mutation. A fresh final read must still prove
+both target effects before complete-journal release and writer admission commit
+together. This hook does not launch the writer or complete Jira review-ready
+finalization, and remains behind the disabled production V1 capability gate.
+
+`TicketMrOperation.current_delivery_receipt` provides read-only qualification for
+the adopted ordinary MR: original successful claim/result, current stopped
+checkout/push, configured route and exact remote MR/human state are rechecked.
+It does not require or grant Jira dispatch authorization, does not replay MR
+creation and leaves ledger/control rows unchanged. Its MR observation timestamp
+is conservative (before collection), separate from qualification completion.
+Finalization still must independently prove fresh external authority.
+Jira comment preflight matches the installed issue/body append tool; visibility
+and public overrides are prohibited. Exact comment receipts accept the Jira
+reader's normalized `text` field as well as legacy `body`. These prerequisites do
+not yet wire review-ready Jira effects or advance the dashboard state.
+
+The Desktop-owned ticket-chat identity slice adds schema version 17, a dedicated
+`TICKET_CHAT` request target, and immutable parent/run mappings. Only that target
+permits an explicitly null Project. An uncertain creation retains its original
+request and generation; it never creates a replacement parent. Creation readback
+requires the exact request hash, tool arguments, dedicated non-source directory,
+null Project and no worktree attachments. Presentation receipts do not update
+writer allocations, candidates, source bindings or delivery status.
+
+This is storage/readback infrastructure, not an enabled runtime. Ticket requests
+are excluded from the executable pending list; direct claim, stored argument
+issuance and broker CLI mutations reject them with
+`ticket_chat_runtime_not_integrated`. Read-only `show` remains available. The
+new route still needs scheduler and broker integration, validation transport and
+integrated acceptance before enabling; toggling the setting alone cannot bypass
+the fence. No existing runs or chats are migrated automatically.
+
+The U7c internal broker boundary now uses `TicketChat.authorize_issuance/3` for
+exact enabled/allowlisted ordinary parent requests. Pending lists, transactional
+claims and store-backed CREATE/FOLLOWUP arguments share it. Pure map builders
+serialize only; they do not authorize sending. CLI adds `followup-args` and typed
+`record-ticket-thread --payload-base64`, but forwards issuance policy only after
+startup policy validation. That validation still rejects runtime enablement, so
+production pending parents remain excluded. Exact already-claimed operations
+can drain after disabling; direct API recording/completion also requires the
+durable claim and linked identity. An absent output directory or accepted turn
+does not authorize retrying uncertain CREATE. Native origin, busy guard/claim
+and combined route acceptance remain outstanding.
+
+`factory.desktop read-ticket-turn REQUEST_KEY THREAD_ID --source-thread-id BROKER_ID`
+collects exact claimed-parent provenance. Its native reader uses optional full-item
+turn pagination without resuming the parent. Missing items, cursor cycles, duplicate
+identities, uninspectable history and detected metadata changes reject readback.
+Receipt timestamps preserve native precision. The collector returns evidence facts,
+not bootstrap acknowledgement, attachment proof or live ownership permission.
+Equal metadata versions are change detection, not an atomic idle snapshot.
+New parent prompts carry the exact request-key marker and final JSON acknowledgement
+instruction; false acknowledgements cannot mark parent requests successful.
+
+Internal ticket-step progress publication is outside delivery adoption. A failed
+presentation does not roll back a commit or consumed worker receipt; subsequent
+reconciliation retries only material publication, including after another role's
+admission rejects. Production admission remains quarantined pending the owning
+Desktop guard and combined acceptance gate.
+
+The internal app-server also rejects native SOURCE startup and retained SOURCE
+turns with `worker_source_containment_unproven`, before a subprocess or model
+turn can begin. A detached-child fixture proved that native PID exit alone does
+not contain all source writers. REVIEW and legacy nil-access sessions retain
+their existing behavior; the new route cannot use these as a writer fallback.
+
+Schema version 20 adds durable FILE_SOURCE edit receipts. The internal writer
+runner keeps a logical SOURCE reservation, but its native process is read-only.
+Only synchronous controller tools `repo_list`, `repo_read`, `repo_write`,
+`repo_delete`, `repo_mkdir`, `repo_read_binary` and `repo_write_binary`
+can inspect/edit its exact checkout. Writes require the full-file SHA-256 (or
+`ABSENT` for a new file in an existing directory), bounded UTF-8 contents, and
+the current request/thread/turn/reservation generation. Symlinks, hardlinks,
+control paths, connectors, shell tools and permission escalation are denied.
+The controller alone runs approved checks and adopts a candidate; workers must
+report unrun checks, not claim them passed. Single-file deletion requires the
+exact current content hash, shares the durable mutation journal, and cannot
+recursively remove directories. `repo_mkdir` creates one directory beneath an
+existing parent and records its invocation nonce in a fixed macOS extended
+attribute, not a Git-visible marker file. Recovery requires the original
+directory device/inode, creation nonce and exact durable child receipt;
+replacement directories are not adopted, even with copied attributes. Attribute
+or receipt failures retain reconciliation rather than permitting a new mutation.
+Binary fixtures use canonical base64 instead of UTF-8 conversion, with the same
+262,144-byte file limit and exact-content mutation journal. Binary reads return
+at most 8,192 raw bytes per page with a full-file hash and next byte offset.
+
+An uncertain edit retains its PREPARED receipt and reservation. Call
+`WorkerFileTools.reconcile/2` to read back the exact resulting file; it never
+rewrites the file, recreates a task, or releases a reservation. Unproven outcomes
+stay pending and prevent result consumption. Required validation and production
+dispatch integration remain incomplete; all production ticket-chat issuance
+fences remain unchanged.
+
+The internal `Scheduler.ticket_step/3` component now launches and adopts ordinary
+(`Required: no`) role workers sequentially in the same checkout. It is not called
+by production scheduler ticks. New launches require controller-owned Jira
+readback bound to the exact run/contract and no older than 60 seconds. Unfinished
+attempts retain their stored model/effort and exact reservation. Planner adoption
+enters ADMITTING_WRITER, leaving Jira/writer admission to the existing controller.
+Writer adoption commits once and recovers that same commit/check after a crash;
+final stage/task/evidence consumption and checkout release are transactional.
+Failed checks or uncertain receipts retain ownership. Verifier adoption requires
+the exact stopped candidate/base-bound receipt. Parent broker issuance and the
+combined production acceptance gate remain U7c work; this component does not
+authorize enabling the new route.
+
+Schema version 24 adds controller check receipts. `TicketWorkerRunner.check/3`
+currently accepts only `git-diff-check`: fixed CLT Git arguments compare pinned
+commit objects with external diff/textconv, hooks and fsmonitor disabled. The
+child has a read-only, network/fork-denying sandbox and a cleared environment.
+Admission and completion bind the stopped worker, contract, clean candidate,
+base and active reservation. The fixed controller helper commits an exclusive
+claim and fsyncs actual child-exit/output evidence before replying. Restart
+reads that exact receipt; missing or corrupt evidence never starts another
+command or releases source. Definite pre-launch rejections remain retryable.
+Successful whitespace checks are not tests or verifier PASS. Build/test actions,
+required live validation and native acceptance remain incomplete.
+`TicketWorkerRunner.ci_binding/4` validates supplied GitLab snapshots against
+an independently configured numeric project ID and the current candidate.
+Merged-result pipelines must prove the candidate as their source parent;
+duplicate jobs, contradictory required-job states and mismatched bindings are
+rejected. Missing pipelines return WAIT without changing delivery state.
+Selected pipelines must also match the MR's `head_pipeline`; an old success
+for the same source SHA is not sufficient, and missing pipeline visibility is
+not silently converted into WAIT.
+This pure data check is not connector provenance, a CI collector or permission
+to push. The next integration reuses the existing explicitly authorized
+CI-preflight route; a new local container build platform is not required.
+`AppServer.mcp_tool_catalog_in_session/2` and `GitLabMcpConnector.catalog/1`
+read advertised schemas only on an existing idle, caller-owned controller
+session. Discovery rejects restricted workers, foreign ports, failed or
+ambiguous inventory and pagination. It starts no model turn and grants no new
+tool-call permission. Schemas are not authenticated CI evidence. Connector
+failure must remain explicit; Jira tracker credentials must never be used as
+an implicit GitLab REST fallback.
+Adversarial review reproduced a parent-directory swap escaping the prototype's
+pathname checks. Native FILE_SOURCE startup and retained turns therefore return
+`worker_file_mutation_containment_unproven` before process/model side effects.
+The prototype is exercised only in private fixture tests. Descriptor-relative
+no-follow I/O is now integrated through a fixed, hash-pinned helper outside the
+source checkout. On this macOS pilot it runs with a cleared environment and OS
+sandbox; read operations have no filesystem-write permission. Root device/inode
+and ancestor-directory identity are checked. Bounded UTF-8 files, modes and exact
+compare-and-swap results are tested in temporary repositories.
+
+Schema version 21 records controller helper exit receipts separately from edit
+intent. Before a possible mutation the pending marker is committed. Only an
+observed exit clears it; closing a Port or seeing matching bytes does not.
+Unknown helper exits prevent replay, reconciliation and result consumption.
+Historical pending edits without this evidence remain quarantined on migration.
+The receipt binds the PID, invocation nonce, helper/input digest and exit status.
+This is not a complete timeout or controller-crash recovery mechanism. Exact
+helper shutdown/recovery, orphan-temporary cleanup and hardened controller
+check execution remain unfinished. No passing fixture
+test removes the native acceptance fence.
+
+Schema version 22 binds each mutating helper invocation before launch. A fixed,
+hash-pinned controller companion checks that exact committed row through normal
+read-only SQLite/WAL access, durably claims the invocation once, owns/waits for
+the sandboxed child, and publishes its bounded response and exact termination
+before replying. It cannot receive a model-selected executable or profile.
+Private journal files live beside the ledger outside all registered source
+roots; future workspace admission rejects that directory. Journal readback uses
+no-follow directory/file descriptors. Direct helper replacement is rejected;
+only bounded reads/listings/digests and temporary-absence inspection retain the
+non-writing direct helper route. New bindings also attest path and before/after
+effect digests; replay/recovery cannot substitute another file with equal bytes.
+
+An offline public repository-tool test kills the callback after the real child
+receipt is stored, reopens the ledger, and recovers the same edit. Signal exits
+are recorded distinctly from normal exit codes. A compile-test-only, hash-checked
+external relay exercises lost replies; production rejects such overrides.
+An isolated fixture BEAM is also killed and reaped after the actual companion
+publishes its receipt; a new ledger connection recovers the same mutation.
+Another test kills and reaps the real sandboxed child before input, recording
+SIGKILL with a null exit code, not an invented exit 137.
+
+Replacement temporaries are `.symphony-<invocation>` in the target parent. The
+helper removes only the dev/inode it actually created after rechecking root and
+parent; an O_EXCL collision grants no deletion authority. After bound terminal
+evidence, an unchanged replace/delete operation may become ABORTED only with
+matching current program/effect binding and absence of the replacement temporary.
+Source ownership is retained, old call IDs remain refused, and a new call may
+retry. Unattested temporaries, unknown exits, changed metadata and old programs
+remain quarantined. This does not reclaim orphan temporaries by filename alone.
+
+Before writing replacement bytes, the helper emits a bounded `TEMP_CREATED`
+frame and waits for an exact nonce/raw-event-digest ACK. The companion checks
+the helper's self-PID against its owned process, independently observes the
+root/parent/temp identities, and fsync-publishes the exact `.creator` bytes before
+ACK. It records the original actual wait result in `.terminal`, rechecks current
+authorization under the same source reservation, and invokes only fixed
+`temporary_recover` code. That operation may unlink only the recorded inode at
+the original parent/root when the target has the original before/after digest;
+a two-link inode additionally requires the target to be that same inode with
+the expected after digest. There is no model-visible cleanup tool.
+
+Cleanup's self-PID and actual exit are durably recorded in `.cleanup` before
+the final composite `.receipt`. Status and cached receipt validation reject
+missing, mismatched, borrowed or malformed creator/cleanup evidence. A killed
+attested helper can therefore clean its own orphan and abort safely; a substituted
+inode remains protected. If only final publication is lost, read-only status
+can assemble the complete matching claim/creator/terminal/cleanup records with
+an explicit `COMPLETE_ARTIFACTS` marker. Marked cached records require fresh
+readback before replay or reconciliation; a later matching producer receipt can
+replace that marker. Existing invalid final receipts never trigger fallback,
+and rejected comparisons do not replace cached evidence. A crash before creator
+attestation or before both terminal records still quarantines the operation.
+These receipts do not solve
+every companion-death/deadline window, native effective permissions or arbitrary
+same-UID races.
+Dispatch and archive/restore remain disabled pending the remaining acceptance.
+
+Native checkout admission and identity rechecks now use fixed CommandLineTools
+Git with a cleared environment, isolated system/global config, disabled hooks,
+fsmonitor, optional locks and lazy fetch. A read-only Seatbelt profile allows
+only that Git executable, denies subprocess creation and prevents file/network
+side effects. Local repository format/worktree configuration remains readable.
+Repositories requiring external clean filters may fail closed during validation;
+this is not permission to fall back to ambient Git. Legacy controller commit,
+push, fetch and authenticated remote operations retain their existing runner.
+This identity hardening does not implement the separate build/check executor.
+
+Schema version 18 adds staged commands, stable questions and immutable native
+input observations. `mix factory.ticket context RUN --workflow WORKFLOW.md`
+reads a <=16 KB projection with a <=2 KB summary. `details`, `journal` and
+`records` provide bounded, ticket-scoped drilldown with exact content digests and
+explicit collection counts. A stale artifact reports `stale_artifact`; refresh
+context rather than treating newer bytes as the older evidence.
+
+`stage` accepts a strict base64 JSON proposal while the parent is active and
+returns `PENDING`. The controller's mechanical native reader initializes and
+calls `thread/read` only; it never resumes the parent or starts a generation.
+Admission requires completed direct client input, fresh projectless identity,
+exact body and question/contract/candidate bindings, and the successful staging
+receipt in that same native turn. Broker/delegated messages, quoted commands,
+edited native items and stale questions cannot authorize actions.
+The recorded invocation must be a standalone `mix factory.ticket stage RUN`
+(optionally under `mise exec --` or a supported shell wrapper), with literal
+base64 proposal and absolute workflow arguments matching the staged record.
+Use the execution tool's working-directory option; shell chains, expansions,
+echoed receipts and marker comments are not supported staging evidence.
+
+For explicit contract revisions and candidate rework, `mix factory.ticket
+prepare-stage RUN --workflow WORKFLOW.md` prepares the literal staging command
+from the bound parent's latest unclosed, single direct-human input. Persisted
+app-server history may label an owning-Desktop turn interrupted before completion;
+this does not prove live activity or authorize admission. It opens the
+existing ledger read-only, preserves the message bytes, and returns
+`PREPARED_ONLY` with `staged: false`. Execute the returned `stage_command`
+unchanged from its returned `cwd`; do not retype the message or JSON. Staging
+still returns only `PENDING`, and the controller still requires the completed
+turn's exact native body and successful stage receipt before acceptance.
+Stale/completed turns, multiple user items, delegation, foreign routes, changed
+bindings, unsupported prose and unsupported shell locators fail closed. Earlier
+failed inputs and proposals are never repaired or rebound by preparation.
+
+Questions permit controller-defined phrase aliases, bounded text as answer data,
+or bounded integers. Explicit `Answer QUESTION_KEY: ...` disambiguates questions;
+`Rework: current candidate` can accompany an answer. Standalone rework and
+`Revise the contract:\n...` express intents, not immediate source/Jira permission.
+Unsupported prose gets a precise rejection rather than an inferred action.
+`ACCEPTED` does not mean `APPLIED`; external adoption/readback belongs to the
+controller integration. Existing source identity, slices and candidate remain
+unchanged by these APIs. Old verifier PASS receipts lacking current contract
+provenance remain historical/unproven, never retroactively certified current.
+
+Material summaries use the existing Desktop request outbox. Only its own
+unclaimed pending presentation can be superseded, atomically with a new immutable
+request/hash. Uncertain requests remain unchanged and expose synchronization lag.
+The parent presentation does not change delivery status or writer allocations.
+Controller presentations render a timestamped, immutable as-of snapshot; the
+parent does not refresh it or claim current-at-render freshness. ACK proves only
+receipt of that presentation. Direct human answers, contract revisions and rework
+commands still require a successful same-turn context refresh before staging.
+Timestamp-only polling advances a local event cursor without enqueuing a model
+turn. Presentation hashing normalizes volatile evidence timestamps only;
+authorization always uses original bytes. A failed unchanged presentation reports
+`SYNC_FAILED`, not a healthy unchanged state, and is not blindly resent.
+
 Manual-validation results are bound to the confirmed contract's named
 non-production environment as well as its exact candidate SHA. The safety
 policy is rechecked before a validator starts and before its result is used.

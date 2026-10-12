@@ -177,12 +177,22 @@ defmodule SymphonyElixir.Factory.Control do
   """
   @spec acquire_tick(Store.connection(), config(), String.t(), keyword()) :: result()
   def acquire_tick(connection, config, dispatcher_id, opts \\ []) do
+    acquire_lease(connection, config, dispatcher_id, opts, false)
+  end
+
+  @doc "Acquires the same exclusive lease for recovery without changing paused control."
+  @spec acquire_recovery_tick(Store.connection(), config(), String.t(), keyword()) :: result()
+  def acquire_recovery_tick(connection, config, dispatcher_id, opts \\ []) do
+    acquire_lease(connection, config, dispatcher_id, opts, true)
+  end
+
+  defp acquire_lease(connection, config, dispatcher_id, opts, recovery) do
     Store.transaction!(connection, fn transaction ->
       row = fetch!(transaction, config.scope)
       current_time = now(opts)
 
       cond do
-        row["status"] != "ACTIVE" ->
+        not lease_status_allowed?(row, recovery) ->
           %{result: "PAUSED", control: row}
 
         row["dispatcher_id"] != dispatcher_id ->
@@ -257,12 +267,22 @@ defmodule SymphonyElixir.Factory.Control do
   """
   @spec renew_tick(Store.connection(), config(), String.t(), String.t(), keyword()) :: result()
   def renew_tick(connection, config, dispatcher_id, tick_id, opts \\ []) do
+    renew_lease(connection, config, dispatcher_id, tick_id, opts, false)
+  end
+
+  @doc "Renews only the exact recovery lease while retaining paused control."
+  @spec renew_recovery_tick(Store.connection(), config(), String.t(), String.t(), keyword()) :: result()
+  def renew_recovery_tick(connection, config, dispatcher_id, tick_id, opts \\ []) do
+    renew_lease(connection, config, dispatcher_id, tick_id, opts, true)
+  end
+
+  defp renew_lease(connection, config, dispatcher_id, tick_id, opts, recovery) do
     Store.transaction!(connection, fn transaction ->
       row = fetch!(transaction, config.scope)
       current_time = now(opts)
 
       cond do
-        row["status"] != "ACTIVE" ->
+        not lease_status_allowed?(row, recovery) ->
           %{result: "PAUSED", control: row}
 
         row["dispatcher_id"] != dispatcher_id or row["tick_id"] != tick_id ->
@@ -289,6 +309,8 @@ defmodule SymphonyElixir.Factory.Control do
       end
     end)
   end
+
+  defp lease_status_allowed?(row, recovery), do: row["status"] == "ACTIVE" or (recovery and row["status"] == "PAUSED")
 
   defp set_status(connection, config, dispatcher_id, target_status, opts) do
     Store.transaction!(connection, fn transaction ->

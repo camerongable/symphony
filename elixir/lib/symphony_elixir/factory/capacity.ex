@@ -24,9 +24,17 @@ defmodule SymphonyElixir.Factory.Capacity do
          {:ok, free_bytes} <- disk_free_bytes(repo_path, opts) do
       writer_disk_gb = value(capacity, "writer_disk_gb")
       bytes_per_writer = trunc(writer_disk_gb * 1_000_000_000)
-      disk_writer_slots = div(free_bytes, bytes_per_writer)
 
-      local_writer_keys = active_issue_keys(connection, nil, @active_writer_states)
+      pending_checkout_keys =
+        Store.query!(connection, "SELECT DISTINCT r.issue_key FROM ticket_checkout_intents i JOIN runs r ON r.run_id = i.run_id WHERE i.phase != 'READY'").rows
+        |> List.flatten()
+        |> MapSet.new()
+        |> MapSet.union(pending_initial_maintenance(connection))
+
+      pending_budget_keys = maybe_exclude(pending_checkout_keys, Keyword.get(opts, :exclude_writer_issue_key))
+      disk_writer_slots = div(max(0, free_bytes - MapSet.size(pending_budget_keys) * bytes_per_writer), bytes_per_writer)
+
+      local_writer_keys = active_issue_keys(connection, nil, @active_writer_states) |> MapSet.union(pending_checkout_keys)
 
       writer_keys =
         local_writer_keys
@@ -79,6 +87,22 @@ defmodule SymphonyElixir.Factory.Capacity do
       {:error, _reason} = error -> error
       _other -> {:error, :invalid_capacity_policy}
     end
+  end
+
+  defp pending_initial_maintenance(connection) do
+    Store.query!(
+      connection,
+      """
+      SELECT DISTINCT r.issue_key FROM workspace_access w JOIN runs r ON r.run_id = w.run_id
+      WHERE w.mode = 'MAINTENANCE' AND w.released_at IS NULL AND r.execution_mode = 'TICKET_SUPERVISOR_V1'
+        AND CASE WHEN json_valid(w.binding_json)
+          THEN json_extract(w.binding_json, '$.run_state') = 'ADMITTING_WRITER'
+            OR json_extract(w.binding_json, '$.candidate_sha') IS NULL
+          ELSE 1 END
+      """
+    ).rows
+    |> List.flatten()
+    |> MapSet.new()
   end
 
   @doc """

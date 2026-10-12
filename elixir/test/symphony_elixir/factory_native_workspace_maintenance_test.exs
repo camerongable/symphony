@@ -101,7 +101,30 @@ defmodule SymphonyElixir.FactoryNativeWorkspaceMaintenanceTest do
     assert [%{eligible: true}] = NativeWorkspaceMaintenance.plan(c.store)
     assert NativeWorkspaceMaintenance.snapshot(c.store) == []
     assert :ok = NativeWorkspaceMaintenance.ensure_available(c.store, "run")
+    assert :ok = NativeWorkspaceMaintenance.ensure_available(c.store, "missing-run")
+    assert NativeWorkspaceMaintenance.snapshot(c.store) == []
     assert Store.one!(c.store, "SELECT COUNT(*) AS count FROM desktop_requests")["count"] == 1
+  end
+
+  test "a V1 issue owner freezes legacy native-workspace maintenance records", c do
+    assert {:ok, record} = NativeWorkspaceMaintenance.reconcile(c.store, c.factory)
+    before_records = Store.query!(c.store, "SELECT * FROM native_workspace_maintenance ORDER BY run_id").rows
+    before_requests = Store.query!(c.store, "SELECT * FROM desktop_requests ORDER BY request_key").rows
+
+    assert {:ok, _v1} =
+             RunLedger.register(c.store, %{
+               run_id: "newer-supervisor",
+               issue_key: "PPL-123",
+               kind: "DELIVERY",
+               state: "READY_FOR_REVIEW",
+               execution_mode: "TICKET_SUPERVISOR_V1"
+             })
+
+    assert {:ok, :no_candidate} = NativeWorkspaceMaintenance.reconcile(c.store, c.factory)
+    assert Store.query!(c.store, "SELECT * FROM native_workspace_maintenance ORDER BY run_id").rows == before_records
+    assert Store.query!(c.store, "SELECT * FROM desktop_requests ORDER BY request_key").rows == before_requests
+    assert NativeWorkspaceMaintenance.plan(c.store) == []
+    assert record["phase"] == "PROBING"
   end
 
   test "maintenance role inherits configured fast model at low effort without changing writer", c do

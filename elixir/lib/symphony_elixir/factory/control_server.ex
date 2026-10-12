@@ -61,6 +61,16 @@ defmodule SymphonyElixir.Factory.ControlServer do
   def acquire_tick(dispatcher_id, server \\ __MODULE__),
     do: GenServer.call(server, {:acquire_tick, dispatcher_id})
 
+  @doc "Acquires an exclusive recovery-only tick without activating the factory."
+  @spec acquire_recovery_tick(String.t(), GenServer.server()) :: map()
+  def acquire_recovery_tick(dispatcher_id, server \\ __MODULE__),
+    do: GenServer.call(server, {:acquire_recovery_tick, dispatcher_id})
+
+  @doc "Renews the exact recovery tick without activating the factory."
+  @spec renew_recovery_tick(String.t(), String.t(), GenServer.server()) :: map()
+  def renew_recovery_tick(dispatcher_id, tick_id, server \\ __MODULE__),
+    do: GenServer.call(server, {:renew_recovery_tick, dispatcher_id, tick_id})
+
   @doc "Renews the exact tick held by the supplied dispatcher."
   @spec renew_tick(String.t(), String.t(), GenServer.server()) :: map()
   def renew_tick(dispatcher_id, tick_id, server \\ __MODULE__),
@@ -126,6 +136,14 @@ defmodule SymphonyElixir.Factory.ControlServer do
 
   def handle_call({:acquire_tick, dispatcher_id}, _from, state) do
     {:reply, Control.acquire_tick(state.store, state.config, dispatcher_id), state}
+  end
+
+  def handle_call({:acquire_recovery_tick, dispatcher_id}, _from, state) do
+    {:reply, Control.acquire_recovery_tick(state.store, state.config, dispatcher_id), state}
+  end
+
+  def handle_call({:renew_recovery_tick, dispatcher_id, tick_id}, _from, state) do
+    {:reply, Control.renew_recovery_tick(state.store, state.config, dispatcher_id, tick_id), state}
   end
 
   def handle_call({:renew_tick, dispatcher_id, tick_id}, _from, state) do

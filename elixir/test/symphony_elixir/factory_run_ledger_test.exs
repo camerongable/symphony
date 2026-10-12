@@ -102,6 +102,19 @@ defmodule SymphonyElixir.FactoryRunLedgerTest do
     assert RunLedger.events(connection, "mode-immutable") == events_before
   end
 
+  test "V1 push handoff is controller-owned while legacy handoff updates remain compatible", %{connection: connection} do
+    for {id, issue, mode} <- [{"native-push", "PPL-106", "TICKET_SUPERVISOR_V1"}, {"legacy-push", "PPL-107", "LEGACY"}] do
+      attrs = %{run_id: id, issue_key: issue, kind: "DELIVERY", state: "PUSHING", execution_mode: mode}
+      assert {:ok, _} = RunLedger.register(connection, attrs)
+    end
+
+    events = RunLedger.events(connection, "native-push")
+    assert {:error, :candidate_handoff_controller_owned} = RunLedger.update(connection, "native-push", %{candidate_handoff: "fake", state: "MR_CREATING"})
+    assert {:ok, %{"candidate_handoff" => nil, "state" => "PUSHING"}} = RunLedger.get(connection, "native-push")
+    assert RunLedger.events(connection, "native-push") == events
+    assert {:ok, %{run: %{"candidate_handoff" => "legacy"}}} = RunLedger.update(connection, "legacy-push", %{candidate_handoff: "legacy"})
+  end
+
   test "enforces one active run per issue and kind", %{connection: connection} do
     attrs = %{run_id: "run-1", issue_key: "PPL-100", kind: "DELIVERY", state: "WRITING"}
     assert {:ok, _registered} = RunLedger.register(connection, attrs, now: @now)

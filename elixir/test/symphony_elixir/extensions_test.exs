@@ -8,6 +8,36 @@ defmodule SymphonyElixir.ExtensionsTest do
   alias SymphonyElixir.Tracker.Memory
 
   @endpoint SymphonyElixirWeb.Endpoint
+  @disabled_factory_projection %{
+    "available" => false,
+    "capacity" => [],
+    "counts" => %{
+      "blocked" => 0,
+      "by_state" => %{},
+      "hibernated" => 0,
+      "in_progress" => 0,
+      "review_ready" => 0,
+      "total_runs" => 0,
+      "visible_tasks" => 0
+    },
+    "current_runs" => [],
+    "disabled" => true,
+    "enabled" => false,
+    "error" => nil,
+    "intake" => %{"available" => false, "count" => 0, "error" => nil, "issues" => [], "observed_at" => nil},
+    "ordinary_factory_enabled" => false,
+    "overview" => %{
+      "active" => 0,
+      "by_issue" => %{},
+      "needs_attention" => 0,
+      "queued" => 0,
+      "review_ready" => 0
+    },
+    "recent_events" => [],
+    "runs" => [],
+    "tasks" => [],
+    "ticket_supervisor_enabled" => false
+  }
 
   defmodule FakeLinearClient do
     def fetch_issues_by_states(states) do
@@ -262,6 +292,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert state_payload == %{
              "generated_at" => state_payload["generated_at"],
+             "factory" => @disabled_factory_projection,
              "counts" => %{"running" => 1, "retrying" => 1, "blocked" => 1},
              "running" => [
                %{
@@ -402,6 +433,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert state_payload ==
              %{
                "generated_at" => state_payload["generated_at"],
+               "factory" => @disabled_factory_projection,
                "error" => %{"code" => "snapshot_unavailable", "message" => "Snapshot unavailable"}
              }
 
@@ -424,6 +456,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert timeout_payload ==
              %{
                "generated_at" => timeout_payload["generated_at"],
+               "factory" => @disabled_factory_projection,
                "error" => %{"code" => "snapshot_timeout", "message" => "Snapshot timed out"}
              }
   end
@@ -605,6 +638,11 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Workspace hibernated"
     assert html =~ "WORKTREE_HIBERNATED"
     assert html =~ "1 visible worker tasks"
+    assert html =~ "Open ticket parent"
+    assert html =~ "Source stage: Ready for review · Parent sync: Pending"
+    assert html =~ "Factory-role tokens/cost: unknown"
+    assert html =~ "Manual validation: required · Not required · Not proven by validator output"
+    assert html =~ "codex://threads/parent-ticket"
 
     document = Floki.parse_document!(html)
     capacity = Floki.find(document, ".capacity-card")
@@ -632,6 +670,148 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert state["factory"]["intake"]["count"] == 1
     assert state["factory"]["counts"]["hibernated"] == 1
     assert hd(state["factory"]["tasks"])["thread_id"] == "thread-verifier"
+    [projected_run | _] = state["factory"]["runs"]
+    assert projected_run["ticket_context"]["codex_thread_url"] == "codex://threads/parent-ticket"
+    assert projected_run["ticket_context"]["candidate_sha"] == String.duplicate("b", 40)
+    assert projected_run["ticket_context"]["synchronization"]["status"] == "PENDING"
+  end
+
+  test "dashboard makes the disabled factory distinct from an unavailable snapshot" do
+    orchestrator_name = Module.concat(__MODULE__, :DisabledFactoryDashboardOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        refresh: :unavailable
+      )
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50,
+      factory_observability: fn ->
+        %{
+          enabled: false,
+          ordinary_factory_enabled: false,
+          ticket_supervisor_enabled: false,
+          disabled: true,
+          available: false,
+          error: nil,
+          runs: [],
+          current_runs: [],
+          tasks: [],
+          recent_events: [],
+          counts: %{},
+          overview: %{},
+          intake: %{},
+          capacity: []
+        }
+      end
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/")
+    assert html =~ "Factory disabled"
+    assert html =~ "Ordinary factory: disabled · Ticket supervisor: disabled (defaults to disabled)."
+    refute html =~ "Factory snapshot unavailable"
+    state = json_response(get(build_conn(), "/api/v1/state"), 200)
+    assert state["factory"]["disabled"]
+    refute state["factory"]["enabled"]
+    refute state["factory"]["ordinary_factory_enabled"]
+    refute state["factory"]["ticket_supervisor_enabled"]
+  end
+
+  test "parent synchronization lag does not change candidate or delivery facts" do
+    orchestrator_name = Module.concat(__MODULE__, :TicketParentSyncOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(name: orchestrator_name, snapshot: static_snapshot(), refresh: :unavailable)
+
+    sync_status = start_supervised!({Agent, fn -> "PENDING" end})
+
+    ticket_context = %{
+      available: true,
+      parent_thread_id: "parent-ticket",
+      codex_thread_url: "codex://threads/parent-ticket",
+      source_stage: "VERIFYING",
+      candidate_sha: String.duplicate("b", 40),
+      contract_revision: "r4",
+      ci: %{checked_at: "2026-10-08T12:00:00Z", artifact: %{availability: "AVAILABLE"}},
+      validation: %{required: 0, status: "PASSED", publication: "NOT_PROVEN_BY_VALIDATOR_OUTPUT"},
+      questions: [%{"question_key" => "q1", "binding" => "CURRENT", "body" => %{availability: "AVAILABLE"}, "answers" => %{availability: "NOT_RECORDED"}}],
+      actionable_question_count: 1,
+      next_action: "Review the draft merge request.",
+      attributed_usage: %{status: "UNKNOWN", tokens: nil, cost: nil},
+      synchronization: %{status: "PENDING", request: %{"status" => "PENDING"}}
+    }
+
+    factory_snapshot = put_in(factory_dashboard_snapshot(), [:runs, Access.at(0), :ticket_context], ticket_context)
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50,
+      factory_observability: fn ->
+        status = Agent.get(sync_status, & &1)
+        put_in(factory_snapshot, [:runs, Access.at(0), :ticket_context, :synchronization, :status], status)
+      end
+    )
+
+    {:ok, view, html} = live(build_conn(), "/")
+    assert html =~ "Open ticket parent"
+    assert html =~ "codex://threads/parent-ticket"
+    assert html =~ "Parent sync: Pending"
+    assert html =~ "Candidate: #{String.duplicate("b", 40)} · contract r4"
+    assert html =~ "CI evidence: Available · checked 2026-10-08T12:00:00Z"
+    assert html =~ "Manual validation: not required · Passed · Not proven by validator output"
+    assert html =~ "1 current decision(s) need an answer"
+    assert html =~ "Decision q1: CURRENT · body Available · answers Not recorded"
+    assert html =~ "Factory-role tokens/cost: unknown"
+    state_before = json_response(get(build_conn(), "/api/v1/state"), 200)["factory"]["runs"] |> hd() |> Map.fetch!("ticket_context")
+    assert state_before["candidate_sha"] == String.duplicate("b", 40)
+    assert state_before["source_stage"] == "VERIFYING"
+    assert state_before["next_action"] == "Review the draft merge request."
+    assert state_before["synchronization"]["status"] == "PENDING"
+    assert state_before["validation"]["required"] == 0
+
+    Agent.update(sync_status, fn _ -> "FAILED" end)
+    SymphonyElixir.StatusDashboard.notify_update()
+    assert_eventually(fn -> render(view) =~ "Parent sync: Failed" end)
+
+    state_after = json_response(get(build_conn(), "/api/v1/state"), 200)["factory"]["runs"] |> hd() |> Map.fetch!("ticket_context")
+    assert state_after["synchronization"]["status"] == "FAILED"
+
+    assert Map.take(state_after, ["candidate_sha", "source_stage", "next_action", "ci", "validation"]) ==
+             Map.take(state_before, ["candidate_sha", "source_stage", "next_action", "ci", "validation"])
+  end
+
+  test "dashboard reports a run-local missing parent context without failing delivery rendering" do
+    orchestrator_name = Module.concat(__MODULE__, :MissingTicketParentOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(name: orchestrator_name, snapshot: static_snapshot(), refresh: :unavailable)
+
+    missing_context = %{
+      available: false,
+      error: "ticket parent not bound",
+      parent_thread_id: nil,
+      source_stage: "READY_FOR_REVIEW",
+      next_action: nil,
+      questions: [],
+      synchronization: %{status: "UNKNOWN"}
+    }
+
+    factory_snapshot = put_in(factory_dashboard_snapshot(), [:runs, Access.at(0), :ticket_context], missing_context)
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50,
+      factory_observability: fn -> factory_snapshot end
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/")
+
+    assert html =~ "Ticket context unavailable; delivery state remains recorded separately."
+    assert html =~ "Open MR"
+    refute html =~ "Open ticket parent"
   end
 
   test "paused dashboard identifies Jira intake as a saved snapshot" do
@@ -1482,7 +1662,23 @@ defmodule SymphonyElixir.ExtensionsTest do
           validation_repair_round: 0,
           last_error: nil,
           updated_at: "2026-09-22T20:00:00Z",
-          tasks: []
+          tasks: [],
+          ticket_context: %{
+            available: true,
+            parent_thread_id: "parent-ticket",
+            codex_thread_url: "codex://threads/parent-ticket",
+            source_stage: "READY_FOR_REVIEW",
+            candidate_sha: String.duplicate("b", 40),
+            contract_revision: "r3",
+            ci: %{checked_at: "2026-09-22T19:59:00Z", artifact: %{availability: "AVAILABLE"}},
+            validation: %{required: 1, status: "NOT_REQUIRED", publication: "NOT_PROVEN_BY_VALIDATOR_OUTPUT"},
+            questions: [%{"question_key" => "q1", "binding" => "STALE", "body" => %{availability: "AVAILABLE"}, "answers" => %{availability: "NOT_RECORDED"}}],
+            actionable_question_count: 0,
+            next_action: "Review the draft merge request.",
+            worker_tasks: [],
+            attributed_usage: %{status: "UNKNOWN", tokens: nil, cost: nil},
+            synchronization: %{status: "PENDING", request: %{"status" => "PENDING"}}
+          }
         },
         %{
           run_id: "run-old",

@@ -12,7 +12,14 @@ defmodule SymphonyElixir.Factory.MrFeedbackLedger do
   @spec record_candidate(Store.connection(), map()) :: {:ok, :recorded | :already_recorded} | {:error, atom()}
   def record_candidate(connection, candidate) when is_map(candidate) do
     with :ok <- valid_candidate?(candidate) do
-      Store.transaction!(connection, &insert_candidate(&1, candidate))
+      Store.transaction!(connection, &record_candidate_transaction(&1, candidate))
+    end
+  end
+
+  defp record_candidate_transaction(transaction, candidate) do
+    case legacy_run?(transaction, candidate.run_id) do
+      :ok -> insert_candidate(transaction, candidate)
+      {:error, _reason} = error -> error
     end
   end
 
@@ -74,6 +81,8 @@ defmodule SymphonyElixir.Factory.MrFeedbackLedger do
       UPDATE mr_feedback_notes SET status = 'SUPERSEDED', updated_at = ?
       WHERE project = ? AND mr_iid = ? AND discussion_id = ? AND note_id = ?
         AND body_sha256 != ? AND status IN ('PENDING', 'CLAIMED')
+        AND EXISTS (SELECT 1 FROM runs WHERE runs.run_id = mr_feedback_notes.run_id AND COALESCE(runs.execution_mode, 'LEGACY') = 'LEGACY'
+          AND NOT EXISTS (SELECT 1 FROM runs AS supervisor WHERE supervisor.issue_key = runs.issue_key AND supervisor.execution_mode = 'TICKET_SUPERVISOR_V1'))
       """,
       [now, identity.project, identity.mr_iid, identity.discussion_id, identity.note_id, current_digest]
     )
@@ -82,17 +91,25 @@ defmodule SymphonyElixir.Factory.MrFeedbackLedger do
   @doc "Terminalizes an unclaimed receipt invalidated by fresh source readback."
   @spec dismiss(Store.connection(), String.t(), atom()) :: :ok | {:error, atom()}
   def dismiss(connection, feedback_key, reason) when is_binary(feedback_key) and is_atom(reason) do
-    Store.transaction!(connection, fn transaction ->
-      Store.query!(
-        transaction,
-        "UPDATE mr_feedback_notes SET status = 'SUPERSEDED', last_error = ?, updated_at = ? WHERE feedback_key = ? AND status = 'PENDING'",
-        [Atom.to_string(reason), DateTime.utc_now() |> DateTime.to_iso8601(), feedback_key]
-      )
+    Store.transaction!(connection, &dismiss_transaction(&1, feedback_key, reason))
+  end
 
-      if Store.one!(transaction, "SELECT changes() AS count")["count"] == 1,
-        do: :ok,
-        else: {:error, :feedback_not_pending}
-    end)
+  defp dismiss_transaction(transaction, feedback_key, reason) do
+    case legacy_feedback?(transaction, feedback_key) do
+      :ok ->
+        Store.query!(
+          transaction,
+          "UPDATE mr_feedback_notes SET status = 'SUPERSEDED', last_error = ?, updated_at = ? WHERE feedback_key = ? AND status = 'PENDING'",
+          [Atom.to_string(reason), DateTime.utc_now() |> DateTime.to_iso8601(), feedback_key]
+        )
+
+        if Store.one!(transaction, "SELECT changes() AS count")["count"] == 1,
+          do: :ok,
+          else: {:error, :feedback_not_pending}
+
+      {:error, _reason} = error ->
+        error
+    end
   end
 
   defp record_discovery_event(transaction, candidate, now) do
@@ -112,7 +129,9 @@ defmodule SymphonyElixir.Factory.MrFeedbackLedger do
   @spec pending(Store.connection()) :: [map()]
   def pending(connection) do
     connection
-    |> Store.query!("SELECT * FROM mr_feedback_notes WHERE status = 'PENDING' ORDER BY created_at, feedback_key")
+    |> Store.query!(
+      "SELECT note.* FROM mr_feedback_notes AS note JOIN runs AS run ON run.run_id = note.run_id WHERE note.status = 'PENDING' AND COALESCE(run.execution_mode, 'LEGACY') = 'LEGACY' AND NOT EXISTS (SELECT 1 FROM runs AS supervisor WHERE supervisor.issue_key = run.issue_key AND supervisor.execution_mode = 'TICKET_SUPERVISOR_V1') ORDER BY note.created_at, note.feedback_key"
+    )
     |> rows_as_maps()
   end
 
@@ -121,7 +140,7 @@ defmodule SymphonyElixir.Factory.MrFeedbackLedger do
   def next(connection) do
     Store.one!(
       connection,
-      "SELECT * FROM mr_feedback_notes WHERE status IN ('CLAIMED', 'PENDING') ORDER BY CASE status WHEN 'CLAIMED' THEN 0 ELSE 1 END, created_at, feedback_key LIMIT 1"
+      "SELECT note.* FROM mr_feedback_notes AS note JOIN runs AS run ON run.run_id = note.run_id WHERE note.status IN ('CLAIMED', 'PENDING') AND COALESCE(run.execution_mode, 'LEGACY') = 'LEGACY' AND NOT EXISTS (SELECT 1 FROM runs AS supervisor WHERE supervisor.issue_key = run.issue_key AND supervisor.execution_mode = 'TICKET_SUPERVISOR_V1') ORDER BY CASE note.status WHEN 'CLAIMED' THEN 0 ELSE 1 END, note.created_at, note.feedback_key LIMIT 1"
     )
   end
 
@@ -134,13 +153,16 @@ defmodule SymphonyElixir.Factory.MrFeedbackLedger do
 
       %{"status" => "CLAIMED", "request_key" => key} ->
         connection
-        |> Store.query!("SELECT * FROM mr_feedback_notes WHERE status = 'CLAIMED' AND request_key = ? ORDER BY created_at, feedback_key", [key])
+        |> Store.query!(
+          "SELECT note.* FROM mr_feedback_notes AS note JOIN runs AS run ON run.run_id = note.run_id WHERE note.status = 'CLAIMED' AND note.request_key = ? AND COALESCE(run.execution_mode, 'LEGACY') = 'LEGACY' AND NOT EXISTS (SELECT 1 FROM runs AS supervisor WHERE supervisor.issue_key = run.issue_key AND supervisor.execution_mode = 'TICKET_SUPERVISOR_V1') ORDER BY note.created_at, note.feedback_key",
+          [key]
+        )
         |> rows_as_maps()
 
       %{"run_id" => run_id, "mr_iid" => mr_iid, "reply_phase" => phase} ->
         connection
         |> Store.query!(
-          "SELECT * FROM mr_feedback_notes WHERE status = 'PENDING' AND run_id = ? AND mr_iid = ? AND reply_phase = ? ORDER BY created_at, feedback_key",
+          "SELECT note.* FROM mr_feedback_notes AS note JOIN runs AS run ON run.run_id = note.run_id WHERE note.status = 'PENDING' AND note.run_id = ? AND note.mr_iid = ? AND note.reply_phase = ? AND COALESCE(run.execution_mode, 'LEGACY') = 'LEGACY' AND NOT EXISTS (SELECT 1 FROM runs AS supervisor WHERE supervisor.issue_key = run.issue_key AND supervisor.execution_mode = 'TICKET_SUPERVISOR_V1') ORDER BY note.created_at, note.feedback_key",
           [run_id, mr_iid, phase]
         )
         |> rows_as_maps()
@@ -159,6 +181,9 @@ defmodule SymphonyElixir.Factory.MrFeedbackLedger do
     current = next_batch(transaction)
 
     cond do
+      not Enum.all?(current, &(legacy_feedback?(transaction, &1["feedback_key"]) == :ok)) ->
+        {:error, :feedback_run_quarantined}
+
       Enum.map(current, & &1["feedback_key"]) != keys ->
         {:error, :feedback_batch_changed}
 
@@ -192,6 +217,9 @@ defmodule SymphonyElixir.Factory.MrFeedbackLedger do
         is_nil(receipt) ->
           {:error, :unknown_feedback}
 
+        legacy_feedback?(transaction, feedback_key) != :ok ->
+          {:error, :feedback_run_quarantined}
+
         receipt["status"] == "CLAIMED" and receipt["request_key"] == request_key ->
           {:ok, receipt}
 
@@ -221,7 +249,8 @@ defmodule SymphonyElixir.Factory.MrFeedbackLedger do
     Store.transaction!(connection, fn transaction ->
       receipt = Store.one!(transaction, "SELECT * FROM mr_feedback_notes WHERE feedback_key = ?", [feedback_key])
 
-      if is_map(receipt) and receipt["status"] == "CLAIMED" and receipt["request_key"] == request_key do
+      with :ok <- legacy_feedback?(transaction, feedback_key),
+           true <- is_map(receipt) and receipt["status"] == "CLAIMED" and receipt["request_key"] == request_key do
         Store.query!(
           transaction,
           "UPDATE mr_feedback_notes SET status = ?, reply_id = ?, last_error = ?, updated_at = ? WHERE feedback_key = ? AND status = 'CLAIMED'",
@@ -230,7 +259,8 @@ defmodule SymphonyElixir.Factory.MrFeedbackLedger do
 
         :ok
       else
-        {:error, :feedback_claim_mismatch}
+        {:error, _reason} = error -> error
+        false -> {:error, :feedback_claim_mismatch}
       end
     end)
   end
@@ -293,8 +323,10 @@ defmodule SymphonyElixir.Factory.MrFeedbackLedger do
     keys = Enum.map(receipts, & &1["feedback_key"])
 
     Enum.all?(keys, fn key ->
-      case Store.one!(connection, "SELECT status, request_key FROM mr_feedback_notes WHERE feedback_key = ?", [key]) do
-        %{"status" => "CLAIMED", "request_key" => ^request_key} -> true
+      case Store.one!(connection, "SELECT note.status, note.request_key, run.execution_mode FROM mr_feedback_notes AS note JOIN runs AS run ON run.run_id = note.run_id WHERE note.feedback_key = ?", [
+             key
+           ]) do
+        %{"status" => "CLAIMED", "request_key" => ^request_key, "execution_mode" => mode} when mode in [nil, "LEGACY"] -> legacy_feedback?(connection, key) == :ok
         _other -> false
       end
     end)
@@ -303,17 +335,48 @@ defmodule SymphonyElixir.Factory.MrFeedbackLedger do
   @doc "Requeues a misclassified observation for a mandatory conversational reply."
   @spec requeue_clarification(Store.connection(), String.t()) :: :ok | {:error, atom()}
   def requeue_clarification(connection, feedback_key) when is_binary(feedback_key) do
-    Store.transaction!(connection, fn transaction ->
-      Store.query!(
-        transaction,
-        "UPDATE mr_feedback_notes SET status = 'PENDING', reply_phase = 2, request_key = NULL, controller_previous_turn_id = NULL, last_error = NULL, updated_at = ? WHERE feedback_key = ? AND status = 'CHANGE_REQUEST'",
-        [DateTime.utc_now() |> DateTime.to_iso8601(), feedback_key]
-      )
+    Store.transaction!(connection, &requeue_clarification_transaction(&1, feedback_key))
+  end
 
-      if Store.one!(transaction, "SELECT changes() AS count")["count"] == 1,
-        do: :ok,
-        else: {:error, :feedback_not_change_request}
-    end)
+  defp requeue_clarification_transaction(transaction, feedback_key) do
+    case legacy_feedback?(transaction, feedback_key) do
+      :ok ->
+        Store.query!(
+          transaction,
+          "UPDATE mr_feedback_notes SET status = 'PENDING', reply_phase = 2, request_key = NULL, controller_previous_turn_id = NULL, last_error = NULL, updated_at = ? WHERE feedback_key = ? AND status = 'CHANGE_REQUEST'",
+          [DateTime.utc_now() |> DateTime.to_iso8601(), feedback_key]
+        )
+
+        if Store.one!(transaction, "SELECT changes() AS count")["count"] == 1,
+          do: :ok,
+          else: {:error, :feedback_not_change_request}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp legacy_run?(connection, run_id) do
+    case Store.one!(
+           connection,
+           "SELECT run.execution_mode, EXISTS (SELECT 1 FROM runs AS supervisor WHERE supervisor.issue_key = run.issue_key AND supervisor.execution_mode = 'TICKET_SUPERVISOR_V1') AS quarantined FROM runs AS run WHERE run.run_id = ?",
+           [run_id]
+         ) do
+      %{"execution_mode" => mode, "quarantined" => 0} when mode in [nil, "LEGACY"] -> :ok
+      _other -> {:error, :feedback_run_quarantined}
+    end
+  end
+
+  defp legacy_feedback?(connection, feedback_key) do
+    case Store.one!(
+           connection,
+           "SELECT run.execution_mode, EXISTS (SELECT 1 FROM runs AS supervisor WHERE supervisor.issue_key = run.issue_key AND supervisor.execution_mode = 'TICKET_SUPERVISOR_V1') AS quarantined FROM mr_feedback_notes AS note JOIN runs AS run ON run.run_id = note.run_id WHERE note.feedback_key = ?",
+           [feedback_key]
+         ) do
+      %{"execution_mode" => mode, "quarantined" => 0} when mode in [nil, "LEGACY"] -> :ok
+      nil -> {:error, :unknown_feedback}
+      _other -> {:error, :feedback_run_quarantined}
+    end
   end
 
   defp rows_as_maps(%{columns: columns, rows: rows}) do

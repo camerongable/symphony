@@ -15,11 +15,38 @@ defmodule SymphonyElixir.Factory.NativeWorkspaceMaintenance do
 
   @spec ensure_available(Store.connection(), String.t()) :: :ok | {:error, atom()}
   def ensure_available(store, run_id) do
+    case Store.one!(
+           store,
+           """
+           SELECT maintenance.phase, run.issue_key FROM runs AS run
+           LEFT JOIN native_workspace_maintenance AS maintenance ON maintenance.run_id = run.run_id
+           WHERE run.run_id = ?
+           """,
+           [run_id]
+         ) do
+      %{"issue_key" => issue_key} when not is_nil(issue_key) ->
+        if v1_issue_owned?(store, issue_key) do
+          {:error, :run_quarantined}
+        else
+          checkout_available(store, run_id)
+        end
+
+      _other ->
+        :ok
+    end
+  end
+
+  @doc "Checks maintenance reservations without admitting cleanup or altering run ownership."
+  @spec checkout_available(Store.connection(), String.t()) :: :ok | {:error, atom()}
+  def checkout_available(store, run_id) do
     case Store.one!(store, "SELECT phase FROM native_workspace_maintenance WHERE run_id = ?", [run_id]) do
       %{"phase" => phase} when phase in @reserved -> {:error, :native_workspace_maintenance_reserved}
       _other -> :ok
     end
   end
+
+  defp v1_issue_owned?(store, issue_key),
+    do: Store.one!(store, "SELECT run_id FROM runs WHERE issue_key = ? AND execution_mode = 'TICKET_SUPERVISOR_V1' LIMIT 1", [issue_key]) != nil
 
   @spec plan(Store.connection()) :: [map()]
   def plan(store) do
@@ -30,6 +57,8 @@ defmodule SymphonyElixir.Factory.NativeWorkspaceMaintenance do
       LEFT JOIN native_workspace_maintenance AS maintenance ON maintenance.run_id = run.run_id
       WHERE run.kind = 'DELIVERY' AND run.workspace_state = 'CODEX_NATIVE' AND run.factory_owned = 0
         AND run.state IN ('READY_FOR_REVIEW', 'DELIVERED')
+        AND COALESCE(run.execution_mode, 'LEGACY') = 'LEGACY'
+        AND NOT EXISTS (SELECT 1 FROM runs AS supervisor WHERE supervisor.issue_key = run.issue_key AND supervisor.execution_mode = 'TICKET_SUPERVISOR_V1')
       ORDER BY COALESCE(maintenance.checked_at, ''), run.updated_at, run.run_id
       """,
       []
@@ -59,7 +88,10 @@ defmodule SymphonyElixir.Factory.NativeWorkspaceMaintenance do
       store,
       """
       SELECT * FROM native_workspace_maintenance
-      WHERE phase IN ('PROBING', 'ARCHIVE_PENDING', 'RESTORE_PENDING', 'RECONCILE_REQUIRED') LIMIT 1
+      WHERE phase IN ('PROBING', 'ARCHIVE_PENDING', 'RESTORE_PENDING', 'RECONCILE_REQUIRED')
+        AND EXISTS (SELECT 1 FROM runs WHERE runs.run_id = native_workspace_maintenance.run_id AND COALESCE(runs.execution_mode, 'LEGACY') = 'LEGACY')
+        AND NOT EXISTS (SELECT 1 FROM runs AS legacy_run JOIN runs AS supervisor ON supervisor.issue_key = legacy_run.issue_key WHERE legacy_run.run_id = native_workspace_maintenance.run_id AND supervisor.execution_mode = 'TICKET_SUPERVISOR_V1')
+      LIMIT 1
       """,
       []
     )
@@ -196,7 +228,8 @@ defmodule SymphonyElixir.Factory.NativeWorkspaceMaintenance do
   end
 
   defp candidate_binding(store, run, require_idle \\ true) do
-    with {:ok, writer} <- TaskLedger.get(store, run["run_id"] <> ":feature-writer"),
+    with :ok <- require_legacy_issue(store, run),
+         {:ok, writer} <- TaskLedger.get(store, run["run_id"] <> ":feature-writer"),
          true <- writer["status"] in ~w(COMPLETE CONSUMED) or {:error, :writer_not_terminal},
          true <- (writer["workspace"] == run["worktree"] and writer["workspace_sha"] == run["candidate_sha"]) or {:error, :writer_binding_stale},
          true <-
@@ -212,6 +245,12 @@ defmodule SymphonyElixir.Factory.NativeWorkspaceMaintenance do
       nil -> {:error, :native_creation_provenance_missing}
       {:error, _reason} = error -> error
     end
+  end
+
+  defp require_legacy_issue(store, run) do
+    if run["execution_mode"] in [nil, "LEGACY"] and not v1_issue_owned?(store, run["issue_key"]),
+      do: :ok,
+      else: {:error, :run_quarantined}
   end
 
   defp creation(store, writer) do

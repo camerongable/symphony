@@ -85,6 +85,22 @@ defmodule SymphonyElixir.FactoryTaskLauncherTest do
     %{store: store, supervisor: supervisor, run: run, policy: policy}
   end
 
+  test "READY rework preserves the stored placement and rejects conflicting caller placement" do
+    task = %{"codex_project_id" => "project-grail", "codex_section_id" => "factory"}
+
+    assert {:ok, %{project_id: "project-grail", section_id: "factory"}} = TaskLauncher.ready_rework_assignment(task, [])
+
+    assert {:ok, %{project_id: "project-grail", section_id: "factory"}} =
+             TaskLauncher.ready_rework_assignment(task, project_id: "project-grail", section_id: "factory")
+
+    assert {:error, :ready_rework_placement_changed} = TaskLauncher.ready_rework_assignment(task, project_id: "other-project")
+    assert {:error, :ready_rework_placement_changed} = TaskLauncher.ready_rework_assignment(task, section_id: "other-section")
+
+    unplaced = %{"codex_project_id" => nil, "codex_section_id" => nil}
+    assert {:ok, %{project_id: nil, section_id: nil}} = TaskLauncher.ready_rework_assignment(unplaced, [])
+    assert {:error, :ready_rework_placement_changed} = TaskLauncher.ready_rework_assignment(unplaced, project_id: "unbound-project")
+  end
+
   test "records the exact model route before launching a visible task", context do
     issue = %Issue{id: "100", identifier: "PPL-123", title: "Plan work"}
 

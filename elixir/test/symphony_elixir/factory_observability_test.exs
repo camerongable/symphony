@@ -174,9 +174,30 @@ defmodule SymphonyElixir.FactoryObservabilityTest do
     assert Enum.any?(snapshot.recent_events, &(&1.event_type == "RUN_REGISTERED"))
   end
 
-  test "returns nil when the factory is disabled" do
-    assert Observability.snapshot(settings: %{factory: %{enabled: false}}) == nil
-    assert Observability.snapshot(settings: :not_a_settings_map) == nil
+  test "returns explicit disabled state without consulting the runtime" do
+    disabled =
+      Observability.snapshot(
+        settings: %{factory: %{enabled: false}},
+        store: :must_not_be_used,
+        control_server: :must_not_be_used
+      )
+
+    assert disabled.disabled
+    refute disabled.enabled
+    refute disabled.available
+    assert disabled.error == nil
+    assert %{disabled: true} = Observability.snapshot(settings: :not_a_settings_map, store: :must_not_be_used)
+  end
+
+  test "current workflows outside the recent-run window remain projected once", context do
+    assert {:ok, _} = RunLedger.register(context.store, %{run_id: "older-active", issue_key: "PPL-OLD", kind: "DELIVERY", state: "VERIFYING"}, now: ~U[2026-09-01 00:00:00Z])
+    assert {:ok, _} = RunLedger.register(context.store, %{run_id: "newer-run", issue_key: "PPL-NEW", kind: "DELIVERY", state: "IMPLEMENTING"}, now: ~U[2026-09-02 00:00:00Z])
+
+    snapshot = Observability.snapshot(settings: %{factory: context.factory}, store: context.store, control_server: context.control_server, run_limit: 1)
+
+    assert Enum.map(snapshot.runs, & &1.run_id) == ["newer-run"]
+    assert Enum.map(snapshot.current_runs, & &1.run_id) == ["newer-run", "older-active"]
+    assert Enum.count(snapshot.current_runs, &(&1.run_id == "older-active")) == 1
   end
 
   test "broker projection distinguishes queued, claimed, and reconciliation requests without claiming liveness", context do

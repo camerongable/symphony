@@ -394,9 +394,13 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp factory_dashboard(assigns) do
     factory =
-      assigns.factory
-      |> update_in([:control], &Map.put_new(&1, :runtime_identity, %{}))
-      |> update_in([:intake], &Map.put_new(&1, :stale, assigns.factory.control.status == "PAUSED"))
+      if Map.get(assigns.factory, :disabled, false) do
+        assigns.factory
+      else
+        assigns.factory
+        |> update_in([:control], &Map.put_new(&1, :runtime_identity, %{}))
+        |> update_in([:intake], &Map.put_new(&1, :stale, assigns.factory.control.status == "PAUSED"))
+      end
 
     assigns =
       assigns
@@ -433,6 +437,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <h2>From Jira to review</h2>
           </div>
           <p>Tickets enter through Jira, become durable workflows, and finish as draft merge requests.</p>
+          <p class="section-copy">Ordinary factory: <%= config_flag(@factory[:ordinary_factory_enabled]) %> · Ticket supervisor: <%= config_flag(@factory[:ticket_supervisor_enabled]) %> (defaults to disabled).</p>
         </div>
 
         <section class="section-card primary-section intake-section">
@@ -550,6 +555,18 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         class="subtle-link"
                         href={codex_thread_url(contract_chat_thread_id(run))}
                       >Open contract chat</a>
+                      <a :if={context_available?(run) && run.ticket_context.parent_thread_id} class="subtle-link" href={codex_thread_url(run.ticket_context.parent_thread_id)}>Open ticket parent</a>
+                      <span :if={context_available?(run)} class="muted">Source stage: <%= humanize_factory_code(run.ticket_context.source_stage) %> · Parent sync: <%= humanize_factory_code(run.ticket_context.synchronization.status) %></span>
+                      <span :if={context_unavailable?(run)} class="muted">Ticket context unavailable; delivery state remains recorded separately.</span>
+                      <span :if={context_available?(run) && run.ticket_context.candidate_sha} class="muted">Candidate: <%= run.ticket_context.candidate_sha %> · contract <%= run.ticket_context.contract_revision || "unknown" %></span>
+                      <span :if={context_available?(run)} class="muted">CI evidence: <%= artifact_availability(run.ticket_context.ci.artifact) %> · checked <%= run.ticket_context.ci.checked_at || "unknown" %></span>
+                      <span :if={context_available?(run)} class="muted">Manual validation: <%= validation_requirement(run.ticket_context.validation.required) %> · <%= humanize_factory_code(run.ticket_context.validation.status || "NOT_RECORDED") %> · <%= humanize_factory_code(run.ticket_context.validation.publication) %></span>
+                      <span :if={Map.get(run, :ticket_context) && run.ticket_context.next_action} class="muted">Next action: <%= run.ticket_context.next_action %></span>
+                      <span :if={context_available?(run) && run.ticket_context.actionable_question_count > 0} class="muted"><%= run.ticket_context.actionable_question_count %> current decision(s) need an answer</span>
+                      <div :if={context_available?(run) && run.ticket_context.questions != []} class="detail-stack muted">
+                        <span :for={question <- run.ticket_context.questions}>Decision <%= question["question_key"] %>: <%= question["binding"] %> · body <%= artifact_availability(question["body"]) %> · answers <%= artifact_availability(question["answers"]) %></span>
+                      </div>
+                      <span :if={context_available?(run) && run.ticket_context.attributed_usage.status == "UNKNOWN"} class="muted">Factory-role tokens/cost: unknown</span>
                       <span :if={run.state == "AWAITING_CONTRACT_INPUT"} class="muted">
                         Answer the question in that Codex chat to continue this ticket.
                       </span>
@@ -852,8 +869,14 @@ defmodule SymphonyElixirWeb.DashboardLive do
         </details>
       <% else %>
         <section class="error-card">
-          <h2 class="error-title">Factory snapshot unavailable</h2>
-          <p class="error-copy"><%= @factory.error.message %></p>
+          <%= if Map.get(@factory, :disabled, false) do %>
+            <h2 class="error-title">Factory disabled</h2>
+            <p class="error-copy">Factory ticket workflows are disabled by configuration.</p>
+            <p class="error-copy">Ordinary factory: <%= config_flag(@factory[:ordinary_factory_enabled]) %> · Ticket supervisor: <%= config_flag(@factory[:ticket_supervisor_enabled]) %> (defaults to disabled).</p>
+          <% else %>
+            <h2 class="error-title">Factory snapshot unavailable</h2>
+            <p class="error-copy"><%= @factory.error.message %></p>
+          <% end %>
         </section>
       <% end %>
     </section>
@@ -1007,6 +1030,20 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp task_without_thread_label(_status), do: "Pending"
 
   defp codex_thread_url(thread_id), do: "codex://threads/#{URI.encode(thread_id)}"
+
+  defp context_available?(run), do: match?(%{available: true}, Map.get(run, :ticket_context))
+  defp context_unavailable?(run), do: match?(%{available: false}, Map.get(run, :ticket_context))
+  defp config_flag(true), do: "enabled"
+  defp config_flag(false), do: "disabled"
+  defp config_flag(_value), do: "unknown"
+  defp validation_requirement(true), do: "required"
+  defp validation_requirement(false), do: "not required"
+  defp validation_requirement(1), do: "required"
+  defp validation_requirement(0), do: "not required"
+  defp validation_requirement(_value), do: "unknown"
+  defp artifact_availability(%{availability: availability}), do: humanize_factory_code(availability)
+  defp artifact_availability(%{"availability" => availability}), do: humanize_factory_code(availability)
+  defp artifact_availability(_artifact), do: "not recorded"
 
   defp short_sha(nil), do: "n/a"
   defp short_sha(sha) when is_binary(sha), do: String.slice(sha, 0, 12)

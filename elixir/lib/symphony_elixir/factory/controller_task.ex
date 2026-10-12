@@ -6,7 +6,7 @@ defmodule SymphonyElixir.Factory.ControllerTask do
   explicitly routed, named, and persisted in the local control record.
   """
 
-  alias SymphonyElixir.Factory.{ControlServer, DesktopStageRunner, ModelRouter, StageRunner}
+  alias SymphonyElixir.Factory.{ControlServer, DesktopRequest, DesktopStageRunner, ModelRouter, StageRunner}
   alias SymphonyElixir.Tracker.Issue
 
   @doc "Runs one structured controller operation in the persistent controller task."
@@ -80,7 +80,24 @@ defmodule SymphonyElixir.Factory.ControllerTask do
     end
   end
 
-  defp structured_output_prompt(prompt, schema) do
+  @doc "Reads one existing controller receipt without changing the controller turn or enqueueing work."
+  @spec read_request_result(map(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
+  def read_request_result(factory, request_key, schema, opts \\ []) do
+    store = Keyword.get(opts, :store, SymphonyElixir.Factory.Supervisor.store_name())
+
+    with {:ok, request} <- DesktopRequest.get(store, request_key),
+         true <-
+           {request["target_kind"], request["target_key"], request["action"], request["codex_project_id"]} ==
+             {"CONTROLLER", factory.scope, "FOLLOWUP", factory.controller_codex_project_id} or
+             {:error, :controller_receipt_scope_mismatch},
+         {:ok, result} <- DesktopStageRunner.read_request_result(store, request_key, schema, opts) do
+      {:ok, result.output}
+    end
+  end
+
+  @doc "Uses the same receipt-only format contract for queued controller operations."
+  @spec structured_output_prompt(String.t(), map()) :: String.t()
+  def structured_output_prompt(prompt, schema) do
     """
     #{prompt}
 

@@ -5,6 +5,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   require Logger
   alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH}
+  alias SymphonyElixir.Factory.WorkerFileTools
 
   @initialize_id 1
   @thread_start_id 2
@@ -15,16 +16,25 @@ defmodule SymphonyElixir.Codex.AppServer do
   @thread_metadata_update_id 7
   @thread_section_move_id 8
   @thread_read_id 9
+  @native_read_deadline_key {__MODULE__, :native_read_deadline}
   @thread_archive_id 10
   @apps_installed_id 11
   @project_list_id 12
   @thread_list_id 13
   @mcp_tool_call_id 14
+  @worker_config_id 15
+  @worker_catalog_id 16
+  @worker_account_id 17
+  @controller_catalog_id 18
+  @native_turn_list_id 19
+  @native_queue_list_id 20
+  @owned_exit_key {__MODULE__, :owned_exit}
   @thread_list_page_size 100
   @thread_list_max_records 10_000
   @thread_list_source_kinds ~w(cli vscode exec appServer subAgent subAgentReview subAgentCompact subAgentThreadSpawn subAgentOther unknown)
   @thread_unsubscribe_timeout_ms 1_000
   @port_line_bytes 1_048_576
+  @ticket_worker_runtime_versions ~w(0.160.0 0.162.0-alpha.2)
   @max_stream_log_bytes 1_000
   @mcp_startup_statuses_key {__MODULE__, :mcp_startup_statuses}
   @mcp_approval_state_key {__MODULE__, :mcp_approval_state}
@@ -44,6 +54,9 @@ defmodule SymphonyElixir.Codex.AppServer do
           section_id: String.t() | nil,
           model: String.t() | nil,
           reasoning_effort: String.t() | nil,
+          worker_policy: map() | nil,
+          worker_files: map() | nil,
+          worker_invocation: String.t() | nil,
           workspace: Path.t(),
           worker_host: String.t() | nil,
           dynamic_tool_binding: map()
@@ -80,6 +93,45 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
+  @doc "Owns a short-lived GitLab connector transport without starting a model turn."
+  @spec with_gitlab_read_session(Path.t(), (session() -> term())) :: term()
+  def with_gitlab_read_session(workspace, operation) when is_function(operation, 1) do
+    with {:ok, session} <-
+           start_session(workspace,
+             ephemeral: true,
+             required_mcp_servers: ["GitLab"],
+             mcp_startup_timeout_ms: 60_000,
+             gitlab_mcp_startup_timeout_sec: 45,
+             service_name: "symphony-factory-connector",
+             thread_source: "symphonyFactoryConnector"
+           ) do
+      try do
+        operation.(session)
+      after
+        stop_session(session)
+      end
+    end
+  end
+
+  @doc "Owns a bounded Jira controller connector without starting a model turn."
+  @spec with_jira_controller_session(Path.t(), (session() -> term())) :: term()
+  def with_jira_controller_session(workspace, operation) when is_function(operation, 1) do
+    with {:ok, session} <-
+           start_session(workspace,
+             ephemeral: true,
+             required_mcp_servers: ["Jira"],
+             mcp_startup_timeout_ms: 60_000,
+             service_name: "symphony-factory-connector",
+             thread_source: "symphonyFactoryConnector"
+           ) do
+      try do
+        operation.(session)
+      after
+        stop_session(session)
+      end
+    end
+  end
+
   @doc "Calls a configured MCP tool on an already-open, caller-owned session."
   @spec call_mcp_tool_in_session(session(), String.t(), String.t(), map()) :: {:ok, map()} | {:error, term()}
   def call_mcp_tool_in_session(%{port: port, thread_id: thread_id}, server, tool, arguments)
@@ -98,6 +150,53 @@ defmodule SymphonyElixir.Codex.AppServer do
     deadline_ms = System.monotonic_time(:millisecond) + Config.settings!().codex.read_timeout_ms
     await_mcp_tool_response(port, deadline_ms, "")
   end
+
+  @doc "Reads advertised schemas on a caller-owned controller session; does not execute a tool or attest API results."
+  @spec mcp_tool_catalog_in_session(session(), String.t()) :: {:ok, map()} | {:error, term()}
+  def mcp_tool_catalog_in_session(%{worker_policy: policy}, _server) when not is_nil(policy), do: {:error, :worker_connector_catalog_forbidden}
+
+  def mcp_tool_catalog_in_session(%{port: port, thread_id: thread_id, worker_policy: nil}, server)
+      when is_port(port) and is_binary(thread_id) and byte_size(thread_id) in 1..256 and
+             is_binary(server) and byte_size(server) in 1..256 do
+    cond do
+      Process.get(@turn_event_state_key) != nil -> {:error, :mcp_catalog_session_busy}
+      :erlang.port_info(port, :connected) != {:connected, self()} -> {:error, :mcp_catalog_session_not_owned}
+      true -> read_controller_catalog(port, thread_id, server)
+    end
+  end
+
+  def mcp_tool_catalog_in_session(_session, _server), do: {:error, :invalid_mcp_catalog_session}
+
+  defp read_controller_catalog(port, thread_id, server) do
+    previous_deadline = Process.get(@native_read_deadline_key)
+    deadline = System.monotonic_time(:millisecond) + 20_000
+    Process.put(@native_read_deadline_key, if(is_integer(previous_deadline), do: min(deadline, previous_deadline), else: deadline))
+
+    try do
+      send_message(port, %{
+        "method" => "mcpServerStatus/list",
+        "id" => @controller_catalog_id,
+        "params" => %{"threadId" => thread_id, "serverName" => server, "detail" => "toolsAndAuthOnly", "limit" => 1}
+      })
+
+      case await_response(port, @controller_catalog_id) do
+        {:ok, %{"data" => [%{"name" => ^server, "toolsError" => nil, "tools" => tools}], "nextCursor" => nil}}
+        when is_map(tools) and map_size(tools) > 0 ->
+          if Enum.all?(tools, &catalog_tool?/1), do: {:ok, tools}, else: {:error, :mcp_tool_catalog_invalid}
+
+        {:ok, _} ->
+          {:error, :mcp_tool_catalog_unavailable}
+
+        {:error, _} = error ->
+          error
+      end
+    after
+      if is_nil(previous_deadline), do: Process.delete(@native_read_deadline_key), else: Process.put(@native_read_deadline_key, previous_deadline)
+    end
+  end
+
+  defp catalog_tool?({name, %{"name" => name, "inputSchema" => %{"type" => "object"}}}) when is_binary(name) and byte_size(name) in 1..256, do: true
+  defp catalog_tool?(_tool), do: false
 
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, opts \\ []) do
@@ -121,58 +220,73 @@ defmodule SymphonyElixir.Codex.AppServer do
       required_mcp_servers: normalize_required_mcp_servers(Keyword.get(opts, :required_mcp_servers, [])),
       resume_thread_id: Keyword.get(opts, :resume_thread_id),
       service_name: Keyword.get(opts, :service_name, "symphony-orchestrator"),
-      thread_source: Keyword.get(opts, :thread_source, "symphony")
+      thread_source: Keyword.get(opts, :thread_source, "symphony"),
+      worker_access: Keyword.get(opts, :worker_access),
+      worker_files: Keyword.get(opts, :worker_files),
+      worker_policy: nil,
+      worker_overrides: []
     }
 
     Process.put(@mcp_startup_statuses_key, %{})
 
     try do
-      dynamic_tool_binding = DynamicTool.bind()
+      binding = DynamicTool.bind()
 
       with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
+           {:ok, thread_options, binding} <- prepare_worker(expanded_workspace, worker_host, thread_options, binding),
            {:ok, port} <-
              start_port(
                expanded_workspace,
                worker_host,
-               dynamic_tool_binding,
-               thread_options.gitlab_mcp_startup_timeout_sec
+               binding,
+               thread_options.gitlab_mcp_startup_timeout_sec,
+               thread_options.worker_overrides
              ) do
         metadata = port_metadata(port, worker_host)
 
-        with {:ok, configured_policies} <- session_policies(expanded_workspace, worker_host),
-             {:ok, session_policies} <- scoped_session_policies(configured_policies, thread_options),
-             {:ok, thread_ref} <-
-               do_start_session(
-                 port,
-                 expanded_workspace,
-                 session_policies,
-                 dynamic_tool_binding,
-                 thread_options
-               ) do
-          {:ok,
-           %{
-             port: port,
-             metadata: metadata,
-             approval_policy: session_policies.approval_policy,
-             auto_approve_requests: false,
-             allowed_mcp_tool_approvals: thread_options.allowed_mcp_tool_approvals,
-             thread_sandbox: session_policies.thread_sandbox,
-             turn_sandbox_policy: session_policies.turn_sandbox_policy,
-             thread_id: thread_ref.thread_id,
-             forked_from_thread_id: thread_ref.forked_from_thread_id,
-             thread_name: thread_options.name,
-             project_id: thread_ref.project_id,
-             section_id: thread_options.section_id,
-             model: thread_options.model,
-             reasoning_effort: thread_options.reasoning_effort,
-             workspace: expanded_workspace,
-             worker_host: worker_host,
-             dynamic_tool_binding: dynamic_tool_binding
-           }}
-        else
-          {:error, reason} ->
+        try do
+          with {:ok, configured_policies} <- session_policies(expanded_workspace, worker_host),
+               {:ok, session_policies} <- worker_session_policies(configured_policies, thread_options),
+               {:ok, thread_ref} <-
+                 do_start_session(
+                   port,
+                   expanded_workspace,
+                   session_policies,
+                   binding,
+                   thread_options
+                 ) do
+            {:ok,
+             %{
+               port: port,
+               metadata: metadata,
+               approval_policy: session_policies.approval_policy,
+               auto_approve_requests: false,
+               allowed_mcp_tool_approvals: thread_options.allowed_mcp_tool_approvals,
+               thread_sandbox: session_policies.thread_sandbox,
+               turn_sandbox_policy: session_policies.turn_sandbox_policy,
+               thread_id: thread_ref.thread_id,
+               forked_from_thread_id: thread_ref.forked_from_thread_id,
+               thread_name: thread_options.name,
+               project_id: thread_ref.project_id,
+               section_id: thread_options.section_id,
+               model: thread_options.model,
+               reasoning_effort: thread_options.reasoning_effort,
+               worker_policy: thread_options.worker_policy,
+               worker_files: thread_options.worker_files,
+               worker_invocation: worker_invocation(thread_options.worker_policy),
+               workspace: expanded_workspace,
+               worker_host: worker_host,
+               dynamic_tool_binding: binding
+             }}
+          else
+            {:error, reason} ->
+              stop_port(port)
+              {:error, reason}
+          end
+        catch
+          kind, reason ->
             stop_port(port)
-            {:error, reason}
+            :erlang.raise(kind, reason, __STACKTRACE__)
         end
       end
     after
@@ -180,34 +294,50 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
+  defp worker_invocation(nil), do: nil
+  defp worker_invocation(_policy), do: Base.encode16(:crypto.strong_rand_bytes(32), case: :lower)
+
+  def run_turn(session, prompt, issue, opts \\ [])
+
   @spec run_turn(session(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
-  def run_turn(
-        %{
-          port: port,
-          metadata: metadata,
-          approval_policy: approval_policy,
-          auto_approve_requests: auto_approve_requests,
-          allowed_mcp_tool_approvals: allowed_mcp_tool_approvals,
-          turn_sandbox_policy: turn_sandbox_policy,
-          thread_id: thread_id,
-          model: model,
-          reasoning_effort: reasoning_effort,
-          thread_name: thread_name,
-          workspace: workspace,
-          dynamic_tool_binding: dynamic_tool_binding
-        },
-        prompt,
-        issue,
-        opts \\ []
-      ) do
+  def run_turn(%{worker_policy: %{"mode" => "SOURCE"}}, _prompt, _issue, _opts),
+    do: {:error, :worker_source_containment_unproven}
+
+  def run_turn(%{worker_policy: %{"mode" => "FILE_SOURCE"}} = session, prompt, issue, opts) do
+    with :ok <- WorkerFileTools.turn_preflight(session[:worker_files], session),
+         :ok <- file_worker_session_owned(session),
+         :ok <- file_worker_runtime(session.port, session.workspace),
+         :ok <- worker_catalog_empty(session.port, session) do
+      run_allowed_turn(session, prompt, issue, opts)
+    end
+  end
+
+  def run_turn(session, prompt, issue, opts), do: run_allowed_turn(session, prompt, issue, opts)
+
+  defp run_allowed_turn(
+         %{
+           port: port,
+           metadata: metadata,
+           approval_policy: approval_policy,
+           auto_approve_requests: auto_approve_requests,
+           allowed_mcp_tool_approvals: allowed_mcp_tool_approvals,
+           turn_sandbox_policy: turn_sandbox_policy,
+           thread_id: thread_id,
+           model: model,
+           reasoning_effort: reasoning_effort,
+           thread_name: thread_name,
+           workspace: workspace,
+           dynamic_tool_binding: dynamic_tool_binding
+         } = session,
+         prompt,
+         issue,
+         opts
+       ) do
     on_message = Keyword.get(opts, :on_message, &default_on_message/1)
     event_scope = Keyword.get(opts, :event_scope, :legacy)
     if event_scope not in [:legacy, :exact_turn], do: raise(ArgumentError, "unsupported event_scope: #{inspect(event_scope)}")
 
-    tool_executor =
-      Keyword.get(opts, :tool_executor, fn tool, arguments ->
-        DynamicTool.execute(tool, arguments, dynamic_tool_binding, issue: issue)
-      end)
+    tool_executor = turn_tool_executor(session, dynamic_tool_binding, issue, opts)
 
     Process.put(@mcp_approval_state_key, %{
       items: %{},
@@ -227,6 +357,8 @@ defmodule SymphonyElixir.Codex.AppServer do
       })
     end
 
+    Process.put({__MODULE__, :file_tool_turn}, get_in(session, [:worker_policy, "mode"]) == "FILE_SOURCE")
+
     try do
       case start_turn(
              port,
@@ -240,6 +372,7 @@ defmodule SymphonyElixir.Codex.AppServer do
                model: model,
                reasoning_effort: reasoning_effort,
                output_schema: Keyword.get(opts, :output_schema),
+               worker_policy: Map.get(session, :worker_policy),
                request_id: turn_start_request_id(event_scope)
              }
            ) do
@@ -298,15 +431,47 @@ defmodule SymphonyElixir.Codex.AppServer do
     after
       Process.delete(@mcp_approval_state_key)
       Process.delete(@turn_event_state_key)
+      Process.delete({__MODULE__, :file_tool_turn})
     end
   end
+
+  defp turn_tool_executor(%{worker_policy: %{"mode" => "FILE_SOURCE"}} = session, _binding, _issue, _opts),
+    do: fn tool, arguments, identity -> WorkerFileTools.execute(session.worker_files, tool, arguments, identity) end
+
+  defp turn_tool_executor(%{worker_policy: %{}}, _binding, _issue, _opts),
+    do: fn _tool, _arguments -> %{success: false, error: "Factory workers cannot call controller connectors"} end
+
+  defp turn_tool_executor(_session, binding, issue, opts),
+    do: Keyword.get(opts, :tool_executor, fn tool, arguments -> DynamicTool.execute(tool, arguments, binding, issue: issue) end)
 
   defp turn_start_request_id(:exact_turn),
     do: "turn-start-#{System.unique_integer([:positive, :monotonic])}"
 
   defp turn_start_request_id(:legacy), do: @turn_start_id
 
-  @spec stop_session(session()) :: :ok
+  @spec stop_session(session()) :: :ok | {:ok, map()} | {:error, term()}
+  def stop_session(%{worker_policy: %{} = policy, port: port, thread_id: thread, metadata: metadata} = session) do
+    Process.unlink(port)
+
+    try do
+      maybe_unsubscribe_owned(port, thread)
+
+      with {:ok, status} <- stop_owned_worker(port, metadata[:codex_app_server_pid]) do
+        {:ok,
+         %{
+           "transport" => "owned_app_server",
+           "thread_id" => thread,
+           "pid" => metadata[:codex_app_server_pid],
+           "invocation_nonce" => session.worker_invocation,
+           "exit_status" => status,
+           "cwd" => policy["cwd"]
+         }}
+      end
+    after
+      stop_port(port)
+    end
+  end
+
   def stop_session(%{port: port, thread_id: thread_id}) when is_port(port) do
     Process.unlink(port)
 
@@ -314,6 +479,60 @@ defmodule SymphonyElixir.Codex.AppServer do
       unsubscribe_thread(port, thread_id)
     after
       stop_port(port)
+    end
+  end
+
+  defp stop_owned_worker(port, pid) do
+    case Process.get({@owned_exit_key, port}) do
+      nil -> receive_owned_exit(port, pid)
+      status -> {:ok, status}
+    end
+  end
+
+  defp maybe_unsubscribe_owned(port, thread) do
+    if :erlang.port_info(port) != :undefined, do: unsubscribe_thread(port, thread)
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp receive_owned_exit(port, pid) do
+    receive do
+      {^port, {:exit_status, status}} -> {:ok, status}
+    after
+      0 -> signal_owned_worker(port, pid)
+    end
+  end
+
+  defp signal_owned_worker(port, pid) do
+    case :erlang.port_info(port, :os_pid) do
+      {:os_pid, actual} when is_binary(pid) ->
+        if to_string(actual) == pid do
+          signal_and_wait(port, pid)
+        else
+          {:error, :worker_shutdown_identity_mismatch}
+        end
+
+      _ ->
+        {:error, :worker_shutdown_unproven}
+    end
+  end
+
+  defp signal_and_wait(port, pid) do
+    case System.cmd("/bin/kill", ["-TERM", pid], stderr_to_stdout: true) do
+      {_output, 0} -> await_owned_worker_exit(port, System.monotonic_time(:millisecond) + 5_000)
+      _ -> {:error, :worker_shutdown_unproven}
+    end
+  end
+
+  defp await_owned_worker_exit(port, deadline) do
+    remaining = max(0, deadline - System.monotonic_time(:millisecond))
+
+    receive do
+      {^port, {:exit_status, status}} -> {:ok, status}
+      {^port, {:data, _}} -> await_owned_worker_exit(port, deadline)
+    after
+      remaining -> {:error, :worker_shutdown_unproven}
     end
   end
 
@@ -362,6 +581,260 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp list_threads_by_title(port, title, archived) do
     list_threads_by_title(port, title, archived, nil, [], [], 0)
+  end
+
+  @doc "Reads persisted native history without loading, resuming, or starting a model turn."
+  def read_native_thread(thread_id, opts \\ [])
+
+  @spec read_native_thread(String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def read_native_thread(thread_id, opts) when is_binary(thread_id) and byte_size(thread_id) in 1..256 do
+    workspace = Keyword.get(opts, :workspace, File.cwd!())
+
+    with {:ok, port} <- start_port(workspace, nil, DynamicTool.bind()) do
+      Process.unlink(port)
+      Process.put(@native_read_deadline_key, System.monotonic_time(:millisecond) + 20_000)
+
+      try do
+        with :ok <- send_initialize(port) do
+          include_turns = Keyword.get(opts, :include_turns, true)
+          send_message(port, %{"method" => "thread/read", "id" => @thread_read_id, "params" => %{"threadId" => thread_id, "includeTurns" => include_turns}})
+
+          case await_response(port, @thread_read_id) do
+            {:ok, %{"thread" => %{"id" => ^thread_id} = thread}} ->
+              with true <-
+                     not include_turns or is_list(thread["turns"]) or
+                       {:error, :native_read_identity_or_history_mismatch},
+                   {:ok, observed} <- maybe_read_complete_history(port, thread, opts),
+                   {:ok, observed} <- maybe_read_latest_turn(port, observed, opts),
+                   {:ok, observed} <- maybe_read_native_queue(port, observed, opts) do
+                recheck_latest_queue_version(port, observed, opts)
+              end
+
+            {:ok, _} ->
+              {:error, :native_read_identity_or_history_mismatch}
+
+            error ->
+              error
+          end
+        end
+      after
+        Process.delete(@native_read_deadline_key)
+        stop_port(port)
+      end
+    end
+  end
+
+  def read_native_thread(_thread_id, _opts), do: {:error, :invalid_native_thread_id}
+
+  @doc "Checks the configured runtime without a thread, model turn, connector call or transferable authority."
+  @spec check_ticket_runtime(Path.t()) :: :ok | {:error, term()}
+  def check_ticket_runtime(workspace) when is_binary(workspace) do
+    with true <- Path.type(workspace) == :absolute,
+         {:ok, cwd} <- PathSafety.canonicalize(workspace),
+         true <- File.dir?(cwd),
+         {:ok, port} <- start_port(cwd, nil, DynamicTool.bind()) do
+      Process.unlink(port)
+      pid = port_metadata(port, nil)[:codex_app_server_pid]
+      previous = Process.get(@native_read_deadline_key)
+      deadline = System.monotonic_time(:millisecond) + 20_000
+      Process.put(@native_read_deadline_key, if(is_integer(previous), do: min(deadline, previous), else: deadline))
+
+      try do
+        result = inspect_ticket_runtime(port)
+
+        case stop_ticket_runtime(port, pid) do
+          {:ok, status} when status in [0, 143] -> result
+          {:ok, _status} -> {:error, :ticket_runtime_process_failed}
+          {:error, _} = error -> error
+        end
+      after
+        if is_nil(previous), do: Process.delete(@native_read_deadline_key), else: Process.put(@native_read_deadline_key, previous)
+        stop_port(port)
+      end
+    else
+      false -> {:error, :ticket_runtime_cwd_unproven}
+      {:error, _} = error -> error
+    end
+  end
+
+  def check_ticket_runtime(_workspace), do: {:error, :ticket_runtime_cwd_unproven}
+
+  defp inspect_ticket_runtime(port) do
+    with {:ok, response} <- initialization_response(port), do: qualify_ticket_runtime_identity(response)
+  rescue
+    _ -> {:error, :ticket_runtime_initialization_failed}
+  catch
+    _kind, _reason -> {:error, :ticket_runtime_initialization_failed}
+  end
+
+  defp stop_ticket_runtime(port, pid) do
+    if is_nil(Process.get({@owned_exit_key, port})) do
+      receive do
+        {^port, {:exit_status, _status}} -> {:error, :ticket_runtime_process_failed}
+      after
+        0 -> signal_owned_worker(port, pid)
+      end
+    else
+      {:error, :ticket_runtime_process_failed}
+    end
+  end
+
+  defp maybe_read_native_queue(port, thread, opts) do
+    if Keyword.get(opts, :include_queue, false) do
+      send_message(port, %{"method" => "thread/queue/list", "id" => @native_queue_list_id, "params" => %{"threadId" => thread["id"], "limit" => 10}})
+
+      case await_response(port, @native_queue_list_id) do
+        {:ok, %{"data" => items, "nextCursor" => next} = result} when is_list(items) ->
+          native_queue_observation(thread, result, items, next)
+
+        {:ok, _} ->
+          {:error, :native_queue_page_invalid}
+
+        error ->
+          error
+      end
+    else
+      {:ok, thread}
+    end
+  end
+
+  defp native_queue_observation(thread, result, items, next) do
+    if Enum.all?(items, &is_map/1) and (is_nil(next) or (is_binary(next) and next != "")) do
+      observation = %{
+        "thread_id" => thread["id"],
+        "observed_at" => DateTime.to_iso8601(DateTime.utc_now()),
+        "empty_complete" => items == [] and is_nil(next),
+        "count_lower_bound" => length(items),
+        "has_more" => not is_nil(next),
+        "raw_response" => result,
+        "sha256" => :crypto.hash(:sha256, Jason.encode!(result)) |> Base.encode16(case: :lower)
+      }
+
+      {:ok, Map.put(thread, "queue_observation", observation)}
+    else
+      {:error, :native_queue_page_invalid}
+    end
+  end
+
+  defp maybe_read_complete_history(port, thread, opts) do
+    if Keyword.get(opts, :complete_history, false) do
+      with true <- is_number(thread["updatedAt"]) or {:error, :native_history_version_missing},
+           {:ok, turns} <- read_turn_pages(port, thread["id"], nil, [], [], 0),
+           :ok <- unchanged_native_history(port, thread) do
+        {:ok, thread |> Map.put("turns", turns) |> Map.put("history_observation", %{"mode" => "PAGED_FULL", "next_cursor" => nil, "turn_count" => length(turns), "updated_at" => thread["updatedAt"]})}
+      end
+    else
+      {:ok, thread}
+    end
+  end
+
+  defp maybe_read_latest_turn(port, thread, opts) do
+    if Keyword.get(opts, :include_latest_turn, false) do
+      params = %{"threadId" => thread["id"], "limit" => 1, "sortDirection" => "desc", "itemsView" => "full"}
+      send_message(port, %{"method" => "thread/turns/list", "id" => @native_turn_list_id, "params" => params})
+
+      with true <- is_number(thread["updatedAt"]) or {:error, :native_history_version_missing},
+           {:ok, %{"data" => [_turn], "nextCursor" => cursor} = raw} <- await_response(port, @native_turn_list_id),
+           true <- is_nil(cursor) or (is_binary(cursor) and cursor != "") or {:error, :native_latest_turn_invalid},
+           :ok <- validate_full_turn_items(raw["data"]),
+           :ok <- validate_native_turn_ids(raw["data"]),
+           :ok <- unchanged_native_history(port, thread) do
+        observation = %{
+          "mode" => "LATEST_DESC",
+          "parameters" => params,
+          "raw_response" => raw,
+          "sha256" => digest_native(raw),
+          "updated_at" => thread["updatedAt"],
+          "observed_at" => DateTime.to_iso8601(DateTime.utc_now())
+        }
+
+        {:ok, Map.put(thread, "latest_turn_observation", observation)}
+      else
+        {:error, _} = error -> error
+        _ -> {:error, :native_latest_turn_invalid}
+      end
+    else
+      {:ok, thread}
+    end
+  end
+
+  defp digest_native(raw), do: Base.encode16(:crypto.hash(:sha256, Jason.encode!(raw)), case: :lower)
+
+  defp recheck_latest_queue_version(port, thread, opts) do
+    if Keyword.get(opts, :include_latest_turn, false) and Keyword.get(opts, :include_queue, false) do
+      original = thread["latest_turn_observation"]
+      send_message(port, %{"method" => "thread/turns/list", "id" => @native_turn_list_id, "params" => original["parameters"]})
+
+      with {:ok, %{"data" => data, "nextCursor" => cursor} = raw} <- await_response(port, @native_turn_list_id),
+           true <- is_nil(cursor) or (is_binary(cursor) and cursor != "") or {:error, :native_latest_turn_invalid},
+           true <- data == original["raw_response"]["data"] or {:error, :native_latest_turn_changed_during_read},
+           :ok <- unchanged_native_history(port, thread) do
+        confirmation = %{"raw_response" => raw, "sha256" => digest_native(raw), "observed_at" => DateTime.to_iso8601(DateTime.utc_now())}
+        {:ok, put_in(thread, ["latest_turn_observation", "confirmation"], confirmation)}
+      else
+        {:error, _} = error -> error
+        _ -> {:error, :native_latest_turn_invalid}
+      end
+    else
+      {:ok, thread}
+    end
+  end
+
+  defp read_turn_pages(_port, _thread, _cursor, _seen, _turns, pages) when pages >= 100, do: {:error, :native_history_page_limit}
+
+  defp read_turn_pages(port, thread, cursor, seen, turns, pages) do
+    params = %{"threadId" => thread, "limit" => 50, "sortDirection" => "asc", "itemsView" => "full"}
+    params = if is_nil(cursor), do: params, else: Map.put(params, "cursor", cursor)
+    send_message(port, %{"method" => "thread/turns/list", "id" => @native_turn_list_id, "params" => params})
+
+    case await_response(port, @native_turn_list_id) do
+      {:ok, %{"data" => page, "nextCursor" => next}} when is_list(page) ->
+        finish_turn_page(port, thread, page, next, seen, turns, pages)
+
+      {:ok, _} ->
+        {:error, :native_history_page_invalid}
+
+      error ->
+        error
+    end
+  end
+
+  defp finish_turn_page(port, thread, page, next, seen, turns, pages) do
+    all = turns ++ page
+
+    with :ok <- validate_full_turn_items(page), :ok <- validate_native_turn_ids(all) do
+      cond do
+        is_nil(next) -> {:ok, all}
+        not is_binary(next) or next == "" or next in seen -> {:error, :native_history_cursor_invalid}
+        true -> read_turn_pages(port, thread, next, [next | seen], all, pages + 1)
+      end
+    end
+  end
+
+  defp validate_full_turn_items(page) do
+    if Enum.all?(page, &(is_map(&1) and is_list(&1["items"]))), do: :ok, else: {:error, :native_history_items_missing}
+  end
+
+  defp validate_native_turn_ids(turns) do
+    ids = Enum.map(turns, & &1["id"])
+    if Enum.all?(ids, &(is_binary(&1) and &1 != "")) and length(Enum.uniq(ids)) == length(ids), do: :ok, else: {:error, :native_history_turn_conflict}
+  end
+
+  defp unchanged_native_history(port, thread) do
+    send_message(port, %{"method" => "thread/read", "id" => @thread_read_id, "params" => %{"threadId" => thread["id"], "includeTurns" => false}})
+
+    case await_response(port, @thread_read_id) do
+      {:ok, %{"thread" => current}} when is_map(current) ->
+        if Map.take(current, ~w(id cwd projectId updatedAt)) == Map.take(thread, ~w(id cwd projectId updatedAt)),
+          do: :ok,
+          else: {:error, :native_history_changed_during_read}
+
+      {:ok, _} ->
+        {:error, :native_history_page_invalid}
+
+      error ->
+        error
+    end
   end
 
   defp list_threads_by_title(_port, _title, _archived, _cursor, _seen, _matches, scanned)
@@ -493,33 +966,36 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp start_port(workspace, worker_host, dynamic_tool_binding),
     do: start_port(workspace, worker_host, dynamic_tool_binding, nil)
 
-  defp start_port(workspace, nil, dynamic_tool_binding, gitlab_mcp_startup_timeout_sec) do
+  defp start_port(workspace, worker_host, dynamic_tool_binding, gitlab_mcp_startup_timeout_sec),
+    do: start_port(workspace, worker_host, dynamic_tool_binding, gitlab_mcp_startup_timeout_sec, [])
+
+  defp start_port(workspace, nil, dynamic_tool_binding, gitlab_mcp_startup_timeout_sec, overrides) do
     executable = System.find_executable("bash")
 
     if is_nil(executable) do
       {:error, :bash_not_found}
     else
-      launch_command = local_launch_command(dynamic_tool_binding, gitlab_mcp_startup_timeout_sec)
+      arguments = Enum.map_join(overrides, "", &(" --config " <> shell_escape(&1)))
+      command = local_launch_command(dynamic_tool_binding, gitlab_mcp_startup_timeout_sec) <> arguments
 
       port =
-        Port.open(
-          {:spawn_executable, String.to_charlist(executable)},
-          [
-            :binary,
-            :exit_status,
-            :stderr_to_stdout,
-            args: [~c"-lc", String.to_charlist(launch_command)],
-            cd: String.to_charlist(workspace),
-            env: tracker_secret_port_env(dynamic_tool_binding),
-            line: @port_line_bytes
-          ]
-        )
+        Port.open({:spawn_executable, String.to_charlist(executable)}, [
+          :binary,
+          :exit_status,
+          :stderr_to_stdout,
+          args: [~c"-lc", String.to_charlist(command)],
+          cd: String.to_charlist(workspace),
+          env: worker_port_env(dynamic_tool_binding, overrides),
+          line: @port_line_bytes
+        ])
 
       {:ok, port}
     end
   end
 
-  defp start_port(workspace, worker_host, dynamic_tool_binding, gitlab_mcp_startup_timeout_sec)
+  defp start_port(_workspace, host, _binding, _timeout, [_ | _]) when is_binary(host), do: {:error, :worker_remote_profile_unsupported}
+
+  defp start_port(workspace, worker_host, dynamic_tool_binding, gitlab_mcp_startup_timeout_sec, [])
        when is_binary(worker_host) do
     remote_command = remote_launch_command(workspace, dynamic_tool_binding, gitlab_mcp_startup_timeout_sec)
     SSH.start_port(worker_host, remote_command, line: @port_line_bytes)
@@ -557,6 +1033,19 @@ defmodule SymphonyElixir.Codex.AppServer do
     |> Enum.map(fn name -> {String.to_charlist(name), false} end)
   end
 
+  defp worker_port_env(binding, []), do: tracker_secret_port_env(binding)
+
+  defp worker_port_env(binding, overrides) do
+    secrets = System.get_env() |> Map.keys() |> Enum.filter(&String.match?(&1, ~r/(?:_TOKEN|_KEY|_SECRET|_PASSWORD)$/))
+    host = code_mode_host_env(overrides)
+    tracker_secret_port_env(binding) ++ Enum.map(secrets, &{String.to_charlist(&1), false}) ++ host
+  end
+
+  defp code_mode_host_env(overrides) do
+    path = Path.dirname(code_mode_host_path()) <> ":" <> (System.get_env("PATH") || "")
+    if "features.code_mode_host=true" in overrides, do: [{~c"PATH", String.to_charlist(path)}], else: []
+  end
+
   defp tracker_secret_unset_command(dynamic_tool_binding) do
     case dynamic_tool_binding.secret_environment_names |> valid_environment_names() do
       [] -> nil
@@ -586,7 +1075,15 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp send_initialize(port) do
+  defp send_initialize(port, options \\ nil) do
+    with {:ok, response} <- initialization_response(port),
+         :ok <- qualify_worker_initialization(response, options) do
+      send_message(port, %{"method" => "initialized", "params" => %{}})
+      :ok
+    end
+  end
+
+  defp initialization_response(port) do
     payload = %{
       "method" => "initialize",
       "id" => @initialize_id,
@@ -604,9 +1101,56 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     send_message(port, payload)
 
-    with {:ok, _} <- await_response(port, @initialize_id) do
-      send_message(port, %{"method" => "initialized", "params" => %{}})
+    await_response(port, @initialize_id)
+  end
+
+  defp qualify_worker_initialization(response, %{worker_access: mode}) when mode in ~w(FILE_SOURCE REVIEW) do
+    qualify_ticket_runtime_identity(response)
+  end
+
+  defp qualify_worker_initialization(_response, _options), do: :ok
+
+  defp qualify_ticket_runtime_identity(response) do
+    with {:ok, home, family, os, agent} <- worker_runtime_fields(response),
+         :ok <- worker_runtime_supported(family, os, agent) do
+      worker_runtime_home(home)
+    end
+  end
+
+  defp worker_runtime_fields(response) do
+    case response do
+      %{"codexHome" => home, "platformFamily" => family, "platformOs" => os, "userAgent" => agent}
+      when is_binary(home) and is_binary(family) and is_binary(os) and is_binary(agent) ->
+        {:ok, home, family, os, agent}
+
+      _ ->
+        {:error, :worker_runtime_identity_unproven}
+    end
+  end
+
+  defp worker_runtime_supported("unix", "macos", agent) do
+    supported_agent? =
+      Enum.any?(@ticket_worker_runtime_versions, fn version ->
+        String.starts_with?(agent, "symphony-orchestrator/#{version} (")
+      end)
+
+    if byte_size(agent) <= 2_048 and supported_agent?,
+      do: :ok,
+      else: {:error, :worker_runtime_unsupported}
+  end
+
+  defp worker_runtime_supported(_family, _os, _agent), do: {:error, :worker_runtime_unsupported}
+
+  defp worker_runtime_home(home) do
+    expected = System.get_env("CODEX_HOME") || Path.join(System.user_home!(), ".codex")
+
+    with true <- (Path.type(home) == :absolute and Path.type(expected) == :absolute) or {:error, :worker_runtime_home_mismatch},
+         {:ok, observed_home} <- PathSafety.canonicalize(home),
+         {:ok, expected_home} <- PathSafety.canonicalize(expected),
+         true <- observed_home == expected_home or {:error, :worker_runtime_home_mismatch} do
       :ok
+    else
+      {:error, _} = error -> error
     end
   end
 
@@ -638,6 +1182,214 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp scoped_session_policies(_policies, _options), do: {:error, :invalid_scoped_mcp_approval}
 
+  defp worker_session_policies(policies, %{worker_policy: nil} = options), do: scoped_session_policies(policies, options)
+
+  defp worker_session_policies(_policies, options) do
+    readonly = options.worker_access in ~w(REVIEW FILE_SOURCE)
+
+    {:ok,
+     %{
+       approval_policy: "never",
+       thread_sandbox: if(readonly, do: "read-only", else: "workspace-write"),
+       turn_sandbox_policy: if(readonly, do: %{"type" => "readOnly"}, else: %{"type" => "workspaceWrite", "networkAccess" => false})
+     }}
+  end
+
+  defp prepare_worker(_workspace, _host, %{worker_access: nil} = options, binding), do: {:ok, options, binding}
+
+  # Native PID exit does not stop a detached writable descendant; this route cannot admit source work yet.
+  defp prepare_worker(_workspace, _host, %{worker_access: "SOURCE"}, _binding), do: {:error, :worker_source_containment_unproven}
+
+  defp prepare_worker(workspace, nil, %{worker_access: "FILE_SOURCE"} = options, binding) do
+    with :ok <- WorkerFileTools.preflight(options.worker_files, workspace),
+         :ok <- restricted_worker_options(options),
+         {:ok, inventory} <- read_worker_configuration(workspace, binding),
+         policy = worker_policy("FILE_SOURCE", workspace),
+         {:ok, overrides} <- worker_overrides(inventory, policy) do
+      overrides = overrides ++ worker_allocation_overrides(options)
+      {:ok, %{options | worker_policy: policy, worker_overrides: overrides}, Map.put(binding, :tool_specs, WorkerFileTools.tool_specs())}
+    end
+  end
+
+  defp prepare_worker(workspace, nil, %{worker_access: "REVIEW"} = options, binding) do
+    with :ok <- restricted_worker_options(options),
+         {:ok, inventory} <- read_worker_configuration(workspace, binding),
+         policy = worker_policy("REVIEW", workspace),
+         {:ok, overrides} <- worker_overrides(inventory, policy) do
+      overrides = overrides ++ worker_allocation_overrides(options)
+      {:ok, %{options | worker_policy: policy, worker_overrides: overrides}, Map.put(binding, :tool_specs, [])}
+    end
+  end
+
+  defp prepare_worker(_workspace, _host, _options, _binding), do: {:error, :worker_access_profile_unsupported}
+
+  defp worker_allocation_overrides(%{reasoning_effort: effort}) when is_binary(effort),
+    do: ["model_reasoning_effort=" <> Jason.encode!(effort)]
+
+  defp worker_allocation_overrides(_options), do: []
+
+  defp restricted_worker_options(options) do
+    empty = %{required_apps: [], required_mcp_servers: [], allowed_mcp_tool_approvals: []}
+    expected = Map.merge(empty, %{fork_on_active_writer: false, project_id: nil, project_root: nil})
+    valid = Map.take(options, Map.keys(expected)) == expected
+    if valid, do: :ok, else: {:error, :worker_capability_configuration_rejected}
+  end
+
+  defp read_worker_configuration(workspace, binding) do
+    with {:ok, port} <- start_port(workspace, nil, binding) do
+      Process.put(@native_read_deadline_key, System.monotonic_time(:millisecond) + 20_000)
+
+      try do
+        with :ok <- send_initialize(port),
+             true <- send_message(port, %{"method" => "config/read", "id" => @worker_config_id, "params" => %{"cwd" => workspace, "includeLayers" => false}}),
+             {:ok, %{"config" => config}} <- await_response(port, @worker_config_id) do
+          {:ok, config}
+        else
+          {:error, _} = error -> error
+          _ -> {:error, :worker_configuration_unavailable}
+        end
+      after
+        stop_port(port)
+        Process.delete(@native_read_deadline_key)
+      end
+    end
+  end
+
+  @doc false
+  @spec worker_policy(String.t(), Path.t()) :: map()
+  def worker_policy(mode, workspace) do
+    policy = %{
+      "mode" => mode,
+      "profile" => worker_profile(mode),
+      "cwd" => workspace,
+      "approval_policy" => "never",
+      "network" => false,
+      "connectors" => [],
+      "source_access" => if(mode == "SOURCE", do: "write", else: "read"),
+      "read_roots" => worker_read_roots(workspace)
+    }
+
+    cond do
+      mode == "FILE_SOURCE" -> Map.put(policy, "file_tools_sha256", WorkerFileTools.tool_contract_sha256())
+      mode == "REVIEW" -> Map.put(policy, "shell_environment", review_shell_environment())
+      true -> policy
+    end
+  end
+
+  defp review_shell_environment do
+    %{
+      "inherit" => "core",
+      "set" => %{
+        "PATH" => "/Library/Developer/CommandLineTools/usr/bin:" <> (System.get_env("PATH") || "/usr/bin:/bin"),
+        "GIT_CONFIG_GLOBAL" => "/dev/null",
+        "GIT_CONFIG_SYSTEM" => "/dev/null",
+        "GIT_CONFIG_NOSYSTEM" => "1",
+        "GIT_OPTIONAL_LOCKS" => "0",
+        "GIT_NO_LAZY_FETCH" => "1",
+        "GIT_NO_REPLACE_OBJECTS" => "1",
+        "GIT_CONFIG_COUNT" => "3",
+        "GIT_CONFIG_KEY_0" => "core.excludesfile",
+        "GIT_CONFIG_VALUE_0" => "/dev/null",
+        "GIT_CONFIG_KEY_1" => "core.fsmonitor",
+        "GIT_CONFIG_VALUE_1" => "false",
+        "GIT_CONFIG_KEY_2" => "core.hooksPath",
+        "GIT_CONFIG_VALUE_2" => "/dev/null"
+      }
+    }
+  end
+
+  defp worker_read_roots(workspace) do
+    home = System.user_home!()
+    tools = [Path.join(home, ".agents/skills"), Path.join(home, ".agents/rules"), Path.join(home, ".local/share/mise"), "/opt/homebrew"]
+
+    roots =
+      case System.cmd("/Library/Developer/CommandLineTools/usr/bin/git", ["-C", workspace, "rev-parse", "--path-format=absolute", "--git-common-dir"], stderr_to_stdout: true) do
+        {path, 0} -> [String.trim(path) | tools]
+        _ -> tools
+      end
+
+    roots |> Enum.filter(&File.dir?/1) |> Enum.map(&canonical_worker_read_root/1) |> Enum.uniq()
+  end
+
+  defp canonical_worker_read_root(path) do
+    {:ok, canonical} = PathSafety.canonicalize(path)
+    canonical
+  end
+
+  defp worker_overrides(config, policy) when is_map(config) do
+    mcp = config["mcp_servers"] || %{}
+    plugins = config["plugins"] || %{}
+
+    valid_inventory = is_map(mcp) and is_map(plugins) and map_size(mcp) + map_size(plugins) <= 256
+
+    if valid_inventory and valid_worker_config_names?(mcp, plugins) do
+      profile = policy["profile"]
+      parent = if policy["mode"] == "SOURCE", do: ":workspace", else: ":read-only"
+      access = policy["source_access"]
+      reads = Enum.map_join(policy["read_roots"], "", &"#{Jason.encode!(&1)}=\"read\",")
+
+      filesystem =
+        ~s({#{reads}":root"="deny",":minimal"="read",":tmpdir"="deny",":slash_tmp"="deny","/Library/Developer/CommandLineTools"="read","/var/db/xcode_select_link"="read",":workspace_roots"={"."="#{access}"}})
+
+      fixed = [
+        "approval_policy=\"never\"",
+        "features.apps=false",
+        "features.multi_agent=false",
+        "web_search=\"disabled\"",
+        "default_permissions=\"#{profile}\"",
+        "permissions.#{profile}.extends=\"#{parent}\"",
+        "permissions.#{profile}.filesystem=#{filesystem}",
+        "permissions.#{profile}.network.enabled=false",
+        "plugins.openai-developers@openai-curated-remote.enabled=false",
+        "plugins.openai-developers@openai-curated-remote.mcp_servers.openai-api-key-local-confirmation.disabled_tools=[\"confirm_openai_api_key_local_destination\"]"
+      ]
+
+      overrides = Enum.map(Map.keys(mcp), &"mcp_servers.#{&1}.enabled=false") ++ Enum.map(Map.keys(plugins), &"plugins.#{&1}.enabled=false")
+      {:ok, fixed ++ overrides ++ file_worker_overrides(policy) ++ review_shell_overrides(policy)}
+    else
+      {:error, :worker_configuration_unavailable}
+    end
+  end
+
+  defp worker_overrides(_config, _mode), do: {:error, :worker_configuration_unavailable}
+
+  defp file_worker_overrides(%{"mode" => "FILE_SOURCE"}), do: Enum.map(file_worker_flags(), fn {flag, enabled} -> "features.#{flag}=#{enabled}" end)
+  defp file_worker_overrides(_policy), do: []
+
+  defp review_shell_overrides(%{"shell_environment" => %{"set" => environment}}) do
+    values = environment |> Enum.sort() |> Enum.map_join(",", fn {key, value} -> "#{Jason.encode!(key)}=#{Jason.encode!(value)}" end)
+    ["shell_environment_policy={inherit=\"core\",set={#{values}},ignore_default_excludes=false}"]
+  end
+
+  defp review_shell_overrides(_policy), do: []
+
+  defp valid_worker_config_names?(mcp, plugins) do
+    Enum.all?(Map.keys(mcp) ++ Map.keys(plugins), fn name ->
+      is_binary(name) and name != "" and not String.contains?(name, [".", "=", "\n", "\r", <<0>>])
+    end)
+  end
+
+  defp worker_profile("SOURCE"), do: "symphony_ticket_source_v1"
+  defp worker_profile("REVIEW"), do: "symphony_ticket_review_v1"
+  defp worker_profile("FILE_SOURCE"), do: "symphony_ticket_file_source_v1"
+
+  defp file_worker_flags,
+    do: %{
+      "shell_tool" => false,
+      "unified_exec" => false,
+      "code_mode_host" => true,
+      "apps" => false,
+      "multi_agent" => false,
+      "browser_use" => false,
+      "browser_use_external" => false,
+      "computer_use" => false,
+      "image_generation" => false,
+      "request_permissions_tool" => false,
+      "hooks" => false
+    }
+
+  defp code_mode_host_path, do: "/Applications/ChatGPT.localized/ChatGPT.app/Contents/Resources/codex-cli/bin/codex-code-mode-host"
+
   defp valid_scoped_jira_approval?(%{server: "Jira", tool: "jira_add_comment", issue_key: issue_key, body_equals: body})
        when is_binary(issue_key) and is_binary(body),
        do: issue_key != "" and body != ""
@@ -649,7 +1401,9 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp valid_scoped_jira_approval?(_approval), do: false
 
   defp do_start_session(port, workspace, session_policies, dynamic_tool_binding, thread_options) do
-    with :ok <- send_initialize(port),
+    with :ok <- send_initialize(port, thread_options),
+         :ok <- file_worker_runtime(port, workspace, thread_options),
+         :ok <- worker_account(port, thread_options),
          {:ok, project_id} <- resolve_project_id(port, thread_options.project_id, thread_options.project_root),
          {:ok, thread_ref} <-
            open_thread(
@@ -660,6 +1414,48 @@ defmodule SymphonyElixir.Codex.AppServer do
              %{thread_options | project_id: project_id}
            ) do
       {:ok, Map.put(thread_ref, :project_id, project_id)}
+    end
+  end
+
+  defp file_worker_runtime(port, workspace, %{worker_access: "FILE_SOURCE"}), do: file_worker_runtime(port, workspace)
+  defp file_worker_runtime(_port, _workspace, _options), do: :ok
+
+  defp file_worker_session_owned(%{port: port, metadata: %{codex_app_server_pid: expected}}) when is_port(port) do
+    owned = :erlang.port_info(port, :connected) == {:connected, self()}
+
+    if owned and port_metadata(port, nil)[:codex_app_server_pid] == expected,
+      do: :ok,
+      else: {:error, :file_worker_session_not_owned}
+  end
+
+  defp file_worker_session_owned(_session), do: {:error, :file_worker_session_not_owned}
+
+  defp file_worker_runtime(port, workspace) do
+    send_message(port, %{"method" => "config/read", "id" => @worker_config_id, "params" => %{"cwd" => workspace, "includeLayers" => false}})
+
+    with {:ok, %{"config" => config}} <- await_response(port, @worker_config_id),
+         true <- config["web_search"] == "disabled" and is_map(config["features"]),
+         true <- Map.take(config["features"], Map.keys(file_worker_flags())) == file_worker_flags(),
+         true <- disabled_inventory?(config["mcp_servers"]) and disabled_inventory?(config["plugins"]) do
+      :ok
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :file_worker_effective_capabilities_mismatch}
+    end
+  end
+
+  defp disabled_inventory?(items) when is_map(items), do: Enum.all?(items, fn {_name, value} -> is_map(value) and value["enabled"] == false end)
+  defp disabled_inventory?(_items), do: false
+
+  defp worker_account(_port, %{worker_policy: nil}), do: :ok
+
+  defp worker_account(port, _options) do
+    send_message(port, %{"method" => "account/read", "id" => @worker_account_id, "params" => %{"refreshToken" => false}})
+
+    case await_response(port, @worker_account_id) do
+      {:ok, %{"account" => %{"type" => "chatgpt"}}} -> :ok
+      {:error, _} = error -> error
+      _ -> {:error, :worker_chatgpt_account_required}
     end
   end
 
@@ -683,6 +1479,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     thread_id = thread_ref.thread_id
 
     with :ok <- notify_thread_created(thread_options, thread_id),
+         :ok <- worker_catalog_empty(port, %{worker_policy: thread_options.worker_policy, thread_id: thread_id}),
          :ok <- set_thread_name(port, thread_id, thread_options.name),
          :ok <- set_thread_project(port, thread_id, thread_options.project_id),
          :ok <- move_thread_to_section(port, thread_id, thread_options.section_id),
@@ -747,6 +1544,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         "threadSource" => thread_options.thread_source
       }
       |> put_if_present("model", thread_options.model)
+      |> worker_params(thread_options.worker_policy)
 
     send_message(port, %{
       "method" => "thread/start",
@@ -755,19 +1553,22 @@ defmodule SymphonyElixir.Codex.AppServer do
     })
 
     case await_response(port, @thread_start_id) do
-      {:ok, %{"thread" => thread_payload}} ->
-        case thread_payload do
-          %{"id" => thread_id} ->
-            {:ok, %{thread_id: thread_id, forked_from_thread_id: nil}}
-
-          _ ->
-            {:error, {:invalid_thread_payload, thread_payload}}
-        end
+      {:ok, response} ->
+        started_thread(response, workspace, thread_options)
 
       other ->
         other
     end
   end
+
+  defp started_thread(%{"thread" => %{"id" => thread_id}} = response, workspace, options) do
+    with :ok <- verify_worker_response(response, workspace, options) do
+      {:ok, %{thread_id: thread_id, forked_from_thread_id: nil}}
+    end
+  end
+
+  defp started_thread(%{"thread" => thread}, _workspace, _options), do: {:error, {:invalid_thread_payload, thread}}
+  defp started_thread(response, _workspace, _options), do: {:error, {:invalid_thread_payload, response}}
 
   defp resume_thread(
          port,
@@ -784,6 +1585,8 @@ defmodule SymphonyElixir.Codex.AppServer do
         "cwd" => workspace
       }
       |> put_if_present("model", thread_options.model)
+      |> worker_params(thread_options.worker_policy)
+      |> resume_worker_tools(thread_options)
 
     send_message(port, %{
       "method" => "thread/resume",
@@ -792,8 +1595,10 @@ defmodule SymphonyElixir.Codex.AppServer do
     })
 
     case await_response(port, @thread_start_id) do
-      {:ok, %{"thread" => %{"id" => thread_id}}} when thread_id == thread_options.resume_thread_id ->
-        {:ok, %{thread_id: thread_id, forked_from_thread_id: nil}}
+      {:ok, %{"thread" => %{"id" => thread_id}} = response} when thread_id == thread_options.resume_thread_id ->
+        with :ok <- verify_worker_response(response, workspace, thread_options) do
+          {:ok, %{thread_id: thread_id, forked_from_thread_id: nil}}
+        end
 
       {:ok, %{"thread" => %{"id" => thread_id}}} ->
         {:error, {:resumed_thread_id_mismatch, thread_options.resume_thread_id, thread_id}}
@@ -1093,6 +1898,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       |> put_if_present("model", turn_options.model)
       |> put_if_present("effort", turn_options.reasoning_effort)
       |> put_if_present("outputSchema", turn_options.output_schema)
+      |> worker_params(turn_options.worker_policy)
 
     request_id = turn_options.request_id
 
@@ -1116,6 +1922,50 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp normalize_thread_name(_name), do: nil
+
+  defp worker_params(params, nil), do: params
+
+  defp worker_params(params, policy),
+    do: params |> Map.drop(["sandbox", "sandboxPolicy"]) |> Map.merge(%{"permissions" => policy["profile"], "runtimeWorkspaceRoots" => [policy["cwd"]], "allowProviderModelFallback" => false})
+
+  defp resume_worker_tools(params, %{worker_access: nil}), do: params
+  # Native resume retains the original tools; the runner rejects any prior policy/tool-version mismatch.
+  defp resume_worker_tools(params, %{worker_access: "FILE_SOURCE"}), do: params
+  defp resume_worker_tools(params, _options), do: Map.put(params, "dynamicTools", [])
+
+  defp verify_worker_response(_response, _workspace, %{worker_policy: nil}), do: :ok
+
+  defp verify_worker_response(response, workspace, options) do
+    if get_in(response, ["activePermissionProfile", "id"]) == options.worker_policy["profile"] and
+         response["approvalPolicy"] == "never" and response["model"] == options.model and
+         response["cwd"] == workspace and response["runtimeWorkspaceRoots"] == [workspace] and response["reasoningEffort"] == options.reasoning_effort and
+         get_in(response, ["thread", "cwd"]) == workspace,
+       do: :ok,
+       else: {:error, :worker_effective_policy_mismatch}
+  end
+
+  defp worker_catalog_empty(_port, %{worker_policy: nil}), do: :ok
+
+  defp worker_catalog_empty(port, %{thread_id: thread_id}) do
+    send_message(port, %{"method" => "mcpServerStatus/list", "id" => @worker_catalog_id, "params" => %{"threadId" => thread_id}})
+
+    case await_response(port, @worker_catalog_id) do
+      {:ok, %{"data" => servers, "nextCursor" => nil}} when is_list(servers) ->
+        if Enum.all?(servers, &disabled_worker_server?/1), do: :ok, else: {:error, :worker_connector_catalog_not_empty}
+
+      {:error, _} = error ->
+        error
+
+      _ ->
+        {:error, :worker_connector_catalog_not_empty}
+    end
+  end
+
+  defp disabled_worker_server?(%{"tools" => tools, "resources" => [], "resourceTemplates" => []} = server) when tools == %{} do
+    server["toolsError"] == nil and (server["runtimeStatus"] == "disabled" or server["name"] == "openai-api-key-local-confirmation")
+  end
+
+  defp disabled_worker_server?(_server), do: false
 
   defp normalize_project_id(project_id) when is_binary(project_id) do
     case String.trim(project_id) do
@@ -1199,16 +2049,21 @@ defmodule SymphonyElixir.Codex.AppServer do
         end
 
       {^port, {:data, {:noeol, chunk}}} ->
-        receive_loop(
-          port,
-          on_message,
-          timeout_ms,
-          pending_line <> to_string(chunk),
-          tool_executor,
-          auto_approve_requests
-        )
+        if exact_turn_scope?() and byte_size(pending_line) + byte_size(chunk) > @port_line_bytes do
+          {:error, :worker_event_buffer_overflow}
+        else
+          receive_loop(
+            port,
+            on_message,
+            timeout_ms,
+            pending_line <> to_string(chunk),
+            tool_executor,
+            auto_approve_requests
+          )
+        end
 
       {^port, {:exit_status, status}} ->
+        Process.put({@owned_exit_key, port}, status)
         if turn_deadline_expired?(), do: {:error, :turn_timeout}, else: {:error, {:port_exit, status}}
     after
       timeout_ms ->
@@ -1217,10 +2072,12 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp dispatch_incoming(port, on_message, data, timeout_ms, tool_executor, auto_approve_requests) do
-    if turn_deadline_expired?() do
-      {:error, :turn_timeout}
-    else
-      handle_incoming(port, on_message, data, effective_turn_timeout(timeout_ms), tool_executor, auto_approve_requests)
+    timeout = effective_turn_timeout(timeout_ms)
+
+    cond do
+      exact_turn_scope?() and byte_size(data) > @port_line_bytes -> {:error, :worker_event_buffer_overflow}
+      turn_deadline_expired?() -> {:error, :turn_timeout}
+      true -> handle_incoming(port, on_message, data, timeout, tool_executor, auto_approve_requests)
     end
   end
 
@@ -1443,7 +2300,9 @@ defmodule SymphonyElixir.Codex.AppServer do
          tool_executor,
          auto_approve_requests
        ) do
-    if exact_turn_scope?() and Map.has_key?(payload, "id") do
+    attributed = bound_file_tool_request?(payload, method, tool_executor)
+
+    if exact_turn_scope?() and Map.has_key?(payload, "id") and not attributed do
       {:error, :worker_request_attribution_unsupported}
     else
       process_turn_method(
@@ -1458,6 +2317,19 @@ defmodule SymphonyElixir.Codex.AppServer do
       )
     end
   end
+
+  defp bound_file_tool_request?(%{"id" => id, "params" => params}, "item/tool/call", executor) do
+    Process.get({__MODULE__, :file_tool_turn}) == true and is_function(executor, 3) and
+      (is_integer(id) or is_binary(id)) and valid_file_request_identity?(params)
+  end
+
+  defp bound_file_tool_request?(_payload, _method, _executor), do: false
+
+  defp valid_file_request_identity?(%{"threadId" => thread, "turnId" => turn, "callId" => call}) do
+    match?(%{identity: {^thread, ^turn}}, Process.get(@turn_event_state_key)) and is_binary(call) and call != ""
+  end
+
+  defp valid_file_request_identity?(_params), do: false
 
   defp process_turn_method(port, on_message, payload, payload_string, method, timeout_ms, tool_executor, auto_approve_requests) do
     metadata = metadata_from_message(port, payload)
@@ -1557,10 +2429,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     tool_name = tool_call_name(params)
     arguments = tool_call_arguments(params)
 
-    result =
-      tool_name
-      |> tool_executor.(arguments)
-      |> normalize_dynamic_tool_result()
+    result = invoke_tool_executor(tool_executor, tool_name, arguments, params) |> normalize_dynamic_tool_result()
 
     send_message(port, %{
       "id" => id,
@@ -1679,6 +2548,9 @@ defmodule SymphonyElixir.Codex.AppServer do
        ) do
     :unhandled
   end
+
+  defp invoke_tool_executor(executor, name, arguments, params) when is_function(executor, 3), do: executor.(name, arguments, params)
+  defp invoke_tool_executor(executor, name, arguments, _params), do: executor.(name, arguments)
 
   defp normalize_dynamic_tool_result(%{"success" => success} = result) when is_boolean(success) do
     output =
@@ -1870,6 +2742,12 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp effective_turn_timeout(timeout_ms) do
+    timeout_ms =
+      case Process.get(@native_read_deadline_key) do
+        nil -> timeout_ms
+        deadline -> min(timeout_ms, max(deadline - System.monotonic_time(:millisecond), 0))
+      end
+
     case Process.get(@turn_event_state_key) do
       %{scope: :exact_turn, deadline: deadline} ->
         min(timeout_ms, max(deadline - System.monotonic_time(:millisecond), 0))
@@ -1895,6 +2773,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           else: await_mcp_tool_response(port, deadline_ms, pending_line <> to_string(chunk))
 
       {^port, {:exit_status, status}} ->
+        Process.put({@owned_exit_key, port}, status)
         {:error, {:port_exit, status}}
     after
       remaining_ms -> {:error, :mcp_tool_response_timeout}
@@ -1940,9 +2819,14 @@ defmodule SymphonyElixir.Codex.AppServer do
         handle_response(port, request_id, complete_line, timeout_ms)
 
       {^port, {:data, {:noeol, chunk}}} ->
-        with_timeout_response(port, request_id, timeout_ms, pending_line <> to_string(chunk))
+        if Process.get(@native_read_deadline_key) != nil and byte_size(pending_line) + byte_size(chunk) > 4_194_304 do
+          {:error, :native_history_exceeds_read_budget}
+        else
+          with_timeout_response(port, request_id, timeout_ms, pending_line <> to_string(chunk))
+        end
 
       {^port, {:exit_status, status}} ->
+        Process.put({@owned_exit_key, port}, status)
         {:error, {:port_exit, status}}
     after
       timeout_ms ->
@@ -1967,11 +2851,24 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     case Jason.decode(payload) do
       {:ok, response} when is_map(response) ->
-        handle_response_payload(port, request_id, timeout_ms, response)
+        if Process.get(@native_read_deadline_key) != nil do
+          handle_native_read_response(port, request_id, timeout_ms, response, byte_size(payload))
+        else
+          handle_response_payload(port, request_id, timeout_ms, response)
+        end
 
       {:error, _} ->
         log_non_json_stream_line(payload, "response stream")
         with_timeout_response(port, request_id, timeout_ms, "")
+    end
+  end
+
+  defp handle_native_read_response(port, request_id, timeout, response, bytes) do
+    cond do
+      bytes > 4_194_304 -> {:error, :native_history_exceeds_read_budget}
+      Map.has_key?(response, "method") and Map.has_key?(response, "id") -> {:error, :native_read_requests_unsupported}
+      Map.has_key?(response, "method") -> with_timeout_response(port, request_id, timeout, "")
+      true -> handle_response_payload(port, request_id, timeout, response)
     end
   end
 
@@ -1995,7 +2892,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp unsupported_strict_request?(%{"method" => method} = response) when is_binary(method),
-    do: exact_turn_scope?() and Map.has_key?(response, "id")
+    do: (exact_turn_scope?() or Process.get(@native_read_deadline_key) != nil) and Map.has_key?(response, "id")
 
   defp unsupported_strict_request?(_response), do: false
 
@@ -2080,6 +2977,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         )
 
       {^port, {:exit_status, status}} ->
+        Process.put({@owned_exit_key, port}, status)
         {:error, {:port_exit, status}}
     after
       remaining_ms ->
@@ -2242,6 +3140,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp stop_port(port) when is_port(port) do
+    Process.delete({@owned_exit_key, port})
+
     case :erlang.port_info(port) do
       :undefined ->
         :ok

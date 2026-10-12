@@ -2,9 +2,10 @@ defmodule Mix.Tasks.Factory.Desktop do
   use Mix.Task
 
   alias SymphonyElixir.Config.Schema
-  alias SymphonyElixir.Factory.{ContractChat, DesktopRequest, DesktopToolArgs, NativeSessionDiscovery, Store}
-  alias SymphonyElixir.Factory.NativeMaintenanceEvidence
+  alias SymphonyElixir.Factory.{ContractChat, DesktopRequest, DesktopToolArgs, NativeSessionDiscovery}
+  alias SymphonyElixir.Factory.{DesktopMrHandshake, NativeMaintenanceEvidence}
   alias SymphonyElixir.Factory.NativeWorkspaceMaintenance
+  alias SymphonyElixir.Factory.{Policy, Store, TicketChat, TicketMrOperation}
   alias SymphonyElixir.Workflow
 
   @shortdoc "Exchange durable factory requests with a Codex Desktop broker"
@@ -16,9 +17,16 @@ defmodule Mix.Tasks.Factory.Desktop do
       mix factory.desktop maintenance-plan --workflow /path/to/WORKFLOW.md
       mix factory.desktop show REQUEST_KEY --workflow /path/to/WORKFLOW.md
       mix factory.desktop create-thread-args REQUEST_KEY --workflow /path/to/WORKFLOW.md
+      mix factory.desktop followup-args REQUEST_KEY --workflow /path/to/WORKFLOW.md
       mix factory.desktop find-thread REQUEST_KEY --source-thread-id BROKER_THREAD_ID --workflow /path/to/WORKFLOW.md
       mix factory.desktop claim REQUEST_KEY --workflow /path/to/WORKFLOW.md
+      mix factory.desktop claim-ticket-followup REQUEST_KEY --source-thread-id BROKER_THREAD_ID --payload-base64 OWNER_OBSERVATION --workflow /path/to/WORKFLOW.md
+      mix factory.desktop claim-ticket-mr REQUEST_KEY --source-thread-id BROKER_THREAD_ID --payload-base64 GUARD_OBSERVATION --workflow /path/to/WORKFLOW.md
+      mix factory.desktop claim-ticket-mr-interactive REQUEST_KEY --source-thread-id BROKER_THREAD_ID --workflow /path/to/WORKFLOW.md
       mix factory.desktop record-thread REQUEST_KEY THREAD_ID VERIFIED_PROJECT_ID --verified-cwd PATH --verified-head-sha SHA --workflow /path/to/WORKFLOW.md
+      mix factory.desktop record-ticket-thread REQUEST_KEY --payload-base64 BASE64_JSON --workflow /path/to/WORKFLOW.md
+      mix factory.desktop read-ticket-turn REQUEST_KEY THREAD_ID --source-thread-id BROKER_THREAD_ID --include-completion --workflow /path/to/WORKFLOW.md
+      mix factory.desktop reconcile-negative-ticket-presentation REQUEST_KEY THREAD_ID --source-thread-id BROKER_THREAD_ID --workflow /path/to/WORKFLOW.md
       mix factory.desktop complete REQUEST_KEY --payload-base64 BASE64_JSON --workflow /path/to/WORKFLOW.md
       mix factory.desktop record-maintenance-evidence REQUEST_KEY --payload-base64 BASE64_JSON --workflow /path/to/WORKFLOW.md
       mix factory.desktop record-user-reply TASK_KEY --payload-base64 BASE64_JSON --workflow /path/to/WORKFLOW.md
@@ -38,6 +46,7 @@ defmodule Mix.Tasks.Factory.Desktop do
     verified_head_sha: :string,
     sessions_root: :string,
     source_thread_id: :string,
+    include_completion: :boolean,
     rejected_tool_call_id: :string,
     tool_error: :string,
     help: :boolean
@@ -56,19 +65,63 @@ defmodule Mix.Tasks.Factory.Desktop do
         Mix.raise("Invalid arguments.\n\n#{@moduledoc}")
 
       true ->
-        factory = load_factory!(Path.expand(opts[:workflow] || "WORKFLOW.md"))
-        {:ok, store} = Store.start_link(database: factory.database)
-        opts = Keyword.put(opts, :native_session_discovery_enabled, factory.native_session_discovery_enabled)
+        run_action(action, opts)
+    end
+  end
 
-        try do
-          action
-          |> execute(store, opts)
-          |> unwrap!()
-          |> Jason.encode!(pretty: true)
-          |> Mix.shell().info()
-        after
-          GenServer.stop(store)
-        end
+  defp run_action(action, opts) do
+    original = Application.fetch_env(:symphony_elixir, :workflow_file_path)
+    path = Path.expand(opts[:workflow] || "WORKFLOW.md")
+
+    try do
+      Workflow.set_workflow_file_path(path)
+      factory = load_factory!(path)
+      {:ok, store} = Store.start_link(database: factory.database)
+      ticket_policy = if Policy.validate(factory) == :ok, do: factory.ticket_supervisor, else: %{}
+      mr_factory = if Policy.validate(factory) == :ok, do: factory, else: nil
+
+      opts =
+        opts
+        |> Keyword.put(:native_session_discovery_enabled, factory.native_session_discovery_enabled)
+        |> Keyword.put(:ticket_policy, ticket_policy)
+        |> Keyword.put(:factory, factory)
+        |> Keyword.put(:ticket_mr_factory, mr_factory)
+
+      try do
+        action
+        |> execute_guarded(store, opts)
+        |> unwrap!()
+        |> Jason.encode!(pretty: true)
+        |> Mix.shell().info()
+      after
+        GenServer.stop(store)
+      end
+    after
+      case original do
+        {:ok, previous} -> Workflow.set_workflow_file_path(previous)
+        :error -> Workflow.clear_workflow_file_path()
+      end
+    end
+  end
+
+  defp execute_guarded([command, key | _] = action, store, opts)
+       when command in ["find-thread", "record-thread", "record-maintenance-evidence", "record-ticket-thread", "read-ticket-turn", "complete", "fail"] do
+    case DesktopRequest.get(store, key) do
+      {:ok, %{"target_kind" => "TICKET_CHAT"} = request} ->
+        execute_ticket_readback(command, action, request, store, opts)
+
+      _ ->
+        execute(action, store, opts)
+    end
+  end
+
+  defp execute_guarded(action, store, opts), do: execute(action, store, opts)
+
+  defp execute_ticket_readback(command, action, request, store, opts) do
+    if command in ["find-thread", "record-thread", "record-maintenance-evidence"] or request["status"] == "PENDING" do
+      {:error, :ticket_chat_runtime_not_integrated}
+    else
+      with :ok <- TicketChat.authorize_readback(store, request), do: execute(action, store, opts)
     end
   end
 
@@ -76,22 +129,29 @@ defmodule Mix.Tasks.Factory.Desktop do
   defp valid_action?(["maintenance-plan"], _opts), do: true
   defp valid_action?(["show", key], _opts), do: key != ""
   defp valid_action?(["create-thread-args", key], _opts), do: key != ""
+  defp valid_action?(["followup-args", key], _opts), do: key != ""
+  defp valid_action?(["read-ticket-turn", key, thread], opts), do: key != "" and thread != "" and is_binary(opts[:source_thread_id])
+  defp valid_action?(["reconcile-negative-ticket-presentation", key, thread], opts), do: key != "" and thread != "" and is_binary(opts[:source_thread_id])
   defp valid_action?(["find-thread", key], _opts), do: key != ""
   defp valid_action?(["claim", key], _opts), do: key != ""
+  defp valid_action?(["claim-ticket-followup", key], opts), do: key != "" and is_binary(opts[:source_thread_id]) and is_binary(opts[:payload_base64])
+  defp valid_action?(["claim-ticket-mr", key], opts), do: key != "" and is_binary(opts[:source_thread_id]) and is_binary(opts[:payload_base64])
+  defp valid_action?(["claim-ticket-mr-interactive", key], opts), do: key != "" and is_binary(opts[:source_thread_id]) and is_nil(opts[:payload_base64])
 
   defp valid_action?(["record-thread", key, thread_id, project_id], _opts),
     do: key != "" and thread_id != "" and project_id != ""
 
   defp valid_action?(["complete", key], opts), do: key != "" and is_binary(opts[:payload_base64])
+  defp valid_action?(["record-ticket-thread", key], opts), do: key != "" and is_binary(opts[:payload_base64])
   defp valid_action?(["record-maintenance-evidence", key], opts), do: key != "" and is_binary(opts[:payload_base64])
   defp valid_action?(["record-user-reply", key], opts), do: key != "" and is_binary(opts[:payload_base64])
   defp valid_action?(["fail", key, reason], _opts), do: key != "" and reason != ""
   defp valid_action?(_action, _opts), do: false
 
-  defp execute(["list"], store, _opts) do
+  defp execute(["list"], store, opts) do
     {:ok,
      %{
-       pending: DesktopRequest.list_pending(store),
+       pending: DesktopRequest.list_pending(store, 50, opts),
        reconciliation: DesktopRequest.list_reconciliation(store),
        waiting_for_user: ContractChat.waiting(store)
      }}
@@ -109,7 +169,23 @@ defmodule Mix.Tasks.Factory.Desktop do
 
   defp execute(["show", key], store, _opts), do: DesktopRequest.get(store, key)
 
-  defp execute(["create-thread-args", key], store, _opts), do: DesktopToolArgs.create_thread(store, key)
+  defp execute(["create-thread-args", key], store, opts), do: DesktopToolArgs.create_thread(store, key, opts)
+  defp execute(["followup-args", key], store, opts), do: DesktopToolArgs.followup(store, key, opts)
+
+  defp execute(["read-ticket-turn", key, thread], store, opts) do
+    read_opts = [include_completion: opts[:include_completion] || false]
+    TicketChat.read_native_turn(store, key, thread, opts[:source_thread_id], read_opts)
+  end
+
+  defp execute(["reconcile-negative-ticket-presentation", key, thread], store, opts),
+    do: DesktopRequest.reconcile_negative_ticket_chat_presentation(store, key, thread, opts[:source_thread_id])
+
+  defp execute(["record-ticket-thread", key], store, opts) do
+    case record_proof(opts) do
+      {:ok, proof} when is_map(proof) -> DesktopRequest.record_ticket_thread(store, key, proof)
+      _ -> {:error, :invalid_workspace_proof}
+    end
+  end
 
   defp execute(["find-thread", key], store, opts) do
     if opts[:native_session_discovery_enabled] do
@@ -126,7 +202,36 @@ defmodule Mix.Tasks.Factory.Desktop do
     end
   end
 
-  defp execute(["claim", key], store, _opts), do: DesktopRequest.claim(store, key)
+  defp execute(["claim", key], store, opts), do: DesktopRequest.claim(store, key, opts)
+
+  defp execute(["claim-ticket-followup", key], store, opts) do
+    case record_proof(opts) do
+      {:ok, owner} when is_map(owner) -> TicketChat.claim_followup(store, key, opts[:source_thread_id], owner, opts)
+      _ -> {:error, :parent_guard_evidence_invalid}
+    end
+  end
+
+  defp execute(["claim-ticket-mr", key], store, opts) do
+    factory = Keyword.fetch!(opts, :factory)
+
+    with :ok <- Policy.validate(factory),
+         true <- factory.ticket_supervisor["enabled"] == true or {:error, :ticket_mr_new_admission_disabled},
+         {:ok, guard} <- record_proof(opts),
+         true <- guard["source_thread_id"] == opts[:source_thread_id] or {:error, :mr_guard_broker_mismatch} do
+      TicketMrOperation.claim_from_jira(store, key, factory, guard, []) |> compact_mr_claim()
+    end
+  end
+
+  defp execute(["claim-ticket-mr-interactive", key], store, opts) do
+    factory = Keyword.fetch!(opts, :factory)
+    broker = opts[:source_thread_id]
+
+    with :ok <- Policy.validate(factory),
+         true <- factory.ticket_supervisor["enabled"] == true or {:error, :ticket_mr_new_admission_disabled} do
+      observe = &DesktopMrHandshake.observe(&1, broker)
+      TicketMrOperation.claim_with_owner(store, key, factory, broker, observe, []) |> compact_mr_claim()
+    end
+  end
 
   defp execute(["record-thread", key, thread_id, project_id], store, opts) do
     with {:ok, proof} <- record_proof(opts) do
@@ -186,6 +291,12 @@ defmodule Mix.Tasks.Factory.Desktop do
       reason -> Mix.raise("Unable to resolve factory configuration: #{inspect(reason)}")
     end
   end
+
+  defp compact_mr_claim({:ok, %{request: request, arguments: arguments}}) do
+    {:ok, %{request_key: request["request_key"], status: request["status"], arguments: arguments}}
+  end
+
+  defp compact_mr_claim(error), do: error
 
   defp record_proof(opts) do
     if is_binary(opts[:payload_base64]) do

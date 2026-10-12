@@ -8,8 +8,16 @@ the existing safety boundaries, and execute its gates in order.
 
 | Plan | Title | Priority | Effort | Depends on | Status |
 | --- | --- | --- | --- | --- | --- |
-| [001](001-ticket-supervisor-workers.md) | Introduce one ticket chat with bounded role workers | P1 | L | Offline foundation before runtime acceptance | IN PROGRESS — adversarial review completed; disabled foundation next |
-| [002](002-correlate-worker-turn-events.md) | Preserve and correlate exact worker-turn events | P1 | M | Source/protocol investigation complete | IN PROGRESS — isolated executor next |
+| [001](001-ticket-supervisor-workers.md) | Introduce one ticket chat with bounded role workers | P1 | L | Historical foundation | REJECTED as active ownership design; retain accepted foundations, do not rerun |
+| [002](002-correlate-worker-turn-events.md) | Preserve and correlate exact worker-turn events | P1 | M | Historical committed foundation | IN PROGRESS — foundation exists; current runtime acceptance belongs to 006 |
+| [006](006-complete-desktop-ticket-chat.md) | Complete ordinary Desktop ticket-chat integration; gate required manual validation separately | P1 | L | Current dirty Slices 1–3 and capability gates | IN PROGRESS — ordinary `Required: no` path authorized; Required: yes remains gated |
+
+Plan 006 was added on 2026-10-04 at HEAD `52a978818875c59ccf2758ed1b728bb23e33f631`.
+Its checksum manifest also pins selected dirty/untracked source: HEAD alone is insufficient.
+It carries forward the Desktop-owned-parent decision from the external historical plan
+`/Users/cgable/Repos/symphony/plans/005-desktop-owned-ticket-chat.md`; the new handoff
+is self-contained and does not require that external path to exist for execution.
+No original Slice 3/4/5 completion or deployment is claimed by this index update.
 
 Source rollback checkpoint: `bc7c28c5f7d79f37cfaf0d2c3ea873f758147863`
 on `cgable/factory-control-plane`. This commit preserves the current Symphony
@@ -18,12 +26,16 @@ settings, Codex chat history, or canonical skills outside this repository.
 
 ## Dependency notes
 
-- Plan 001 first characterizes the protocol and builds the disabled foundation.
+- Historical Plan 001 characterized the protocol and built the disabled foundation.
   Runtime permissions, worker readback and restart acceptance must pass before
   admitting work or enabling the new route. This avoids requiring a complete
   system before building the primitives needed to test it.
-- Execute bounded plan 002 first for plan 001's offline protocol foundation;
-  its tests cannot satisfy the later real-runtime acceptance gate.
+- Do not dispatch historical Plan 002 again for rejected Plan 001. Its committed
+  event-correlation foundation is reused by 006; its tests cannot satisfy native acceptance.
+- Plan 006 is the sole active handoff. The ordinary path proceeds through U6N and
+  U7–U11; the Required: yes manual-validation executor remains a separate U1/U3–U6
+  gated follow-on. Each implementation unit is independently reviewed; production
+  routing stays disabled pending its own acceptance and deployment authorization.
 - The older `elixir/docs/factory-hardening-plan.md` remains the record of completed
   reliability work and unfinished native-cleanup acceptance. Plan 001 proposes a
   different execution boundary; it neither marks native cleanup complete nor

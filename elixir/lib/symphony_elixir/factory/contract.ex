@@ -8,6 +8,15 @@ defmodule SymphonyElixir.Factory.Contract do
 
   @begin_marker "AI FACTORY CONTRACT BEGIN"
   @end_marker "AI FACTORY CONTRACT END"
+  @validation_fields [
+    {"Environment", "environment"},
+    {"Services", "services"},
+    {"Setup and deploy", "setup_and_deploy"},
+    {"Test data", "test_data"},
+    {"Evidence", "evidence"},
+    {"Teardown", "teardown"},
+    {"Database migrations", "database_migrations"}
+  ]
 
   @type bound_contract :: %{
           issue_key: String.t(),
@@ -240,7 +249,8 @@ defmodule SymphonyElixir.Factory.Contract do
   @doc "Reads the required yes/no value from the contract's Manual Validation section."
   @spec manual_validation_required(String.t()) :: {:ok, boolean()} | {:error, term()}
   def manual_validation_required(markdown) do
-    with {:ok, section} <- manual_validation_section(markdown) do
+    with :ok <- validation_unquoted_header(markdown),
+         {:ok, section} <- manual_validation_section(markdown) do
       case Regex.scan(~r/^- Required:[ \t]*(.*)$/im, section) do
         [[_match, value]] -> manual_validation_decision(value)
         [] -> {:error, :manual_validation_contract_missing}
@@ -265,6 +275,169 @@ defmodule SymphonyElixir.Factory.Contract do
         error
     end
   end
+
+  @doc "Reads bounded validation declarations as data, never executable actions or live evidence."
+  @spec manual_validation_definition(String.t()) :: {:ok, map() | nil} | {:error, term()}
+  def manual_validation_definition(markdown) when is_binary(markdown) and byte_size(markdown) <= 1_048_576 do
+    if String.valid?(markdown) do
+      case manual_validation_required(markdown) do
+        {:ok, false} -> {:ok, nil}
+        {:ok, true} -> validation_definition(markdown)
+        {:error, _} = error -> error
+      end
+    else
+      {:error, :manual_validation_markdown_invalid}
+    end
+  end
+
+  def manual_validation_definition(_markdown), do: {:error, :manual_validation_markdown_invalid}
+
+  defp validation_unquoted_header(markdown) do
+    case Regex.run(~r/^## Manual Validation[ \t]*\r?$/im, markdown, return: :index) do
+      [{offset, _length}] ->
+        prefix = binary_part(markdown, 0, offset)
+        fence = prefix |> String.split("\n") |> Enum.reduce(nil, &validation_fence/2)
+
+        with true <- is_nil(fence) or {:error, :manual_validation_format_unsupported},
+             :ok <- validation_comment_prefix(prefix),
+             {:ok, section} <- manual_validation_section(markdown) do
+          validation_comment_section(section)
+        end
+
+      _ ->
+        {:error, :manual_validation_contract_missing}
+    end
+  end
+
+  defp validation_fence(line, fence) do
+    case Regex.run(~r/\A {0,3}(`{3,}|~{3,})([^\r\n]*)\r?\z/, line) do
+      [_, marker, _tail] when is_nil(fence) ->
+        {String.first(marker), byte_size(marker)}
+
+      [_, marker, tail] ->
+        {character, length} = fence
+        if String.first(marker) == character and byte_size(marker) >= length and String.trim(tail) == "", do: nil, else: fence
+
+      _ ->
+        fence
+    end
+  end
+
+  defp validation_comment_prefix(prefix) do
+    case prefix |> String.split("\n") |> Enum.reduce({nil, false, false}, &validation_prefix_line/2) do
+      {nil, false, false} -> :ok
+      _ -> {:error, :manual_validation_format_unsupported}
+    end
+  end
+
+  defp validation_prefix_line(_line, {fence, comment_open, true}), do: {fence, comment_open, true}
+
+  defp validation_prefix_line(line, {fence, comment_open, false}) when not is_nil(fence),
+    do: {validation_fence(line, fence), comment_open, false}
+
+  defp validation_prefix_line(line, {nil, true, false}), do: validation_prefix_comment_line(line, true)
+
+  defp validation_prefix_line(line, {nil, false, false}) do
+    case validation_fence(line, nil) do
+      {_, _} = fence -> {fence, false, false}
+      nil -> validation_prefix_comment_line(line, false)
+    end
+  end
+
+  defp validation_prefix_comment_line(line, comment_open) do
+    case validation_comment_tokens(line, comment_open) do
+      {:ok, next_open} -> {nil, next_open, false}
+      {:error, _} -> {nil, comment_open, true}
+    end
+  end
+
+  defp validation_comment_section(section) do
+    if Regex.match?(~r/<!--|-->/, section), do: {:error, :manual_validation_format_unsupported}, else: :ok
+  end
+
+  defp validation_comment_tokens(line, comment_open) do
+    Regex.scan(~r/<!--|-->/, line)
+    |> Enum.reduce_while({:ok, comment_open}, fn [token], {:ok, open} ->
+      case {open, token} do
+        {false, "<!--"} -> {:cont, {:ok, true}}
+        {true, "-->"} -> {:cont, {:ok, false}}
+        _ -> {:halt, {:error, :manual_validation_format_unsupported}}
+      end
+    end)
+  end
+
+  defp validation_definition(markdown) do
+    with {:ok, section} <- manual_validation_section(markdown),
+         true <- byte_size(section) <= 16_384 or {:error, :manual_validation_definition_too_large},
+         :ok <- validation_format(section),
+         {:ok, fields} <- validation_fields(section),
+         true <- fields["environment"] in ~w(cpp-dev cpp-sandbox cpp-test) or {:error, :manual_validation_environment_not_supported},
+         {:ok, cases} <- validation_cases(section),
+         {:ok, services} <- validation_services(fields["services"]) do
+      {:ok, fields |> Map.put("services", services) |> Map.put("cases", cases)}
+    end
+  end
+
+  defp validation_format(section) do
+    labels = ["Required", "Cases" | Enum.map(@validation_fields, &elem(&1, 0))] |> Enum.map_join("|", &Regex.escape/1)
+    field = ~r/\A- (?:#{labels}):[^\r\n]*\r?\z/i
+    case_line = ~r/\A- MV-[1-9][0-9]{0,8}:[^\r\n]*\r?\z/
+    lines = String.split(section, "\n")
+
+    if Enum.all?(lines, &(String.trim(&1) == "" or Regex.match?(field, &1) or Regex.match?(case_line, &1))),
+      do: :ok,
+      else: {:error, :manual_validation_format_unsupported}
+  end
+
+  defp validation_fields(section) do
+    Enum.reduce_while(@validation_fields, {:ok, %{}}, fn {label, key}, {:ok, result} ->
+      case validation_field(section, label) do
+        {:ok, value} -> {:cont, {:ok, Map.put(result, key, value)}}
+        _ -> {:halt, {:error, {:manual_validation_field_invalid, key}}}
+      end
+    end)
+  end
+
+  defp validation_field(section, label) do
+    case Regex.scan(~r/^- #{Regex.escape(label)}:[ \t]*(.*)$/im, section) do
+      [[_, value]] ->
+        trimmed = String.trim(value)
+        if bounded_declaration?(trimmed), do: {:ok, trimmed}, else: :invalid
+
+      _ ->
+        :invalid
+    end
+  end
+
+  defp validation_cases(section) do
+    cases =
+      Regex.scan(~r/^- (MV-[1-9][0-9]*):[ \t]*(.*)$/m, section)
+      |> Enum.map(fn [_, id, expectation] -> %{"id" => id, "expectation" => String.trim(expectation)} end)
+
+    ids = Enum.map(cases, & &1["id"])
+
+    if length(cases) in 1..20 and Enum.uniq(ids) == ids and Enum.all?(cases, &bounded_declaration?(&1["expectation"])) and validation_case_references?(section, ids),
+      do: {:ok, cases},
+      else: {:error, :manual_validation_cases_invalid}
+  end
+
+  defp validation_case_references?(section, ids) do
+    case Regex.scan(~r/^- Cases:[ \t]*(.*)$/im, section) do
+      [] -> true
+      [[_, value]] -> value |> String.split(",") |> Enum.map(&String.trim/1) |> Kernel.==(ids)
+      _ -> false
+    end
+  end
+
+  defp validation_services(value) do
+    services = value |> String.split(",") |> Enum.map(&String.trim/1)
+
+    if length(services) in 1..8 and Enum.uniq(services) == services and Enum.all?(services, &Regex.match?(~r/\A[a-z][a-z0-9-]{0,63}\z/, &1)),
+      do: {:ok, services},
+      else: {:error, :manual_validation_services_invalid}
+  end
+
+  defp bounded_declaration?(value), do: byte_size(value) in 1..4096 and not String.contains?(value, <<0>>)
 
   defp manual_validation_section(markdown) when is_binary(markdown) do
     case Regex.scan(~r/^## Manual Validation[ \t]*\r?$\r?\n?(.*?)(?=^#+[ \t]+\S|\z)/ims, markdown) do
