@@ -5,6 +5,29 @@ controller-launched role workers and one source checkout used sequentially.
 
 ## Current checkpoint
 
+### October 12 disabled local release
+
+User authorization to finish covered commit, push and disabled local deployment.
+Implementation commit: `96df378f54e91dfb4812c6fd95cade2147daf48a`.
+The LaunchAgent now executes the committed implementation checkout's existing
+`elixir/scripts/run-local-factory`, retaining the original local workflow file.
+That file explicitly disables ticket-supervisor admission and native cleanup.
+The pre-existing scheduler ACTIVE state and broker automation ACTIVE state were
+preserved; no real-ticket activation or dispatch was requested by this release.
+
+Restart completed; HTTP dashboard and `/api/v1/state` both respond successfully.
+Status reports `ticket_supervisor_enabled: false`, no running agents, and runtime
+start `2026-10-12T03:41:31.328600Z`. SQLite integrity check returned `ok`.
+Rollback copies and before/after readbacks are retained under
+`/private/tmp/symphony-disabled-release.GUSdjS`.
+
+Push remains unfinished: three HTTPS push attempts failed with
+`LibreSSL SSL_connect: SSL_ERROR_SYSCALL`; the SSH diagnostic connection was
+closed before authentication. No remote push success is claimed. No additional
+full test suite was run. Activation remains a separate gate; normal legacy
+broker status/list sandbox compatibility is not certified by the restricted
+read-only synthetic replay. The checkpoints below retain historical evidence.
+
 ### October 12 broker and focused timeout acceptance
 
 The actual broker's read-only replay passed under its recorded restricted
