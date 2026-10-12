@@ -47,7 +47,7 @@ defmodule SymphonyElixir.Factory.TicketChat do
   def authorize_issuance(store, request, policy) do
     with true <- (is_map(policy) and policy["enabled"] === true) or {:error, :ticket_chat_runtime_not_integrated},
          {:ok, chat} <- get(store, request["target_key"]),
-         true <- (is_list(policy["pilot_issue_keys"]) and chat["issue_key"] in policy["pilot_issue_keys"]) or {:error, :ticket_chat_not_allowlisted},
+         true <- SymphonyElixir.Factory.Policy.ticket_selected?(policy, chat["issue_key"]) or {:error, :ticket_chat_not_allowlisted},
          true <- request["status"] == "PENDING" or {:error, :ticket_chat_request_already_issued},
          :ok <- validate_linked_request(store, request, true),
          :ok <- validate_request(store, request) do

@@ -72,6 +72,21 @@ defmodule SymphonyElixir.FactoryPolicyTest do
     assert {:error, :native_archive_restore_capability_unproven} = Policy.validate(factory)
   end
 
+  test "ticket route supports explicit global selection without bypassing its enabled gate" do
+    for {policy, issue, expected} <- [
+          {%{}, "PPL-123", false},
+          {%{"enabled" => false, "all_eligible_tickets" => true}, "PPL-123", false},
+          {%{"enabled" => true, "pilot_issue_keys" => ["PPL-123"]}, "PPL-123", true},
+          {%{"enabled" => true, "pilot_issue_keys" => ["PPL-123"]}, "PPL-456", false},
+          {%{"enabled" => true, "all_eligible_tickets" => true}, "PPL-456", true}
+        ] do
+      assert Policy.ticket_selected?(policy, issue) == expected
+    end
+
+    assert {:error, :invalid_ticket_supervisor_policy} =
+             Policy.validate(Map.put(valid_factory(), :ticket_supervisor, %{"all_eligible_tickets" => "true"}))
+  end
+
   test "ticket supervisor static policy is disabled by default and accepts a well-shaped enabled route" do
     factory = valid_factory() |> put_in([:manual_validation, "required_apps"], ["polaris-app"])
     assert :ok = Policy.validate(factory)

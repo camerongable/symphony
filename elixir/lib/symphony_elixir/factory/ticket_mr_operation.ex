@@ -540,7 +540,7 @@ defmodule SymphonyElixir.Factory.TicketMrOperation do
     cond do
       Map.get(factory, :task_transport) != "desktop_broker" -> {:error, :ticket_mr_transport_mismatch}
       policy["enabled"] != true -> {:error, :ticket_mr_new_admission_disabled}
-      issue_key not in (policy["pilot_issue_keys"] || []) -> {:error, :ticket_mr_new_admission_disabled}
+      not SymphonyElixir.Factory.Policy.ticket_selected?(policy, issue_key) -> {:error, :ticket_mr_new_admission_disabled}
       true -> :ok
     end
   end

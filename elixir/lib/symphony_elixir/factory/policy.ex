@@ -33,12 +33,25 @@ defmodule SymphonyElixir.Factory.Policy do
 
     cond do
       not is_boolean(enabled) -> {:error, :invalid_ticket_supervisor_policy}
+      not is_boolean(value(policy, "all_eligible_tickets", false)) -> {:error, :invalid_ticket_supervisor_policy}
       not valid_string_list?(pilot_issue_keys) -> {:error, :invalid_ticket_supervisor_policy}
       true -> :ok
     end
   end
 
   defp validate_ticket_supervisor(_policy), do: {:error, :invalid_ticket_supervisor_policy}
+
+  @doc "Selects the ticket route without widening queue or contract eligibility."
+  @spec ticket_selected?(map(), String.t()) :: boolean()
+  def ticket_selected?(policy, issue_key) when is_map(policy) and is_binary(issue_key) do
+    keys = value(policy, "pilot_issue_keys", [])
+
+    value(policy, "enabled", false) === true and
+      (value(policy, "all_eligible_tickets", false) === true or
+         (is_list(keys) and issue_key in keys))
+  end
+
+  def ticket_selected?(_policy, _issue_key), do: false
 
   defp validate_specification_authorization(mode) when mode in ["auto_after_critic", "human_confirmation"], do: :ok
   defp validate_specification_authorization(_mode), do: {:error, :invalid_specification_authorization_mode}

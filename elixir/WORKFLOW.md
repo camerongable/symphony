@@ -439,7 +439,14 @@ Controller write and credentialed remote operations are unchanged.
 
 Schema version 17 also reserves Desktop-owned, projectless parent identities
 under route `desktop_owned_ticket_chat_v1`. Identity is scoped by dispatcher,
-immutable Jira issue ID and repository key, with separate run links. Only the
+immutable Jira issue ID and repository key, with separate run links.
+
+Set `factory.ticket_supervisor.all_eligible_tickets: true` and `enabled: true`
+to select the new route for all new deliveries in the existing assignee/repository
+queue, without a per-ticket pilot list. Existing execution modes are immutable;
+contracts requiring manual validation remain unsupported on this route rather
+than silently falling back to legacy delivery. Native cleanup stays separate.
+Only the
 new `TICKET_CHAT` request kind accepts a null Project; legacy TASK/CONTROLLER
 requests retain their original payload hashes and Project constraints. This
 foundation keeps the runtime fence: no native ticket requests can be claimed or

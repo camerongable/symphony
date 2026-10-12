@@ -2444,10 +2444,16 @@ defmodule SymphonyElixir.FactorySchedulerTest do
     end
   end
 
-  test "normal tick binds parent inputs from factory policy without injected ticket options", ctx do
+  test "global ordinary admission binds parent inputs without injected options or a pilot list", ctx do
     configured = ticket_registration_context(ctx)
     fields = Map.new(configured.ticket_options, fn {key, value} -> {Atom.to_string(key), value} end)
-    policy = Map.merge(configured.factory.ticket_supervisor, fields)
+
+    policy =
+      configured.factory.ticket_supervisor
+      |> Map.merge(fields)
+      |> Map.put("all_eligible_tickets", true)
+      |> Map.put("pilot_issue_keys", [])
+
     context = configured |> Map.delete(:ticket_options) |> put_in([:factory, :ticket_supervisor], policy)
     contract = Contract.bind("PPL-123", 1, "## Manual Validation\n- Required: no")
     Process.put(:factory_controller_response, intake_response(authorized_snapshot(contract, ["ai-ready", "repo-grail"])))

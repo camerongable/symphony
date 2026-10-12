@@ -32,6 +32,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
     MrFeedbackPoller,
     MrFeedbackRework,
     NativeWorkspaceMaintenance,
+    Policy,
     Prompt,
     Queue,
     Recovery,
@@ -128,8 +129,8 @@ defmodule SymphonyElixir.Factory.Scheduler do
     end
   end
 
-  defp parent_admission_policy(%{"enabled" => true, "pilot_issue_keys" => issues}, issue) when is_list(issues) do
-    if issue in issues, do: :ok, else: {:error, :ticket_chat_not_allowlisted}
+  defp parent_admission_policy(%{"enabled" => true} = policy, issue) do
+    if Policy.ticket_selected?(policy, issue), do: :ok, else: {:error, :ticket_chat_not_allowlisted}
   end
 
   defp parent_admission_policy(_policy, _issue), do: {:error, :ticket_chat_runtime_not_integrated}
@@ -964,9 +965,15 @@ defmodule SymphonyElixir.Factory.Scheduler do
 
   defp normal_ticket_advance_keys(context, :before_dispatch) do
     with %{enabled: true, task_transport: "desktop_broker"} <- context.factory,
-         %{"enabled" => true, "pilot_issue_keys" => keys} when is_list(keys) <- Map.get(context.factory, :ticket_supervisor),
+         %{"enabled" => true} = policy <- Map.get(context.factory, :ticket_supervisor),
          %{"status" => "ACTIVE"} <- Control.status(context.store, context.factory.scope) do
-      keys
+      Store.query!(
+        context.store,
+        "SELECT DISTINCT runs.issue_key FROM runs JOIN ticket_chat_runs AS link ON link.run_id = runs.run_id JOIN ticket_chats AS chat ON chat.chat_key = link.chat_key WHERE runs.execution_mode = 'TICKET_SUPERVISOR_V1' AND chat.scope_key = ?",
+        [context.factory.scope]
+      )
+      |> then(fn result -> Enum.map(result.rows, fn [key] -> key end) end)
+      |> Enum.filter(&Policy.ticket_selected?(policy, &1))
     else
       _ -> []
     end
@@ -2045,7 +2052,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
 
   defp prepare_delivery_registration(context, attrs) do
     policy = Map.get(context.factory, :ticket_supervisor, %{})
-    selected = policy["enabled"] == true and attrs.issue_key in (policy["pilot_issue_keys"] || [])
+    selected = Policy.ticket_selected?(policy, attrs.issue_key)
     if selected, do: prepare_ticket_registration(context, attrs), else: {:ok, attrs, nil}
   end
 
@@ -2192,7 +2199,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
   defp advance_ticket_run(context, run, acc) do
     policy = Map.get(context.factory, :ticket_supervisor, %{})
 
-    if policy["enabled"] == true and run["issue_key"] in (policy["pilot_issue_keys"] || []) do
+    if Policy.ticket_selected?(policy, run["issue_key"]) do
       options = Keyword.put(context.ticket_options, :jira_reader, context.jira_reader)
       ticket_tick_result(context, run, options, acc)
     else

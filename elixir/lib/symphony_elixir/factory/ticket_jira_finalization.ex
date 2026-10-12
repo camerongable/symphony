@@ -280,8 +280,8 @@ defmodule SymphonyElixir.Factory.TicketJiraFinalization do
     control = Control.status(store, factory.scope)
 
     valid =
-      factory.task_transport == "desktop_broker" and policy["enabled"] == true and
-        run["issue_key"] in (policy["pilot_issue_keys"] || []) and is_map(control) and control["status"] == "ACTIVE"
+      factory.task_transport == "desktop_broker" and
+        SymphonyElixir.Factory.Policy.ticket_selected?(policy, run["issue_key"]) and is_map(control) and control["status"] == "ACTIVE"
 
     cond do
       not valid -> {:error, :ticket_jira_new_effect_not_admitted}

@@ -130,7 +130,12 @@ Configuration, safety boundaries, recovery, and cutover are documented in
 The `factory.ticket_supervisor` setting remains default-off:
 `{"enabled": false, "pilot_issue_keys": []}`. New run registrations record an
 immutable execution mode, while historical rows remain `NULL` and continue to
-follow the legacy route. Static Policy validation checks configuration shape without
+follow the legacy route. Set `all_eligible_tickets: true` together with `enabled: true`
+to select this route for every new ticket within the existing queue. This does not
+bypass authorization, capacity, runtime, or Required:no eligibility, and does not
+migrate historical runs. Omission preserves pilot-list behavior; disabling
+`enabled` stops new admission while retaining recovery readback.
+Static Policy validation checks configuration shape without
 spawning a process. Enabled startup qualifies the actual configured CLI once in the
 explicit canonical `parent_output_root` before storage/controller children start;
 unsupported runtime or cwd stops startup with a typed error. Per-effect claims and
