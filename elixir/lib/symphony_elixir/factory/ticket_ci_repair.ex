@@ -659,7 +659,7 @@ defmodule SymphonyElixir.Factory.TicketCiRepair do
   @spec source_path?(term()) :: boolean()
   def source_path?(path) when is_binary(path) do
     # Grail's Go workflows package is product source, not factory workflow policy.
-    product_go = String.starts_with?(path, "go/src/grail.com/workflows/") and String.ends_with?(path, ".go")
+    product_go = product_go_source?(path)
     checked = if product_go, do: String.replace_prefix(path, "go/src/grail.com/workflows/", "go/src/grail.com/"), else: path
     segments = String.split(checked, "/")
 
@@ -669,6 +669,10 @@ defmodule SymphonyElixir.Factory.TicketCiRepair do
   end
 
   def source_path?(_path), do: false
+
+  defp product_go_source?(path) do
+    String.starts_with?(path, "go/src/grail.com/workflows/") and String.ends_with?(path, ".go")
+  end
 
   defp policy_file?(path, product_go) do
     String.downcase(Path.basename(path)) in Enum.map(@policy_names, &String.downcase/1) or

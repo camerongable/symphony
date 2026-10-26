@@ -8055,7 +8055,11 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     original = Jason.decode!(worker["output_json"])
     assert original["status"] == "COMPLETE" and original["changed_paths"] == []
     before_sha = String.trim(git(ctx.path, ["rev-parse", "HEAD"]))
-    if ctx[:ordinary_policy_negative], do: assert_protected_ordinary_generation(ctx, context, options, key, run, original)
+
+    if ctx[:ordinary_policy_negative] do
+      assert_protected_ordinary_generation(ctx, context, options, key, run, original)
+    end
+
     assert {:ok, %{status: "PREPARED", intents: intents}} = TicketCiGeneration.prepare(ctx.store, key)
     assert length(intents) == 2
     assert {:error, :controller_generation_pending} = TicketCiGeneration.commit_ready(ctx.store, key)
