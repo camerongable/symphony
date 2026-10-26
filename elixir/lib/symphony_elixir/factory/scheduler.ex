@@ -69,6 +69,12 @@ defmodule SymphonyElixir.Factory.Scheduler do
   alias SymphonyElixir.Tracker.Issue
 
   @terminal_states ~w(READY_FOR_REVIEW DELIVERED AWAITING_VALIDATION CANCELLED FAILED)
+  @local_intake_denials ~w(
+    manual_validation_contract_missing ambiguous_manual_validation_section
+    ambiguous_manual_validation_decision ambiguous_manual_validation_environment
+    manual_validation_environment_missing manual_validation_format_unsupported
+    ticket_manual_validation_not_supported manual_validation_disabled production_validation_forbidden
+  )a
   @type context :: map()
 
   @doc "Reserves/reuses one parent for an ordinary run; does not dispatch native or source work."
@@ -2379,13 +2385,21 @@ defmodule SymphonyElixir.Factory.Scheduler do
       {:error, {:insufficient_writer_capacity, _cleaned}} ->
         {:ok, add_event(acc, issue_key, "INSUFFICIENT_WRITER_CAPACITY", nil)}
 
-      {:error, :manual_validation_contract_missing} ->
-        with :ok <- IntakeLedger.record_blocked(context.store, context.factory.scope, snapshot, context.intake_observed_at, :manual_validation_contract_missing) do
-          {:ok, add_event(acc, issue_key, "INTAKE_BLOCKED", :manual_validation_contract_missing)}
-        end
+      {:error, reason} when reason in @local_intake_denials ->
+        block_intake(context, snapshot, acc, reason)
+
+      {:error, {:manual_validation_environment_not_allowed, _environment}} ->
+        block_intake(context, snapshot, acc, :manual_validation_environment_not_allowed)
 
       {:error, reason} ->
         {:error, {:delivery_registration_failed, reason}}
+    end
+  end
+
+  defp block_intake(context, snapshot, acc, reason) do
+    # Admission denials bind this observation only; global failures still stop the tick.
+    with :ok <- IntakeLedger.record_blocked(context.store, context.factory.scope, snapshot, context.intake_observed_at, reason) do
+      {:ok, add_event(acc, snapshot_value(snapshot, "key"), "INTAKE_BLOCKED", reason)}
     end
   end
 

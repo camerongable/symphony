@@ -7,6 +7,12 @@ The local Jira factory keeps source-writing and exact-commit review in isolated
 worktrees; contract-only conversations can stay in their repository Project
 without allocating a worktree.
 
+Ticket-local manual-validation admission denials remain visible without blocking
+unrelated queued or active work. Global configuration, provider, runtime and ledger
+failures still fail the tick. A leased callback stops when its renewing owner dies;
+the durable lease expires normally, and already-issued external effects remain
+uncertain until exact readback reconciles them.
+
 A default-off ticket-chat route reserves one projectless Desktop parent per
 ticket and repository route, separately from delivery workers. Enabled startup
 qualifies the configured runtime before factory children start; individual claims

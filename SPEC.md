@@ -2480,3 +2480,18 @@ before committing. Failures before publication remain retryable preparation;
 failures after publication remain uncertain and MUST NOT automatically reissue.
 Publication and recovery deferrals MUST be durably scoped to the attempted
 operation, including across scheduler ticks and restarts.
+
+The leased scheduler callback MUST terminate when its renewing owner terminates,
+including abrupt owner death before callback startup. Callback termination MUST
+NOT clear a durable lease or prove cancellation of an already-issued external
+effect. Replacement work MUST wait for ordinary lease expiry/acquisition; uncertain
+operations MUST retain their existing exact-readback fences.
+
+New-ticket manual-validation declaration errors and selected-capability mismatches
+MAY reject only that exact intake observation, without preventing unrelated queued
+or active work from advancing. Such denials MUST use bounded safe decision codes
+and messages, never echo an untrusted environment value, and MUST create no run,
+parent, request or source-workspace admission for the rejected ticket. A fresh,
+corrected authorized observation MUST be reconsidered. Global policy, provider,
+runtime, routing, internal and ledger failures MUST remain fatal; failure to persist
+the exact-observation denial MUST NOT be treated as successful isolation.

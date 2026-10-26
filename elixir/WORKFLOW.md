@@ -334,6 +334,21 @@ legacy transport behavior. Disabled V1 runs are quarantined while unrelated
 legacy work continues; unknown execution modes still stop the tick. Changing
 global transport does not enable V1 or rewrite existing runs.
 
+An authorized newcomer requiring unavailable manual validation is a ticket-local
+admission denial, including with the valid default `manual_validation: {}`.
+Missing, ambiguous or unsupported declarations and disallowed admission environments
+also remain visible as fixed-code `INTAKE_BLOCKED` decisions on the exact intake
+observation. They create no newcomer run, parent, request or checkout and do not
+block unrelated active/queued tickets. Fresh corrected authorization is reconsidered.
+This does not enable validation or alter active-validator enforcement. Unsafe policy,
+missing Slack coordination, provider/runtime/configuration/internal errors, changed
+observations and denial-write failures remain fatal.
+
+The tick callback is bound to its renewing owner's lifetime without giving its
+small process guard durable authority. Owner death stops callback execution but
+does not release its lease, clear uncertain external operations or authorize replay;
+normal expiry and exact readback remain separate recovery fences.
+
 Parent admission inputs under this section are `parent_output_root`,
 `broker_thread_id`, `ticket_cli_root` and `ticket_workflow`. The first three are
 explicit and never inferred from controller identity or source directories.

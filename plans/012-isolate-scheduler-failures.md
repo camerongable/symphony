@@ -2,6 +2,7 @@
 
 ## Status and authority
 
+- Local implementation and targeted verification completed; parent-owned integration/deployment and final independent acceptance remain separate.
 - Priority P1; effort M; risk MED; category correctness and lifecycle tests.
 - Planned at `c66c33993735bbcfb80018296b4e247413749d61`, 2026-10-26.
 - Depends on plan 011, deployed and independently qualified. PPL-9881 resumed through the ordinary controller and demonstrated tool activity on its newly bound SOURCE turn.
@@ -122,3 +123,18 @@ Stop and report before improvising if this needs another lease owner/journal, gl
 ## Maintenance
 
 Callback lifetime and durable operation uncertainty solve different problems; keep both fences. New Contract errors need a deliberate local/global decision and safe message mapping, not a prefix match. This workstream does not recover completed native turns, republish broker responses, change error classification or refresh MR admission observations; those belong to the next approved workstream.
+
+## Local execution evidence
+
+Base: `70fa2a422b0b289618b4b84f6734d0de70ad5add`; early lease checkpoint:
+`931872fd802d78247d14edb6cff9f4a29d655e49` (independent early critic accepted).
+Logs are outside source at `/private/tmp/symphony-review-contract.gTnJeO/scheduler-evidence`.
+
+- Lease regression: red 1/1 failure at missing callback DOWN after owner death; green 1/0. Final full lease suite: 26 tests, 0 failures, exit 0, including natural expiry/replacement, real transaction rollback, startup death, exact release, and issued uncertainty after reopen.
+- Default-disabled mixed queues: red 2/2 failures at `manual_validation_disabled`; green 2/0 with real recorded worker evidence consumed and the active ordinary run advanced to VERIFYING in both orders. The eight additional denial mappings were red 8/8, then green 8/0.
+- Final scheduler/controller-health/isolation group: 98 tests, 0 failures, exit 0. This includes actual Controller `reconcile_now` with synthetic local Jira/runtime transport for provider, runtime, queue and denial-write failures; each retains exact FAILED health. Changed observation and unsafe-policy/Slack errors remain fatal. Corrected authorized content re-admits.
+- Journal/operation/Desktop-request regression group: 44 tests, 0 failures, exit 0.
+- `mix specs.check`, `mix format --check-formatted`, and independent `mix build`: exit 0. A second formatting pass was needed for the lease test's anonymous-function arguments, then the lease suite was rerun. An existing runtime-trace assertion was narrowed from total line count to exactly one initialize and only initialize/initialized messages, retaining the exact one-probe assertion.
+- `HEX_OFFLINE=1 make all`: exit 2 during setup, because the local Hex registry does not cache `file_system`; no network/cache/install workaround was attempted. Direct `mix lint` and JSON Credo: exit 14. Full coverage and dialyzer were NOT REACHED.
+- Credo normalized filename/check/message multiset: C66 649, current 652, +3/-0 (two new isolation-test line-length findings and one scheduler-test alias-use finding). Exact comparison is `credo-delta.json`; no unrelated lint refactor was made.
+- All product/priv source stayed frozen during the pinned test runs. `elixir/priv` has no diff from C66; no schema/configuration changes, external writes, service actions or other-worktree edits occurred. The source/test results are not deployment proof.

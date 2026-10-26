@@ -57,7 +57,9 @@ defmodule SymphonyElixir.FactoryTickLeaseTest do
             receive do
               :old_barrier -> send(parent, :dead_callback_effect)
             end
-          end, control_server: context.control_name)
+          end,
+          control_server: context.control_name
+        )
       end)
 
     assert_receive {:blocked_callback, callback, tick}, 1_000
@@ -88,7 +90,9 @@ defmodule SymphonyElixir.FactoryTickLeaseTest do
             receive do
               :finish -> send(parent, :old_effect)
             end
-          end, control_server: context.control_name)
+          end,
+          control_server: context.control_name
+        )
       end)
 
     assert_receive {:first_callback, callback, old_tick}, 1_000
@@ -132,7 +136,9 @@ defmodule SymphonyElixir.FactoryTickLeaseTest do
                 :finish -> :completed
               end
             end)
-          end, control_server: context.control_name)
+          end,
+          control_server: context.control_name
+        )
       end)
 
     assert_receive {:transaction_callback, callback}, 1_000
@@ -159,7 +165,9 @@ defmodule SymphonyElixir.FactoryTickLeaseTest do
                 receive do
                   :finish -> send(parent, :startup_effect)
                 end
-              end, control_server: context.control_name)
+              end,
+              control_server: context.control_name
+            )
         end
       end)
 
@@ -188,7 +196,9 @@ defmodule SymphonyElixir.FactoryTickLeaseTest do
             receive do
               :never -> :ok
             end
-          end, control_server: context.control_name)
+          end,
+          control_server: context.control_name
+        )
       end)
 
     owner_ref = Process.monitor(owner)
@@ -221,7 +231,9 @@ defmodule SymphonyElixir.FactoryTickLeaseTest do
             receive do
               :finish -> flunk("must not replay the issued effect")
             end
-          end, control_server: context.control_name)
+          end,
+          control_server: context.control_name
+        )
       end)
 
     assert_receive {:issued_callback, callback}, 1_000
