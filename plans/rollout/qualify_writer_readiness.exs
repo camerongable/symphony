@@ -1,5 +1,5 @@
 {:ok, _} = Application.ensure_all_started(:exqlite)
-alias SymphonyElixir.Factory.{ReviewProtocol, RunLedger, Store, WorkerEvidence}
+alias SymphonyElixir.Factory.{ReviewProtocol, RunLedger, Store, TicketCiRepair, WorkerEvidence}
 
 run_id = "ab5ab1fe-32cc-48c1-985e-3c3800adcfa2"
 request = "desktop:11b288b43e59ae80afdfc26b01e1bcf2f2d297249cc54e8f0d0af98829629c5a"
@@ -24,6 +24,12 @@ try do
   output = Jason.decode!(row["output_json"])
   "COMPLETE" = output["status"]
   :ok = ReviewProtocol.validate_result(store, task, binding, output)
+  true = length(output["changed_paths"]) == 6
+  true = "go/src/grail.com/workflows/docextract/workflow.go" in output["changed_paths"]
+  true = Enum.all?(output["changed_paths"], &TicketCiRepair.source_path?/1)
+  false = TicketCiRepair.source_path?("go/src/grail.com/workflows/docextract/WORKFLOW.local.md")
+  false = TicketCiRepair.source_path?("go/src/grail.com/workflows/config/workflow.go")
+  false = TicketCiRepair.source_path?(".github/workflows/ci.yml")
   {:ok, ^packet} = ReviewProtocol.context(store, task)
   true = Store.one!(store, "SELECT * FROM worker_evidence WHERE request_key=?", [request]) == row
   true = Store.one!(store, "SELECT * FROM factory_tasks WHERE task_key=?", [row["task_key"]]) == task
@@ -39,6 +45,8 @@ try do
       output_sha256: row["output_sha256"],
       context_sha256: digest.(Jason.encode!(packet)),
       original_report_status: output["status"],
+      changed_source_paths_classified: length(output["changed_paths"]),
+      protected_policy_paths_rejected: true,
       raw_worker_task_and_context_unchanged: true,
       run_unchanged: true,
       live_ledger_writes: 0,
