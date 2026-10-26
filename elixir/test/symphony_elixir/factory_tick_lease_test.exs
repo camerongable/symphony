@@ -3,10 +3,12 @@ defmodule SymphonyElixir.FactoryTickLeaseTest do
 
   alias SymphonyElixir.Factory.{Control, ControlServer, Store, TickLease}
 
-  setup do
+  setup context do
     suffix = "#{System.system_time(:nanosecond)}-#{System.unique_integer([:positive])}"
     database = Path.join(System.tmp_dir!(), "symphony-tick-#{suffix}.sqlite")
-    store = start_supervised!({Store, database: database})
+    fixture = if context[:journal], do: SymphonyElixir.TicketWorkerFixture.setup_fixture(context)
+    database = if fixture, do: fixture.database, else: database
+    store = if fixture, do: fixture.store, else: start_supervised!({Store, database: database})
     reader = start_supervised!(%{id: :reader, start: {Store, :start_read_only, [[database: database]]}})
     control_name = Module.concat(__MODULE__, "Control#{suffix}")
 
@@ -14,12 +16,12 @@ defmodule SymphonyElixir.FactoryTickLeaseTest do
       enabled: true,
       scope: "assigned-jira-work",
       dispatcher_id: "dispatcher-a",
-      lease_seconds: 240
+      lease_seconds: if(context[:short_lease], do: 1, else: 240)
     }
 
     start_supervised!({ControlServer, store: store, read_store: reader, factory: factory, name: control_name})
     on_exit(fn -> File.rm(database) end)
-    %{control_name: control_name, factory: factory, store: store}
+    Map.merge(fixture || %{}, %{control_name: control_name, factory: factory, store: store, database: database})
   end
 
   test "paused control is a quiet no-op", context do
@@ -39,6 +41,213 @@ defmodule SymphonyElixir.FactoryTickLeaseTest do
 
     assert %{"tick_id" => nil, "status" => "ACTIVE"} =
              Control.status(context.store, context.factory.scope)
+  end
+
+  test "abrupt owner death terminates a blocked callback without releasing its durable lease", context do
+    assert {:ok, _} = ControlServer.activate("dispatcher-a", context.control_name)
+    parent = self()
+
+    owner =
+      spawn(fn ->
+        TickLease.run(
+          context.factory,
+          fn tick ->
+            send(parent, {:blocked_callback, self(), tick})
+
+            receive do
+              :old_barrier -> send(parent, :dead_callback_effect)
+            end
+          end,
+          control_server: context.control_name
+        )
+      end)
+
+    assert_receive {:blocked_callback, callback, tick}, 1_000
+    on_exit(fn -> Process.exit(callback, :kill) end)
+    callback_ref = Process.monitor(callback)
+    owner_ref = Process.monitor(owner)
+    Process.exit(owner, :kill)
+    assert_receive {:DOWN, ^owner_ref, :process, ^owner, :killed}, 1_000
+    assert_receive {:DOWN, ^callback_ref, :process, ^callback, :killed}, 1_000
+    send(callback, :old_barrier)
+    refute_received :dead_callback_effect
+    assert ControlServer.status(context.control_name)["tick_id"] == tick["tick_id"]
+    assert %{result: "LEASE_HELD"} = ControlServer.acquire_tick("dispatcher-a", context.control_name)
+  end
+
+  @tag short_lease: true
+  test "replacement waits for natural expiry and cannot overlap the dead callback", context do
+    assert {:ok, _} = ControlServer.activate("dispatcher-a", context.control_name)
+    parent = self()
+
+    owner =
+      spawn(fn ->
+        TickLease.run(
+          context.factory,
+          fn tick ->
+            send(parent, {:first_callback, self(), tick})
+
+            receive do
+              :finish -> send(parent, :old_effect)
+            end
+          end,
+          control_server: context.control_name
+        )
+      end)
+
+    assert_receive {:first_callback, callback, old_tick}, 1_000
+    callback_ref = Process.monitor(callback)
+    Process.exit(owner, :kill)
+    assert_receive {:DOWN, ^callback_ref, :process, ^callback, :killed}, 1_000
+    assert {:skipped, "LEASE_HELD"} = TickLease.run(context.factory, fn -> flunk("unexpired lease") end, control_server: context.control_name)
+
+    assert_eventually(fn ->
+      case TickLease.run(context.factory, fn tick -> tick end, control_server: context.control_name) do
+        {:skipped, "LEASE_HELD"} ->
+          false
+
+        {:ran, replacement} ->
+          assert replacement["tick_id"] != old_tick["tick_id"]
+          assert replacement["generation"] > old_tick["generation"]
+          true
+      end
+    end)
+
+    send(callback, :finish)
+    refute_received :old_effect
+    assert ControlServer.status(context.control_name)["tick_id"] == nil
+  end
+
+  test "owner death rolls back the callback's real SQLite transaction", context do
+    assert {:ok, _} = ControlServer.activate("dispatcher-a", context.control_name)
+    Store.query!(context.store, "CREATE TABLE callback_effects (value INTEGER)")
+    parent = self()
+
+    owner =
+      spawn(fn ->
+        TickLease.run(
+          context.factory,
+          fn ->
+            Store.transaction!(context.store, fn tx ->
+              Store.query!(tx, "INSERT INTO callback_effects VALUES (1)")
+              send(parent, {:transaction_callback, self()})
+
+              receive do
+                :finish -> :completed
+              end
+            end)
+          end,
+          control_server: context.control_name
+        )
+      end)
+
+    assert_receive {:transaction_callback, callback}, 1_000
+    callback_ref = Process.monitor(callback)
+    Process.exit(owner, :kill)
+    assert_receive {:DOWN, ^callback_ref, :process, ^callback, :killed}, 1_000
+    assert Store.query!(context.store, "SELECT value FROM callback_effects").rows == []
+    assert is_binary(ControlServer.status(context.control_name)["tick_id"])
+  end
+
+  test "owner death at callback startup never leaves source work running", context do
+    assert {:ok, _} = ControlServer.activate("dispatcher-a", context.control_name)
+    parent = self()
+
+    owner =
+      spawn(fn ->
+        receive do
+          :start ->
+            TickLease.run(
+              context.factory,
+              fn ->
+                send(parent, {:startup_source, self()})
+
+                receive do
+                  :finish -> send(parent, :startup_effect)
+                end
+              end,
+              control_server: context.control_name
+            )
+        end
+      end)
+
+    :erlang.trace(owner, true, [:procs])
+    send(owner, :start)
+    assert_receive {:trace, ^owner, :spawn, callback, _}, 1_000
+    callback_ref = Process.monitor(callback)
+    Process.exit(owner, :kill)
+    assert_receive {:DOWN, ^callback_ref, :process, ^callback, reason}, 1_000
+    assert reason in [:killed, :noproc]
+    send(callback, :finish)
+    refute_received :startup_effect
+  end
+
+  test "unexpected callback death exits the owner only after exact release", context do
+    assert {:ok, _} = ControlServer.activate("dispatcher-a", context.control_name)
+    parent = self()
+
+    owner =
+      spawn(fn ->
+        TickLease.run(
+          context.factory,
+          fn ->
+            send(parent, {:unexpected_callback, self()})
+
+            receive do
+              :never -> :ok
+            end
+          end,
+          control_server: context.control_name
+        )
+      end)
+
+    owner_ref = Process.monitor(owner)
+    assert_receive {:unexpected_callback, callback}, 1_000
+    Process.exit(callback, :kill)
+    assert_receive {:DOWN, ^owner_ref, :process, ^owner, :killed}, 1_000
+    assert ControlServer.status(context.control_name)["tick_id"] == nil
+  end
+
+  @tag journal: true
+  test "issued Jira uncertainty remains unclaimable after owner death and Store reopen", context do
+    alias SymphonyElixir.Factory.{RunLedger, TicketJiraJournal, Worktree}
+    SymphonyElixir.TicketWorkerFixture.bind_parent(context)
+    {:ok, %{run: run}} = RunLedger.update(context.store, "run", %{state: "MR_CREATING", mr_url: "https://gitlab.example.test/project/-/merge_requests/1"})
+    {:ok, identity} = Worktree.checkout_identity(%{"path" => context.repo}, context.path, clean: true, detached: false, expected_branch: run["branch"], expected_sha: context.sha)
+    checkout = Map.new(identity, fn {key, value} -> {Atom.to_string(key), value} end)
+    {:ok, journal} = TicketJiraJournal.prepare(context.store, "run", "REVIEW_READY", "Synthetic review candidate", checkout)
+    key = journal["operation_key"]
+    assert {:ok, _} = ControlServer.activate("dispatcher-a", context.control_name)
+    parent = self()
+
+    owner =
+      spawn(fn ->
+        TickLease.run(
+          context.factory,
+          fn ->
+            assert {:ok, %{"phase" => "FIRST_UNCERTAIN"}} = TicketJiraJournal.claim(context.store, key)
+            send(parent, {:issued_callback, self()})
+
+            receive do
+              :finish -> flunk("must not replay the issued effect")
+            end
+          end,
+          control_server: context.control_name
+        )
+      end)
+
+    assert_receive {:issued_callback, callback}, 1_000
+    callback_ref = Process.monitor(callback)
+    Process.exit(owner, :kill)
+    assert_receive {:DOWN, ^callback_ref, :process, ^callback, :killed}, 1_000
+    {:ok, reopened} = Store.start_link(database: context.database)
+
+    try do
+      assert {:ok, %{"phase" => "FIRST_UNCERTAIN"}} = TicketJiraJournal.get(reopened, key)
+      assert {:error, :ticket_jira_effect_not_unissued} = TicketJiraJournal.claim(reopened, key)
+    after
+      GenServer.stop(reopened)
+    end
   end
 
   test "the monitored callback receives only its acquired identity and renewal preserves it", context do
@@ -430,6 +639,18 @@ defmodule SymphonyElixir.FactoryTickLeaseTest do
       _ ->
         Process.sleep(10)
         assert_renewing(server, attempts - 1)
+    end
+  end
+
+  defp assert_eventually(fun, attempts \\ 200)
+  defp assert_eventually(_fun, 0), do: flunk("lease did not expire naturally")
+
+  defp assert_eventually(fun, attempts) do
+    unless fun.() do
+      receive do
+      after
+        10 -> assert_eventually(fun, attempts - 1)
+      end
     end
   end
 end

@@ -1498,10 +1498,17 @@ Workflow titles fall back to the matching saved Jira snapshot when the ticket is
 absent from intake. Dark surfaces stay neutral; labeled indicators convey health.
 
 Schema v38 stores controller-owned intake rejection decisions separately from
-the observed Jira snapshot. A missing required manual-validation declaration
-shows `INTAKE_BLOCKED` with an actionable reason without starving other work;
-the next snapshot clears stale decisions. This hardening is local-only until an
-explicitly authorized deployment.
+the observed Jira snapshot. Missing, ambiguous or unsupported manual-validation
+declarations, disabled/unsupported selected capability, and forbidden admission
+environments show `INTAKE_BLOCKED` with fixed safe reasons without starving queued
+or active work. The next snapshot clears stale decisions and permits correction.
+Global policy, provider, runtime, routing and ledger errors still fail the tick;
+denial persistence requires the exact saved observation. No migration is needed.
+
+Leased callbacks stop if their renewing owner dies, including while waiting in a
+SQLite transaction. The callback's guard owns no lease and changes no caller exit
+policy. Abrupt death leaves the durable lease to expire normally; stopping local
+execution never clears issued-operation uncertainty or authorizes replay.
 
 The observability UI now runs on a minimal Phoenix stack:
 

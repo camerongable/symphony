@@ -2357,7 +2357,9 @@ defmodule SymphonyElixir.FactorySchedulerTest do
     assert RunLedger.list(ctx.store) == [run]
     assert Store.one!(ctx.store, "SELECT COUNT(*) AS count FROM desktop_requests")["count"] == 1
     assert Store.query!(ctx.store, "SELECT observed FROM runtime_probe_marks").rows == [[1]]
-    assert length(File.read!(trace) |> String.split("\n", trim: true)) == 1
+    methods = trace |> File.read!() |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!(&1)["method"])
+    assert Enum.count(methods, &(&1 == "initialize")) == 1
+    assert Enum.all?(methods, &(&1 in ~w(initialize initialized)))
     refute_received {:stage_launch, _, _, _, _}
     refute_received {:jira_write_options, _}
   end
@@ -2379,7 +2381,8 @@ defmodule SymphonyElixir.FactorySchedulerTest do
     context = ticket_registration_context(ctx)
     required = Contract.bind("PPL-123", 1, "## Manual Validation\n- Required: yes\n- Environment: cpp-test")
     Process.put(:factory_controller_response, intake_response(authorized_snapshot(required, ["ai-ready", "repo-grail"])))
-    assert {:error, {:delivery_registration_failed, :ticket_manual_validation_not_supported}} = tick(context)
+    assert {:ok, rejected} = tick(context)
+    assert Enum.any?(rejected.events, &(&1.event == "INTAKE_BLOCKED" and &1.detail == :ticket_manual_validation_not_supported))
     assert RunLedger.list(ctx.store) == []
 
     for contract <- [
@@ -2531,6 +2534,76 @@ defmodule SymphonyElixir.FactorySchedulerTest do
     assert Store.one!(ctx.store, "SELECT COUNT(*) AS n FROM ticket_chats")["n"] == 1
     assert Store.query!(ctx.store, "SELECT * FROM workspace_access").rows == []
     refute_received {:jira_write_options, _}
+  end
+
+  test "default disabled validation does not starve another authorized queued ticket", ctx do
+    context = ticket_registration_context(ctx)
+    context = put_in(context.factory.ticket_supervisor["pilot_issue_keys"], ["PPL-123", "PPL-124"])
+    context = %{context | factory: %{context.factory | manual_validation: %{}}}
+    bad = authorized_snapshot(Contract.bind("PPL-123", 1, "## Manual Validation\n- Required: yes\n- Environment: cpp-test"), ["ai-ready", "repo-grail"])
+    good = authorized_snapshot(Contract.bind("PPL-124", 1, "## Manual Validation\n- Required: no"), ["ai-ready", "repo-grail"]) |> Map.merge(%{"key" => "PPL-124", "id" => "101"})
+    Process.put(:factory_controller_response, %{intake_response(bad) | "snapshot_json" => Jason.encode!([bad, good])})
+    assert {:ok, result} = tick(context)
+    assert Enum.any?(result.events, &(&1.issue_key == "PPL-123" and &1.event == "INTAKE_BLOCKED" and &1.detail == :manual_validation_disabled))
+    assert [%{"issue_key" => "PPL-124", "state" => "ADMITTING_WRITER"}] = RunLedger.list(ctx.store)
+    assert Store.query!(ctx.store, "SELECT issue_key FROM ticket_chats").rows == [["PPL-124"]]
+    assert Store.query!(ctx.store, "SELECT * FROM workspace_access").rows == []
+    refute_received {:jira_write_options, _}
+  end
+
+  test "unsafe policy and Slack coordination failures remain fatal admission errors", ctx do
+    context = ticket_registration_context(ctx)
+    contract = Contract.bind("PPL-123", 1, "## Manual Validation\n- Required: yes\n- Environment: cpp-test")
+
+    for {field, value, reason} <- [
+          {"allow_production", true, :unsafe_manual_validation_policy},
+          {"allow_database_ddl", true, :unsafe_manual_validation_policy},
+          {"require_slack_coordination", false, :slack_coordination_required}
+        ] do
+      rejected = put_in(context.factory.manual_validation[field], value)
+      Process.put(:factory_controller_response, intake_response(authorized_snapshot(contract, ["ai-ready", "repo-grail"])))
+      assert {:error, {:delivery_registration_failed, ^reason}} = tick(rejected)
+      assert RunLedger.list(ctx.store) == []
+      assert_no_ticket_admission_effects(ctx.store)
+      assert {:ok, %{decisions: %{}}} = IntakeLedger.get(ctx.store, context.factory.scope)
+    end
+  end
+
+  for {reason, markdown, environments} <- [
+        {:ambiguous_manual_validation_section, "## Manual Validation\n- Required: no\n## Manual Validation\n- Required: no", ["cpp-test"]},
+        {:ambiguous_manual_validation_decision, "## Manual Validation\n- Required: no\n- Required: yes", ["cpp-test"]},
+        {:ambiguous_manual_validation_environment, "## Manual Validation\n- Required: yes\n- Environment: cpp-test\n- Environment: cpp-dev", ["cpp-test"]},
+        {:manual_validation_environment_missing, "## Manual Validation\n- Required: yes", ["cpp-test"]},
+        {:manual_validation_format_unsupported, "```\n## Manual Validation\n- Required: no\n```", ["cpp-test"]},
+        {:ticket_manual_validation_not_supported, "## Manual Validation\n- Required: yes\n- Environment: cpp-test", ["cpp-test"]},
+        {:manual_validation_environment_not_allowed, "## Manual Validation\n- Required: yes\n- Environment: untrusted-secret-environment", ["cpp-test"]},
+        {:production_validation_forbidden, "## Manual Validation\n- Required: yes\n- Environment: production", ["production"]}
+      ] do
+    @local_reason reason
+    @local_markdown markdown
+    @local_environments environments
+    test "#{reason} is a bounded visible denial with no admission effects and later correction is admissible", ctx do
+      context = ticket_registration_context(ctx)
+      context = put_in(context.factory.manual_validation["allowed_environments"], @local_environments)
+      bad = Contract.bind("PPL-123", 1, @local_markdown)
+      Process.put(:factory_controller_response, intake_response(authorized_snapshot(bad, ["ai-ready", "repo-grail"])))
+      assert {:ok, rejected} = tick(context)
+      assert Enum.any?(rejected.events, &(&1.issue_key == "PPL-123" and &1.event == "INTAKE_BLOCKED" and &1.detail == @local_reason))
+      assert RunLedger.list(ctx.store) == []
+      assert_no_ticket_admission_effects(ctx.store)
+      assert {:ok, %{decisions: %{"PPL-123" => decision}}} = IntakeLedger.get(ctx.store, context.factory.scope)
+      assert decision["code"] == Atom.to_string(@local_reason)
+      refute Jason.encode!(decision) =~ "untrusted-secret-environment"
+      control = start_supervised!({SymphonyElixir.Factory.ControlServer, store: ctx.store, factory: Map.put(context.factory, :lease_seconds, 240), name: nil})
+      visible = SymphonyElixir.Factory.Observability.snapshot(settings: %{factory: context.factory}, store: ctx.store, control_server: control)
+      assert [%{local_state: "INTAKE_BLOCKED", admission_error: %{code: code}}] = visible.intake.issues
+      assert code == Atom.to_string(@local_reason)
+      corrected = Contract.bind("PPL-123", 2, "## Manual Validation\n- Required: no")
+      Process.put(:factory_controller_response, intake_response(authorized_snapshot(corrected, ["ai-ready", "repo-grail"])))
+      assert {:ok, _} = tick(context)
+      assert [%{"state" => "ADMITTING_WRITER", "spec_revision" => 2}] = RunLedger.list(ctx.store)
+      assert {:ok, %{decisions: %{}}} = IntakeLedger.get(ctx.store, context.factory.scope)
+    end
   end
 
   defp ticket_registration_context(ctx) do

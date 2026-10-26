@@ -14,6 +14,8 @@ the existing safety boundaries, and execute its gates in order.
 | [007](007-complete-verifier-repair-cycle.md) | Complete retained-history verifier repair and current-status reporting | P0 | L | Copied deployed-source baseline and 80 passing focused checks | DONE — scoped local deployment00:50UTC20Oct; three packaged cases and independent preservation accepted; full quality limits remain |
 | [008](008-complete-mr-receipts-and-ten-attempts.md) | Complete typed MR receipts, ten total attempts and ordinary generated-build handoff | P0 | L | Deployed007 scoped fix | DONE — scoped local deployment20Oct07:35UTC; preserved7spent, normal8thSOURCEgen39/native activity independently verified; ticket repair/CI/delivery not yet proven; existing full-quality limits remain |
 | [009](009-bound-push-receipt-readback.md) | Recover bounded push receipts without repeating issuance | P0 | M | Deployed008 | IN PROGRESS — actual push remote-confirmed;262236byte receipt exceeds old262144 reader cap; new bounded readonly recovery candidate required |
+| [011](011-review-report-contract.md) | Make reports robust and bound repair review | P0 | L | Frozen deployed R20 baseline | DONE — local C66 deployment26Oct18:11UTC;100 artifact tests; preserved schema/history; PPL-9881 new SOURCE activity proven; full lint gate limited |
+| [012](012-isolate-scheduler-failures.md) | Isolate intake rejections and tick callback lifetime | P1 | M | Deployed011/C66 | IN PROGRESS — approved second workstream; planning and early review underway |
 
 Plan 006 was added on 2026-10-04 at HEAD `52a978818875c59ccf2758ed1b728bb23e33f631`.
 Its checksum manifest also pins selected dirty/untracked source: HEAD alone is insufficient.
@@ -35,7 +37,8 @@ settings, Codex chat history, or canonical skills outside this repository.
   system before building the primitives needed to test it.
 - Do not dispatch historical Plan 002 again for rejected Plan 001. Its committed
   event-correlation foundation is reused by 006; its tests cannot satisfy native acceptance.
-- Plan 006 is the sole active handoff. The ordinary path proceeds through U6N and
+- Plan 006 was the original ordinary-ticket handoff; later plans retain and harden
+  that foundation. The ordinary path proceeds through U6N and
   U7–U11; the Required: yes manual-validation executor remains a separate U1/U3–U6
   gated follow-on. Each implementation unit is independently reviewed; production
   routing stays disabled pending its own acceptance and deployment authorization.

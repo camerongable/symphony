@@ -9,6 +9,19 @@ defmodule SymphonyElixir.Factory.IntakeLedger do
 
   alias SymphonyElixir.Factory.Store
 
+  @blocked_decisions %{
+    manual_validation_contract_missing: "Confirmed delivery contract must explicitly declare whether manual validation is required.",
+    manual_validation_disabled: "Required manual validation is not enabled for new ticket admission.",
+    ambiguous_manual_validation_section: "Confirmed delivery contract must contain one Manual Validation section.",
+    ambiguous_manual_validation_decision: "Confirmed delivery contract must contain one manual-validation decision.",
+    ambiguous_manual_validation_environment: "Confirmed delivery contract must select one manual-validation environment.",
+    manual_validation_environment_missing: "Required manual validation must declare its environment.",
+    manual_validation_format_unsupported: "Manual-validation declarations must use supported unquoted Markdown.",
+    ticket_manual_validation_not_supported: "Required manual validation is not supported by the selected ticket route.",
+    manual_validation_environment_not_allowed: "The declared manual-validation environment is not allowed for new ticket admission.",
+    production_validation_forbidden: "Production manual validation is forbidden."
+  }
+
   @doc "Replaces the last successful Jira intake snapshot for one factory scope."
   @spec replace(Store.connection(), String.t(), [map()], keyword()) ::
           {:ok, %{scope: String.t(), observed_at: String.t(), snapshots: [map()]}}
@@ -81,16 +94,16 @@ defmodule SymphonyElixir.Factory.IntakeLedger do
   def get(_connection, _scope), do: {:error, :invalid_intake_scope}
 
   @doc "Records a controller rejection only against the exact saved intake observation."
-  @spec record_blocked(Store.connection(), String.t(), map(), String.t(), :manual_validation_contract_missing) ::
+  @spec record_blocked(Store.connection(), String.t(), map(), String.t(), atom()) ::
           :ok | {:error, term()}
-  def record_blocked(connection, scope, snapshot, observed_at, :manual_validation_contract_missing) do
+  def record_blocked(connection, scope, snapshot, observed_at, reason) when is_map_key(@blocked_decisions, reason) do
     Store.transaction!(connection, fn tx ->
       with {:ok, %{observed_at: ^observed_at, snapshots: snapshots, decisions: decisions}} <- get(tx, scope),
            issue_key when is_binary(issue_key) <- snapshot["key"],
            true <- Enum.find(snapshots, &(&1["key"] == issue_key)) == snapshot do
         decision = %{
-          "code" => "manual_validation_contract_missing",
-          "message" => "Confirmed delivery contract must explicitly declare whether manual validation is required."
+          "code" => Atom.to_string(reason),
+          "message" => Map.fetch!(@blocked_decisions, reason)
         }
 
         Store.query!(tx, "UPDATE intake_snapshots SET decisions_json = ? WHERE scope = ?", [Jason.encode!(Map.put(decisions, issue_key, decision)), String.trim(scope)])
@@ -103,9 +116,9 @@ defmodule SymphonyElixir.Factory.IntakeLedger do
 
   defp valid_decisions?(decisions) do
     Enum.all?(decisions, fn
-      {key, %{"code" => "manual_validation_contract_missing", "message" => message}}
+      {key, %{"code" => code, "message" => message}}
       when is_binary(key) and is_binary(message) ->
-        true
+        Enum.any?(@blocked_decisions, fn {reason, safe_message} -> Atom.to_string(reason) == code and safe_message == message end)
 
       _ ->
         false
