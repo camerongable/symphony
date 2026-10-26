@@ -653,6 +653,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
     on_exit(fn -> :persistent_term.erase(ContinuationWorkerServer) end)
     context = Map.merge(context, %{task_supervisor: tasks, recipient: self()})
     options = Keyword.put(options, :app_server, ContinuationWorkerServer)
+    assert_iteration_authority_selector(store, context, options)
     assert {:ok, _} = SymphonyElixir.Factory.Control.activate(store, factory, factory.dispatcher_id)
 
     assert {:ran, {:ok, %{status: "LAUNCHED"}}} =
@@ -705,6 +706,33 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
     end
 
     GenServer.stop(recovered)
+  end
+
+  defp assert_iteration_authority_selector(store, context, options) do
+    %{"payload_json" => raw} = Store.one!(store, "SELECT payload_json FROM events WHERE event_type='TICKET_VERIFIER_REPAIR_AUTHORIZED' AND json_extract(payload_json,'$.version')=4")
+
+    historical =
+      Jason.decode!(raw)
+      |> put_in(["authorization", "authorization_key"], "unrelated-prior-authorization")
+      |> put_in(["authorization", "verifier_request_key"], "unrelated-prior-verifier")
+      |> put_in(["run", "code_repair_round"], 11)
+      |> put_in(["run", "verifier_round"], 1)
+
+    insert = fn payload ->
+      [[id]] =
+        Store.query!(store, "INSERT INTO events(occurred_at,event_type,run_id,payload_json) VALUES (?,'TICKET_VERIFIER_REPAIR_AUTHORIZED','run',?) RETURNING id", [
+          DateTime.to_iso8601(DateTime.utc_now()),
+          payload
+        ]).rows
+
+      id
+    end
+
+    insert.(Jason.encode!(historical))
+    duplicate = insert.(raw)
+    assert {:error, :implementation_iteration_limit} = Scheduler.ticket_step(context, "run", options)
+    assert {:error, :unknown_task} = TaskLedger.get(store, "run:feature-writer")
+    Store.query!(store, "DELETE FROM events WHERE id=?", [duplicate])
   end
 
   defp configure_continuation_jira(ctx, run) do
@@ -789,7 +817,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
       Process.put(:worker_output, output)
       schema = ReviewProtocol.schema_json(prompt, StageSchemas.for_stage(:change_verifier))
       assert {:ok, _} = TicketWorkerRunner.run(ctx.path, issue(), prompt, schema, options)
-      adoption_context = if(ctx[:legacy_counter_allowance] and round == last_round, do: put_in(context, [:factory, :maximum_code_repair_rounds], 10), else: context)
+      adoption_context = if(ctx[:legacy_counter_allowance] == true and round == last_round, do: put_in(context, [:factory, :maximum_code_repair_rounds], 10), else: context)
 
       result =
         if correction? != false and round == last_round do
