@@ -645,3 +645,9 @@ changing raw evidence, verdict, source or repair counters. A separately explicit
 mandatory finding IDs and operator scope to one ordinary-tick continuation. It
 does not inherit BLOCK authority, dispatch at staging, or authorize a later
 automatic repair. The implementation README defines the exact payloads.
+For legacy counters beyond both configured caps, reference version 2 explicitly
+binds `source_allowance` configured/prior/next implementation and combined-repair
+counters plus `maximum_additional_iterations:1`. Its applied authority derives
+only that exact run's next-iteration ceiling; configured WORKFLOW limits remain
+unchanged. Honest CONTINUE advances the iteration and then stops, without an
+automatic extra source iteration.

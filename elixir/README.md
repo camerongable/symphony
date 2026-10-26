@@ -200,6 +200,24 @@ the ordinary owned tick still gate application. Stage never dispatches. Apply
 advances one combined repair round, retaining configured/effective limits and
 automatic two used. Another REPAIR stops again; nothing grants a third automatic
 repair. Old BLOCK authorization versions and physical programs are unchanged.
+If both legacy counters already exceed configured limits, use
+`review_policy_stop.version:2` and include this exact `source_allowance` shape
+(these numbers illustrate the current 26/25 and 12/10 case):
+
+```json
+{"configured_implementation_limit":25,"prior_implementation_iteration":26,"next_implementation_iteration":27,"configured_code_repair_limit":10,"prior_code_repair_round":12,"next_code_repair_round":13,"maximum_additional_iterations":1}
+```
+
+The version-4 `REVIEW_POLICY_STOP_CONTINUATION_V2` authorization records configured
+25/10 separately from effective 27/13. The same authenticated applied receipt
+derives the exact REPAIRING run's source-iteration ceiling; no WORKFLOW setting or
+prior counter changes. The existing instruction snapshot, request, SOURCE
+reservation and immutable evidence bind the admitted writer. COMPLETE and honest
+CONTINUE both advance implementation 26 to 27; CONTINUE remains non-complete and
+another source iteration is denied. Existing independently authorized
+same-iteration infrastructure recovery is separate and does not grant iteration
+28 or permission to replay ambiguous source actions. Physical publication proves
+the writer packet's pre-26 and adopted run's post-27 counters independently.
 New physical history codec v21, push helpers v27/v28 and status reader v15 admit
 the new proofs; retained v1 and legacy histories keep their original codecs.
 
@@ -234,7 +252,7 @@ Original finding IDs and `BLOCK` remain intact. Version-2 ordinary repair proof
 binds both events through generation, push and archived history; bare `BLOCK`
 does not grant repair authority and delivery still requires fresh verifier `PASS`.
 
-A single additional repair beyond the combined historical budget requires an
+For BLOCK authorizations, a single additional repair beyond the combined historical budget requires an
 explicit `ticket_supervisor.verifier_repair_budget_exceptions` entry keyed by the
 approval's `authorization_key`, as well as the normal operator approval command.
 The entry exactly binds `kind: ONE_VERIFIER_REPAIR`, run/candidate/contract,

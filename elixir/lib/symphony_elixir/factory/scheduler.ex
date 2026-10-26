@@ -830,7 +830,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
     confirmation = TicketCompletionConfirmation.authorization(store, run, factory)
 
     cond do
-      run["implementation_iteration"] < factory.maximum_implementation_iterations ->
+      run["implementation_iteration"] < TicketVerifierRepair.implementation_limit(store, run, factory) ->
         {:ok, %{key: run["run_id"] <> ":feature-writer", role: "feature-writer", schema: :native_feature_writer}}
 
       is_map(confirmation) ->

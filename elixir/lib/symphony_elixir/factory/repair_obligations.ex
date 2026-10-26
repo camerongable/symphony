@@ -98,6 +98,7 @@ defmodule SymphonyElixir.Factory.RepairObligations do
          true <- packet["verifier_round"] in [run["verifier_round"], run["verifier_round"] - 1],
          true <- Map.take(packet, ~w(run_id spec_revision contract_sha256)) == Map.take(run, ~w(run_id spec_revision contract_sha256)),
          {:ok, review} <- ordinary_review(store, packet),
+         true <- source_iteration?(review, packet, run, phase),
          verifier when is_map(verifier) <- Store.one!(store, "SELECT * FROM worker_evidence WHERE request_key=? AND run_id=? AND status='CONSUMED'", [review["verifier_request_key"], run["run_id"]]),
          {:ok, ^review} <- review(store, verifier, packet),
          {:ok, findings} <- Jason.decode(packet["repair_findings"] || "null"),
@@ -141,6 +142,14 @@ defmodule SymphonyElixir.Factory.RepairObligations do
       :error -> proof
     end
   end
+
+  defp source_iteration?(%{"operator_authorization" => %{"review_policy_stop" => %{"version" => 2, "source_allowance" => allowance}}}, packet, run, phase) do
+    packet["implementation_iteration"] == allowance["prior_implementation_iteration"] and
+      packet["code_repair_round"] == allowance["next_code_repair_round"] and
+      run["implementation_iteration"] == allowance[if(phase == :generation, do: "prior_implementation_iteration", else: "next_implementation_iteration")]
+  end
+
+  defp source_iteration?(_review, _packet, _run, _phase), do: true
 
   defp ordinary_source_phase?(store, source, binding, :consumed),
     do: source["status"] == "CONSUMED" and is_binary(source["consumed_at"]) and released_worker?(store, source, binding, "SOURCE")

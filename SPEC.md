@@ -2401,6 +2401,18 @@ authority MUST NOT masquerade as legacy BLOCK recovery. Configured and effective
 combined limits MUST remain separately recorded; all retained codec bytes remain
 immutable.
 
+If both legacy implementation and combined repair counters already meet or exceed
+configured limits, a new policy-stop continuation version MAY explicitly bind
+one implementation iteration with configured/current/next counters. The exact
+applied receipt MUST authenticate the effective ceiling only for the same
+REPAIRING run, candidate, contract and repair round. Configured limits and prior
+counters MUST NOT change. Existing instruction/request/SOURCE reservation and
+evidence bindings remain authoritative. COMPLETE or honest CONTINUE MUST advance
+the iteration once; CONTINUE MUST NOT authorize another iteration. Existing
+independently authorized same-iteration infrastructure recovery remains separate.
+Publication MUST independently prove the admitted writer's prior iteration and
+the adopted run's exact next iteration.
+
 An explicit source-completion confirmation MAY admit one read-only request at
 the implementation limit. It MUST bind the exact current run, candidate,
 contract/revision, repair/verifier counters, and prior consumed CONTINUE binding
