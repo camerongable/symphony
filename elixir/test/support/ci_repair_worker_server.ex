@@ -172,7 +172,8 @@ defmodule SymphonyElixir.CiRepairWorkerServer do
     opts[:on_message].(%{event: :session_started, thread_id: session.thread_id, turn_id: turn})
     identity = %{"threadId" => session.thread_id, "turnId" => turn, "callId" => turn <> ":read-old", "namespace" => nil, "tool" => "repo_read"}
     old = fixture_read(session, "pkg/old.go", identity)
-    moved = fixture_read(session, "moved/job.go", %{identity | "callId" => turn <> ":read-moved"})
+    moved_path = Application.get_env(:symphony_elixir, :ordinary_go_path, "moved/job.go")
+    moved = fixture_read(session, moved_path, %{identity | "callId" => turn <> ":read-moved"})
     reviewed = packet["repair_review"]["prior_candidate_sha"]
     marker = "// review #{reviewed}"
 
@@ -187,8 +188,8 @@ defmodule SymphonyElixir.CiRepairWorkerServer do
 
           true = deleted["success"]
           content = "package moved\nimport \"example.invalid/fixture/dep\"\nfunc Value() int{return dep.Value}\n#{marker}\n"
-          fixture_write(session, "moved/job.go", "ABSENT", content, %{identity | "callId" => turn <> ":write-moved"})
-          ["moved/job.go", "pkg/old.go"]
+          fixture_write(session, moved_path, "ABSENT", content, %{identity | "callId" => turn <> ":write-moved"})
+          [moved_path, "pkg/old.go"]
 
         true ->
           content = "package pkg\nimport \"fmt\"\nfunc Value() string{return fmt.Sprint(1)}\n#{marker}\n"

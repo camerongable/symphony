@@ -295,6 +295,53 @@ defmodule SymphonyElixir.FactoryTicketCiRepairTest do
     assert Enum.find(incomplete["trace_availability"], &(&1["job_id"] == 8))["status"] == "UNAVAILABLE"
   end
 
+  test "diagnosis admits product Go workflow source without admitting workflow policy" do
+    source = [
+      "go/src/grail.com/doc-extract/worker/runner.go",
+      "go/src/grail.com/doc-extract/worker/cmd/main.go",
+      "go/src/grail.com/doc-extract/worker/cmd/main_test.go",
+      "go/src/grail.com/workflows/docextract/contracts.go",
+      "go/src/grail.com/workflows/docextract/activities.go",
+      "go/src/grail.com/workflows/docextract/workflow.go",
+      "go/src/grail.com/workflows/docextract/workflow_test.go"
+    ]
+
+    assert {:ok, diagnosis} = TicketCiRepair.assess(ci([7]), source, %{7 => "synthetic compiler failure"})
+    assert diagnosis["allowed_writer_paths"] == Enum.sort(source)
+
+    for path <- [
+          "go/src/grail.com/workflows/docextract/workflows/activities.go",
+          "go/src/grail.com/workflows/docextract/Workflows/activities.go",
+          "go/src/grail.com/workflows/docextract/.agents/job.go",
+          "go/src/grail.com/workflows/docextract/config/job.go",
+          "go/src/grail.com/workflows/docextract/Config/job.go",
+          "go/src/grail.com/workflows/docextract/policy.go",
+          "go/src/grail.com/workflows/docextract/AGENTS.md",
+          "go/src/grail.com/workflows/docextract/go.mod",
+          "go/src/grail.com/workflows/docextract/workflow.lock",
+          "go/src/grail.com/workflows/docextract/WORKFLOW.md",
+          "go/src/grail.com/workflows/docextract/workflow.yaml",
+          "go/src/grail.com/workflows/docextract/workflow.go.yaml",
+          "go/src/grail.com/workflows/docextract/workflow.GO",
+          "go/src/grail.com/workflows/docextract/workflow.go/child.yaml",
+          "go/src/grail.com/workflows/docextract/workflow.go/../job.go",
+          "go/src/grail.com/workflows//workflow.go",
+          "go/src/grail.com/workflows/./workflow.go",
+          "go/src/grail.com/workflows/../workflow.go",
+          "/go/src/grail.com/workflows/docextract/workflow.go",
+          "go/src/grail.com/workflows/docextract/workflow\\file.go",
+          "go/src/grail.com/workflows/docextract/workflow\n.go",
+          "GO/src/grail.com/workflows/docextract/workflow.go",
+          "go/src/grail.com/Workflows/docextract/workflow.go",
+          "go/src/grail.com/workflows-other/docextract/workflow.go",
+          "other/go/src/grail.com/workflows/docextract/workflow.go",
+          "pkg/workflow.go"
+        ] do
+      assert {:ok, denied} = TicketCiRepair.assess(ci([7]), [path], %{7 => "synthetic compiler failure"})
+      assert denied["allowed_writer_paths"] == [], path
+    end
+  end
+
   test "logs cannot grant CI configuration writes or turn infrastructure and injected instructions into repair authority" do
     for path <- [
           ".gitlab-ci.yml",
