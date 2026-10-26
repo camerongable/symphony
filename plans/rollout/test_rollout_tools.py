@@ -1,5 +1,6 @@
 """Fail-closed preparation checks; never controls launchd or opens the live ledger."""
 
+import hashlib
 import importlib.util
 import json
 import plistlib
@@ -86,15 +87,20 @@ CREATE TABLE worker_instruction_snapshots(value TEXT);
 CREATE TABLE worker_instruction_task_bindings(value TEXT);
 CREATE TABLE worker_file_operations(value TEXT);
 CREATE TABLE worker_evidence(request_key TEXT PRIMARY KEY,binding_json TEXT,binding_sha256 TEXT,
- output_json TEXT,output_sha256 TEXT,thread_id TEXT,turn_id TEXT,owner_stopped_at TEXT,status TEXT);
-INSERT INTO worker_evidence VALUES('request','binding','binding-sha','output','output-sha','thread','turn','stopped','RESULT_RECORDED');
+ output_json TEXT,output_sha256 TEXT,thread_id TEXT,turn_id TEXT,owner_stopped_at TEXT,owner_stop_json TEXT,status TEXT);
+INSERT INTO worker_evidence VALUES('request','binding','binding-sha','output','output-sha','thread','turn','stopped','stop-proof','RESULT_RECORDED');
+CREATE TABLE factory_tasks(task_key TEXT PRIMARY KEY,status TEXT,updated_at TEXT,output_json TEXT);
+INSERT INTO factory_tasks VALUES('old-task','CONSUMED','old-time','original-output');
 CREATE TABLE desktop_requests(request_key TEXT PRIMARY KEY,status TEXT);
 INSERT INTO desktop_requests VALUES('old-uncertain','RECONCILE_REQUIRED');
 ''')
                 with sqlite3.connect(root / 'before-cutover.sqlite') as backup:
                     db.commit()
                     db.backup(backup)
-            (root / 'audited-protected.json').write_text(json.dumps({'event_limit': 1}))
+            with sqlite3.connect(database) as db:
+                schema = [list(row) for row in db.execute('SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name')]
+            schema_sha = hashlib.sha256(json.dumps(schema, separators=(',', ':'), ensure_ascii=False).encode()).hexdigest()
+            (root / 'audited-protected.json').write_text(json.dumps({'event_limit': 1, 'schema_sha256': schema_sha}))
             g, _capture = cutover.bind(root)
             g.readonly = lambda: sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)
             g.historical_after_start()
@@ -105,8 +111,11 @@ INSERT INTO desktop_requests VALUES('old-uncertain','RECONCILE_REQUIRED');
             for statement, restore in (
                 ("UPDATE events SET payload='changed' WHERE id=1", "UPDATE events SET payload='original' WHERE id=1"),
                 ("UPDATE worker_evidence SET output_json='rewritten'", "UPDATE worker_evidence SET output_json='output'"),
+                ("UPDATE worker_evidence SET owner_stop_json='rewritten'", "UPDATE worker_evidence SET owner_stop_json='stop-proof'"),
+                ("UPDATE factory_tasks SET output_json='rewritten'", "UPDATE factory_tasks SET output_json='original-output'"),
                 ("UPDATE desktop_requests SET status='PENDING'", "UPDATE desktop_requests SET status='RECONCILE_REQUIRED'"),
                 ("UPDATE factory_schema_migrations SET version=55", "UPDATE factory_schema_migrations SET version=54"),
+                ("CREATE INDEX unexpected_history_index ON worker_evidence(status)", "DROP INDEX unexpected_history_index"),
             ):
                 with sqlite3.connect(database) as db:
                     db.execute(statement)

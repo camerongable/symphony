@@ -274,14 +274,24 @@ IO.puts("NATIVE_SOURCE_QUIET")
         backup = evidence_root / 'before-cutover.sqlite'
         with sqlite3.connect(backup.as_uri() + '?mode=ro&immutable=1', uri=True) as prior, g.readonly() as current:
             assert current.execute('SELECT MAX(version) FROM factory_schema_migrations').fetchone()[0] == 54
+            schema = [list(row) for row in current.execute('SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name')]
+            assert hashlib.sha256(json.dumps(schema, separators=(',', ':'), ensure_ascii=False).encode()).hexdigest() == protected['schema_sha256']
             for table in ('events', 'worker_instruction_snapshots', 'worker_instruction_task_bindings', 'worker_file_operations'):
                 quoted = '"' + table + '"'
                 limit = ' WHERE id <= ' + str(protected['event_limit']) if table == 'events' else ''
                 for row in prior.execute('SELECT rowid,* FROM ' + quoted + limit + ' ORDER BY rowid'):
                     assert current.execute('SELECT rowid,* FROM ' + quoted + ' WHERE rowid=?', (row[0],)).fetchone() == row, table
-            raw_fields = 'request_key,binding_json,binding_sha256,output_json,output_sha256,thread_id,turn_id,owner_stopped_at'
-            for row in prior.execute('SELECT ' + raw_fields + ' FROM worker_evidence'):
-                assert current.execute('SELECT ' + raw_fields + ' FROM worker_evidence WHERE request_key=?', (row[0],)).fetchone() == row
+            for table, key in (('worker_evidence', 'request_key'), ('factory_tasks', 'task_key')):
+                columns = [row[1] for row in prior.execute('PRAGMA table_info(' + table + ')')]
+                for row in prior.execute('SELECT * FROM ' + table):
+                    original = dict(zip(columns, row))
+                    updated_row = current.execute('SELECT * FROM ' + table + ' WHERE ' + key + '=?', (original[key],)).fetchone()
+                    assert updated_row is not None
+                    updated = dict(zip(columns, updated_row))
+                    mutable = {'status', 'consumed_at'} if table == 'worker_evidence' else set()
+                    if table == 'factory_tasks' and original[key] == RUN + ':feature-writer':
+                        mutable = {'status', 'updated_at'}
+                    assert {name: original[name] for name in columns if name not in mutable} == {name: updated[name] for name in columns if name not in mutable}
             for row in prior.execute("SELECT * FROM desktop_requests WHERE status IN ('RECONCILE_REQUIRED','CREATE_UNCERTAIN','FOLLOWUP_UNCERTAIN')"):
                 assert current.execute('SELECT * FROM desktop_requests WHERE request_key=?', (row[0],)).fetchone() == row
 
