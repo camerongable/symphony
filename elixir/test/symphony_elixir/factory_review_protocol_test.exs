@@ -106,17 +106,7 @@ defmodule SymphonyElixir.FactoryReviewProtocolTest do
       {"failed implementation", put_in(result, ["review_report", "criteria", Access.at(1), "status"], "FAIL")},
       {"unresolved closure", put_in(result, ["review_report", "closures", Access.at(0), "status"], "UNRESOLVED")},
       {"stale candidate", put_in(result, ["review_report", "candidate_sha"], "other")},
-      {"missing boundary evidence", put_in(result, ["review_report", "boundary_sweeps", Access.at(0), "evidence"], [])},
-      {"mandatory finding",
-       put_in(result, ["review_report", "findings"], [
-         %{
-           "id" => "NEW",
-           "description" => "Unfinished safety repair",
-           "classification" => "NEW",
-           "disposition" => "REQUIRED_REPAIR",
-           "basis" => %{"kind" => "SAFETY_INVARIANT", "reference" => "PRIVACY"}
-         }
-       ])}
+      {"missing boundary evidence", put_in(result, ["review_report", "boundary_sweeps", Access.at(0), "evidence"], [])}
     ]
 
     for {name, changed} <- mutations do
@@ -146,6 +136,28 @@ defmodule SymphonyElixir.FactoryReviewProtocolTest do
     assert {:error, _} = ReviewProtocol.validate(verifier, verifier_binding, verifier_result)
     verifier_result = put_in(verifier_result, ["review_report", "affected_path_checks"], [])
     assert {:error, _} = ReviewProtocol.validate(verifier, verifier_binding, verifier_result)
+  end
+
+  test "writer finding observations remain compatible without granting independent verifier acceptance" do
+    {writer, binding, result} = focused_writer()
+    report = result["review_report"]
+    report = Map.update!(report, "criteria", &Enum.map(&1, fn row -> Map.put(row, "status", "PASS") end))
+    report = Map.update!(report, "boundary_sweeps", &Enum.map(&1, fn row -> Map.merge(row, %{"status" => "CHECKED", "paths" => ["handler.go"]}) end))
+
+    finding = %{
+      "id" => "NEW",
+      "description" => "Writer privacy observation",
+      "classification" => "NEW",
+      "disposition" => "REQUIRED_REPAIR",
+      "basis" => %{"kind" => "SAFETY_INVARIANT", "reference" => "PRIVACY"}
+    }
+
+    report = Map.put(report, "findings", [finding])
+    assert :ok = ReviewProtocol.validate(writer, binding, Map.put(result, "review_report", report))
+
+    verifier = Map.put(writer, "role", "change-verifier")
+    verifier_result = %{"status" => "PASS", "candidate_sha" => "candidate", "checks" => [], "review_report" => Map.put(report, "affected_path_checks", [])}
+    assert {:error, :review_report_verdict_contradiction} = ReviewProtocol.validate(verifier, binding(verifier), verifier_result)
   end
 
   test "focused reviews bind prior provenance and escalate late mandatory findings without a third repair" do

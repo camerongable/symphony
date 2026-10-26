@@ -144,16 +144,27 @@ defmodule SymphonyElixir.Factory.TicketPushIO do
   @typed_review_history Path.expand("../../../priv/ticket_push_history_validator_v21.py", __DIR__)
   @external_resource @typed_review_history
   @typed_review_history_sha :crypto.hash(:sha256, File.read!(@typed_review_history)) |> Base.encode16(case: :lower)
-  @capability_origins Path.expand("../../../priv/ticket_push_readback_origins_v15.json", __DIR__)
+  @writer_readiness_helper Path.expand("../../../priv/ticket_push_executor_v29.py", __DIR__)
+  @external_resource @writer_readiness_helper
+  @writer_readiness_helper_sha :crypto.hash(:sha256, File.read!(@writer_readiness_helper)) |> Base.encode16(case: :lower)
+  @writer_readiness_capability_helper Path.expand("../../../priv/ticket_push_executor_v30.py", __DIR__)
+  @external_resource @writer_readiness_capability_helper
+  @writer_readiness_capability_helper_sha :crypto.hash(:sha256, File.read!(@writer_readiness_capability_helper)) |> Base.encode16(case: :lower)
+  @writer_readiness_history Path.expand("../../../priv/ticket_push_history_validator_v22.py", __DIR__)
+  @external_resource @writer_readiness_history
+  @writer_readiness_history_sha :crypto.hash(:sha256, File.read!(@writer_readiness_history)) |> Base.encode16(case: :lower)
+  @capability_origins Path.expand("../../../priv/ticket_push_readback_origins_v16.json", __DIR__)
   @external_resource @capability_origins
   @capability_origins_raw File.read!(@capability_origins)
   @capability_origins_sha :crypto.hash(:sha256, @capability_origins_raw) |> Base.encode16(case: :lower)
-  @capability_reader Path.expand("../../../priv/ticket_push_status_reader_v15.py", __DIR__)
+  @capability_reader Path.expand("../../../priv/ticket_push_status_reader_v16.py", __DIR__)
   @external_resource @capability_reader
   @capability_reader_sha :crypto.hash(:sha256, File.read!(@capability_reader)) |> Base.encode16(case: :lower)
   @large_helper_shas [
+    @writer_readiness_helper_sha,
     @typed_review_helper_sha,
     @current_review_helper_sha,
+    @writer_readiness_capability_helper_sha,
     @typed_review_capability_helper_sha,
     @current_review_capability_helper_sha,
     @capability_helper_sha,
@@ -353,7 +364,13 @@ defmodule SymphonyElixir.Factory.TicketPushIO do
          :ok <- TicketCiRepairSuccessor.recheck_push_context(store, run, Map.take(binding, ~w(ci_evidence_successor ci_repair_policy_receipt verified_ci_rollover ordinary_verifier_repair)), store),
          {:ok, inputs} <- TicketCiRepair.input_snapshot(store, run["run_id"]),
          true <- input_proof(inputs) == execution["ci_human_inputs"] or {:error, :ticket_push_execution_changed},
-         {:ok, history} <- observe_history(store, run["run_id"], prepared.mode, execution["helper_sha256"] in [@typed_review_helper_sha, @typed_review_capability_helper_sha]),
+         {:ok, history} <-
+           observe_history(
+             store,
+             run["run_id"],
+             prepared.mode,
+             execution["helper_sha256"] in [@writer_readiness_helper_sha, @writer_readiness_capability_helper_sha, @typed_review_helper_sha, @typed_review_capability_helper_sha]
+           ),
          true <- Map.put_new(history, "successors_json", "[]") == execution["worker_history"] or {:error, :ticket_push_execution_changed} do
       :ok
     end
@@ -455,6 +472,12 @@ defmodule SymphonyElixir.Factory.TicketPushIO do
   defp large_payload_program(@current_review_capability_helper_sha),
     do: {"ticket_push_executor_v26.py", "ticket_push_history_validator_v20.py", @current_review_history_sha, @current_review_capability_helper}
 
+  defp large_payload_program(@writer_readiness_helper_sha),
+    do: {"ticket_push_executor_v29.py", "ticket_push_history_validator_v22.py", @writer_readiness_history_sha, @writer_readiness_helper}
+
+  defp large_payload_program(@writer_readiness_capability_helper_sha),
+    do: {"ticket_push_executor_v30.py", "ticket_push_history_validator_v22.py", @writer_readiness_history_sha, @writer_readiness_capability_helper}
+
   defp large_payload_program(@typed_review_helper_sha),
     do: {"ticket_push_executor_v27.py", "ticket_push_history_validator_v21.py", @typed_review_history_sha, @typed_review_helper}
 
@@ -535,8 +558,8 @@ defmodule SymphonyElixir.Factory.TicketPushIO do
     end
   end
 
-  defp history_program(:capability), do: {"ticket_push_history_validator_v21.py", @typed_review_history_sha}
-  defp history_program(:large), do: {"ticket_push_history_validator_v21.py", @typed_review_history_sha}
+  defp history_program(:capability), do: {"ticket_push_history_validator_v22.py", @writer_readiness_history_sha}
+  defp history_program(:large), do: {"ticket_push_history_validator_v22.py", @writer_readiness_history_sha}
   defp observe_history(store, run_id, mode, review? \\ true)
   defp observe_history(store, run_id, mode, true), do: TicketPushWorkerHistory.observe_review(store, run_id, mode)
   defp observe_history(store, run_id, :capability, false), do: TicketPushWorkerHistory.observe_capability(store, run_id)
@@ -602,8 +625,10 @@ defmodule SymphonyElixir.Factory.TicketPushIO do
            @budget_helper_sha,
            @current_helper_sha,
            @capability_helper_sha,
+           @writer_readiness_helper_sha,
            @typed_review_helper_sha,
            @current_review_helper_sha,
+           @writer_readiness_capability_helper_sha,
            @typed_review_capability_helper_sha,
            @current_review_capability_helper_sha,
            @review_helper_sha,
@@ -684,8 +709,10 @@ defmodule SymphonyElixir.Factory.TicketPushIO do
              @budget_helper_sha,
              @current_helper_sha,
              @capability_helper_sha,
+             @writer_readiness_helper_sha,
              @typed_review_helper_sha,
              @current_review_helper_sha,
+             @writer_readiness_capability_helper_sha,
              @typed_review_capability_helper_sha,
              @current_review_capability_helper_sha,
              @review_helper_sha,
@@ -729,8 +756,10 @@ defmodule SymphonyElixir.Factory.TicketPushIO do
              @budget_helper_sha,
              @current_helper_sha,
              @capability_helper_sha,
+             @writer_readiness_helper_sha,
              @typed_review_helper_sha,
              @current_review_helper_sha,
+             @writer_readiness_capability_helper_sha,
              @typed_review_capability_helper_sha,
              @current_review_capability_helper_sha,
              @review_helper_sha,
@@ -913,8 +942,8 @@ defmodule SymphonyElixir.Factory.TicketPushIO do
   end
 
   defp execution_helper(execution, _mode) do
-    capability_helpers = [@typed_review_capability_helper_sha, @current_review_capability_helper_sha, @review_capability_helper_sha, @capability_helper_sha]
-    executable_helpers = [@typed_review_helper_sha, @current_review_helper_sha, @review_helper_sha, @acknowledged_helper_sha | capability_helpers]
+    capability_helpers = [@writer_readiness_capability_helper_sha, @typed_review_capability_helper_sha, @current_review_capability_helper_sha, @review_capability_helper_sha, @capability_helper_sha]
+    executable_helpers = [@writer_readiness_helper_sha, @typed_review_helper_sha, @current_review_helper_sha, @review_helper_sha, @acknowledged_helper_sha | capability_helpers]
     mode = if execution["helper_sha256"] in capability_helpers, do: :capability, else: :large
 
     with true <- execution["helper_sha256"] in executable_helpers,
@@ -959,8 +988,8 @@ defmodule SymphonyElixir.Factory.TicketPushIO do
          true <- execution["companion_path"] == Path.join(Path.dirname(execution["helper_path"]), "worker_file_companion.py"),
          true <- execution["companion_sha256"] == @companion_sha,
          :ok <- status_program(helper, @capability_helper_sha, execution["root"]),
-         {:ok, reader} <- PathSafety.canonicalize(Application.app_dir(:symphony_elixir, "priv/ticket_push_status_reader_v15.py")),
-         {:ok, origins} <- PathSafety.canonicalize(Application.app_dir(:symphony_elixir, "priv/ticket_push_readback_origins_v15.json")),
+         {:ok, reader} <- PathSafety.canonicalize(Application.app_dir(:symphony_elixir, "priv/ticket_push_status_reader_v16.py")),
+         {:ok, origins} <- PathSafety.canonicalize(Application.app_dir(:symphony_elixir, "priv/ticket_push_readback_origins_v16.json")),
          :ok <- status_program(reader, @capability_reader_sha, execution["root"]),
          :ok <- status_program(origins, @capability_origins_sha, execution["root"]) do
       {:ok, reader}
@@ -983,8 +1012,10 @@ defmodule SymphonyElixir.Factory.TicketPushIO do
           @legacy_v18_helper_sha,
           @legacy_v19_helper_sha,
           @legacy_v20_helper_sha,
+          @writer_readiness_helper_sha,
           @typed_review_helper_sha,
           @current_review_helper_sha,
+          @writer_readiness_capability_helper_sha,
           @typed_review_capability_helper_sha,
           @current_review_capability_helper_sha,
           @review_helper_sha,
@@ -1014,7 +1045,9 @@ defmodule SymphonyElixir.Factory.TicketPushIO do
 
   defp capability_status_origin?(execution) do
     local =
-      local_capability?(execution, "ticket_push_executor_v27.py", @typed_review_helper_sha) or
+      local_capability?(execution, "ticket_push_executor_v29.py", @writer_readiness_helper_sha) or
+        local_capability?(execution, "ticket_push_executor_v30.py", @writer_readiness_capability_helper_sha) or
+        local_capability?(execution, "ticket_push_executor_v27.py", @typed_review_helper_sha) or
         local_capability?(execution, "ticket_push_executor_v28.py", @typed_review_capability_helper_sha) or
         local_capability?(execution, "ticket_push_executor_v25.py", @current_review_helper_sha) or
         local_capability?(execution, "ticket_push_executor_v26.py", @current_review_capability_helper_sha) or
@@ -1263,11 +1296,11 @@ defmodule SymphonyElixir.Factory.TicketPushIO do
     end
   end
 
-  defp helper_name(:capability), do: "ticket_push_executor_v28.py"
+  defp helper_name(:capability), do: "ticket_push_executor_v30.py"
 
   defp helper_name(mode) do
     case mode do
-      :large -> "ticket_push_executor_v27.py"
+      :large -> "ticket_push_executor_v29.py"
       :current -> "ticket_push_executor_v11.py"
       :ordinary_repair -> "ticket_push_executor_v9.py"
       :successor -> "ticket_push_executor_v6.py"
@@ -1281,8 +1314,8 @@ defmodule SymphonyElixir.Factory.TicketPushIO do
   defp helper_sha(:successor), do: @successor_helper_sha
   defp helper_sha(:ordinary_repair), do: @ordinary_helper_sha
   defp helper_sha(:current), do: @current_helper_sha
-  defp helper_sha(:large), do: @typed_review_helper_sha
-  defp helper_sha(:capability), do: @typed_review_capability_helper_sha
+  defp helper_sha(:large), do: @writer_readiness_helper_sha
+  defp helper_sha(:capability), do: @writer_readiness_capability_helper_sha
   defp helper_sha(:human_import), do: @import_helper_sha
   defp helper_sha(:previous_successor), do: @previous_successor_helper_sha
   defp helper_sha(true), do: @next_ci_helper_sha

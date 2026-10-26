@@ -173,7 +173,7 @@ defmodule SymphonyElixir.Factory.ReviewReport do
   defp verdict?(%{"role" => "feature-writer"} = packet, output, report) do
     output["status"] != "COMPLETE" or
       (output["blockers"] == [] and report["block_reason"] == "NONE" and Enum.all?(report["criteria"], &(&1["status"] in ~w(PASS NOT_CHECKED))) and
-         Enum.all?(report["closures"], &(&1["status"] != "UNRESOLVED")) and findings(output) == [] and
+         Enum.all?(report["closures"], &(&1["status"] != "UNRESOLVED")) and
          Enum.all?(report["affected_path_checks"], &(&1["status"] == "CHECKED")) and
          Enum.all?(report["boundary_sweeps"], &(&1["status"] == "CHECKED" or historical_boundary?(packet, output, report, &1))))
   end

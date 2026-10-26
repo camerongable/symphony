@@ -187,6 +187,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
     unless ctx[:parent_bound], do: bind_parent(ctx)
     candidate = candidate || ctx[:candidate_sha] || ctx.sha
     criteria = if ctx[:structured_review], do: "AC-1: fixture behavior and boundary coverage.", else: "Updated verifier contract."
+    criteria = if ctx[:policy_stop_continuation], do: criteria <> " AC-2: unchanged verified behavior.", else: criteria
     contract = Contract.bind("PPL-123", 2, criteria <> "\n\n## Manual Validation\n- Required: no")
     {:ok, existing_run} = RunLedger.get(ctx.store, "run")
     snapshot = Jason.decode!(existing_run["snapshot_json"])
@@ -638,6 +639,15 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
       "affected_path_checks" => []
     }
 
+    report =
+      if ctx.writer_status == "COMPLETE" do
+        report
+        |> Map.update!("boundary_sweeps", &Enum.map(&1, fn row -> if row["id"] == "AC-2", do: Map.merge(row, %{"status" => "UNAVAILABLE", "paths" => []}), else: row end))
+        |> Map.put("affected_path_checks", [%{"id" => "repaired source boundary", "status" => "CHECKED", "evidence" => ["fixture.txt:1 inspected source; tests NOT_RUN"]}])
+      else
+        report
+      end
+
     continuing? = ctx.writer_status == "CONTINUE"
 
     output = %{
@@ -670,6 +680,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
 
     assert {:ok, _} = SymphonyElixir.Factory.Controller.cached_generation_policy(recovered, "grail")
     context = %{context | store: recovered}
+    assert_preserved_writer_provenance(recovered, key, output)
     {:ok, task} = TaskLedger.get(store, key)
     native = %{"id" => task["thread_id"], "cwd" => ctx.path, "projectId" => task["codex_project_id"], "updatedAt" => 1, "status" => %{"type" => "idle"}}
     turn = %{"id" => task["turn_id"], "status" => "completed", "items" => []}
@@ -695,17 +706,35 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
     assert {:ok, _} = RunLedger.update(replay, "run", %{state: "REPAIRING"})
     assert {:error, :implementation_iteration_limit} = Scheduler.ticket_step(%{context | store: replay}, "run", options)
     assert {:ok, _} = RunLedger.update(replay, "run", %{state: run["state"]})
-    GenServer.stop(replay)
 
     unless continuing? do
-      assert {:ok, proof} = SymphonyElixir.Factory.RepairObligations.ordinary_preflight(store, run)
+      assert {:ok, proof} = SymphonyElixir.Factory.RepairObligations.ordinary_preflight(replay, run)
       assert proof["version"] == 3
       path = Path.join(ctx.root, "policy-stop-publication-proof.json")
       File.write!(path, Jason.encode!(%{"run" => run, "proof" => proof}))
       assert {"PHYSICAL_POLICY_STOP_PUBLICATION_PASS\n", 0} = System.cmd("python3", ["-B", "test/support/check_policy_stop_publication.py", ctx.database, path])
     end
 
+    GenServer.stop(replay)
     GenServer.stop(recovered)
+  end
+
+  defp assert_preserved_writer_provenance(store, key, output) do
+    {:ok, task} = TaskLedger.get(store, key)
+    evidence = Store.one!(store, "SELECT * FROM worker_evidence WHERE task_key=? ORDER BY rowid DESC LIMIT 1", [key])
+    binding = Jason.decode!(evidence["binding_json"])
+    assert Jason.decode!(evidence["output_json"]) == output
+    assert :ok = ReviewProtocol.validate_result(store, task, binding, output)
+    {:ok, packet} = ReviewProtocol.context(store, task)
+    origin = hd(packet["review_protocol"]["review_scope"]["carried_evidence"])
+    prior = Store.one!(store, "SELECT * FROM worker_evidence WHERE request_key=?", [origin["request_key"]])
+
+    Store.query!(store, "UPDATE worker_evidence SET output_sha256=? WHERE request_key=?", [String.duplicate("0", 64), origin["request_key"]])
+    assert {:error, :review_report_scope_unproven} = ReviewProtocol.validate_result(store, task, binding, output)
+    Store.query!(store, "UPDATE worker_evidence SET output_sha256=? WHERE request_key=?", [prior["output_sha256"], origin["request_key"]])
+    assert :ok = ReviewProtocol.validate_result(store, task, binding, output)
+    assert {:ok, ^packet} = ReviewProtocol.context(store, task)
+    assert Store.one!(store, "SELECT * FROM worker_evidence WHERE task_key=? ORDER BY rowid DESC LIMIT 1", [key]) == evidence
   end
 
   defp assert_iteration_authority_selector(store, context, options) do
@@ -801,6 +830,13 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
       packet = Jason.decode!(prompt)
       assert packet["review_protocol"]["repairs_used"] == round
       output = structured_repair(packet, candidate, "new finding #{round}")
+
+      output =
+        if ctx[:policy_stop_continuation] do
+          update_in(output, ["review_report", "criteria"], &Enum.map(&1, fn row -> if row["id"] == "AC-2", do: Map.put(row, "status", "PASS"), else: row end))
+        else
+          output
+        end
 
       output =
         if correction? != false and round == last_round,

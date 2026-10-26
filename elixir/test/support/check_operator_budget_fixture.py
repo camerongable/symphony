@@ -21,7 +21,7 @@ with sqlite3.connect(Path(database).as_uri() + '?mode=ro', uri=True) as connecti
     mapping = dict(connection.execute('SELECT * FROM worker_instruction_task_bindings WHERE task_key=? AND prompt_sha256=?', (worker['task_key'], binding['input_sha256'])).fetchone())
     reviewed = json.loads(connection.execute('SELECT binding_json FROM worker_instruction_snapshots WHERE binding_sha256=?', (mapping['instruction_binding_sha256'],)).fetchone()[0])
     if reviewed.get('review_protocol', {}).get('version') == 2 or 'review_policy_stop' in ref:
-        typed_path = path.with_name('ticket_push_history_validator_v21.py')
+        typed_path = path.with_name('ticket_push_history_validator_v22.py')
         typed_spec = importlib.util.spec_from_file_location('typed_review_history', typed_path)
         history = importlib.util.module_from_spec(typed_spec)
         typed_spec.loader.exec_module(history)

@@ -6,7 +6,7 @@ import sqlite3
 import sys
 
 database, packet_path = sys.argv[1:]
-path = Path(__file__).resolve().parents[2] / 'priv/ticket_push_history_validator_v21.py'
+path = Path(__file__).resolve().parents[2] / 'priv/ticket_push_history_validator_v22.py'
 spec = importlib.util.spec_from_file_location('policy_stop_history', path)
 history = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(history)

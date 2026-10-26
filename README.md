@@ -132,6 +132,11 @@ The controller and successor physical publication codec both validate its scope.
 Source writers may report classified observations and honestly unrun checks;
 source-ready completion does not replace independent verifier acceptance. Rejected
 stopped reports surface a concrete factory action without discarding their edits.
+For v2 writers without controller-bound affected paths, descriptive path checks
+are supplemental source evidence, not verifier coverage. A focused writer may
+leave an unchanged boundary unavailable only with a same-criterion NOT_CHECKED
+row and authenticated latest historical PASS provenance. Independent verifier
+PASS still requires all admitted criteria and bound path checks to pass.
 One explicit, deterministic report-only correction can reconcile duplicated v1
 finding descriptions without changing original bytes, evidence, verdict, or repair
 budget. An exact policy-stopped REPAIR can receive a separately journaled,

@@ -94,6 +94,17 @@ independent findings. Stopped report rejections are projected read-only from the
 exact current receipt, with a factory-owned recovery action rather than a generic
 waiting message. Consumption or changed task identity removes that projection.
 
+Version-2 writers without an `affected_paths` key may supply descriptive source
+checks with unique nonblank IDs and nonempty evidence. COMPLETE requires these
+checks CHECKED; they do not imply bound verifier coverage. Only focused writers
+may retain an UNAVAILABLE boundary with empty paths, paired with a NOT_CHECKED
+criterion and authenticated latest historical PASS evidence for that criterion.
+No prior PASS, missing provenance, or a comprehensive scope permits that exception.
+Independent verifier PASS remains strict: all criteria PASS, admitted boundaries
+and path checks CHECKED, resolved closures, exact candidate, and no required finding.
+New physical publication uses validator v22 and executors v29/v30; reader v16
+retains historical helper identities without modifying retained programs.
+
 An explicitly configured `ticket_supervisor.source_completion_confirmations`
 entry may authorize one read-only confirmation at the exhausted implementation
 limit. It binds the exact run, candidate, contract, counters, and consumed

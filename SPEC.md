@@ -2356,9 +2356,20 @@ using the exact admitted verifier schema; retained codecs MUST remain immutable.
 Writer finding classifications are advisory observations, not verifier verdicts.
 Writer COMPLETE denotes source readiness for controller validation and MAY retain
 NOT_CHECKED criteria when checks cannot execute in the writer sandbox. It MUST
-still have complete inspected evidence, checked boundaries, no failed criterion,
-no unresolved closure, and no blocker. Independent verifier PASS MUST continue to
-require every criterion to pass. A rejected stopped result MUST remain immutable
+still have complete source evidence, no failed criterion, no unresolved closure,
+and no blocker. For version-2 writers only, affected-path checks without an
+admitted `affected_paths` key are supplemental descriptive checks with unique
+nonblank IDs and nonempty evidence; COMPLETE MUST mark those checks CHECKED.
+Explicitly bound paths MUST retain exact coverage, including empty bindings.
+A focused writer MAY retain an UNAVAILABLE boundary with empty paths only when
+the same-ID criterion is NOT_CHECKED and its latest carried criterion is PASS,
+with nonempty evidence and authenticated request/output/candidate provenance.
+COMPREHENSIVE writers and boundaries without qualifying history MUST remain
+CHECKED; CHECKED boundaries MUST have nonempty path evidence. This MUST NOT
+rewrite admitted schema, output, history, or advisory writer findings.
+Independent verifier PASS MUST continue to require every criterion PASS, every
+admitted boundary and path check CHECKED, resolved closures, exact candidate
+identity, and no mandatory findings. A rejected stopped result MUST remain immutable
 and MUST expose a current, evidence-bound factory recovery action; healthy ticks
 MUST NOT hide that rejection or imply progress.
 
