@@ -1689,6 +1689,9 @@ def ordinary_repair_proof(connection, execution, binding, run, historical=False)
     expected_findings = review_finding_entries(run['contract_sha256'], verifier[0], verifier[1], verifier[2], verifier[3])
     if proof['version'] in (2,3):
         operator_repair_authority(connection,proof,run,verifier,packet,expected_findings)
+        allowance = proof['operator_authorization'].get('review_policy_stop', {}).get('source_allowance')
+        if allowance is not None:
+            require(packet['implementation_iteration'] == allowance['prior_implementation_iteration'] and run['implementation_iteration'] == allowance['next_implementation_iteration'])
     if 'repair_review' in packet:
         review = packet['repair_review']; require(type(review) is dict)
         require(review['prior_candidate_sha'] == proof['reviewed_candidate_sha'] and review['verifier_request_key'] == proof['verifier_request_key'] and review['verifier_output_sha256'] == proof['verifier_output_sha256'])
@@ -1844,6 +1847,22 @@ def validate_review_admission(connection, worker, binding, output, packet):
 
 
 def validate_operator_budget(auth, input, prior):
+    if auth.get('version') == 4:
+        require(auth['kind'] == 'REVIEW_POLICY_STOP_CONTINUATION_V2' and auth['automatic_repairs_used'] == 2 and auth['operator_repair_limit'] == 1)
+        reference = input['review_policy_stop']
+        require(type(reference['version']) is int and reference['version'] == 2)
+        configured, effective = auth['configured_limits'], auth['limits']
+        require(set(configured) == set(effective) == {'maximum_implementation_iterations', 'maximum_code_repair_rounds'})
+        require(all(type(value) is int and value >= 0 for value in list(configured.values()) + list(effective.values())))
+        require(type(prior['implementation_iteration']) is int and type(prior['code_repair_round']) is int)
+        require(prior['implementation_iteration'] >= configured['maximum_implementation_iterations'] and prior['code_repair_round'] >= configured['maximum_code_repair_rounds'])
+        expected = dict(configured_implementation_limit=configured['maximum_implementation_iterations'], prior_implementation_iteration=prior['implementation_iteration'], next_implementation_iteration=prior['implementation_iteration']+1, configured_code_repair_limit=configured['maximum_code_repair_rounds'], prior_code_repair_round=prior['code_repair_round'], next_code_repair_round=prior['code_repair_round']+1, maximum_additional_iterations=1)
+        require(reference['source_allowance'] == expected and all(type(value) is int for value in reference['source_allowance'].values()))
+        require(effective == dict(maximum_implementation_iterations=expected['next_implementation_iteration'], maximum_code_repair_rounds=expected['next_code_repair_round']))
+        budget = {key:input[key] for key in 'run_id candidate_sha spec_revision contract_sha256 verifier_request_key verifier_output_sha256 authorization_reference'.split()}
+        budget.update(kind='ONE_VERIFIER_REPAIR', verifier_round=prior['verifier_round'], prior_code_repair_round=prior['code_repair_round'], next_code_repair_round=prior['code_repair_round']+1, configured_limit=configured['maximum_code_repair_rounds'])
+        require(auth['budget_exception'] == budget)
+        return
     if auth.get('version') == 3:
         require(auth['kind'] == 'REVIEW_POLICY_STOP_CONTINUATION_V1' and auth['automatic_repairs_used'] == 2 and auth['operator_repair_limit'] == 1 and 'review_policy_stop' in input)
         return validate_operator_budget(dict(auth, version=2 if 'budget_exception' in auth else 1), input, prior)
@@ -1882,8 +1901,8 @@ def operator_repair_authority(connection,proof,run,verifier,packet,findings):
         require(len(found)==1 and sha(found[0]['payload_json'].encode())==ref[prefix+'_sha256'])
         events.append(decode(found[0]['payload_json'],262144))
     auth,applied=events
-    continuation = auth.get('version') == 3
-    require(type(auth['version']) is int and auth['version'] in (1,2,3) and auth['kind']==('REVIEW_POLICY_STOP_CONTINUATION_V1' if continuation else 'BLOCKED_VERIFIER_REPAIR_AUTHORIZATION_V'+str(auth['version'])) and auth['authority']=='LOCAL_OPERATOR_AUTHORIZATION')
+    continuation = auth.get('version') in (3,4)
+    require(type(auth['version']) is int and auth['version'] in (1,2,3,4) and auth['kind']==('REVIEW_POLICY_STOP_CONTINUATION_V'+str(auth['version']-2) if continuation else 'BLOCKED_VERIFIER_REPAIR_AUTHORIZATION_V'+str(auth['version'])) and auth['authority']=='LOCAL_OPERATOR_AUTHORIZATION')
     input=auth['authorization']; prior=auth['run']
     input_fields=set('authorization_key run_id candidate_sha spec_revision contract_sha256 verifier_request_key verifier_output_sha256 authorization_reference authorization_body repair_instructions'.split())
     if continuation: input_fields.add('review_policy_stop')
@@ -1911,9 +1930,13 @@ def operator_repair_authority(connection,proof,run,verifier,packet,findings):
     expected_terminal={'version':1,'kind':'TICKET_VERIFIER_TERMINAL_V1','reason':'verification_blocked','request_key':worker['request_key'],'task_key':worker['task_key'],'binding_sha256':worker['binding_sha256'],'output_sha256':worker['output_sha256'],'prior_run':before}
     if continuation:
         reference = input['review_policy_stop']
-        require(reference == ref['review_policy_stop'] and set(reference) == set('version automatic_repairs_used policy_event_id policy_sha256 required_finding_ids'.split()))
+        reference_fields = set('version automatic_repairs_used policy_event_id policy_sha256 required_finding_ids'.split())
+        if auth['version'] == 4: reference_fields.add('source_allowance')
+        require(reference == ref['review_policy_stop'] and set(reference) == reference_fields)
         require(type(reference['policy_event_id']) is int and reference['policy_event_id'] > 0 and hex_digest(reference['policy_sha256']))
-        require(type(reference['version']) is int and reference['version'] == 1 and type(reference['automatic_repairs_used']) is int and reference['automatic_repairs_used'] == 2)
+        require(type(reference['version']) is int and reference['version'] == (2 if auth['version'] == 4 else 1) and type(reference['automatic_repairs_used']) is int and reference['automatic_repairs_used'] == 2)
+        if auth['version'] == 4:
+            require(packet['implementation_iteration'] == prior['implementation_iteration'] and packet['code_repair_round'] == prior['code_repair_round']+1)
         require(reference['required_finding_ids'] == [row['id'] for row in findings])
         policy_rows = rows(connection, "SELECT * FROM events WHERE id=? AND run_id=? AND event_type='TICKET_REVIEW_DECISION'", (reference['policy_event_id'], run['run_id']))
         require(len(policy_rows) == 1 and sha(policy_rows[0]['payload_json'].encode()) == reference['policy_sha256'])

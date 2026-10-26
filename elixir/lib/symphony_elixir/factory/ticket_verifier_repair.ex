@@ -47,8 +47,9 @@ defmodule SymphonyElixir.Factory.TicketVerifierRepair do
          true <- proof["authority"] == "LOCAL_OPERATOR_AUTHORIZATION",
          :ok <- valid_input(proof["authorization"]),
          input = proof["authorization"],
-         true <- policy_stop?(input) == (proof["version"] == 3),
-         prior = proof["run"],
+         true <- policy_stop?(input) == proof["version"] in [3, 4],
+         true <- source_allowance?(input) == (proof["version"] == 4),
+         prior when is_map(prior) <- proof["run"],
          true <- valid_archived_budget?(proof, input, prior),
          true <- Map.take(input, ~w(run_id candidate_sha spec_revision contract_sha256)) == Map.take(prior, ~w(run_id candidate_sha spec_revision contract_sha256)),
          true <- Map.take(packet, ~w(run_id spec_revision contract_sha256)) == Map.take(prior, ~w(run_id spec_revision contract_sha256)),
@@ -107,6 +108,26 @@ defmodule SymphonyElixir.Factory.TicketVerifierRepair do
   end
 
   defp valid_applied_tick?(_, _), do: false
+
+  @doc "Derives one exact applied operator iteration ceiling without changing configured policy."
+  @spec implementation_limit(Store.connection(), map(), map()) :: non_neg_integer()
+  def implementation_limit(store, run, factory) do
+    configured = factory.maximum_implementation_iterations
+
+    with true <- run["state"] == "REPAIRING" and run["execution_mode"] == "TICKET_SUPERVISOR_V1",
+         [[raw]] <- Store.query!(store, "SELECT payload_json FROM events WHERE event_type=? AND run_id=? AND json_extract(payload_json,'$.version')=4", [@authorized, run["run_id"]]).rows,
+         {:ok, proof} <- Jason.decode(raw),
+         prior = proof["run"],
+         true <- Map.take(run, @terminal_fields) == Map.update!(Map.take(prior, @terminal_fields), "code_repair_round", &(&1 + 1)),
+         true <- proof["configured_limits"] == %{"maximum_implementation_iterations" => configured, "maximum_code_repair_rounds" => factory.maximum_code_repair_rounds},
+         {:ok, verifier} <- WorkerEvidence.get(store, proof["authorization"]["verifier_request_key"]),
+         {:ok, reference} when is_map(reference) <- review_authority(store, run, verifier),
+         true <- get_in(reference, ["review_policy_stop", "source_allowance"]) == source_binding(prior, configured, factory.maximum_code_repair_rounds) do
+      prior["implementation_iteration"] + 1
+    else
+      _ -> configured
+    end
+  end
 
   @doc "Selects only a staged, unconsumed operator authorization; does not grant worker admission."
   @spec pending?(Store.connection(), String.t()) :: boolean()
@@ -456,7 +477,7 @@ defmodule SymphonyElixir.Factory.TicketVerifierRepair do
          true <- is_nil(pending_amendment),
          true <- WorkerEvidence.pending(store, run["run_id"]) == [],
          {:ok, _budget} <- repair_budget(factory, run, input),
-         true <- run["implementation_iteration"] < factory.maximum_implementation_iterations do
+         {:ok, _implementation_limit} <- implementation_budget(factory, run, input) do
       :ok
     else
       _ -> {:error, :verifier_repair_admission_unavailable}
@@ -515,15 +536,56 @@ defmodule SymphonyElixir.Factory.TicketVerifierRepair do
 
     proof = if policy_stop?(input), do: Map.merge(proof, %{"version" => 3, "kind" => "REVIEW_POLICY_STOP_CONTINUATION_V1", "automatic_repairs_used" => 2, "operator_repair_limit" => 1}), else: proof
 
-    if budget.exception do
+    proof =
+      if budget.exception do
+        proof
+        |> Map.put("version", if(policy_stop?(input), do: 3, else: 2))
+        |> Map.put("kind", if(policy_stop?(input), do: "REVIEW_POLICY_STOP_CONTINUATION_V1", else: "BLOCKED_VERIFIER_REPAIR_AUTHORIZATION_V2"))
+        |> Map.put("budget_exception", budget.exception)
+        |> Map.put("configured_limits", Map.put(proof["limits"], "maximum_code_repair_rounds", factory.maximum_code_repair_rounds))
+      else
+        proof
+      end
+
+    if source_allowance?(input) do
+      {:ok, limit} = implementation_budget(factory, observed.run, input)
+
       proof
-      |> Map.put("version", if(policy_stop?(input), do: 3, else: 2))
-      |> Map.put("kind", if(policy_stop?(input), do: "REVIEW_POLICY_STOP_CONTINUATION_V1", else: "BLOCKED_VERIFIER_REPAIR_AUTHORIZATION_V2"))
-      |> Map.put("budget_exception", budget.exception)
-      |> Map.put("configured_limits", Map.put(proof["limits"], "maximum_code_repair_rounds", factory.maximum_code_repair_rounds))
+      |> Map.merge(%{"version" => 4, "kind" => "REVIEW_POLICY_STOP_CONTINUATION_V2"})
+      |> put_in(["limits", "maximum_implementation_iterations"], limit)
     else
       proof
     end
+  end
+
+  defp source_allowance?(input), do: get_in(input, ["review_policy_stop", "version"]) == 2
+
+  defp implementation_budget(factory, run, input) do
+    configured = factory.maximum_implementation_iterations
+
+    cond do
+      source_allowance?(input) and run["implementation_iteration"] >= configured and run["code_repair_round"] >= factory.maximum_code_repair_rounds and
+          get_in(input, ["review_policy_stop", "source_allowance"]) === source_binding(run, configured, factory.maximum_code_repair_rounds) ->
+        {:ok, run["implementation_iteration"] + 1}
+
+      not source_allowance?(input) and run["implementation_iteration"] < configured ->
+        {:ok, configured}
+
+      true ->
+        {:error, :verifier_repair_implementation_budget_unproven}
+    end
+  end
+
+  defp source_binding(run, implementation_limit, repair_limit) do
+    %{
+      "configured_implementation_limit" => implementation_limit,
+      "prior_implementation_iteration" => run["implementation_iteration"],
+      "next_implementation_iteration" => run["implementation_iteration"] + 1,
+      "configured_code_repair_limit" => repair_limit,
+      "prior_code_repair_round" => run["code_repair_round"],
+      "next_code_repair_round" => run["code_repair_round"] + 1,
+      "maximum_additional_iterations" => 1
+    }
   end
 
   defp repair_budget(factory, run, input) do
@@ -565,6 +627,15 @@ defmodule SymphonyElixir.Factory.TicketVerifierRepair do
       valid_archived_budget?(Map.put(proof, "version", if(Map.has_key?(proof, "budget_exception"), do: 2, else: 1)), input, prior)
   end
 
+  defp valid_archived_budget?(%{"version" => 4, "configured_limits" => configured, "limits" => effective} = proof, input, prior) do
+    policy_stop?(input) and source_allowance?(input) and proof["automatic_repairs_used"] === 2 and proof["operator_repair_limit"] === 1 and
+      valid_limits?(configured) and valid_limits?(effective) and
+      prior["implementation_iteration"] >= configured["maximum_implementation_iterations"] and prior["code_repair_round"] >= configured["maximum_code_repair_rounds"] and
+      get_in(input, ["review_policy_stop", "source_allowance"]) === source_binding(prior, configured["maximum_implementation_iterations"], configured["maximum_code_repair_rounds"]) and
+      proof["budget_exception"] === budget_binding(input, prior, configured["maximum_code_repair_rounds"]) and
+      effective === %{"maximum_implementation_iterations" => prior["implementation_iteration"] + 1, "maximum_code_repair_rounds" => prior["code_repair_round"] + 1}
+  end
+
   defp valid_archived_budget?(proof, _input, _prior),
     do: proof["version"] == 1 and not Map.has_key?(proof, "budget_exception") and not Map.has_key?(proof, "configured_limits")
 
@@ -582,6 +653,7 @@ defmodule SymphonyElixir.Factory.TicketVerifierRepair do
   defp valid_authorization_version?(%{"version" => 1, "kind" => "BLOCKED_VERIFIER_REPAIR_AUTHORIZATION_V1"}), do: true
   defp valid_authorization_version?(%{"version" => 2, "kind" => "BLOCKED_VERIFIER_REPAIR_AUTHORIZATION_V2"}), do: true
   defp valid_authorization_version?(%{"version" => 3, "kind" => "REVIEW_POLICY_STOP_CONTINUATION_V1"}), do: true
+  defp valid_authorization_version?(%{"version" => 4, "kind" => "REVIEW_POLICY_STOP_CONTINUATION_V2"}), do: true
   defp valid_authorization_version?(_), do: false
 
   defp authorization(store, key) do
@@ -663,6 +735,20 @@ defmodule SymphonyElixir.Factory.TicketVerifierRepair do
        do: :ok
 
   defp idle_control(_, _), do: {:error, :verifier_repair_control_busy}
+
+  defp valid_input(%{"review_policy_stop" => %{"version" => 2} = reference} = input) do
+    allowance = reference["source_allowance"]
+
+    with true <-
+           is_map(allowance) and
+             Enum.sort(Map.keys(allowance)) ==
+               ~w(configured_code_repair_limit configured_implementation_limit maximum_additional_iterations next_code_repair_round next_implementation_iteration prior_code_repair_round prior_implementation_iteration),
+         true <- Enum.all?(Map.values(allowance), &(is_integer(&1) and &1 >= 0)) and allowance["maximum_additional_iterations"] === 1 do
+      valid_input(Map.put(input, "review_policy_stop", reference |> Map.delete("source_allowance") |> Map.put("version", 1)))
+    else
+      _ -> {:error, :verifier_repair_authorization_invalid}
+    end
+  end
 
   defp valid_input(%{"review_policy_stop" => reference} = input) when is_map(reference) do
     with :ok <- valid_input(Map.delete(input, "review_policy_stop")),

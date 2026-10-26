@@ -11,6 +11,11 @@
   Independent final review, final quality-gate disposition, local integration,
   deployment, and live ticket recovery remain parent-owned gates; this status
   does not claim PPL-9881 is PASS or human-review-ready.
+- The actual legacy-counter regression now proves ordinary SOURCE admission at
+  implementation 26/configured 25 and combined repair 12/configured 10, with an
+  exact versioned operator allowance for next 27/13. COMPLETE publication and
+  honest CONTINUE-to-cap denial both pass, including reopened result adoption
+  and exact counter-binding negatives. No new journal or result schema is added.
 - Priority: P0; effort: L; risk: MED–HIGH.
 - User authorized implementation, local integration/merge, deployment, and intervention to get PPL-9881 moving; do not publish a GitHub PR or push externally.
 - Dependencies: the deployed R20 baseline, not the dirty development checkout.
@@ -21,6 +26,24 @@
 - This is workstream 1 only. Scheduler ownership/intake isolation and transport/MR timing fixes are workstreams 2/3 and must wait until PPL-9881 actually advances.
 
 ## Why
+
+Deployment is held for the actual legacy-counter gap: PPL-9881 is at implementation
+iteration 26 with configured maximum 25, and combined repair round 12 with maximum
+10. The previously tested operator continuation did not grant SOURCE admission
+past the implementation cap. Add a new explicit policy-stop authorization version
+binding configured/current/next counters 25/26/27 and 10/12/13, automatic repairs
+used 2, and exactly one implementation iteration. Keep configured limits and prior counters
+unchanged. Derive only the exact run's effective next-iteration limit from that
+applied receipt at native admission; use the existing instruction/task/reservation
+and worker evidence bindings as the admission ledger. Existing independently
+authorized same-iteration infrastructure recovery remains separate; never replay
+ambiguous source effects. Honest CONTINUE remains
+admissible evidence and advances the counter to 27, where another source turn is
+denied. Preserve old authorization versions and independently validate archived
+pre-26/post-27 evidence in physical publication. Required regression: public CLI
+stage -> owned tick apply -> ordinary SOURCE admission at those actual counters ->
+writer adoption -> reopened SQLite -> physical publication -> second admission
+denied. This is bounded authority under outcome 7, not a global policy reset.
 
 CI passed for candidate `4e5c48fc2150515c4cb5ce0771f4c204b10c532c`, MR !47818, pipeline 2987402948. Verifier 5 finished with REPAIR, closing all seven previous findings and identifying a remaining asynchronous logging leak. Its complete report was rejected because a detailed top-level finding and its shorter classification description were not exactly equal. A read-only diagnostic proved changing only that duplicated description in memory passes the existing validator. Nothing was persisted or adopted.
 

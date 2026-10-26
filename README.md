@@ -137,6 +137,10 @@ finding descriptions without changing original bytes, evidence, verdict, or repa
 budget. An exact policy-stopped REPAIR can receive a separately journaled,
 operator-authorized one-repair continuation; automatic attempts remain two used,
 and another REPAIR stops again. Historical BLOCK authority remains distinct.
+When legacy counters already exceed configured limits, that exact operator
+receipt can explicitly bind one additional implementation iteration: configured
+25/10, current 26/12, next 27/13. It does not reset counters or change WORKFLOW.
+Honest CONTINUE advances to 27 and stops before another source iteration.
 One exact, explicitly authorized read-only completion confirmation can finish an
 adopted continuation at its implementation limit without reopening source edits,
 granting another repair, or replacing CI and independent verification.
