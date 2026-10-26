@@ -23,6 +23,36 @@ def module(name, path):
 
 
 class PreparationTests(unittest.TestCase):
+    def test_artifact_inventory_excludes_only_bounded_regular_mix_test_metadata(self):
+        builder = module('test_metadata_inventory', ROOT / 'build_review_release.py')
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            metadata = root / 'lib/symphony_elixir/.mix'
+            metadata.mkdir(parents=True)
+            executable = root / 'lib/symphony_elixir/module.beam'
+            executable.write_bytes(b'code')
+            expected = builder.inventory(root)
+            cache = metadata / '.mix_test_failures'
+            cache.write_bytes(b'generated test result')
+            self.assertEqual(builder.artifact_inventory(root), expected)
+            unknown = metadata / 'unknown'
+            unknown.write_bytes(b'unknown file')
+            self.assertIn('lib/symphony_elixir/.mix/unknown', builder.artifact_inventory(root))
+            executable.write_bytes(b'changed code')
+            self.assertNotEqual(builder.artifact_inventory(root)['lib/symphony_elixir/module.beam'], expected['lib/symphony_elixir/module.beam'])
+
+    def test_artifact_inventory_rejects_linked_test_metadata(self):
+        builder = module('linked_metadata_inventory', ROOT / 'build_review_release.py')
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            metadata = root / 'lib/symphony_elixir/.mix'
+            metadata.mkdir(parents=True)
+            external = root / 'external'
+            external.write_bytes(b'external')
+            (metadata / '.mix_test_failures').symlink_to(external)
+            with self.assertRaises(AssertionError):
+                builder.artifact_inventory(root)
+
     def test_original_c66_pins_validate_the_full_release_not_an_overlay(self):
         cutover = module('original_c66_test', ROOT / 'review_cutover.py')
         with tempfile.TemporaryDirectory() as temporary:

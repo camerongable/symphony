@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import tarfile
 import tempfile
@@ -30,6 +31,15 @@ def inventory(root, source=False):
     return {path.relative_to(root).as_posix(): {'sha256': sha(path)}
             for path in sorted(root.rglob('*')) if path.is_file()
             and (not source or not set(path.relative_to(root).parts) & EXCLUDE)}
+
+
+def artifact_inventory(root):
+    relative = 'lib/symphony_elixir/.mix/.mix_test_failures'
+    cache = root / relative
+    if cache.exists() or cache.is_symlink():
+        metadata = cache.lstat()
+        assert stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 1_048_576
+    return {name: value for name, value in inventory(root).items() if name != relative}
 
 
 def command(args, cwd, env=None, timeout=60):
@@ -67,7 +77,7 @@ def main():
 
     assert sha(BASE / 'evidence/release-manifest.json') == BASE_SHA
     base = json.loads((BASE / 'evidence/release-manifest.json').read_bytes())
-    assert inventory(BASE / 'dev') == base['artifact']
+    assert artifact_inventory(BASE / 'dev') == base['artifact']
     assert all(sha(Path(base['source_root']) / name) == digest
                for name, digest in base['source_hashes'].items())
     dependency_source = Path(base['source_root']) / 'elixir/deps'
@@ -91,10 +101,15 @@ def main():
     assert all(source_map[name]['sha256'] == digest
                for name, digest in retained_helpers.items())
     shutil.copytree(dependency_source, source / 'elixir/deps', symlinks=False)
-    shutil.copytree(BASE / 'dev', release / 'dev', symlinks=False,
-                    ignore=lambda directory, _names: {'node_modules'}
-                    if Path(directory).name == 'symphony_elixir'
-                    and Path(directory).parent.name == 'phoenix-colocated' else set())
+    def transient_build_files(directory, _names):
+        path = Path(directory)
+        if path.name == 'symphony_elixir' and path.parent.name == 'phoenix-colocated':
+            return {'node_modules'}
+        if path.name == '.mix' and path.parent.name == 'symphony_elixir':
+            return {'.mix_test_failures'}
+        return set()
+
+    shutil.copytree(BASE / 'dev', release / 'dev', symlinks=False, ignore=transient_build_files)
     for name in source_map:
         if name.startswith('elixir/priv/'):
             target = release / 'dev/lib/symphony_elixir/priv' / Path(name).relative_to('elixir/priv')
@@ -109,7 +124,7 @@ def main():
     assert compiled.returncode == 0, (compiled.stdout + compiled.stderr)[-3000:]
     assert inventory(source, True) == source_map
     assert inventory(source / 'elixir/deps') == dependencies
-    assert inventory(BASE / 'dev') == base['artifact']
+    assert artifact_inventory(BASE / 'dev') == base['artifact']
 
     origin_script = '''
 [source, build] = System.argv()
@@ -127,7 +142,7 @@ IO.puts(Jason.encode!(origins))
                                   '-pa', str(release / 'dev/lib/jason/ebin'), '-e', origin_script,
                                   '--', str(source), str(release / 'dev')], source / 'elixir', env))
     assert all(item['source'] in source_map for item in origins)
-    artifact = inventory(release / 'dev')
+    artifact = artifact_inventory(release / 'dev')
     factories = {item['module']: artifact[item['path']]['sha256'] for item in origins
                  if item['module'].startswith('Elixir.SymphonyElixir.Factory.')}
     fingerprint_script = '''
