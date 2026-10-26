@@ -532,9 +532,10 @@ defmodule SymphonyElixir.Factory.ReviewProtocol do
   def decision(_packet, _output), do: :legacy
 
   @doc "Records one policy decision with verifier consumption in the caller's adoption transaction."
-  @spec apply_policy(Store.connection(), map(), map(), map(), String.t(), boolean()) :: {:ok, term()} | {:error, atom()}
-  def apply_policy(store, run, task, output, request, combined_budget_available \\ true)
+  @spec apply_policy(Store.connection(), map(), map(), map(), String.t()) :: {:ok, term()} | {:error, atom()}
+  def apply_policy(store, run, task, output, request), do: apply_policy(store, run, task, output, request, true)
 
+  @spec apply_policy(Store.connection(), map(), map(), map(), String.t(), boolean()) :: {:ok, term()} | {:error, atom()}
   def apply_policy(%DBConnection{} = store, run, task, output, request, combined_budget_available) when is_boolean(combined_budget_available) do
     with row when is_map(row) <- Store.one!(store, "SELECT * FROM worker_evidence WHERE request_key=?", [request]),
          true <- row["task_key"] == task["task_key"] and row["output_json"] == Jason.encode!(output),
