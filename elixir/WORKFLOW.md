@@ -628,6 +628,16 @@ A newly admitted CI claim can carry an optional generated-only capability for
 authenticated strict-dependency failures in already-allowed Go files. The
 capability pins the failed-candidate source blobs and exact existing sibling
 BUILD paths without extending worker permissions or changing historical packets.
+Writer `COMPLETE` means source readiness, not independent acceptance. For v2
+writers without controller-bound `affected_paths`, descriptive path checks are
+supplemental source evidence with unique nonblank IDs and nonempty evidence;
+supplied checks must be CHECKED. A focused writer may leave a boundary
+UNAVAILABLE with empty paths only when the same criterion is NOT_CHECKED and its
+latest carried PASS has nonempty evidence and authenticated request, output, and
+candidate identity. Checked boundaries still require paths. Verifier PASS must
+keep all criteria PASS, all admitted sweeps and path checks CHECKED, closures
+resolved, exact candidate identity, and no required findings.
+
 If no source fix is needed, the writer returns a genuine no-edit `COMPLETE`;
 only the controller selects the bound Gazelle-only step, with no prior
 `CONTINUE` slice and no changed candidate. Source-edit repairs keep their

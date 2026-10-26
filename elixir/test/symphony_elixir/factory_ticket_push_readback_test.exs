@@ -45,6 +45,13 @@ defmodule SymphonyElixir.FactoryTicketPushReadbackTest do
     assert entry["helper_path"] == Path.join(entry["release_root"], "dev/lib/symphony_elixir/priv/ticket_push_executor_v24.py")
   end
 
+  test "writer readiness status catalog preserves every historical origin", context do
+    previous = Jason.decode!(File.read!(Path.join(context.priv, "ticket_push_readback_origins_v15.json")))
+    current = Jason.decode!(File.read!(Path.join(context.priv, "ticket_push_readback_origins_v16.json")))
+    assert current["version"] == 16
+    assert current["entries"] == previous["entries"]
+  end
+
   @tag attested_readback: :capability_prior_history
   test "the next push history validator accepts the pinned predecessor but not a sibling or changed program", context do
     {intent, receipt} = recorded(context, context.attested.name, context.attested.recorded_priv)
@@ -134,6 +141,10 @@ defmodule SymphonyElixir.FactoryTicketPushReadbackTest do
         :review_capability,
         :forward_ordinary,
         :forward_capability,
+        :writer_readiness_ordinary,
+        :writer_readiness_capability,
+        :typed_ordinary,
+        :typed_capability,
         :capability_legacy_v20,
         :capability_legacy_v19,
         :capability_legacy_v18,
@@ -642,12 +653,21 @@ defmodule SymphonyElixir.FactoryTicketPushReadbackTest do
       next_reader = Path.join(priv, name)
       File.write!(next_reader, Regex.replace(~r/ORIGINS_SHA256 = "[0-9a-f]{64}"/, File.read!(next_reader), "ORIGINS_SHA256 = \"#{hash(forward)}\""))
     end
+
+    latest = Jason.encode!(%{"version" => 16, "entries" => [entry]})
+    File.write!(Path.join(priv, "ticket_push_readback_origins_v16.json"), latest)
+    next_reader = Path.join(priv, "ticket_push_status_reader_v16.py")
+    File.write!(next_reader, Regex.replace(~r/ORIGINS_SHA256 = "[0-9a-f]{64}"/, File.read!(next_reader), "ORIGINS_SHA256 = \"#{hash(latest)}\""))
   end
 
   defp install_forward_attestation(_priv, _entry, _version), do: :ok
 
   defp attestation_kind(:bounded), do: {"ticket_push_executor_v11.py", true, 4, "ticket_push_status_reader_v2.py"}
   defp attestation_kind(:forward_ordinary), do: {"ticket_push_executor_v25.py", true, 15, "ticket_push_status_reader_v14.py"}
+  defp attestation_kind(:writer_readiness_ordinary), do: {"ticket_push_executor_v29.py", true, 16, "ticket_push_status_reader_v16.py"}
+  defp attestation_kind(:writer_readiness_capability), do: {"ticket_push_executor_v30.py", true, 16, "ticket_push_status_reader_v16.py"}
+  defp attestation_kind(:typed_ordinary), do: {"ticket_push_executor_v27.py", true, 16, "ticket_push_status_reader_v16.py"}
+  defp attestation_kind(:typed_capability), do: {"ticket_push_executor_v28.py", true, 16, "ticket_push_status_reader_v16.py"}
   defp attestation_kind(:forward_capability), do: {"ticket_push_executor_v26.py", true, 15, "ticket_push_status_reader_v14.py"}
   defp attestation_kind(:review_ordinary), do: {"ticket_push_executor_v23.py", true, 14, "ticket_push_status_reader_v13.py"}
   defp attestation_kind(:review_capability), do: {"ticket_push_executor_v24.py", true, 14, "ticket_push_status_reader_v13.py"}

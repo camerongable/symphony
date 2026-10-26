@@ -65,6 +65,101 @@ defmodule SymphonyElixir.FactoryReviewProtocolTest do
     Map.put(result, "review_report", report)
   end
 
+  defp focused_writer do
+    history = %{
+      "status" => "REPAIR",
+      "finding_entries" => [%{"id" => "F-1", "finding" => "Prior implementation defect"}],
+      "repair_admitted" => true,
+      "request_key" => "origin",
+      "output_sha256" => "origin-output",
+      "candidate_sha" => "prior-candidate",
+      "criteria" => [%{"id" => "AC-1", "status" => "PASS", "evidence" => ["prior verified behavior"]}, %{"id" => "AC-2", "status" => "FAIL", "evidence" => ["prior defect"]}]
+    }
+
+    writer = ReviewProtocol.attach(Map.drop(packet(), ["review_protocol"]) |> Map.put("role", "feature-writer"), [history])
+    report = typed_result(writer, [], "PASS")["review_report"]
+    report = put_in(report, ["criteria", Access.at(0), "status"], "NOT_CHECKED")
+    report = put_in(report, ["boundary_sweeps", Access.at(0)], %{"id" => "AC-1", "status" => "UNAVAILABLE", "evidence" => ["Unchanged area; historical verification only"], "paths" => []})
+    report = Map.put(report, "affected_path_checks", [%{"id" => "source implementation", "status" => "CHECKED", "evidence" => ["handler.go:42 repaired source"]}])
+    result = %{"status" => "COMPLETE", "changed_paths" => ["handler.go"], "commit_message" => "fix: repair implementation", "blockers" => [], "checks" => ["Tests NOT_RUN"], "review_report" => report}
+    {writer, %{"expected_sha" => "candidate", "schema" => ReviewProtocol.schema(writer, StageSchemas.for_stage(:native_feature_writer))}, result}
+  end
+
+  test "focused writer readiness preserves honest historical boundaries and supplemental source checks" do
+    {writer, binding, result} = focused_writer()
+    assert :ok = ReviewProtocol.validate(writer, binding, result)
+    assert result["status"] == "COMPLETE"
+    assert get_in(result, ["review_report", "criteria", Access.at(0), "status"]) == "NOT_CHECKED"
+  end
+
+  test "writer readiness cannot invent current checks, historical passes or acceptance" do
+    {writer, binding, result} = focused_writer()
+
+    mutations = [
+      {"duplicate supplemental ID", update_in(result, ["review_report", "affected_path_checks"], &(&1 ++ &1))},
+      {"blank supplemental ID", put_in(result, ["review_report", "affected_path_checks", Access.at(0), "id"], " ")},
+      {"empty supplemental evidence", put_in(result, ["review_report", "affected_path_checks", Access.at(0), "evidence"], [])},
+      {"unavailable supplemental check", put_in(result, ["review_report", "affected_path_checks", Access.at(0), "status"], "UNAVAILABLE")},
+      {"blank path", put_in(result, ["review_report", "boundary_sweeps", Access.at(0), "paths"], [" "])},
+      {"checked without path", put_in(result, ["review_report", "boundary_sweeps", Access.at(0), "status"], "CHECKED")},
+      {"pass without inspection", put_in(result, ["review_report", "criteria", Access.at(0), "status"], "PASS")},
+      {"failed implementation", put_in(result, ["review_report", "criteria", Access.at(1), "status"], "FAIL")},
+      {"unresolved closure", put_in(result, ["review_report", "closures", Access.at(0), "status"], "UNRESOLVED")},
+      {"stale candidate", put_in(result, ["review_report", "candidate_sha"], "other")},
+      {"missing boundary evidence", put_in(result, ["review_report", "boundary_sweeps", Access.at(0), "evidence"], [])}
+    ]
+
+    for {name, changed} <- mutations do
+      assert {:error, _} = ReviewProtocol.validate(writer, binding, changed), name
+    end
+
+    for changed <-
+          [
+            put_in(writer, ["review_protocol", "review_scope", "mode"], "COMPREHENSIVE"),
+            put_in(writer, ["review_protocol", "review_scope", "carried_evidence"], []),
+            put_in(writer, ["review_protocol", "review_scope", "carried_evidence", Access.at(0), "criteria", Access.at(0), "status"], "FAIL"),
+            put_in(writer, ["review_protocol", "review_scope", "carried_evidence", Access.at(0), "criteria", Access.at(0), "status"], "NOT_CHECKED"),
+            put_in(writer, ["review_protocol", "review_scope", "carried_evidence", Access.at(0), "criteria", Access.at(0), "evidence"], []),
+            put_in(writer, ["review_protocol", "review_scope", "carried_evidence", Access.at(0), "criteria"], []),
+            update_in(writer, ["review_protocol", "review_scope", "carried_evidence"], &(&1 ++ [put_in(hd(&1), ["criteria", Access.at(0), "status"], "FAIL")]))
+          ] ++ Enum.map(~w(request_key output_sha256 candidate_sha), &put_in(writer, ["review_protocol", "review_scope", "carried_evidence", Access.at(0), &1], "")) do
+      assert {:error, _} = ReviewProtocol.validate(changed, binding, result)
+    end
+
+    bound = put_in(writer, ["review_protocol", "review_scope", "affected_paths"], [])
+    assert {:error, _} = ReviewProtocol.validate(bound, binding, result)
+    assert {:error, :review_protocol_schema_changed} = ReviewProtocol.validate(writer, Map.put(binding, "schema", %{}), result)
+
+    verifier = Map.put(writer, "role", "change-verifier")
+    verifier_binding = binding(verifier)
+    verifier_result = result |> Map.take(~w(checks review_report)) |> Map.merge(%{"status" => "PASS", "candidate_sha" => "candidate"})
+    assert {:error, _} = ReviewProtocol.validate(verifier, verifier_binding, verifier_result)
+    verifier_result = put_in(verifier_result, ["review_report", "affected_path_checks"], [])
+    assert {:error, _} = ReviewProtocol.validate(verifier, verifier_binding, verifier_result)
+  end
+
+  test "writer finding observations remain compatible without granting independent verifier acceptance" do
+    {writer, binding, result} = focused_writer()
+    report = result["review_report"]
+    report = Map.update!(report, "criteria", &Enum.map(&1, fn row -> Map.put(row, "status", "PASS") end))
+    report = Map.update!(report, "boundary_sweeps", &Enum.map(&1, fn row -> Map.merge(row, %{"status" => "CHECKED", "paths" => ["handler.go"]}) end))
+
+    finding = %{
+      "id" => "NEW",
+      "description" => "Writer privacy observation",
+      "classification" => "NEW",
+      "disposition" => "REQUIRED_REPAIR",
+      "basis" => %{"kind" => "SAFETY_INVARIANT", "reference" => "PRIVACY"}
+    }
+
+    report = Map.put(report, "findings", [finding])
+    assert :ok = ReviewProtocol.validate(writer, binding, Map.put(result, "review_report", report))
+
+    verifier = Map.put(writer, "role", "change-verifier")
+    verifier_result = %{"status" => "PASS", "candidate_sha" => "candidate", "checks" => [], "review_report" => Map.put(report, "affected_path_checks", [])}
+    assert {:error, :review_report_verdict_contradiction} = ReviewProtocol.validate(verifier, binding(verifier), verifier_result)
+  end
+
   test "focused reviews bind prior provenance and escalate late mandatory findings without a third repair" do
     finding = %{
       "id" => "F-1",

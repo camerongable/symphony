@@ -52,19 +52,52 @@ defmodule SymphonyElixir.Factory.ReviewReport do
          :ok <- check(exact_ids?(report["boundary_sweeps"], protocol["review_scope"]["criterion_ids"]), :review_report_boundaries_incomplete),
          :ok <-
            check(
-             exact_ids?(report["affected_path_checks"], Map.get(protocol["review_scope"], "affected_paths", [])) and Enum.all?(report["affected_path_checks"], &texts?(&1["evidence"])),
+             affected_paths?(packet, report) and Enum.all?(report["affected_path_checks"], &texts?(&1["evidence"])),
              :review_report_affected_paths_incomplete
            ),
          :ok <-
            check(
-             Enum.all?(report["criteria"] ++ report["closures"] ++ report["boundary_sweeps"], &texts?(&1["evidence"])) and Enum.all?(report["boundary_sweeps"], &texts?(&1["paths"])),
+             Enum.all?(report["criteria"] ++ report["closures"] ++ report["boundary_sweeps"], &texts?(&1["evidence"])) and
+               Enum.all?(report["boundary_sweeps"], &(texts?(&1["paths"]) or (&1["paths"] == [] and historical_boundary?(packet, output, report, &1)))),
              :review_report_evidence_missing
            ),
          :ok <- validate_findings(protocol, report),
-         :ok <- check(verdict?(packet["role"], output, report), :review_report_verdict_contradiction) do
+         :ok <- check(verdict?(packet, output, report), :review_report_verdict_contradiction) do
       :ok
     end
   end
+
+  defp affected_paths?(packet, report) do
+    scope = packet["review_protocol"]["review_scope"]
+    rows = report["affected_path_checks"]
+
+    if packet["role"] == "feature-writer" and not Map.has_key?(scope, "affected_paths") do
+      Enum.all?(rows, &text?(&1["id"])) and Enum.uniq_by(rows, & &1["id"]) == rows
+    else
+      exact_ids?(rows, Map.get(scope, "affected_paths", []))
+    end
+  end
+
+  defp historical_boundary?(%{"role" => "feature-writer"} = packet, %{"status" => "COMPLETE"}, report, %{"status" => "UNAVAILABLE"} = boundary) do
+    scope = packet["review_protocol"]["review_scope"]
+    criterion = Enum.find(report["criteria"], &(&1["id"] == boundary["id"]))
+
+    latest =
+      Enum.reduce(scope["carried_evidence"], nil, fn origin, previous ->
+        case Enum.find(origin["criteria"] || [], &(&1["id"] == boundary["id"])) do
+          nil -> previous
+          row -> {row, origin}
+        end
+      end)
+
+    scope["mode"] == "FOCUSED" and criterion["status"] == "NOT_CHECKED" and texts?(boundary["evidence"]) and
+      case latest do
+        {%{"status" => "PASS"} = row, origin} -> texts?(row["evidence"]) and Enum.all?(~w(request_key output_sha256 candidate_sha), &text?(origin[&1]))
+        _ -> false
+      end
+  end
+
+  defp historical_boundary?(_, _, _, _), do: false
 
   defp valid_scope?(protocol) do
     scope = protocol["review_scope"]
@@ -125,7 +158,7 @@ defmodule SymphonyElixir.Factory.ReviewReport do
   defp basis?(%{"basis" => %{"kind" => "PREFERENCE", "reference" => ref}, "disposition" => "OBSERVATION"}, _protocol, _known), do: text?(ref)
   defp basis?(_, _, _), do: false
 
-  defp verdict?("change-verifier", output, report) do
+  defp verdict?(%{"role" => "change-verifier"}, output, report) do
     required = findings(output)
     checked = Enum.all?(report["boundary_sweeps"] ++ report["affected_path_checks"], &(&1["status"] == "CHECKED"))
     closed = Enum.all?(report["closures"], &(&1["status"] != "UNRESOLVED"))
@@ -137,10 +170,12 @@ defmodule SymphonyElixir.Factory.ReviewReport do
     end
   end
 
-  defp verdict?("feature-writer", output, report) do
+  defp verdict?(%{"role" => "feature-writer"} = packet, output, report) do
     output["status"] != "COMPLETE" or
       (output["blockers"] == [] and report["block_reason"] == "NONE" and Enum.all?(report["criteria"], &(&1["status"] in ~w(PASS NOT_CHECKED))) and
-         Enum.all?(report["closures"], &(&1["status"] != "UNRESOLVED")) and Enum.all?(report["boundary_sweeps"] ++ report["affected_path_checks"], &(&1["status"] == "CHECKED")))
+         Enum.all?(report["closures"], &(&1["status"] != "UNRESOLVED")) and
+         Enum.all?(report["affected_path_checks"], &(&1["status"] == "CHECKED")) and
+         Enum.all?(report["boundary_sweeps"], &(&1["status"] == "CHECKED" or historical_boundary?(packet, output, report, &1))))
   end
 
   defp exact_ids?(rows, ids), do: Enum.sort(Enum.map(rows, & &1["id"])) == Enum.sort(ids)
