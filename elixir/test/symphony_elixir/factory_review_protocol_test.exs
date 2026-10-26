@@ -5,6 +5,7 @@ defmodule SymphonyElixir.FactoryReviewProtocolTest do
 
   defp packet(history \\ []) do
     ReviewProtocol.attach(%{"run_id" => "run", "spec_revision" => 1, "contract_sha256" => "contract", "role" => "change-verifier", "contract" => "AC-1: response. AC-2: value-free logs."}, history)
+    |> put_in(["review_protocol", "version"], 1)
   end
 
   defp output(packet, status \\ "PASS") do
@@ -32,6 +33,101 @@ defmodule SymphonyElixir.FactoryReviewProtocolTest do
 
   defp binding(packet), do: %{"expected_sha" => "candidate", "schema" => ReviewProtocol.schema(packet, StageSchemas.for_stage(:change_verifier))}
   defp prior(id \\ "finding", admitted \\ true), do: %{"status" => "REPAIR", "finding_entries" => [%{"id" => id, "finding" => "Prior privacy finding"}], "repair_admitted" => admitted}
+
+  test "typed findings have one authoritative description and observations do not block PASS" do
+    packet = ReviewProtocol.attach(Map.drop(packet(), ["review_protocol"]), [])
+    assert packet["review_protocol"]["version"] == 2
+    result = output(packet) |> Map.delete("findings")
+    report = result["review_report"] |> Map.delete("finding_classifications") |> Map.put("version", 2)
+
+    observation = %{
+      "id" => "OBS-1",
+      "description" => "A possible readability improvement",
+      "classification" => "NEW",
+      "disposition" => "OBSERVATION",
+      "basis" => %{"kind" => "PREFERENCE", "reference" => "Readability"}
+    }
+
+    result = Map.put(result, "review_report", Map.put(report, "findings", [observation]))
+    assert :ok = ReviewProtocol.validate(packet, binding(packet), result)
+    assert ReviewProtocol.findings(result) == []
+    assert :pass = ReviewProtocol.decision(packet, result)
+    assert {:error, :review_report_candidate_changed} = ReviewProtocol.validate(packet, binding(packet), put_in(result, ["review_report", "candidate_sha"], "stale"))
+    serious = put_in(result, ["review_report", "findings", Access.at(0), "basis"], %{"kind" => "SAFETY_INVARIANT", "reference" => "PRIVACY"})
+    assert {:error, :review_report_observation_blocks_acceptance} = ReviewProtocol.validate(packet, binding(packet), serious)
+  end
+
+  defp typed_result(packet, rows, status \\ "REPAIR") do
+    result = output(packet, status) |> Map.delete("findings")
+    ids = packet["review_protocol"]["review_scope"]["criterion_ids"]
+    report = result["review_report"] |> Map.delete("finding_classifications") |> Map.merge(%{"version" => 2, "findings" => rows})
+    report = Map.update!(report, "criteria", &Enum.filter(&1, fn row -> row["id"] in ids end)) |> Map.update!("boundary_sweeps", &Enum.filter(&1, fn row -> row["id"] in ids end))
+    Map.put(result, "review_report", report)
+  end
+
+  test "focused reviews bind prior provenance and escalate late mandatory findings without a third repair" do
+    finding = %{
+      "id" => "F-1",
+      "description" => "Private value reaches error logger",
+      "classification" => "NEW",
+      "disposition" => "REQUIRED_REPAIR",
+      "basis" => %{"kind" => "ACCEPTANCE_CRITERION", "reference" => "AC-2"}
+    }
+
+    first = ReviewProtocol.attach(Map.drop(packet(), ["review_protocol"]), [])
+    assert first["review_protocol"]["review_scope"]["mode"] == "COMPREHENSIVE"
+    assert :ok = ReviewProtocol.validate(first, binding(first), typed_result(first, [finding]))
+
+    history = %{
+      "status" => "REPAIR",
+      "finding_entries" => [%{"id" => "F-1", "finding" => finding["description"], "basis" => finding["basis"], "disposition" => "REQUIRED_REPAIR"}],
+      "repair_admitted" => true,
+      "request_key" => "origin",
+      "output_sha256" => "origin-output",
+      "candidate_sha" => "prior-candidate",
+      "criteria" => [%{"id" => "AC-1", "status" => "PASS", "evidence" => ["historical inspection"]}]
+    }
+
+    followup = ReviewProtocol.attach(Map.drop(packet(), ["review_protocol"]), [history])
+
+    assert followup["review_protocol"]["review_scope"] == %{
+             "mode" => "FOCUSED",
+             "criterion_ids" => ["AC-2"],
+             "carried_evidence" => [Map.take(history, ~w(request_key output_sha256 candidate_sha criteria))]
+           }
+
+    regression = finding |> Map.put("classification", "REGRESSION") |> Map.put("description", "Same invariant regressed on affected path")
+    result = typed_result(followup, [regression])
+    assert :ok = ReviewProtocol.validate(followup, binding(followup), result)
+    assert :repair = ReviewProtocol.decision(followup, result)
+    reused = put_in(result, ["review_report", "findings", Access.at(0), "classification"], "NEW")
+    assert {:error, :review_report_finding_identity_changed} = ReviewProtocol.validate(followup, binding(followup), reused)
+    late = typed_result(followup, [Map.put(finding, "id", "NEW-2")])
+    assert :ok = ReviewProtocol.validate(followup, binding(followup), late)
+    assert {:stop, %{"reason" => "LATE_FINDING_ESCALATION", "repairs_used" => 1}} = ReviewProtocol.decision(followup, late)
+    exhausted = put_in(followup, ["review_protocol", "repairs_used"], 2)
+    assert {:stop, %{"reason" => "REPAIR_LIMIT", "repairs_used" => 2}} = ReviewProtocol.decision(exhausted, result)
+  end
+
+  test "authenticated BLOCK obligations allow honest unresolved reports without spending an automatic repair" do
+    blocked = prior("BLOCK-F", false) |> Map.put("status", "BLOCK")
+    packet = ReviewProtocol.attach(Map.drop(packet(), ["review_protocol"]), [blocked])
+
+    row = %{
+      "id" => "BLOCK-F",
+      "description" => "Still unresolved",
+      "classification" => "UNRESOLVED",
+      "disposition" => "REQUIRED_REPAIR",
+      "basis" => %{"kind" => "PRIOR_FINDING", "reference" => "BLOCK-F"}
+    }
+
+    result = typed_result(packet, [row]) |> put_in(["review_report", "closures", Access.at(0), "status"], "UNRESOLVED")
+    assert packet["review_protocol"]["repairs_used"] == 0
+    assert :ok = ReviewProtocol.validate(packet, binding(packet), result)
+    assert :repair = ReviewProtocol.decision(packet, result)
+    invalid = put_in(result, ["review_report", "findings", Access.at(0), "id"], "unknown")
+    assert {:error, _} = ReviewProtocol.validate(packet, binding(packet), invalid)
+  end
 
   test "legacy schemas and evidence remain byte-identical" do
     packet = %{"role" => "change-verifier"}

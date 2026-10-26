@@ -209,7 +209,7 @@ defmodule SymphonyElixir.DesktopTicketLifecycleFixture do
           rows = fn ids, status -> Enum.map(ids, &%{"id" => &1, "status" => status, "evidence" => ["Synthetic fixture boundary observation"]}) end
 
           report = %{
-            "version" => 1,
+            "version" => protocol["version"],
             "candidate_sha" => base["candidate_sha"] || base["base_sha"],
             "block_reason" => "NONE",
             "criteria" => rows.(protocol["criterion_ids"], "PASS"),
@@ -218,7 +218,11 @@ defmodule SymphonyElixir.DesktopTicketLifecycleFixture do
             "finding_classifications" => []
           }
 
-          Map.put(output, "review_report", report)
+          if protocol["version"] == 2 do
+            output |> Map.delete("findings") |> Map.put("review_report", report |> Map.delete("finding_classifications") |> Map.put("findings", []))
+          else
+            Map.put(output, "review_report", report)
+          end
       end
     end
 

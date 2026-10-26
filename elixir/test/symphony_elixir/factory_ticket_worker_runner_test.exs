@@ -115,7 +115,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
   test "stopped rejected reports are visible read-only and disappear after consumption or generation drift", ctx do
     {prompt, options} = prepare(ctx)
     packet = Jason.decode!(prompt)
-    report = %{"version" => 1, "candidate_sha" => ctx.sha, "block_reason" => "NONE", "criteria" => [], "closures" => [], "boundary_sweeps" => [], "finding_classifications" => []}
+    report = %{"version" => 2, "candidate_sha" => ctx.sha, "block_reason" => "NONE", "criteria" => [], "closures" => [], "boundary_sweeps" => [], "findings" => []}
     output = %{"status" => "CONTINUE", "changed_paths" => [], "commit_message" => nil, "blockers" => [], "checks" => [], "review_report" => report}
     Process.put(:worker_output, output)
     schema = ReviewProtocol.schema(packet, StageSchemas.for_stage(:native_feature_writer))
@@ -124,8 +124,8 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
     {:ok, _} = TaskLedger.update(ctx.store, "writer", Map.merge(Map.take(pending, ~w(output_json thread_id turn_id)), %{"status" => "COMPLETE"}))
     {:ok, run} = RunLedger.get(ctx.store, "run")
     before = Store.query!(ctx.store, "SELECT id FROM events ORDER BY id").rows
-    assert %{reason: "review_protocol_evidence_incomplete", request_key: "reservation:request"} = ReviewProtocol.pending_status(ctx.store, run)
-    assert %{reason: "review_protocol_evidence_incomplete"} = ReviewProtocol.pending_status(ctx.store, run)
+    assert %{reason: "review_report_criteria_incomplete", request_key: "reservation:request"} = ReviewProtocol.pending_status(ctx.store, run)
+    assert %{reason: "review_report_criteria_incomplete"} = ReviewProtocol.pending_status(ctx.store, run)
     assert Store.query!(ctx.store, "SELECT id FROM events ORDER BY id").rows == before
 
     factory = %{enabled: true, scope: "fixture", dispatcher_id: "fixture", lease_seconds: 240, repositories: %{}}
@@ -147,7 +147,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
     assert is_nil(ReviewProtocol.pending_status(ctx.store, Map.put(run, "state", "VERIFYING")))
     assert is_nil(ReviewProtocol.pending_status(ctx.store, Map.update!(run, "verifier_round", &(&1 + 1))))
     assert is_nil(ReviewProtocol.pending_status(ctx.store, Map.update!(run, "implementation_iteration", &(&1 + 1))))
-    assert %{reason: "review_protocol_evidence_incomplete"} = ReviewProtocol.pending_status(ctx.store, run)
+    assert %{reason: "review_report_criteria_incomplete"} = ReviewProtocol.pending_status(ctx.store, run)
     Store.query!(ctx.store, "UPDATE factory_tasks SET turn_id='different-turn' WHERE task_key='writer'")
     assert is_nil(ReviewProtocol.pending_status(ctx.store, run))
     Store.query!(ctx.store, "UPDATE factory_tasks SET turn_id=? WHERE task_key='writer'", [pending["turn_id"]])
@@ -186,6 +186,16 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
 
     {:ok, _} = TicketWorkerRunner.bind_base(ctx.store, "run", ctx.sha)
     {:ok, prompt} = TicketWorkerRunner.packet(ctx.store, "run", "change-verifier", ctx.sha)
+
+    prompt =
+      if ctx[:legacy_report] do
+        base = Jason.decode!(prompt) |> Map.drop(~w(shared_instructions instruction_delivery instruction_snapshot_sha256 instruction_binding_sha256)) |> put_in(["review_protocol", "version"], 1)
+        {:ok, instructions} = WorkerInstructions.admit(ctx.store, base, "change-verifier", Path.join(System.user_home!(), ".agents"))
+        Jason.encode!(Map.merge(base, instructions))
+      else
+        prompt
+      end
+
     prompt_sha = :crypto.hash(:sha256, prompt) |> Base.encode16(case: :lower)
     key = ctx[:verifier_task_key] || "writer"
     request = ctx[:verifier_request_key] || "verifier:request"
@@ -451,7 +461,14 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
       packet = Jason.decode!(prompt)
       assert packet["review_protocol"]["repairs_used"] == round
       output = structured_repair(packet, candidate, "new finding #{round}")
-      output = if reason == "UNRESOLVED_FINDING" and round == last_round, do: put_in(output, ["review_report", "closures", Access.at(0), "status"], "UNRESOLVED"), else: output
+
+      output =
+        if reason == "UNRESOLVED_FINDING" and round == last_round do
+          output |> put_in(["review_report", "closures", Access.at(0), "status"], "UNRESOLVED") |> put_in(["review_report", "findings", Access.at(0), "classification"], "UNRESOLVED")
+        else
+          output
+        end
+
       Process.put(:worker_output, output)
       schema = ReviewProtocol.schema_json(prompt, StageSchemas.for_stage(:change_verifier))
       assert {:ok, _} = TicketWorkerRunner.run(ctx.path, issue(), prompt, schema, options)
@@ -534,13 +551,13 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
     rows = fn ids, status -> Enum.map(ids, &%{"id" => &1, "status" => status, "evidence" => ["fixture.txt:1; tested success and failure boundary"]}) end
     protocol = packet["review_protocol"]
 
-    %{
+    result = %{
       "status" => "REPAIR",
       "candidate_sha" => candidate,
       "findings" => [finding],
       "checks" => [],
       "review_report" => %{
-        "version" => 1,
+        "version" => protocol["version"],
         "candidate_sha" => candidate,
         "block_reason" => "NONE",
         "criteria" => rows.(protocol["criterion_ids"], "FAIL"),
@@ -549,6 +566,76 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
         "finding_classifications" => [%{"finding" => finding, "classification" => "NEW"}]
       }
     }
+
+    if protocol["version"] == 2 do
+      prior = List.first(protocol["finding_obligations"])
+
+      row = %{
+        "id" => if(prior, do: prior["id"], else: "F-1"),
+        "description" => finding,
+        "classification" => if(prior, do: "REGRESSION", else: "NEW"),
+        "disposition" => "REQUIRED_REPAIR",
+        "basis" => if(prior && prior["basis"], do: prior["basis"], else: %{"kind" => "ACCEPTANCE_CRITERION", "reference" => "AC-1"})
+      }
+
+      result |> Map.delete("findings") |> update_in(["review_report"], &(Map.delete(&1, "finding_classifications") |> Map.put("findings", [row])))
+    else
+      result
+    end
+  end
+
+  @tag structured_review: true, legacy_report: true
+  test "one explicit report-only mapping survives adoption and reopen without rewriting raw evidence", ctx do
+    {:ok, _} = TaskLedger.update(ctx.store, "writer", %{status: "CONSUMED"})
+    ctx = Map.put(ctx, :verifier_task_key, "run:change-verifier:0")
+    {prompt, options, candidate} = prepare_verifier(ctx)
+
+    original =
+      structured_repair(Jason.decode!(prompt), candidate, "Detailed genuine mandatory privacy finding")
+      |> put_in(["review_report", "finding_classifications", Access.at(0), "finding"], "Short summary")
+
+    Process.put(:worker_output, original)
+    schema = ReviewProtocol.schema_json(prompt, StageSchemas.for_stage(:change_verifier))
+    assert {:ok, _} = TicketWorkerRunner.run(ctx.path, issue(), prompt, schema, options)
+    assert {:error, :review_protocol_evidence_incomplete} = TicketWorkerRunner.adoption(ctx.store, "verifier:request")
+    {:ok, before} = WorkerEvidence.get(ctx.store, "verifier:request")
+    {:ok, _} = TaskLedger.update(ctx.store, ctx.verifier_task_key, Map.merge(Map.take(before, ~w(output_json thread_id turn_id)), %{"status" => "COMPLETE"}))
+
+    input = %{
+      "run_id" => "run",
+      "request_key" => before["request_key"],
+      "binding_sha256" => before["binding_sha256"],
+      "output_sha256" => before["output_sha256"],
+      "mapping" => [%{"classification_index" => 0, "finding_index" => 0}]
+    }
+
+    assert {:ok, prepared} = ReviewProtocol.prepare_correction(ctx.store, input)
+    assert prepared["status"] == "REPORT_CORRECTION_PREPARED"
+
+    assert {:ok, receipt} =
+             ReviewProtocol.correct_report(ctx.store, Map.merge(input, %{"projection_sha256" => prepared["projection_sha256"], "authorization_reference" => "explicit test operator approval"}))
+
+    assert {:ok, ^receipt} =
+             ReviewProtocol.correct_report(ctx.store, Map.merge(input, %{"projection_sha256" => prepared["projection_sha256"], "authorization_reference" => "explicit test operator approval"}))
+
+    assert {:ok, ^before} = WorkerEvidence.get(ctx.store, "verifier:request")
+    {:ok, reopened} = Store.start_link(database: ctx.database)
+    context = %{store: reopened, workspace_root: Path.join(ctx.root, "workspaces"), factory: %{maximum_code_repair_rounds: 25}}
+
+    try do
+      assert {:ok, %{status: "ADOPTED", run: run}} = Scheduler.ticket_step(context, "run", opts(ctx))
+      assert run["state"] == "REPAIRING"
+      {:ok, after_evidence} = WorkerEvidence.get(reopened, "verifier:request")
+      assert Map.take(after_evidence, ~w(output_json output_sha256 binding_json binding_sha256)) == Map.take(before, ~w(output_json output_sha256 binding_json binding_sha256))
+      {:ok, task} = TaskLedger.get(reopened, ctx.verifier_task_key)
+      assert task["output_json"] == before["output_json"]
+      assert {:ok, [entry]} = ReviewProtocol.history(reopened, Jason.decode!(prompt))
+      assert entry["repair_admitted"]
+      assert entry["finding_entries"] |> hd() |> Map.fetch!("finding") == "Detailed genuine mandatory privacy finding"
+      assert length(Store.query!(reopened, "SELECT id FROM events WHERE event_type='TICKET_REVIEW_REPORT_CORRECTED'").rows) == 1
+    after
+      GenServer.stop(reopened)
+    end
   end
 
   @tag verifier_terminal_adoption: true

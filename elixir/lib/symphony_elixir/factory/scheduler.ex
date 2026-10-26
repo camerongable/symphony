@@ -1102,13 +1102,13 @@ defmodule SymphonyElixir.Factory.Scheduler do
     result =
       case policy do
         {:ok, {:stop, stop}} -> {:policy_stop, stop}
-        {:ok, _} -> consume_change_verifier_output(context, run, output, %{events: []})
+        {:ok, _} -> consume_change_verifier_output(context, run, ReviewProtocol.projection(output), %{events: []})
         error -> error
       end
 
     case result do
       {:policy_stop, stop} ->
-        record_ticket_verifier_terminal(context.store, run, request_key, {:verification_policy_stopped, output["findings"]}, stop)
+        record_ticket_verifier_terminal(context.store, run, request_key, {:verification_policy_stopped, ReviewProtocol.findings(output)}, stop)
 
       {:ok, _} ->
         :ok
