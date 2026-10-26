@@ -115,7 +115,20 @@ defmodule SymphonyElixir.Factory.TicketVerifierRepair do
     configured = factory.maximum_implementation_iterations
 
     with true <- run["state"] == "REPAIRING" and run["execution_mode"] == "TICKET_SUPERVISOR_V1",
-         [[raw]] <- Store.query!(store, "SELECT payload_json FROM events WHERE event_type=? AND run_id=? AND json_extract(payload_json,'$.version')=4", [@authorized, run["run_id"]]).rows,
+         [[raw]] <-
+           Store.query!(
+             store,
+             """
+             SELECT payload_json FROM events WHERE event_type=? AND run_id=? AND json_extract(payload_json,'$.version')=4
+               AND json_extract(payload_json,'$.run.code_repair_round')=?
+               AND json_extract(payload_json,'$.run.implementation_iteration')=?
+               AND json_extract(payload_json,'$.run.candidate_sha')=?
+               AND json_extract(payload_json,'$.run.spec_revision')=?
+               AND json_extract(payload_json,'$.run.contract_sha256')=?
+               AND json_extract(payload_json,'$.run.verifier_round')=?
+             """,
+             [@authorized, run["run_id"], run["code_repair_round"] - 1, run["implementation_iteration"], run["candidate_sha"], run["spec_revision"], run["contract_sha256"], run["verifier_round"]]
+           ).rows,
          {:ok, proof} <- Jason.decode(raw),
          prior = proof["run"],
          true <- Map.take(run, @terminal_fields) == Map.update!(Map.take(prior, @terminal_fields), "code_repair_round", &(&1 + 1)),

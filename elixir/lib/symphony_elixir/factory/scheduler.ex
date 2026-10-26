@@ -1132,9 +1132,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
   defp ticket_role_transition(_context, _run, _task, _output, _request_key), do: {:error, :ticket_role_output_not_adoptable}
 
   defp ticket_review_policy(context, run, task, output, request_key) do
-    if output["status"] == "REPAIR" and run["code_repair_round"] + 1 > context.factory.maximum_code_repair_rounds,
-      do: {:ok, :legacy},
-      else: ReviewProtocol.apply_policy(context.store, run, task, output, request_key)
+    ReviewProtocol.apply_policy(context.store, run, task, output, request_key, run["code_repair_round"] + 1 <= context.factory.maximum_code_repair_rounds)
   end
 
   defp record_ticket_verifier_terminal(store, run, request_key, reason, policy \\ nil) do
