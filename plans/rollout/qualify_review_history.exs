@@ -43,7 +43,7 @@ true = Store.one!(store, "SELECT * FROM worker_evidence WHERE request_key=?", [r
 true = Store.one!(store, "SELECT * FROM factory_tasks WHERE task_key=?", [row["task_key"]]) == task
 {:ok, ^before_run} = RunLedger.get(store, run_id)
 [[54]] = Store.query!(store, "SELECT MAX(version) FROM factory_schema_migrations").rows
-[[1]] = Store.query!(store, "PRAGMA query_only").rows
+[[0]] = Store.query!(store, "SELECT total_changes()").rows
 GenServer.stop(store)
 
 IO.puts(Jason.encode!(%{
