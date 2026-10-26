@@ -6,6 +6,10 @@ Code.eval_file(guard_path)
 {:ok, _} = Application.ensure_all_started(:exqlite)
 
 alias SymphonyElixir.Factory.{ReviewProtocol, RunLedger, Store}
+SymphonyElixir.Workflow.set_workflow_file_path("/Users/cgable/Repos/symphony/elixir/WORKFLOW.local.md")
+factory = SymphonyElixir.Config.settings!().factory
+true = factory.maximum_implementation_iterations == 25
+true = factory.maximum_code_repair_rounds == 10
 
 run_id = "ab5ab1fe-32cc-48c1-985e-3c3800adcfa2"
 request = "desktop:b996c85fd59f267cb7ee029cac2f25f2e56e245de90f3945d6e8526a1b6c38bc"
@@ -14,6 +18,7 @@ request = "desktop:b996c85fd59f267cb7ee029cac2f25f2e56e245de90f3945d6e8526a1b6c3
 true = before_run["state"] == "VERIFYING"
 true = before_run["candidate_sha"] == "4e5c48fc2150515c4cb5ce0771f4c204b10c532c"
 true = before_run["verifier_round"] == 5 and before_run["code_repair_round"] == 12
+true = before_run["implementation_iteration"] == 26
 true = before_run["ci_pipeline_id"] == 2_987_402_948
 row = Store.one!(store, "SELECT * FROM worker_evidence WHERE request_key=?", [request])
 task = Store.one!(store, "SELECT * FROM factory_tasks WHERE task_key=?", [row["task_key"]])
@@ -52,6 +57,10 @@ IO.puts(Jason.encode!(%{
   source_commit: manifest["source_commit"],
   original_report_status: "REPAIR",
   automatic_repairs_used: 2,
+  configured_implementation_limit: 25,
+  current_implementation_iteration: 26,
+  configured_combined_repair_limit: 10,
+  current_combined_repair_round: 12,
   correction_prepared: prepared,
   raw_worker_and_task_unchanged: true,
   run_unchanged: true,
