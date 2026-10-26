@@ -17,6 +17,7 @@ the existing safety boundaries, and execute its gates in order.
 | [011](011-review-report-contract.md) | Make reports robust and bound repair review | P0 | L | Frozen deployed R20 baseline | DONE — local C66 deployment26Oct18:11UTC;100 artifact tests; preserved schema/history; PPL-9881 new SOURCE activity proven; full lint gate limited |
 | [012](012-isolate-scheduler-failures.md) | Isolate intake rejections and tick callback lifetime | P1 | M | Deployed011/C66 | DONE — deployed16ed26Oct19:43UTC with013; 355 artifact tests PASS; schema/history preserved; full quality limits remain |
 | [013](013-separate-writer-readiness-from-verifier-acceptance.md) | Separate writer readiness from verifier acceptance | P0 | M | Deployed011/C66 | DONE — deployed16ed26Oct19:43UTC; exact stopped report accepted; ordinary generation subsequently exposed separate product-workflow path denial; no product adoption yet |
+| [015](015-admit-product-go-workflow-source.md) | Admit product Go workflow source without policy authority | P0 | S | Deployed013/16ed | IN PROGRESS — cold plan review accepted; public source-classification RED/GREEN; real controller generation regression and independent implementation review pending |
 
 Plan 006 was added on 2026-10-04 at HEAD `52a978818875c59ccf2758ed1b728bb23e33f631`.
 Its checksum manifest also pins selected dirty/untracked source: HEAD alone is insufficient.
