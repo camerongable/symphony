@@ -597,7 +597,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
           assert {:ok, _} = TicketWorkerRunner.run(ctx.path, issue(), prompt, schema, run_options)
           assert {:ok, %{run: again}} = Scheduler.ticket_step(context, "run", options)
           assert again["state"] == "FAILED" and again["code_repair_round"] == continued["code_repair_round"]
-          assert %{title: "Combined repair limit reached"} = ReviewProtocol.status(reopened, again)
+          assert %{title: "Verification repair limit reached"} = ReviewProtocol.status(reopened, again)
           assert {:ok, retained} = ReviewProtocol.history(reopened, packet)
           assert Enum.count(retained, & &1["repair_admitted"]) == 2
           assert Store.one!(reopened, "SELECT COUNT(*) AS count FROM events WHERE event_type='TICKET_VERIFIER_REPAIR_APPLIED'")["count"] == 1
@@ -789,6 +789,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
       Process.put(:worker_output, output)
       schema = ReviewProtocol.schema_json(prompt, StageSchemas.for_stage(:change_verifier))
       assert {:ok, _} = TicketWorkerRunner.run(ctx.path, issue(), prompt, schema, options)
+      adoption_context = if(ctx[:legacy_counter_allowance] and round == last_round, do: put_in(context, [:factory, :maximum_code_repair_rounds], 10), else: context)
 
       result =
         if correction? != false and round == last_round do
@@ -799,7 +800,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
           {:ok, reopened} = Store.start_link(database: ctx.database)
 
           try do
-            outcome = Scheduler.ticket_step(%{context | store: reopened}, "run", opts(ctx))
+            outcome = Scheduler.ticket_step(%{adoption_context | store: reopened}, "run", opts(ctx))
             {:ok, preserved} = WorkerEvidence.get(reopened, current.verifier_request_key)
             assert Map.take(preserved, ~w(output_json output_sha256 binding_json binding_sha256)) == Map.take(raw_evidence, ~w(output_json output_sha256 binding_json binding_sha256))
             {:ok, task} = TaskLedger.get(reopened, current.verifier_task_key)

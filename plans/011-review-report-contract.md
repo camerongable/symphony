@@ -44,6 +44,10 @@ pre-26/post-27 evidence in physical publication. Required regression: public CLI
 stage -> owned tick apply -> ordinary SOURCE admission at those actual counters ->
 writer adoption -> reopened SQLite -> physical publication -> second admission
 denied. This is bounded authority under outcome 7, not a global policy reset.
+The corrected report itself must be adopted with the actual combined cap 10.
+An authenticated already-stopping report decision (including two-used REPAIR_LIMIT)
+is recorded before the combined cap fallback. Only a report that would otherwise
+admit a repair retains the legacy combined-budget stop; neither path grants work.
 
 CI passed for candidate `4e5c48fc2150515c4cb5ce0771f4c204b10c532c`, MR !47818, pipeline 2987402948. Verifier 5 finished with REPAIR, closing all seven previous findings and identifying a remaining asynchronous logging leak. Its complete report was rejected because a detailed top-level finding and its shorter classification description were not exactly equal. A read-only diagnostic proved changing only that duplicated description in memory passes the existing validator. Nothing was persisted or adopted.
 

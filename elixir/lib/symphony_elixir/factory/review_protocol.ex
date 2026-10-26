@@ -532,8 +532,10 @@ defmodule SymphonyElixir.Factory.ReviewProtocol do
   def decision(_packet, _output), do: :legacy
 
   @doc "Records one policy decision with verifier consumption in the caller's adoption transaction."
-  @spec apply_policy(Store.connection(), map(), map(), map(), String.t()) :: {:ok, term()} | {:error, atom()}
-  def apply_policy(%DBConnection{} = store, run, task, output, request) do
+  @spec apply_policy(Store.connection(), map(), map(), map(), String.t(), boolean()) :: {:ok, term()} | {:error, atom()}
+  def apply_policy(store, run, task, output, request, combined_budget_available \\ true)
+
+  def apply_policy(%DBConnection{} = store, run, task, output, request, combined_budget_available) when is_boolean(combined_budget_available) do
     with row when is_map(row) <- Store.one!(store, "SELECT * FROM worker_evidence WHERE request_key=?", [request]),
          true <- row["task_key"] == task["task_key"] and row["output_json"] == Jason.encode!(output),
          true <- digest(row["binding_json"]) == row["binding_sha256"] and digest(row["output_json"]) == row["output_sha256"],
@@ -541,13 +543,15 @@ defmodule SymphonyElixir.Factory.ReviewProtocol do
          {:ok, packet} <- bound_context(store, task, binding),
          true <- row["run_id"] == run["run_id"] and binding["expected_sha"] == run["candidate_sha"],
          :ok <- validate_result(store, task, binding, output) do
-      record_policy(store, run, packet, row, decision(packet, output))
+      choice = decision(packet, output)
+      choice = if(choice == :repair and not combined_budget_available, do: :legacy, else: choice)
+      record_policy(store, run, packet, row, choice)
     else
       _ -> {:error, :review_policy_adoption_unproven}
     end
   end
 
-  def apply_policy(_store, _run, _task, _output, _request), do: {:error, :review_policy_adoption_transaction_required}
+  def apply_policy(_store, _run, _task, _output, _request, _combined_budget_available), do: {:error, :review_policy_adoption_transaction_required}
 
   defp record_policy(_store, _run, _packet, _row, :legacy), do: {:ok, :legacy}
 
