@@ -22,6 +22,99 @@ def module(name, path):
 
 
 class PreparationTests(unittest.TestCase):
+    def test_original_c66_pins_validate_the_full_release_not_an_overlay(self):
+        cutover = module('original_c66_test', ROOT / 'review_cutover.py')
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            release, source = root / 'original', root / 'source'
+            (release / 'evidence').mkdir(parents=True)
+            (release / 'dev').mkdir()
+            source.mkdir()
+            artifact = release / 'dev/fixture.beam'
+            artifact.write_bytes(b'original artifact')
+            (source / 'fixture.ex').write_text('original source')
+            launcher, guard = release / 'run-local-factory', release / 'release_boot_guard.exs'
+            launcher.write_text('launcher')
+            guard.write_text('guard')
+            manifest = release / 'evidence/release-manifest.json'
+            manifest.write_text(json.dumps({'build': str(release / 'dev'), 'source_root': str(source),
+                                           'source_hashes': {'fixture.ex': cutover.sha(source / 'fixture.ex')},
+                                           'artifact': {'fixture.beam': {'sha256': cutover.sha(artifact)}}}))
+            with patch.multiple(cutover, OLD_RELEASE=release, OLD_MANIFEST_SHA=cutover.sha(manifest),
+                                OLD_LAUNCHER_SHA=cutover.sha(launcher), OLD_BOOT_SHA=cutover.sha(guard)):
+                g, _capture = cutover.bind(root)
+                self.assertEqual(g.original_pins(), {'build': str(release / 'dev'), 'source': str(source)})
+                artifact.write_bytes(b'changed artifact')
+                with self.assertRaises(AssertionError):
+                    g.original_pins()
+
+    def test_atomic_plist_change_preserves_unrelated_settings_and_restores_exact_bytes(self):
+        cutover = module('atomic_plist_test', ROOT / 'review_cutover.py')
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'service.plist'
+            original = plistlib.dumps({'ProgramArguments': ['/old/launcher', 'workflow'],
+                                      'EnvironmentVariables': {'MIX_BUILD_PATH': '/old/build', 'KEEP': 'value'},
+                                      'KeepAlive': True, 'StandardErrorPath': '/logs/errors'})
+            path.write_bytes(original)
+            path.chmod(0o640)
+            expected = plistlib.loads(original)
+            expected['ProgramArguments'][0] = '/new/launcher'
+            expected['EnvironmentVariables']['MIX_BUILD_PATH'] = '/new/build'
+            changed = plistlib.dumps(expected)
+            cutover.replace_plist(path, cutover.sha(path), changed)
+            self.assertEqual(path.read_bytes(), changed)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o640)
+            self.assertEqual(plistlib.loads(changed)['EnvironmentVariables']['KEEP'], 'value')
+            with self.assertRaises(AssertionError):
+                cutover.replace_plist(path, 'stale', original)
+            self.assertEqual(path.read_bytes(), changed)
+            cutover.replace_plist(path, cutover.sha(path), original)
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_poststart_checks_allow_consumption_but_reject_changed_evidence_and_event_prefix(self):
+        cutover = module('poststart_history_test', ROOT / 'review_cutover.py')
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = root / 'fixture.sqlite'
+            with sqlite3.connect(database) as db:
+                db.executescript('''
+CREATE TABLE factory_schema_migrations(version INTEGER);
+INSERT INTO factory_schema_migrations VALUES (54);
+CREATE TABLE events(id INTEGER PRIMARY KEY, payload TEXT);
+INSERT INTO events VALUES(1,'original');
+CREATE TABLE worker_instruction_snapshots(value TEXT);
+CREATE TABLE worker_instruction_task_bindings(value TEXT);
+CREATE TABLE worker_file_operations(value TEXT);
+CREATE TABLE worker_evidence(request_key TEXT PRIMARY KEY,binding_json TEXT,binding_sha256 TEXT,
+ output_json TEXT,output_sha256 TEXT,thread_id TEXT,turn_id TEXT,owner_stopped_at TEXT,status TEXT);
+INSERT INTO worker_evidence VALUES('request','binding','binding-sha','output','output-sha','thread','turn','stopped','RESULT_RECORDED');
+CREATE TABLE desktop_requests(request_key TEXT PRIMARY KEY,status TEXT);
+INSERT INTO desktop_requests VALUES('old-uncertain','RECONCILE_REQUIRED');
+''')
+                with sqlite3.connect(root / 'before-cutover.sqlite') as backup:
+                    db.commit()
+                    db.backup(backup)
+            (root / 'audited-protected.json').write_text(json.dumps({'event_limit': 1}))
+            g, _capture = cutover.bind(root)
+            g.readonly = lambda: sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)
+            g.historical_after_start()
+            with sqlite3.connect(database) as db:
+                db.execute("UPDATE worker_evidence SET status='CONSUMED'")
+                db.execute("INSERT INTO events VALUES(2,'ordinary adoption')")
+            g.historical_after_start()
+            for statement, restore in (
+                ("UPDATE events SET payload='changed' WHERE id=1", "UPDATE events SET payload='original' WHERE id=1"),
+                ("UPDATE worker_evidence SET output_json='rewritten'", "UPDATE worker_evidence SET output_json='output'"),
+                ("UPDATE desktop_requests SET status='PENDING'", "UPDATE desktop_requests SET status='RECONCILE_REQUIRED'"),
+                ("UPDATE factory_schema_migrations SET version=55", "UPDATE factory_schema_migrations SET version=54"),
+            ):
+                with sqlite3.connect(database) as db:
+                    db.execute(statement)
+                with self.subTest(statement=statement), self.assertRaises(AssertionError):
+                    g.historical_after_start()
+                with sqlite3.connect(database) as db:
+                    db.execute(restore)
+
     def test_artifact_results_from_another_build_of_the_same_commit_are_rejected(self):
         cutover = module('review_evidence_test', ROOT / 'review_cutover.py')
         candidate = {'source_commit': 'same-commit', 'manifest_sha256': 'candidate-manifest',

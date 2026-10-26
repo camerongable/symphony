@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import plistlib
 import re
+import secrets
 import shutil
 import sqlite3
 import subprocess
@@ -21,17 +22,36 @@ TOOLS = Path(__file__).resolve().parent
 HISTORICAL = Path('/private/tmp/symphony-push-handoff.cnRVdUfY/review-cutover-r19f2')
 GUARD_SHA = '41c26ac2067bdba97ecbf92238e11f813e0e45c8068283b75565677abfe53482'
 THAW_SHA = 'cec22fd5003117f496bbe369baaf935f8c9f4797ae519ae0ca90578fb12b4534'
-OLD_RELEASE = Path('/Users/cgable/Library/Application Support/ai-factory/releases/symphony-ci-pass-overlay-cnRVdUfY-r20')
-OLD_MANIFEST_SHA = 'cb6e49358a07192ed847893990a327f450f4d6c2c6a6955d8f89cbf777810801'
-OLD_LAUNCHER_SHA = 'b20a594abb11e07bebb31643506d63e77d942d44b96f818c691add164aba49a0'
-OLD_BOOT_SHA = '5a7ac6ec35ba8465e0eedb4122940016dd30fec1306e0bd5d700ade2204f8de6'
+OLD_RELEASE = Path('/Users/cgable/Library/Application Support/ai-factory/releases/symphony-review-report-c66c339')
+OLD_MANIFEST_SHA = 'cce0e5b38f355ff425bbfc9b6be2e4dcaf2b191e0ed0932b4f05288367d13e24'
+OLD_LAUNCHER_SHA = '7decfb7d1b499fb102d80eeea29514e884332b40b951720305aba86def215828'
+OLD_BOOT_SHA = '418b1a40af2c0ae5059fd841b9191ecacc0b8de6b451a4dd499e97bffcb60fb8'
 RUN = 'ab5ab1fe-32cc-48c1-985e-3c3800adcfa2'
 CANDIDATE = '4e5c48fc2150515c4cb5ce0771f4c204b10c532c'
-REPORT = 'desktop:b996c85fd59f267cb7ee029cac2f25f2e56e245de90f3945d6e8526a1b6c38bc'
+REPORT = 'desktop:11b288b43e59ae80afdfc26b01e1bcf2f2d297249cc54e8f0d0af98829629c5a'
 
 
 def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def replace_plist(path, expected_sha, raw):
+    assert path.is_file() and not path.is_symlink() and sha(path) == expected_sha
+    original = path.stat()
+    temporary = path.with_name(path.name + '.cutover-' + secrets.token_hex(8))
+    with temporary.open('xb') as stream:
+        os.fchmod(stream.fileno(), original.st_mode & 0o777)
+        stream.write(raw)
+        stream.flush()
+        os.fsync(stream.fileno())
+    assert sha(path) == expected_sha
+    os.replace(temporary, path)
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+    assert path.read_bytes() == raw
 
 
 def validate_artifact_evidence(value, validation):
@@ -50,9 +70,9 @@ def bind(evidence_root):
     g = importlib.util.module_from_spec(spec)
     exec(compile(raw, str(path), 'exec', dont_inherit=True), g.__dict__)
     g.ROOT = evidence_root
-    g.OLD_PID = '21641'
-    g.OLD_START = 'Sun Oct 25 18:57:15 2026'
-    g.OLD_FINGERPRINT = '279f7ab2d9ed171d682efb94bd357a18941dd98b784f58ccc3ea62e9d9400d5b'
+    g.OLD_PID = '8427'
+    g.OLD_START = 'Mon Oct 26 11:11:31 2026'
+    g.OLD_FINGERPRINT = 'e7a05f9eae2083a9de7720c8591df495d63107880ab111e912b60457b1871180'
 
     def configuration():
         broker = tomllib.loads(g.BROKER.read_text())
@@ -90,12 +110,16 @@ def bind(evidence_root):
         return value, manifest, audit
 
     def native_quiet_for(value):
+        with g.readonly() as db:
+            threads = [row[0] for row in db.execute('SELECT DISTINCT thread_id FROM worker_evidence WHERE run_id=? AND thread_id IS NOT NULL', (RUN,))]
+        assert threads and len(threads) <= 100
         script = '''
-thread = "01a13272-9eb0-7550-8411-9dbb54b09c57"
-{:ok, queue} = SymphonyElixir.Factory.NativeQueueReadback.read("/Users/cgable/.codex/queue_1.sqlite", thread)
-{:ok, lock} = SymphonyElixir.Factory.NativeQueueReadback.writer_unlocked("/Users/cgable/.codex", thread)
-true = queue["thread_id"] == thread and queue["item_count"] == 0
-true = lock["status"] in ["absent", "unlocked"]
+for thread <- System.argv() do
+  {:ok, queue} = SymphonyElixir.Factory.NativeQueueReadback.read("/Users/cgable/.codex/queue_1.sqlite", thread)
+  {:ok, lock} = SymphonyElixir.Factory.NativeQueueReadback.writer_unlocked("/Users/cgable/.codex", thread)
+  true = queue["thread_id"] == thread and queue["item_count"] == 0
+  true = lock["status"] in ["absent", "unlocked"]
+end
 IO.puts("NATIVE_SOURCE_QUIET")
 '''
         env = {key: value for key, value in os.environ.items() if key not in
@@ -103,7 +127,7 @@ IO.puts("NATIVE_SOURCE_QUIET")
                 'MIX_BUILD_PATH', 'MIX_ENV', 'MIX_TARGET', 'ERL_FLAGS')}
         env.update(ERL_FLAGS='+S 4:4')
         result = subprocess.run(['/opt/homebrew/bin/mise', 'exec', '--', 'elixir',
-                                 '-pa', str(Path(value['build']) / 'lib/*/ebin'), '-e', script],
+                                 '-pa', str(Path(value['build']) / 'lib/*/ebin'), '-e', script, '--', *threads],
                                 cwd=Path(value['source']) / 'elixir', env=env,
                                 capture_output=True, text=True, timeout=20)
         assert result.returncode == 0 and result.stdout.strip() == 'NATIVE_SOURCE_QUIET'
@@ -113,34 +137,28 @@ IO.puts("NATIVE_SOURCE_QUIET")
         native_quiet_for(value)
 
     def original_pins():
-        path = OLD_RELEASE / 'evidence/overlay-manifest.json'
+        path = OLD_RELEASE / 'evidence/release-manifest.json'
         assert sha(path) == OLD_MANIFEST_SHA
         assert sha(OLD_RELEASE / 'run-local-factory') == OLD_LAUNCHER_SHA
-        assert sha(OLD_RELEASE / 'overlay_boot_guard.exs') == OLD_BOOT_SHA
+        assert sha(OLD_RELEASE / 'release_boot_guard.exs') == OLD_BOOT_SHA
         old = json.loads(path.read_bytes())
         for name, digest in old['source_hashes'].items():
             assert sha(Path(old['source_root']) / name) == digest, name
-        override = old['override']
-        assert sha(OLD_RELEASE / 'overrides' / (override['module'] + '.beam')) == override['sha256']
-        base = OLD_RELEASE.parent / 'symphony-generation-handoff-cnRVdUfY-r19f'
-        base_path = base / 'evidence/release-manifest.json'
-        assert sha(base_path) == old['base_manifest_sha256']
-        base_manifest = json.loads(base_path.read_bytes())
-        for name, entry in base_manifest['artifact'].items():
-            assert sha(base / 'dev' / name) == entry['sha256'], name
-        return {'build': str(base / 'dev'), 'source': old['source_root']}
+        for name, entry in old['artifact'].items():
+            assert sha(Path(old['build']) / name) == entry['sha256'], name
+        return {'build': old['build'], 'source': old['source_root']}
 
     def eligible():
         with g.readonly() as db:
             db.row_factory = sqlite3.Row
             run = dict(db.execute('SELECT * FROM runs WHERE run_id=?', (RUN,)).fetchone())
-            assert run['state'] == 'VERIFYING' and run['candidate_sha'] == CANDIDATE
-            assert run['verifier_round'] == 5 and run['code_repair_round'] == 12
+            assert run['state'] == 'REPAIRING' and run['candidate_sha'] == CANDIDATE
+            assert run['verifier_round'] == 5 and run['code_repair_round'] == 13
             assert run['implementation_iteration'] == 26
             assert run['ci_pipeline_id'] == 2987402948
             evidence = dict(db.execute('SELECT * FROM worker_evidence WHERE request_key=?', (REPORT,)).fetchone())
             assert evidence['status'] == 'RESULT_RECORDED' and evidence['owner_stopped_at']
-            assert json.loads(evidence['output_json'])['status'] == 'REPAIR'
+            assert json.loads(evidence['output_json'])['status'] == 'COMPLETE'
             assert db.execute('SELECT MAX(version) FROM factory_schema_migrations').fetchone()[0] == 54
             return {'run': {key: run[key] for key in ('state', 'candidate_sha', 'verifier_round', 'code_repair_round', 'implementation_iteration')},
                     'report': {key: evidence[key] for key in ('request_key', 'binding_sha256', 'output_sha256', 'owner_stopped_at')}}
@@ -197,7 +215,7 @@ IO.puts("NATIVE_SOURCE_QUIET")
         original = g.PLIST.read_bytes()
         plist = plistlib.loads(original)
         assert plist['ProgramArguments'] == [str(OLD_RELEASE / 'run-local-factory'), str(g.WORKFLOW)]
-        assert plist['EnvironmentVariables']['MIX_BUILD_PATH'].endswith('symphony-generation-handoff-cnRVdUfY-r19f/dev')
+        assert plist['EnvironmentVariables']['MIX_BUILD_PATH'] == g.original_pins()['build']
         with (evidence_root / 'service.original.plist').open('xb') as stream:
             stream.write(original)
         assert sha(HISTORICAL / 'thaw_guardian.py') == THAW_SHA
@@ -238,15 +256,55 @@ IO.puts("NATIVE_SOURCE_QUIET")
         launchd = g.command(['/bin/launchctl', 'print', g.SERVICE])
         assert re.search(r'^\s*pid = ' + runtime['os_pid'] + r'$', launchd, re.M)
         assert re.search(r'^\s*program = ' + re.escape(audit['replacement_launcher']) + r'$', launchd, re.M)
-        # No correction is staged until this proof completes, so even pending report rows stay exact.
-        g.protected(audit)
-        assert eligible() == g.load('captured.json')['ticket']
+        # Full-row preservation is proven before bootstrap; ordinary ticks may now consume the result.
+        before = g.load('prebootstrap-preservation.json')
+        assert before['manifest_sha256'] == value['manifest_sha256']
+        assert before['protected_sha256'] == audit['protected_snapshot']['sha256']
+        historical_after_start()
         g.save_equal('started.json', {'result': 'PASS', 'runtime_identity': runtime,
                                     'manifest_sha256': value['manifest_sha256'],
                                     'guard_ledger_row_writes': 0,
-                                    'all_protected_tables_and_event_prefix_preserved': True,
+                                    'all_protected_tables_preserved_before_bootstrap': True,
+                                    'historical_evidence_and_event_prefix_preserved_after_start': True,
                                     'schema_migration': None})
         print(json.dumps({'result': 'STARTED_HISTORY_PRESERVED', 'runtime': runtime}))
+
+    def historical_after_start():
+        protected = g.load('audited-protected.json')
+        backup = evidence_root / 'before-cutover.sqlite'
+        with sqlite3.connect(backup.as_uri() + '?mode=ro&immutable=1', uri=True) as prior, g.readonly() as current:
+            assert current.execute('SELECT MAX(version) FROM factory_schema_migrations').fetchone()[0] == 54
+            for table in ('events', 'worker_instruction_snapshots', 'worker_instruction_task_bindings', 'worker_file_operations'):
+                quoted = '"' + table + '"'
+                limit = ' WHERE id <= ' + str(protected['event_limit']) if table == 'events' else ''
+                for row in prior.execute('SELECT rowid,* FROM ' + quoted + limit + ' ORDER BY rowid'):
+                    assert current.execute('SELECT rowid,* FROM ' + quoted + ' WHERE rowid=?', (row[0],)).fetchone() == row, table
+            raw_fields = 'request_key,binding_json,binding_sha256,output_json,output_sha256,thread_id,turn_id,owner_stopped_at'
+            for row in prior.execute('SELECT ' + raw_fields + ' FROM worker_evidence'):
+                assert current.execute('SELECT ' + raw_fields + ' FROM worker_evidence WHERE request_key=?', (row[0],)).fetchone() == row
+            for row in prior.execute("SELECT * FROM desktop_requests WHERE status IN ('RECONCILE_REQUIRED','CREATE_UNCERTAIN','FOLLOWUP_UNCERTAIN')"):
+                assert current.execute('SELECT * FROM desktop_requests WHERE request_key=?', (row[0],)).fetchone() == row
+
+    def start():
+        value, _manifest, audit = g.qualified()
+        assert g.load('stopped.json')['result'] == 'EXACT_ISSUER_STOPPED'
+        g.absent()
+        assert g.configuration() == g.load('captured.json')['configuration']
+        g.quiet()
+        g.native_quiet()
+        g.protected(audit)
+        saved = evidence_root / 'service.original.plist'
+        assert sha(saved) == g.load('captured.json')['plist_sha256'] == sha(g.PLIST)
+        expected = plistlib.loads(saved.read_bytes())
+        expected['ProgramArguments'][0] = audit['replacement_launcher']
+        expected['EnvironmentVariables']['MIX_BUILD_PATH'] = audit['replacement_build']
+        replace_plist(g.PLIST, sha(saved), plistlib.dumps(expected))
+        g.protected(audit)
+        g.save('prebootstrap-preservation.json', {'manifest_sha256': value['manifest_sha256'],
+               'protected_sha256': audit['protected_snapshot']['sha256'], 'guard_ledger_row_writes': 0})
+        g.save('start-intent.json', {'manifest_sha256': value['manifest_sha256'], 'plist_sha256': sha(g.PLIST), 'attempts': 1})
+        g.command(['/bin/launchctl', 'bootstrap', 'gui/505', str(g.PLIST)], timeout=15)
+        g.finish_start()
 
     def restore_check():
         # A broken replacement must not prevent recovery to the separately pinned original.
@@ -274,16 +332,27 @@ IO.puts("NATIVE_SOURCE_QUIET")
         assert current == original or current == replacement
         g.quiet()
         g.native_quiet_for(original_runtime)
-        print('ORIGINAL_R20_RESTORE_ALLOWED_AFTER_EXACT_PLIST_RESTORATION')
+        print('ORIGINAL_C66_RESTORE_ALLOWED_AFTER_EXACT_PLIST_RESTORATION')
+
+    def restore_original():
+        g.restore_check()
+        saved = evidence_root / 'service.original.plist'
+        if g.PLIST.read_bytes() != saved.read_bytes():
+            replace_plist(g.PLIST, sha(g.PLIST), saved.read_bytes())
+        original_restore()
 
     g.configuration = configuration
     g.candidate = candidate
     g.native_quiet = native_quiet
     g.qualified = qualified
     g.finish_start = finish_start
+    g.historical_after_start = historical_after_start
+    g.start = start
     g.original_pins = original_pins
     g.native_quiet_for = native_quiet_for
     g.restore_check = restore_check
+    original_restore = g.restore_original
+    g.restore_original = restore_original
     return g, capture
 
 

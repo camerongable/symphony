@@ -11,11 +11,9 @@ import tarfile
 import tempfile
 
 
-BASE = Path('/Users/cgable/Library/Application Support/ai-factory/releases/symphony-generation-handoff-cnRVdUfY-r19f')
-BASE_SHA = '1b3bbe66c469a3aea634004c6b17f77f2b4533f87a6882a48649b7f3e8587d48'
-OLD = BASE.parent / 'symphony-ci-pass-overlay-cnRVdUfY-r20'
-OLD_SHA = 'cb6e49358a07192ed847893990a327f450f4d6c2c6a6955d8f89cbf777810801'
-BASELINE_COMMIT = 'be5c26369a80c4347c7bc66cb3e39c6851f4b7cd'
+BASE = Path('/Users/cgable/Library/Application Support/ai-factory/releases/symphony-review-report-c66c339')
+BASE_SHA = 'cce0e5b38f355ff425bbfc9b6be2e4dcaf2b191e0ed0932b4f05288367d13e24'
+BASELINE_COMMIT = 'c66c33993735bbcfb80018296b4e247413749d61'
 ROOT = Path(__file__).resolve().parent
 EXCLUDE = {'.git', '_build', 'deps', 'bin', 'log', 'logs', 'cover', '__pycache__'}
 
@@ -68,12 +66,10 @@ def main():
     evidence.mkdir(parents=True, exist_ok=False)
 
     assert sha(BASE / 'evidence/release-manifest.json') == BASE_SHA
-    assert sha(OLD / 'evidence/overlay-manifest.json') == OLD_SHA
     base = json.loads((BASE / 'evidence/release-manifest.json').read_bytes())
-    old = json.loads((OLD / 'evidence/overlay-manifest.json').read_bytes())
     assert inventory(BASE / 'dev') == base['artifact']
-    assert all(sha(Path(old['source_root']) / name) == digest
-               for name, digest in old['source_hashes'].items())
+    assert all(sha(Path(base['source_root']) / name) == digest
+               for name, digest in base['source_hashes'].items())
     dependency_source = Path(base['source_root']) / 'elixir/deps'
     dependencies = inventory(dependency_source)
     assert hashlib.sha256(encode(dependencies)).hexdigest() == base['dependency_source_sha256']
@@ -90,7 +86,10 @@ def main():
             files.extractall(source, filter='data')
     source_map = inventory(source, True)
     assert 'elixir/lib/symphony_elixir/factory/ticket_mr_operation.ex' in source_map
-    assert source_map['elixir/lib/symphony_elixir/factory/ticket_mr_operation.ex']['sha256'] == old['source_hashes']['elixir/lib/symphony_elixir/factory/ticket_mr_operation.ex']
+    retained_helpers = {name: digest for name, digest in base['source_hashes'].items()
+                        if name.startswith('elixir/priv/')}
+    assert all(source_map[name]['sha256'] == digest
+               for name, digest in retained_helpers.items())
     shutil.copytree(dependency_source, source / 'elixir/deps', symlinks=False)
     shutil.copytree(BASE / 'dev', release / 'dev', symlinks=False,
                     ignore=lambda directory, _names: {'node_modules'}
@@ -145,7 +144,7 @@ IO.puts(Base.encode16(:crypto.hash(:sha256, :erlang.term_to_binary(digests)), ca
                 'source': source_map, 'source_hashes': {name: item['sha256'] for name, item in source_map.items()},
                 'factory_modules': factories, 'factory_beam_fingerprint': fingerprint,
                 'artifact': artifact, 'compiled_origins': origins, 'source_commit': args.commit,
-                'deployed_baseline_commit': BASELINE_COMMIT, 'previous_manifest_sha256': OLD_SHA,
+                'deployed_baseline_commit': BASELINE_COMMIT, 'previous_manifest_sha256': BASE_SHA,
                 'base_artifact_manifest_sha256': BASE_SHA, 'dependency_source_sha256': base['dependency_source_sha256'],
                 'compile_command': compile_command, 'activation': False}
     manifest_path = release / 'evidence/release-manifest.json'
