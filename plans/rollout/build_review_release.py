@@ -1,0 +1,189 @@
+"""Build an inactive, versioned local factory release from one clean commit."""
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tarfile
+import tempfile
+
+
+BASE = Path('/Users/cgable/Library/Application Support/ai-factory/releases/symphony-generation-handoff-cnRVdUfY-r19f')
+BASE_SHA = '1b3bbe66c469a3aea634004c6b17f77f2b4533f87a6882a48649b7f3e8587d48'
+OLD = BASE.parent / 'symphony-ci-pass-overlay-cnRVdUfY-r20'
+OLD_SHA = 'cb6e49358a07192ed847893990a327f450f4d6c2c6a6955d8f89cbf777810801'
+BASELINE_COMMIT = 'be5c26369a80c4347c7bc66cb3e39c6851f4b7cd'
+ROOT = Path(__file__).resolve().parent
+EXCLUDE = {'.git', '_build', 'deps', 'bin', 'log', 'logs', 'cover', '__pycache__'}
+
+
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def encode(value):
+    return json.dumps(value, sort_keys=True, separators=(',', ':')).encode()
+
+
+def inventory(root, source=False):
+    return {path.relative_to(root).as_posix(): {'sha256': sha(path)}
+            for path in sorted(root.rglob('*')) if path.is_file()
+            and (not source or not set(path.relative_to(root).parts) & EXCLUDE)}
+
+
+def command(args, cwd, env=None, timeout=60):
+    return subprocess.run(args, cwd=cwd, env=env, capture_output=True, text=True,
+                          check=True, timeout=timeout).stdout.strip()
+
+
+def clean_env(build=None):
+    env = {key: value for key, value in os.environ.items() if key not in
+           ('ELIXIR_ERL_OPTIONS', 'ERL_AFLAGS', 'ERL_ZFLAGS', 'ERL_LIBS',
+            'MIX_BUILD_PATH', 'MIX_ENV', 'MIX_TARGET', 'ERL_FLAGS')}
+    env.update(ERL_FLAGS='+S 4:4', MIX_ENV='dev', MIX_TARGET='host',
+               PYTHONDONTWRITEBYTECODE='1')
+    if build:
+        env['MIX_BUILD_PATH'] = str(build)
+    return env
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--worktree', type=Path, required=True)
+    parser.add_argument('--commit', required=True)
+    parser.add_argument('--name', required=True)
+    parser.add_argument('--evidence', type=Path, required=True)
+    args = parser.parse_args()
+    worktree = args.worktree.resolve()
+    assert worktree.is_dir()
+    assert args.name.startswith('symphony-review-report-')
+    assert all(ch.isalnum() or ch == '-' for ch in args.name)
+    assert command(['git', 'rev-parse', 'HEAD'], worktree) == args.commit
+    assert command(['git', 'status', '--porcelain', '--untracked-files=normal'], worktree) == ''
+    command(['git', 'merge-base', '--is-ancestor', BASELINE_COMMIT, args.commit], worktree)
+    evidence = args.evidence.resolve()
+    evidence.mkdir(parents=True, exist_ok=False)
+
+    assert sha(BASE / 'evidence/release-manifest.json') == BASE_SHA
+    assert sha(OLD / 'evidence/overlay-manifest.json') == OLD_SHA
+    base = json.loads((BASE / 'evidence/release-manifest.json').read_bytes())
+    old = json.loads((OLD / 'evidence/overlay-manifest.json').read_bytes())
+    assert inventory(BASE / 'dev') == base['artifact']
+    assert all(sha(Path(old['source_root']) / name) == digest
+               for name, digest in old['source_hashes'].items())
+    dependency_source = Path(base['source_root']) / 'elixir/deps'
+    dependencies = inventory(dependency_source)
+    assert hashlib.sha256(encode(dependencies)).hexdigest() == base['dependency_source_sha256']
+
+    release = BASE.parent / args.name
+    source = BASE.parent.parent / 'source-snapshots' / args.name
+    assert not release.exists() and not source.exists()
+    source.mkdir()
+    with tempfile.TemporaryFile() as archive:
+        subprocess.run(['git', 'archive', '--format=tar', args.commit], cwd=worktree,
+                       stdout=archive, check=True, timeout=30)
+        archive.seek(0)
+        with tarfile.open(fileobj=archive) as files:
+            files.extractall(source, filter='data')
+    source_map = inventory(source, True)
+    assert 'elixir/lib/symphony_elixir/factory/ticket_mr_operation.ex' in source_map
+    assert source_map['elixir/lib/symphony_elixir/factory/ticket_mr_operation.ex']['sha256'] == old['source_hashes']['elixir/lib/symphony_elixir/factory/ticket_mr_operation.ex']
+    shutil.copytree(dependency_source, source / 'elixir/deps', symlinks=False)
+    shutil.copytree(BASE / 'dev', release / 'dev', symlinks=False,
+                    ignore=lambda directory, _names: {'node_modules'}
+                    if Path(directory).name == 'symphony_elixir'
+                    and Path(directory).parent.name == 'phoenix-colocated' else set())
+    for name in source_map:
+        if name.startswith('elixir/priv/'):
+            target = release / 'dev/lib/symphony_elixir/priv' / Path(name).relative_to('elixir/priv')
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source / name, target)
+    (release / 'evidence').mkdir()
+    env = clean_env(release / 'dev')
+    compile_command = ['/opt/homebrew/bin/mise', 'exec', '--', 'mix', 'compile', '--force', '--no-deps-check']
+    compiled = subprocess.run(compile_command, cwd=source / 'elixir', env=env,
+                              capture_output=True, text=True, timeout=300)
+    (evidence / 'release-compile.log').write_text(compiled.stdout + compiled.stderr)
+    assert compiled.returncode == 0, (compiled.stdout + compiled.stderr)[-3000:]
+    assert inventory(source, True) == source_map
+    assert inventory(source / 'elixir/deps') == dependencies
+    assert inventory(BASE / 'dev') == base['artifact']
+
+    origin_script = '''
+[source, build] = System.argv()
+origins = for path <- Path.wildcard(Path.join(build, "lib/symphony_elixir/ebin/*.beam")) do
+  {:ok, {module, [compile_info: info]}} = :beam_lib.chunks(String.to_charlist(path), [:compile_info])
+  origin = to_string(info[:source])
+  true = String.starts_with?(origin, source <> "/") and File.regular?(origin)
+  %{module: to_string(module), source: Path.relative_to(origin, source), path: Path.relative_to(path, build)}
+end
+{:ok, [{:application, :symphony_elixir, properties}]} = :file.consult(String.to_charlist(Path.join(build, "lib/symphony_elixir/ebin/symphony_elixir.app")))
+true = Enum.sort(Enum.map(origins, & &1.module)) == Enum.sort(Enum.map(properties[:modules], &to_string/1))
+IO.puts(Jason.encode!(origins))
+'''
+    origins = json.loads(command(['/opt/homebrew/bin/mise', 'exec', '--', 'elixir',
+                                  '-pa', str(release / 'dev/lib/jason/ebin'), '-e', origin_script,
+                                  '--', str(source), str(release / 'dev')], source / 'elixir', env))
+    assert all(item['source'] in source_map for item in origins)
+    artifact = inventory(release / 'dev')
+    factories = {item['module']: artifact[item['path']]['sha256'] for item in origins
+                 if item['module'].startswith('Elixir.SymphonyElixir.Factory.')}
+    fingerprint_script = '''
+digests = IO.read(:stdio, :eof) |> Jason.decode!() |> Enum.sort()
+  |> Enum.map(fn {name, hex} -> {name, Base.decode16!(hex, case: :lower)} end)
+IO.puts(Base.encode16(:crypto.hash(:sha256, :erlang.term_to_binary(digests)), case: :lower))
+'''
+    fingerprint = subprocess.run(['/opt/homebrew/bin/mise', 'exec', '--', 'elixir',
+                                  '-pa', str(release / 'dev/lib/jason/ebin'), '-e', fingerprint_script],
+                                 cwd=source / 'elixir', env=env, input=json.dumps(factories),
+                                 capture_output=True, text=True, check=True, timeout=30).stdout.strip()
+    manifest = {'kind': 'FACTORY_REVIEW_REPORT_RELEASE_V1', 'schema_version': 54,
+                'build': str(release / 'dev'), 'source_root': str(source), 'release': str(release),
+                'source': source_map, 'source_hashes': {name: item['sha256'] for name, item in source_map.items()},
+                'factory_modules': factories, 'factory_beam_fingerprint': fingerprint,
+                'artifact': artifact, 'compiled_origins': origins, 'source_commit': args.commit,
+                'deployed_baseline_commit': BASELINE_COMMIT, 'previous_manifest_sha256': OLD_SHA,
+                'base_artifact_manifest_sha256': BASE_SHA, 'dependency_source_sha256': base['dependency_source_sha256'],
+                'compile_command': compile_command, 'activation': False}
+    manifest_path = release / 'evidence/release-manifest.json'
+    manifest_path.write_bytes(encode(manifest))
+    guard_path = release / 'release_boot_guard.exs'
+    shutil.copy2(ROOT / 'review_release_boot_guard.exs', guard_path)
+    guard_eval = (f'path = {json.dumps(str(guard_path))}; raw = File.read!(path); '
+                  f'true = Base.encode16(:crypto.hash(:sha256, raw), case: :lower) == "{sha(guard_path)}"; '
+                  'Code.eval_string(raw, [], file: path); '
+                  f':ok = ReviewReportReleaseBootGuard.load({json.dumps(str(manifest_path))}, "{sha(manifest_path)}"); ')
+    launcher = '''#!/bin/zsh
+set -euo pipefail
+export PATH='/Applications/ChatGPT.localized/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS:/Applications/ChatGPT.localized/ChatGPT.app/Contents/Resources:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'
+unset ELIXIR_ERL_OPTIONS ERL_AFLAGS ERL_ZFLAGS ERL_LIBS MIX_TARGET ERL_FLAGS
+export MIX_ENV=dev
+export MIX_BUILD_PATH=@BUILD@
+cd @SOURCE@
+guard_eval=@GUARD@
+case "${SYMPHONY_PUSH_HANDOFF_QUALIFY:-}" in
+  "") guard_eval+='SymphonyElixir.CLI.main(System.argv())' ;;
+  1) guard_eval+='IO.puts("FACTORY_REVIEW_REPORT_COLD_BOOT_ATTESTED")' ;;
+  *) exit 78 ;;
+esac
+exec /opt/homebrew/bin/mise exec -- mix run --no-compile --no-deps-check --no-start -e "${guard_eval}" -- --i-understand-that-this-will-be-running-without-the-usual-guardrails --logs-root "${SYMPHONY_FACTORY_LOGS_ROOT:-/Users/cgable/Library/Logs/ai-factory}" "${1:-/Users/cgable/Repos/symphony/elixir/WORKFLOW.local.md}"
+'''
+    quote = lambda value: "'" + value.replace("'", "'\\''") + "'"
+    launcher = launcher.replace('@BUILD@', quote(str(release / 'dev'))).replace('@SOURCE@', quote(str(source / 'elixir'))).replace('@GUARD@', quote(guard_eval))
+    launcher_path = release / 'run-local-factory'
+    launcher_path.write_text(launcher)
+    launcher_path.chmod(0o755)
+    result = {'result': 'BUILT_NOT_ACTIVATED', 'release': str(release), 'source': str(source),
+              'build': str(release / 'dev'), 'source_commit': args.commit,
+              'manifest_sha256': sha(manifest_path), 'guard_sha256': sha(guard_path),
+              'launcher_sha256': sha(launcher_path), 'factory_beam_fingerprint': fingerprint,
+              'factory_module_count': len(factories), 'schema_version': 54}
+    (evidence / 'candidate.json').write_bytes(encode(result))
+    print(json.dumps(result))
+
+
+if __name__ == '__main__':
+    main()
