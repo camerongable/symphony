@@ -5,7 +5,7 @@ defmodule SymphonyElixir.FactoryCapabilityCodecTest do
   alias SymphonyElixir.Factory.{BrokerRuntime, Store, TicketCapabilityRecovery, TicketPushIO}
 
   test "current capability codec is exact while legacy large payload origin remains supported" do
-    for {issuer, history} <- [{16, 13}, {15, 12}, {14, 11}] do
+    for {issuer, history} <- [{31, 23}, {32, 23}, {29, 22}, {30, 22}, {16, 13}, {15, 12}, {14, 11}] do
       helper = Application.app_dir(:symphony_elixir, "priv/ticket_push_executor_v#{issuer}.py")
       program = Application.app_dir(:symphony_elixir, "priv/ticket_push_history_validator_v#{history}.py")
       companion = Application.app_dir(:symphony_elixir, "priv/worker_file_companion.py")
@@ -20,6 +20,8 @@ defmodule SymphonyElixir.FactoryCapabilityCodecTest do
       }
 
       assert TicketPushIO.large_payload_origin?(execution)
+      refute TicketPushIO.large_payload_origin?(Map.put(execution, "history_program_sha256", String.duplicate("0", 64)))
+      refute TicketPushIO.large_payload_origin?(Map.put(execution, "history_program_path", Path.join(Path.dirname(program), "ticket_push_history_validator_v1.py")))
       refute TicketPushIO.large_payload_origin?(Map.put(execution, "helper_path", "/tmp/untrusted/" <> Path.basename(helper)))
       assert TicketPushIO.execution_size_valid?(Jason.encode!(Map.put(execution, "padding", String.duplicate("x", 270_000))))
     end

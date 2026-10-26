@@ -12,6 +12,58 @@ spec.loader.exec_module(history)
 
 
 class ReviewCodecTest(unittest.TestCase):
+    def test_completed_ordinary_push_binds_current_and_retained_history_programs(self):
+        codec_path = path.with_name('ticket_push_history_validator_v23.py')
+        codec_spec = importlib.util.spec_from_file_location('ordinary_programs', codec_path)
+        codec = importlib.util.module_from_spec(codec_spec)
+        codec_spec.loader.exec_module(codec)
+        local = path.parent
+        producer = (local.parent / 'lib/symphony_elixir/factory/ticket_push_io.ex').read_text()
+        self.assertIn('defp helper_name(:capability), do: "ticket_push_executor_v32.py"', producer)
+        self.assertIn(':large -> "ticket_push_executor_v31.py"', producer)
+        for helper_name, history_name in (
+            ('ticket_push_executor_v31.py', 'ticket_push_history_validator_v23.py'),
+            ('ticket_push_executor_v32.py', 'ticket_push_history_validator_v23.py'),
+            ('ticket_push_executor_v29.py', 'ticket_push_history_validator_v22.py'),
+            ('ticket_push_executor_v30.py', 'ticket_push_history_validator_v22.py'),
+        ):
+            execution = {
+                'helper_path': str(local / helper_name),
+                'helper_sha256': hashlib.sha256((local / helper_name).read_bytes()).hexdigest(),
+                'companion_path': str(local / 'worker_file_companion.py'),
+                'companion_sha256': '87f3dd595ddc70205ed881b42ab5a9401b0705c13cdc8fda2c2b8b5bac4b0b3b',
+                'history_program_path': str(local / history_name),
+                'history_program_sha256': hashlib.sha256((local / history_name).read_bytes()).hexdigest(),
+                'run_id': 'ordinary-run', 'invocation': 'a' * 64,
+            }
+            run = dict.fromkeys('run_id issue_key repo_path worktree branch base_branch candidate_sha contract_sha256 spec_revision'.split(), 'identity')
+            run.update(run_id='ordinary-run', candidate_sha='b' * 40)
+            binding_json = codec.canonical(run).decode()
+            execution.update(intent_json=binding_json, intent_sha256=codec.sha(binding_json.encode()))
+            execution_json = codec.canonical(execution).decode()
+            receipt = {'version': 1, 'execution_json': execution_json, 'helper_pid': 123, 'child_pid': 124,
+                       'termination': {'kind': 'exited', 'code': 0}, 'timed_out': False, 'overflow': False,
+                       'output_base64': '', 'output_sha256': hashlib.sha256(b'').hexdigest(),
+                       'stderr_code': 'GIT_EXIT_ZERO', 'stderr_bytes': 0, 'stderr_sha256': hashlib.sha256(b'').hexdigest()}
+            receipt_json = codec.canonical(receipt).decode()
+            intent = {'version': 1, 'kind': 'TICKET_PUSH', 'phase': 'COMPLETED', 'binding_json': binding_json,
+                      'binding_sha256': execution['intent_sha256'], 'reservation_key': 'ticket-push:' + execution['intent_sha256'],
+                      'reservation_generation': 1, 'owner_nonce': 'a' * 64, 'helper_pid': 123,
+                      'execution_json': execution_json, 'receipt_json': receipt_json,
+                      'receipt_sha256': codec.sha(receipt_json.encode()), 'remote_sha': run['candidate_sha']}
+            with self.subTest(helper=helper_name):
+                raw = codec.canonical(intent).decode()
+                self.assertEqual(codec.push_completed_marker(raw, run)['kind'], 'COMPLETED_V12_PUSH_SIZE_V1')
+                for field, value in (('helper_path', str(local / 'ticket_push_executor_v999.py')),
+                                     ('helper_path', str(local / 'ticket_push_executor_v28.py')),
+                                     ('helper_sha256', '0' * 64), ('history_program_sha256', '0' * 64),
+                                     ('history_program_path', str(local / 'ticket_push_history_validator_v21.py'))):
+                    changed = dict(intent, execution_json=codec.canonical(dict(execution, **{field: value})).decode())
+                    changed['receipt_json'] = codec.canonical(dict(receipt, execution_json=changed['execution_json'])).decode()
+                    changed['receipt_sha256'] = codec.sha(changed['receipt_json'].encode())
+                    with self.subTest(field=field), self.assertRaises(ValueError):
+                        codec.push_completed_marker(codec.canonical(changed).decode(), run)
+
     def test_focused_writer_readiness_is_not_physical_verifier_acceptance(self):
         codec_spec = importlib.util.spec_from_file_location('writer_readiness', path.with_name('ticket_push_history_validator_v22.py'))
         codec = importlib.util.module_from_spec(codec_spec)
