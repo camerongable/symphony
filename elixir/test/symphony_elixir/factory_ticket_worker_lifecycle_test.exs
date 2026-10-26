@@ -94,6 +94,12 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
       on_exit(fn -> Application.delete_env(:symphony_elixir, :ordinary_go_generation) end)
     end
 
+    if path = context[:ordinary_go_path] do
+      File.mkdir_p!(Path.join(context.path, Path.dirname(path)))
+      Application.put_env(:symphony_elixir, :ordinary_go_path, path)
+      on_exit(fn -> Application.delete_env(:symphony_elixir, :ordinary_go_path) end)
+    end
+
     :ok
   end
 
@@ -5358,6 +5364,34 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     assert sizes["GAZELLE_DIFF"] > 2_097_152
   end
 
+  @tag broker_thread_id: "00000000-0000-0000-0000-000000000001", mr_preflight: true
+  @tag ci_repair_fixture: true,
+       ci_repair_native: true,
+       verifier_repair_cycle: true,
+       ordinary_final_rollover: true,
+       ordinary_go_generation: true,
+       ordinary_go_path: "go/src/grail.com/workflows/docextract/workflow.go",
+       timeout: 900_000
+  test "product Go workflow source generates and publishes through ordinary repair after restart", ctx do
+    assert_mr_adoption(ctx)
+    [gofmt] = Store.query!(ctx.store, "SELECT binding_json FROM ticket_ordinary_generation_intents WHERE operation='GOFMT_DIFF'").rows
+    assert Jason.decode!(hd(gofmt))["paths"] == ["go/src/grail.com/workflows/docextract/workflow.go"]
+    assert File.read!(Path.join(ctx.path, "go/src/grail.com/workflows/docextract/BUILD")) =~ "//dep"
+    assert git(ctx.path, ["status", "--porcelain"]) == ""
+  end
+
+  @tag broker_thread_id: "00000000-0000-0000-0000-000000000001", mr_preflight: true
+  @tag ci_repair_fixture: true,
+       ci_repair_native: true,
+       verifier_repair_cycle: true,
+       ordinary_go_generation: true,
+       ordinary_go_path: "go/src/grail.com/workflows/docextract/config/workflow.go",
+       ordinary_policy_negative: true,
+       timeout: 900_000
+  test "protected product workflow policy stops before ordinary generation observation or adoption", ctx do
+    assert catch_throw(assert_mr_adoption(ctx)) == :protected_generation_denied
+  end
+
   @tag :capability_counter_lineage
   test "preloaded capability counters are recorded by the original completed predecessor push", ctx do
     seed_capability_counters(Map.put(ctx, :capability_recovery_native, true))
@@ -8017,6 +8051,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     original = Jason.decode!(worker["output_json"])
     assert original["status"] == "COMPLETE" and original["changed_paths"] == []
     before_sha = String.trim(git(ctx.path, ["rev-parse", "HEAD"]))
+    if ctx[:ordinary_policy_negative], do: assert_protected_ordinary_generation(ctx, context, options, key, run, original)
     assert {:ok, %{status: "PREPARED", intents: intents}} = TicketCiGeneration.prepare(ctx.store, key)
     assert length(intents) == 2
     assert {:error, :controller_generation_pending} = TicketCiGeneration.commit_ready(ctx.store, key)
@@ -8051,8 +8086,9 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
       end
 
     assert {:ok, effective} = generated, inspect(diagnostics, limit: :infinity, printable_limit: 20_000)
-    assert "moved/BUILD" in effective["changed_paths"]
-    assert "moved/job.go" in effective["changed_paths"]
+    moved_path = ctx[:ordinary_go_path] || "moved/job.go"
+    assert Path.join(Path.dirname(moved_path), "BUILD") in effective["changed_paths"]
+    assert moved_path in effective["changed_paths"]
     assert "pkg/BUILD" in effective["changed_paths"]
     assert String.trim(git(ctx.path, ["rev-parse", "HEAD"])) == before_sha
     assert {:ok, held} = WorkspaceAccess.get(ctx.store, worker["reservation_key"])
@@ -8076,6 +8112,32 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     assert consumed["output_json"] == worker["output_json"]
     IO.puts("ordinary Go: actual confined generation, held SOURCE, process restart, no re-execution and exact controller commit passed")
     {committed, restarted}
+  end
+
+  defp assert_protected_ordinary_generation(ctx, context, options, key, run, original) do
+    alias SymphonyElixir.Factory.TicketCiGeneration
+    tables = ~w(ticket_ordinary_generation_intents ticket_ordinary_generation_events worker_file_operations worker_evidence runs controller_checks workspace_access)
+    snapshot = fn -> Map.new(tables, &{&1, Store.query!(ctx.store, "SELECT * FROM #{&1} ORDER BY rowid").rows}) end
+    before = snapshot.()
+    {:ok, transport} = WorkerFileIO.controller_spool(ctx.store, ctx.path)
+    spool_files = File.ls!(transport["spool"]) |> Enum.sort()
+    status = git(ctx.path, ["status", "--porcelain"])
+    head = git(ctx.path, ["rev-parse", "HEAD"])
+    source = File.read!(Path.join(ctx.path, ctx.ordinary_go_path))
+    runtime = Path.join(ctx.root, "runtime-fixture")
+    marker = Path.join(ctx.root, "forbidden-generation-observation")
+    File.write!(runtime, "#!/bin/sh\ntouch '#{marker}'\nexit 97\n")
+
+    assert {:error, :controller_generation_scope_unproven} = TicketCiGeneration.prepare(ctx.store, key)
+    assert {:error, :controller_generation_scope_unproven} = TicketCiGeneration.complete(ctx.store, key, run, original)
+    assert {:error, :controller_generation_scope_unproven} = Scheduler.ticket_step(context, "run", options)
+    refute File.exists?(marker)
+    assert Enum.sort(File.ls!(transport["spool"])) == spool_files
+    assert snapshot.() == before
+    assert git(ctx.path, ["status", "--porcelain"]) == status
+    assert git(ctx.path, ["rev-parse", "HEAD"]) == head
+    assert File.read!(Path.join(ctx.path, ctx.ordinary_go_path)) == source
+    throw(:protected_generation_denied)
   end
 
   defp assert_repair_cycle_ready(ctx, factory, options, rolled, mr) do
@@ -8259,11 +8321,13 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
 
   defp assert_ordinary_physical_negatives(ctx, execution, binding, run) do
     payload = Path.join(ctx.root, "ordinary-proof-negative.json")
+    moved_path = ctx[:ordinary_go_path] || "moved/job.go"
+    moved_build = Path.join(Path.dirname(moved_path), "BUILD")
 
     {go_paths, present_go, generated_paths} =
       if ctx[:capability_recovery_native],
         do: {["dep/dep.go", "moved/job.go", "pkg/old.go"], ["dep/dep.go", "moved/job.go"], ["dep/dep.go", "moved/BUILD", "moved/job.go", "pkg/BUILD"]},
-        else: {["moved/job.go", "pkg/old.go"], ["moved/job.go"], ["moved/BUILD", "moved/job.go", "pkg/BUILD"]}
+        else: {Enum.sort([moved_path, "pkg/old.go"]), [moved_path], Enum.sort([moved_build, moved_path, "pkg/BUILD"])}
 
     File.write!(payload, Jason.encode!(%{"execution" => execution, "binding" => binding, "run" => run, "go_paths" => go_paths, "present_go" => present_go, "generated_paths" => generated_paths}))
 

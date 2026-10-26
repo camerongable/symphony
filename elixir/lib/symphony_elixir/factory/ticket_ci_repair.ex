@@ -658,23 +658,23 @@ defmodule SymphonyElixir.Factory.TicketCiRepair do
   @doc "Checks a relative source path without granting any filesystem authority."
   @spec source_path?(term()) :: boolean()
   def source_path?(path) when is_binary(path) do
-    segments = String.split(path, "/")
     # Grail's Go workflows package is product source, not factory workflow policy.
-    protected = if String.starts_with?(path, "go/src/grail.com/workflows/"), do: @protected -- ["workflows"], else: @protected
+    product_go = String.starts_with?(path, "go/src/grail.com/workflows/") and String.ends_with?(path, ".go")
+    checked = if product_go, do: String.replace_prefix(path, "go/src/grail.com/workflows/", "go/src/grail.com/"), else: path
+    segments = String.split(checked, "/")
 
     path != "" and byte_size(path) <= 1024 and String.valid?(path) and Path.type(path) == :relative and
-      Enum.all?(segments, &(&1 not in ["", ".", ".."] and String.downcase(&1) not in protected)) and
-      not Regex.match?(~r/[\x00-\x1f\x7f\\]/, path) and not policy_file?(path)
+      Enum.all?(segments, &(&1 not in ["", ".", ".."] and String.downcase(&1) not in @protected)) and
+      not Regex.match?(~r/[\x00-\x1f\x7f\\]/, path) and not policy_file?(path, product_go)
   end
 
   def source_path?(_path), do: false
 
-  defp policy_file?(path) do
-    checked = String.replace_prefix(path, "go/src/grail.com/workflows/", "go/src/grail.com/")
-
+  defp policy_file?(path, product_go) do
     String.downcase(Path.basename(path)) in Enum.map(@policy_names, &String.downcase/1) or
       String.ends_with?(String.downcase(Path.basename(path)), [".lock"]) or
-      String.contains?(String.downcase(checked), ["/workflow", "/policy", "/config/"])
+      String.contains?(String.downcase(path), ["/policy", "/config/"]) or
+      (not product_go and String.contains?(String.downcase(path), "/workflow"))
   end
 
   defp failed_ids(%{"status" => "BLOCK", "pipeline_id" => pipeline, "failed_jobs" => jobs})
