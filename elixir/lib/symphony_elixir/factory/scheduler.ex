@@ -22,6 +22,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
     Control,
     ControllerTask,
     DesktopRequest,
+    FailedTurnRecovery,
     IntakeLedger,
     JiraMcpConnector,
     JiraMcpReader,
@@ -36,6 +37,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
     Prompt,
     Queue,
     Recovery,
+    ReviewProtocol,
     RunLedger,
     StageSchemas,
     Store,
@@ -43,17 +45,21 @@ defmodule SymphonyElixir.Factory.Scheduler do
     TaskLedger,
     TicketAmendmentCritic,
     TicketAmendmentJiraOperation,
+    TicketCapabilityRecovery,
     TicketChat,
     TicketChatCommands,
     TicketChatOutbox,
     TicketCheckout,
+    TicketCompletionConfirmation,
     TicketContextReader,
     TicketContractAmendment,
+    TicketInfrastructureRecovery,
     TicketJiraFinalization,
     TicketJiraJournal,
     TicketJiraOperation,
     TicketMrOperation,
     TicketPush,
+    TicketVerifierRepair,
     TicketWorkerRunner,
     WorkerEvidence,
     WorkspaceAccess,
@@ -79,8 +85,24 @@ defmodule SymphonyElixir.Factory.Scheduler do
   defp ticket_parent_step_locked(context, run_id, opts) do
     with {:ok, run} <- RunLedger.get(context.store, run_id),
          {:ok, attrs} <- prepare_ticket_parent(context, run, opts),
-         :ok <- check_new_parent_runtime(context.store, run_id, opts[:parent_output_root]) do
+         :ok <- check_new_parent_runtime(context.store, run_id, Path.dirname(attrs.cwd)),
+         :ok <- rehome_dated_unissued_parent(context, run, attrs, opts) do
       reserve_ticket_parent(context, run, attrs)
+    end
+  end
+
+  defp rehome_dated_unissued_parent(context, run, attrs, opts) do
+    dated = is_binary(opts[:parent_output_root]) and String.contains?(opts[:parent_output_root], "{date}")
+
+    with true <- dated,
+         {:ok, chat} <- TicketChat.for_run(context.store, run["run_id"]),
+         true <- chat["cwd"] != attrs.cwd do
+      case TicketChat.rehome_unissued(context.store, run["run_id"], attrs, run) do
+        {:ok, _} -> :ok
+        {:error, _} = error -> error
+      end
+    else
+      _ -> :ok
     end
   end
 
@@ -102,6 +124,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
          {:ok, reader} <- TicketContextReader.bind(context.store, run_id, opts),
          snapshot <- Jason.decode!(run["snapshot_json"]),
          cwd <- Path.join(root, TicketChat.directory_name(context.factory.scope, snapshot["id"], run["repo_key"])),
+         cwd <- retained_parent_cwd(context, run, snapshot, cwd),
          attrs = %{
            scope_key: context.factory.scope,
            issue_id: snapshot["id"],
@@ -123,6 +146,22 @@ defmodule SymphonyElixir.Factory.Scheduler do
     end
   end
 
+  defp retained_parent_cwd(context, run, snapshot, planned) do
+    existing =
+      case TicketChat.for_run(context.store, run["run_id"]) do
+        {:ok, _} = bound -> bound
+        _ -> TicketChat.find(context.store, context.factory.scope, snapshot["id"], run["repo_key"])
+      end
+
+    with {:ok, chat} <- existing,
+         {:ok, request} <- DesktopRequest.get(context.store, chat["create_request_key"]),
+         true <- request["status"] != "PENDING" or not is_nil(chat["thread_id"]) do
+      chat["cwd"]
+    else
+      _ -> planned
+    end
+  end
+
   defp reserve_ticket_parent(context, run, attrs) do
     with {:ok, reserved} <- TicketChat.reserve(context.store, run["run_id"], attrs, run) do
       parent_admission_result(context.store, run["run_id"], reserved)
@@ -136,6 +175,10 @@ defmodule SymphonyElixir.Factory.Scheduler do
   defp parent_admission_policy(_policy, _issue), do: {:error, :ticket_chat_runtime_not_integrated}
 
   defp parent_output_root(root) when is_binary(root) do
+    dated = String.contains?(root, "{date}")
+    root = TicketChat.output_root(root)
+    if dated, do: File.mkdir_p!(root)
+
     with true <- Path.type(root) == :absolute or {:error, :ticket_parent_output_root_required},
          {:ok, canonical} <- PathSafety.canonicalize(root),
          true <- (canonical == root and File.dir?(root)) or {:error, :ticket_parent_output_root_invalid} do
@@ -176,19 +219,29 @@ defmodule SymphonyElixir.Factory.Scheduler do
   end
 
   defp ticket_step_locked(context, run_id, opts) do
-    with {:ok, run} <- RunLedger.get(context.store, run_id),
-         :ok <- TicketChat.ordinary_delivery_eligibility(run),
+    with {:ok, run} <- RunLedger.get(context.store, run_id) do
+      if run["state"] == "FAILED" and TicketVerifierRepair.pending?(context.store, run_id) do
+        opts = Keyword.put(opts, :workspace, controller_workspace(context))
+        TicketVerifierRepair.apply_authorized(context.store, run_id, context.factory, opts)
+      else
+        ticket_active_step(context, run, opts)
+      end
+    end
+  end
+
+  defp ticket_active_step(context, run, opts) do
+    run_id = run["run_id"]
+
+    with :ok <- TicketChat.ordinary_delivery_eligibility(run),
          {:ok, _} <- TicketChat.ready_for_run(context.store, run_id) do
-      opts =
-        opts
-        |> Keyword.put_new(:workspace_root, context.workspace_root)
-        |> Keyword.put_new_lazy(:capacity_policy, fn -> factory_policy(context) end)
+      opts = ticket_runtime_options(context, opts)
 
       result =
         case current_ticket_attempts(context.store, run) do
           [] -> ticket_unreserved_step(context, run, opts)
           [[_key, "RESERVED"]] -> launch_ticket_stage(context, run, opts)
-          [[key, _]] -> adopt_ticket_stage(context, key)
+          [[key, "RECONCILE_REQUIRED"]] -> retry_rejected_ticket_resume(context, run, key, opts)
+          [[key, _]] -> adopt_or_recover_ticket_stage(context, run, key, opts)
           _ -> {:error, :worker_attempt_reconciliation_required}
         end
 
@@ -197,6 +250,81 @@ defmodule SymphonyElixir.Factory.Scheduler do
       case result do
         {:ok, response} -> {:ok, Map.put(response, :presentation, presentation)}
         error -> error
+      end
+    end
+  end
+
+  defp adopt_or_recover_ticket_stage(context, run, key, opts) do
+    successor = SymphonyElixir.Factory.TicketCiRepairSuccessor
+    supervisor_policy = Map.get(context.factory, :ticket_supervisor, %{})
+
+    if Map.get(supervisor_policy, "ci_repair") == "native_bounded_v1" and Policy.ticket_selected?(supervisor_policy, run["issue_key"]) and successor.eligible?(context.store, run, key) do
+      options =
+        ticket_runtime_options(context, Keyword.merge(Map.get(context, :ticket_options, []), opts))
+        |> Keyword.put(:workspace, controller_workspace(context))
+
+      with {:ok, authorization} <- ticket_authorization(context, run, options),
+           {:ok, prepared} <- successor.prepare(context.store, key, authorization, options) do
+        launch_ticket_stage(context, run, Keyword.put(options, :ci_evidence_successor, prepared))
+      else
+        {:error, :ci_repair_attempt_limit} ->
+          with {:ok, authorization} <- ticket_authorization(context, run, options),
+               {:ok, exhausted} <- successor.record_exhaustion(context.store, key, authorization, options) do
+            {:ok, %{status: "CI_REPAIR_EXHAUSTED", run: exhausted, model_invoked: false}}
+          end
+
+        {:error, reason} when reason in ~w(ci_successor_complete_evidence_unavailable ci_successor_evidence_not_new)a ->
+          {:ok, %{status: "BLOCKED_NO_NEW_EVIDENCE", model_invoked: false, reason: reason}}
+
+        {:error, _} = error ->
+          error
+      end
+    else
+      case ticket_infrastructure_resume(context.store, key) do
+        {:ok, resume} -> launch_ticket_stage(context, run, Keyword.put(opts, :blocked_resume, resume))
+        :none -> adopt_ticket_stage(context, key)
+        {:error, _} = error -> error
+      end
+    end
+  end
+
+  defp ticket_infrastructure_resume(store, key) do
+    case TicketCapabilityRecovery.pending_resume(store, key) do
+      :none -> TicketInfrastructureRecovery.resume(store, key)
+      result -> result
+    end
+  end
+
+  defp retry_rejected_ticket_resume(context, run, key, opts) do
+    case FailedTurnRecovery.prepare_schema_confirmation(context.store, key, opts) do
+      :none -> retry_ordinary_rejected_resume(context, run, key, opts)
+      {:ok, proof} -> {:ok, %{status: "RECOVERY_PREPARED", recovery_key: proof["recovery_key"], model_invoked: false}}
+      error -> error
+    end
+  end
+
+  defp retry_ordinary_rejected_resume(context, run, key, opts) do
+    case WorkerEvidence.rearm_rejected_resume(context.store, key) do
+      {:ok, _} -> launch_ticket_stage(context, run, opts)
+      {:error, :worker_resume_retry_not_due} -> {:ok, %{status: "WAITING_FOR_WRITER", reason: "Native resume retry cooldown", model_invoked: false}}
+      {:error, _} -> prepare_failed_ticket_retry(context, key, opts)
+    end
+  end
+
+  defp prepare_failed_ticket_retry(context, key, opts) do
+    with {:ok, evidence} <- WorkerEvidence.get(context.store, key) do
+      case FailedTurnRecovery.prepare_automatic(context.store, key, evidence["turn_id"], opts) do
+        {:ok, receipt} ->
+          {:ok, %{status: "RECOVERY_PREPARED", recovery_key: receipt["recovery_key"], model_invoked: false}}
+
+        {:error, :failed_retry_cooldown} ->
+          {:ok, %{status: "WAITING_FOR_WRITER", reason: "Failed native turn retry cooldown", model_invoked: false}}
+
+        {:error, :failed_retry_not_eligible} ->
+          adopt_ticket_stage(context, key)
+
+        {:error, _} = error ->
+          error
       end
     end
   end
@@ -240,8 +368,8 @@ defmodule SymphonyElixir.Factory.Scheduler do
   defp ticket_unreserved_step(context, run, opts), do: launch_ticket_stage(context, run, opts)
 
   defp admit_ticket_writer(context, run, opts) do
-    with {:ok, chat} <- TicketChat.ready_for_run(context.store, run["run_id"]) do
-      TicketJiraOperation.start_implementation(context.store, run["run_id"], Keyword.put(opts, :workspace, chat["cwd"]))
+    with {:ok, _chat} <- TicketChat.ready_for_run(context.store, run["run_id"]) do
+      TicketJiraOperation.start_implementation(context.store, run["run_id"], Keyword.put(opts, :workspace, controller_workspace(context)))
     end
   end
 
@@ -292,18 +420,54 @@ defmodule SymphonyElixir.Factory.Scheduler do
   end
 
   defp launch_ticket_stage(context, run, opts) do
+    opts = ticket_runtime_options(context, opts)
     base = Store.one!(context.store, "SELECT base_sha FROM ticket_review_bases WHERE run_id = ?", [run["run_id"]])
 
     with %{"base_sha" => base_sha} <- base,
-         {:ok, stage} <- ticket_stage(run, context.factory),
+         {:ok, stage} <- ticket_stage(run, context.factory, context.store),
          {:ok, authorization} <- ticket_authorization(context, run, opts),
-         {:ok, base_prompt} <- TicketWorkerRunner.packet(context.store, run["run_id"], stage.role, base_sha),
-         {:ok, prompt, blocked_resume} <- launch_prompt(context.store, run, stage, base_prompt, opts) do
+         {:ok, prompt, blocked_resume} <- ticket_launch_prompt(context, run, stage, base_sha, opts),
+         :ok <- TicketCompletionConfirmation.validate_prompt(stage[:completion_confirmation], prompt) do
       launch_ticket_stage_task(context, run, opts, stage, base_sha, authorization, prompt, blocked_resume)
     else
       nil -> {:error, :ticket_review_base_missing}
       {:error, _} = error -> error
     end
+  end
+
+  defp ticket_launch_prompt(context, run, stage, base_sha, opts) do
+    case opts[:ci_evidence_successor] do
+      %{run: ^run, prompt: prompt} ->
+        {:ok, prompt, nil}
+
+      nil ->
+        ticket_base_prompt(context, run, stage, base_sha, opts)
+
+      _ ->
+        {:error, :ci_successor_preparation_changed}
+    end
+  end
+
+  defp ticket_runtime_options(context, opts) do
+    opts
+    |> Keyword.put_new(:workspace_root, context.workspace_root)
+    |> Keyword.put_new_lazy(:capacity_policy, fn -> factory_policy(context) end)
+  end
+
+  defp ticket_base_prompt(context, run, stage, base_sha, opts) do
+    prepared = if is_map(opts[:blocked_resume]), do: {:ok, opts[:blocked_resume]}, else: recover_prepared_blocked_resume(context.store, run, stage)
+
+    with {:ok, resume} <- prepared, do: ticket_base_prompt(context, run, stage, base_sha, opts, resume)
+  end
+
+  defp ticket_base_prompt(context, run, stage, base_sha, opts, %{"operational_recovery_key" => "TCAP-" <> _} = resume) do
+    with {:ok, packet} <- TicketCapabilityRecovery.retained_packet(context.store, run, base_sha, resume),
+         do: launch_prompt(context.store, run, stage, packet, Keyword.put(opts, :blocked_resume, resume))
+  end
+
+  defp ticket_base_prompt(context, run, stage, base_sha, opts, _resume) do
+    with {:ok, packet} <- TicketWorkerRunner.packet(context.store, run["run_id"], stage.role, base_sha),
+         do: launch_prompt(context.store, run, stage, packet, opts)
   end
 
   defp launch_ticket_stage_task(context, run, opts, stage, base_sha, authorization, prompt, blocked_resume) do
@@ -327,6 +491,26 @@ defmodule SymphonyElixir.Factory.Scheduler do
 
     launch_opts = apply_resume_launch_options(launch_opts, blocked_resume, prompt, run, base_sha)
 
+    with {:ok, launch_opts} <- capability_launch_options(context, prompt, launch_opts) do
+      launch_prepared_ticket_stage(context, run, prompt, stage, launch_opts)
+    end
+  end
+
+  defp capability_launch_options(context, prompt, opts) do
+    case opts[:blocked_resume] do
+      %{"operational_recovery_key" => "TCAP-" <> _} = resume ->
+        opts = Keyword.put(opts, :workspace, controller_workspace(context))
+
+        with {:ok, checked} <- TicketCapabilityRecovery.prepare(context.store, resume["request_key"], context.factory, Keyword.put(opts, :capability_prompt, prompt)) do
+          {:ok, Keyword.put(opts, :blocked_resume, Map.merge(resume, checked))}
+        end
+
+      _ ->
+        {:ok, opts}
+    end
+  end
+
+  defp launch_prepared_ticket_stage(context, run, prompt, stage, launch_opts) do
     case TaskLauncher.launch(
            context.store,
            context.task_supervisor,
@@ -334,7 +518,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
            issue_from_snapshot(decode_json!(run["snapshot_json"])),
            run["worktree"],
            prompt,
-           StageSchemas.for_stage(stage.schema),
+           ReviewProtocol.schema_json(prompt, StageSchemas.for_stage(stage.schema)),
            launch_opts
          ) do
       {:ok, launch} -> {:ok, %{status: "LAUNCHED", launch: launch}}
@@ -356,6 +540,9 @@ defmodule SymphonyElixir.Factory.Scheduler do
     Keyword.put(launch_opts, :ready_rework, resume)
   end
 
+  defp apply_resume_launch_options(launch_opts, %{kind: :failed_turn, receipt: receipt}, _prompt, _run, _base_sha),
+    do: Keyword.put(launch_opts, :failed_turn_recovery, receipt)
+
   defp apply_resume_launch_options(launch_opts, _resume, _prompt, _run, _base_sha), do: launch_opts
 
   defp launch_prompt(store, run, stage, base_prompt, opts) do
@@ -371,6 +558,14 @@ defmodule SymphonyElixir.Factory.Scheduler do
   end
 
   defp launch_prompt_without_resume(store, run, stage, base_prompt, opts) do
+    case SymphonyElixir.Factory.FailedTurnRecovery.prepared(store, run["run_id"], base_prompt) do
+      {:ok, receipt} -> {:ok, receipt["prompt"], %{kind: :failed_turn, receipt: receipt}}
+      {:error, _} = error -> error
+      :none -> launch_prompt_without_failed_recovery(store, run, stage, base_prompt, opts)
+    end
+  end
+
+  defp launch_prompt_without_failed_recovery(store, run, stage, base_prompt, opts) do
     case recover_prepared_ready_rework(store, run, stage, base_prompt) do
       {:ok, nil} -> launch_prompt_after_ready_rework(store, run, stage, base_prompt, opts)
       {:ok, prepared} -> {:ok, prepared.prompt, prepared}
@@ -445,6 +640,38 @@ defmodule SymphonyElixir.Factory.Scheduler do
     end
   end
 
+  defp blocked_resume_prompt(store, run, %{role: "feature-writer"}, base_prompt, %{"operational_recovery_key" => "TCAP-" <> _ = key} = resume) do
+    disposition = current_blocked_writer_disposition(store, run["run_id"], run["run_id"] <> ":feature-writer")
+
+    with true <- resume_disposition_matches?(disposition, resume) or {:error, :ticket_blocked_rework_not_current} do
+      prompt =
+        Jason.encode!(%{
+          "base_packet" => Jason.decode!(base_prompt),
+          "controller_infrastructure_recovery" => key,
+          "recovery_instruction" => TicketCapabilityRecovery.body(),
+          "blocked_writer_context" => disposition
+        })
+
+      {:ok, prompt, resume}
+    end
+  end
+
+  defp blocked_resume_prompt(store, run, %{role: "feature-writer"}, base_prompt, %{"operational_recovery_key" => key} = resume) when is_binary(key) do
+    disposition = current_blocked_writer_disposition(store, run["run_id"], run["run_id"] <> ":feature-writer")
+
+    with true <- resume_disposition_matches?(disposition, resume) or {:error, :ticket_blocked_rework_not_current} do
+      prompt =
+        Jason.encode!(%{
+          "base_packet" => Jason.decode!(base_prompt),
+          "controller_infrastructure_recovery" => key,
+          "recovery_instruction" => TicketInfrastructureRecovery.body(),
+          "blocked_writer_context" => disposition
+        })
+
+      {:ok, prompt, resume}
+    end
+  end
+
   defp blocked_resume_prompt(store, run, %{role: "feature-writer"}, base_prompt, resume) do
     with true <- is_map(resume) or {:error, :ticket_blocked_rework_not_current},
          input when is_map(input) <- Store.one!(store, "SELECT * FROM ticket_chat_inputs WHERE input_key = ?", [resume["input_key"]]),
@@ -461,7 +688,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
   defp blocked_resume_prompt(_store, _run, _stage, _base_prompt, _resume), do: {:error, :blocked_rework_requires_feature_writer}
 
   defp resume_disposition_matches?(disposition, resume),
-    do: disposition["disposition_key"] == resume["disposition_key"] and disposition["request_key"] == resume["request_key"]
+    do: is_map(disposition) and disposition["disposition_key"] == resume["disposition_key"] and disposition["request_key"] == resume["request_key"]
 
   defp recover_prepared_blocked_resume(store, run, %{role: "feature-writer", key: task_key}) do
     pending = WorkerEvidence.pending(store, run["run_id"]) |> Enum.filter(&(&1["task_key"] == task_key and &1["status"] == "RESERVED"))
@@ -473,8 +700,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
             {:ok, nil}
 
           {:ok, transfer} ->
-            command = prepared_resume_command(store, run["run_id"], attempt["request_key"])
-            recover_prepared_blocked_resume(store, run, attempt, command, transfer)
+            recover_transferred_resume(store, run, attempt, transfer)
 
           {:error, _} = error ->
             error
@@ -489,6 +715,17 @@ defmodule SymphonyElixir.Factory.Scheduler do
   end
 
   defp recover_prepared_blocked_resume(_store, _run, _stage), do: {:ok, nil}
+
+  defp recover_transferred_resume(store, _run, attempt, %{"operational_recovery_key" => "TCAP-" <> _} = transfer),
+    do: TicketCapabilityRecovery.prepared(store, attempt, transfer)
+
+  defp recover_transferred_resume(store, _run, attempt, %{"operational_recovery_key" => key} = transfer) when is_binary(key),
+    do: TicketInfrastructureRecovery.prepared(store, attempt, transfer)
+
+  defp recover_transferred_resume(store, run, attempt, transfer) do
+    command = prepared_resume_command(store, run["run_id"], attempt["request_key"])
+    recover_prepared_blocked_resume(store, run, attempt, command, transfer)
+  end
 
   defp blocked_transfer_for_reserved_attempt(store, run_id, task_key, request_key) do
     %{columns: columns, rows: rows} =
@@ -586,28 +823,46 @@ defmodule SymphonyElixir.Factory.Scheduler do
     end
   end
 
-  defp ticket_stage(%{"state" => "PLANNING"} = run, _factory),
+  defp ticket_stage(%{"state" => "PLANNING"} = run, _factory, _store),
     do: {:ok, %{key: run["run_id"] <> ":feature-planner", role: "feature-planner", schema: :feature_planner}}
 
-  defp ticket_stage(%{"state" => state} = run, factory) when state in ~w(WRITING REPAIRING REVIEW_WRITING) do
-    if run["implementation_iteration"] < factory.maximum_implementation_iterations,
-      do: {:ok, %{key: run["run_id"] <> ":feature-writer", role: "feature-writer", schema: :native_feature_writer}},
-      else: {:error, :implementation_iteration_limit}
+  defp ticket_stage(%{"state" => state} = run, factory, store) when state in ~w(WRITING REPAIRING REVIEW_WRITING) do
+    confirmation = TicketCompletionConfirmation.authorization(store, run, factory)
+
+    cond do
+      run["implementation_iteration"] < factory.maximum_implementation_iterations ->
+        {:ok, %{key: run["run_id"] <> ":feature-writer", role: "feature-writer", schema: :native_feature_writer}}
+
+      is_map(confirmation) ->
+        {:ok, %{key: run["run_id"] <> ":feature-writer", role: "feature-writer", schema: :native_feature_writer, completion_confirmation: confirmation}}
+
+      true ->
+        {:error, :implementation_iteration_limit}
+    end
   end
 
-  defp ticket_stage(%{"state" => "VERIFYING"} = run, _factory),
+  defp ticket_stage(%{"state" => "VERIFYING"} = run, _factory, _store),
     do: {:ok, %{key: "#{run["run_id"]}:change-verifier:#{run["verifier_round"]}", role: "change-verifier", schema: :change_verifier}}
 
-  defp ticket_stage(_run, _factory), do: {:error, :ticket_role_stage_not_admitted}
+  defp ticket_stage(_run, _factory, _store), do: {:error, :ticket_role_stage_not_admitted}
 
-  defp ticket_authorization(context, run, opts) do
+  defp ticket_authorization(context, run, opts, prior \\ nil) do
     reader = Keyword.get(opts, :jira_reader, JiraMcpReader)
-    read_opts = [workspace: context.workspace_root, store: context.store, connector: Map.get(context, :jira_connector) || JiraMcpConnector, app_server: Map.get(context, :jira_app_server, AppServer)]
+
+    read_opts = [
+      workspace: controller_workspace(context),
+      store: context.store,
+      connector: Map.get(context, :jira_connector) || JiraMcpConnector,
+      app_server: Map.get(context, :jira_app_server, AppServer)
+    ]
 
     with {:ok, snapshot} <- reader.issue(run["issue_key"], read_opts) do
       observed_at = DateTime.utc_now()
       ticket_opts = Keyword.put(Map.get(context, :ticket_options, []), :workspace_root, context.workspace_root)
-      TicketWorkerRunner.delivery_authorization(context.store, run, snapshot, observed_at, ticket_opts)
+
+      if prior,
+        do: TicketWorkerRunner.refresh_delivery_authorization(run, snapshot, observed_at, prior),
+        else: TicketWorkerRunner.delivery_authorization(context.store, run, snapshot, observed_at, ticket_opts)
     end
   end
 
@@ -679,7 +934,8 @@ defmodule SymphonyElixir.Factory.Scheduler do
 
   defp adopt_recorded_ticket_stage(context, key) do
     with {:ok, adopted} <- TicketWorkerRunner.adoption(context.store, key) do
-      case Exqlite.transaction(context.store, &ticket_adoption_transaction(%{context | store: &1}, adopted, key)) do
+      # Exact checkout revalidation can scan a monorepo multiple times before atomic release.
+      case Exqlite.transaction(context.store, &ticket_adoption_transaction(%{context | store: &1}, adopted, key), timeout: 60_000) do
         {:ok, result} -> result
         {:error, reason} -> {:error, reason}
       end
@@ -840,10 +1096,28 @@ defmodule SymphonyElixir.Factory.Scheduler do
     :ok
   end
 
-  defp ticket_role_transition(context, %{"state" => "VERIFYING"} = run, %{"role" => "change-verifier"}, output, _request_key) do
-    case consume_change_verifier_output(context, run, output, %{events: []}) do
-      {:ok, _} -> :ok
-      error -> error
+  defp ticket_role_transition(context, %{"state" => "VERIFYING"} = run, %{"role" => "change-verifier"} = task, output, request_key) do
+    policy = ticket_review_policy(context, run, task, output, request_key)
+
+    result =
+      case policy do
+        {:ok, {:stop, stop}} -> {:policy_stop, stop}
+        {:ok, _} -> consume_change_verifier_output(context, run, output, %{events: []})
+        error -> error
+      end
+
+    case result do
+      {:policy_stop, stop} ->
+        record_ticket_verifier_terminal(context.store, run, request_key, {:verification_policy_stopped, output["findings"]}, stop)
+
+      {:ok, _} ->
+        :ok
+
+      {:error, {kind, _findings} = reason} when kind in [:verification_blocked, :code_repair_limit] ->
+        record_ticket_verifier_terminal(context.store, run, request_key, reason)
+
+      error ->
+        error
     end
   end
 
@@ -856,6 +1130,39 @@ defmodule SymphonyElixir.Factory.Scheduler do
   end
 
   defp ticket_role_transition(_context, _run, _task, _output, _request_key), do: {:error, :ticket_role_output_not_adoptable}
+
+  defp ticket_review_policy(context, run, task, output, request_key) do
+    if output["status"] == "REPAIR" and run["code_repair_round"] + 1 > context.factory.maximum_code_repair_rounds,
+      do: {:ok, :legacy},
+      else: ReviewProtocol.apply_policy(context.store, run, task, output, request_key)
+  end
+
+  defp record_ticket_verifier_terminal(store, run, request_key, reason, policy \\ nil) do
+    with {:ok, evidence} <- WorkerEvidence.get(store, request_key),
+         {:ok, _} <- RunLedger.update(store, run["run_id"], %{state: "FAILED", failure_code: failure_code(reason), last_error: inspect(reason)}) do
+      receipt = %{
+        "version" => if(policy, do: 2, else: 1),
+        "kind" => if(policy, do: "TICKET_VERIFIER_TERMINAL_V2", else: "TICKET_VERIFIER_TERMINAL_V1"),
+        "request_key" => request_key,
+        "task_key" => evidence["task_key"],
+        "binding_sha256" => evidence["binding_sha256"],
+        "output_sha256" => evidence["output_sha256"],
+        "reason" => Atom.to_string(elem(reason, 0)),
+        "prior_run" => Map.take(run, ~w(run_id candidate_sha spec_revision contract_sha256 verifier_round code_repair_round implementation_iteration))
+      }
+
+      receipt = if policy, do: Map.put(receipt, "review_policy", policy), else: receipt
+
+      Store.query!(store, "INSERT INTO events(occurred_at,event_type,run_id,payload_json) VALUES (?,?,?,?)", [
+        DateTime.to_iso8601(DateTime.utc_now()),
+        "TICKET_NATIVE_VERIFIER_TERMINAL",
+        run["run_id"],
+        Jason.encode!(receipt)
+      ])
+
+      :ok
+    end
+  end
 
   @doc "Runs one serialized reconciliation and dispatch tick."
   @spec tick(context(), keyword()) :: {:ok, map()} | {:error, term()}
@@ -958,7 +1265,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
           {:ok, acc}
 
         selected ->
-          reconcile_selected_ticket(context, selected, acc)
+          reconcile_selected_ticket(Map.put(context, :ordinary_rejection_dispatch, mode == :before_dispatch), selected, acc)
       end
     end
   end
@@ -1000,7 +1307,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
              true <- chat["scope_key"] == context.factory.scope or {:error, :ticket_recovery_scope_changed} do
           options =
             context.ticket_options
-            |> Keyword.put(:workspace, chat["cwd"])
+            |> Keyword.put(:workspace, controller_workspace(context))
             |> Keyword.put_new(:workspace_root, context.workspace_root)
             |> Keyword.put(:jira_reader, context.jira_reader)
             |> Keyword.put_new(:jira_connector, context.jira_connector || JiraMcpConnector)
@@ -1011,13 +1318,21 @@ defmodule SymphonyElixir.Factory.Scheduler do
       end)
 
     case result do
-      {:ok, %{status: status}} -> {:ok, add_event(acc, run["issue_key"], "TICKET_" <> status, run["run_id"])}
-      {:error, reason} -> {:ok, add_event(acc, run["issue_key"], "TICKET_DEFERRED", failure_code(reason))}
-      :aborted -> {:error, :ticket_stage_lock_unavailable}
+      {:ok, %{status: status}} ->
+        record_ticket_recovery_outcome(context.store, run, "SUCCEEDED", status)
+        {:ok, add_event(acc, run["issue_key"], "TICKET_" <> status, run["run_id"])}
+
+      {:error, reason} ->
+        record_ticket_recovery_outcome(context.store, run, "DEFERRED", ticket_deferral_code(reason, 3))
+        {:ok, add_event(acc, run["issue_key"], "TICKET_DEFERRED", failure_code(reason))}
+
+      :aborted ->
+        {:error, :ticket_stage_lock_unavailable}
     end
   rescue
     error ->
       detail = failure_code({:ticket_step_exception, error.__struct__})
+      record_ticket_recovery_outcome(context.store, run, "DEFERRED", detail)
       {:ok, add_event(acc, run["issue_key"], "TICKET_DEFERRED", detail)}
   end
 
@@ -1043,7 +1358,15 @@ defmodule SymphonyElixir.Factory.Scheduler do
       |> Keyword.put(:expected_envelope, run["candidate_handoff"])
 
     with {:ok, authorization} <- ticket_authorization(context, run, options) do
-      TicketPush.reconcile(context.store, run["run_id"], authorization, options)
+      module = SymphonyElixir.Factory.TicketPushPreissuanceRejection
+
+      if context[:ordinary_rejection_dispatch] == true and Map.get(context.factory.ticket_supervisor, "ci_repair") == "native_bounded_v1" and
+           Policy.ticket_selected?(context.factory.ticket_supervisor, run["issue_key"]) and module.eligible?(run) do
+        options = ticket_runtime_options(context, options) |> Keyword.put(:ordinary_controller_tick, true)
+        module.rearm(context.store, run["run_id"], authorization, options)
+      else
+        TicketPush.reconcile(context.store, run["run_id"], authorization, options)
+      end
     end
   end
 
@@ -1118,6 +1441,19 @@ defmodule SymphonyElixir.Factory.Scheduler do
     ])
   end
 
+  defp record_ticket_recovery_outcome(store, run, status, reason) do
+    payload = Jason.encode!(%{operation_key: run["recovery_key"], operation: run["recovery_operation"], status: status, reason: reason})
+    previous = Store.one!(store, "SELECT payload_json FROM events WHERE run_id = ? AND event_type = 'TICKET_RECOVERY_OUTCOME' ORDER BY id DESC LIMIT 1", [run["run_id"]])
+
+    unless previous && previous["payload_json"] == payload do
+      Store.query!(store, "INSERT INTO events(occurred_at,event_type,run_id,payload_json) VALUES (?,'TICKET_RECOVERY_OUTCOME',?,?)", [
+        DateTime.to_iso8601(DateTime.utc_now()),
+        run["run_id"],
+        payload
+      ])
+    end
+  end
+
   defp run_tick(context) do
     workspace = controller_workspace(context)
     File.mkdir_p!(workspace)
@@ -1163,12 +1499,12 @@ defmodule SymphonyElixir.Factory.Scheduler do
            :ok <- reconcile_stale_tasks(context),
            {:ok, jql} <- Queue.jql(context.factory.queue),
            {:ok, queued_snapshots} <- fetch_queue(context, workspace, jql),
-           {:ok, _intake_snapshot} <-
+           {:ok, intake_snapshot} <-
              IntakeLedger.replace(context.store, context.factory.scope, queued_snapshots),
            {:ok, snapshots} <- fetch_active_snapshots(context, workspace, queued_snapshots),
-           {:ok, intake} <- reconcile_intake(context, snapshots),
+           {:ok, intake} <- reconcile_intake(Map.put(context, :intake_observed_at, intake_snapshot.observed_at), snapshots),
            {:ok, legacy_result} <- advance_runs(context, workspace, intake),
-           {:ok, advance_result} <- advance_ticket_runs(context, legacy_result, recovery[:recovery_run_id]) do
+           {:ok, advance_result} <- advance_ticket_runs(Map.put(context, :ordinary_rejection_dispatch, true), legacy_result, recovery[:recovery_run_id]) do
         :ok = sweep_one_cleanup_candidate(context)
         NativeWorkspaceMaintenance.reconcile(context.store, context.factory)
         {:ok, %{advance_result | events: recovery.events ++ advance_result.events}}
@@ -2045,6 +2381,11 @@ defmodule SymphonyElixir.Factory.Scheduler do
       {:error, {:insufficient_writer_capacity, _cleaned}} ->
         {:ok, add_event(acc, issue_key, "INSUFFICIENT_WRITER_CAPACITY", nil)}
 
+      {:error, :manual_validation_contract_missing} ->
+        with :ok <- IntakeLedger.record_blocked(context.store, context.factory.scope, snapshot, context.intake_observed_at, :manual_validation_contract_missing) do
+          {:ok, add_event(acc, issue_key, "INTAKE_BLOCKED", :manual_validation_contract_missing)}
+        end
+
       {:error, reason} ->
         {:error, {:delivery_registration_failed, reason}}
     end
@@ -2064,7 +2405,8 @@ defmodule SymphonyElixir.Factory.Scheduler do
     with true <- native_transport?(context) or {:error, :ticket_chat_desktop_transport_required},
          true <- attrs.manual_validation_required == false or {:error, :ticket_manual_validation_not_supported},
          {:ok, _parent} <- prepare_ticket_parent(context, ordinary, options),
-         :ok <- AppServer.check_ticket_runtime(options[:parent_output_root]) do
+         {:ok, root} <- parent_output_root(options[:parent_output_root]),
+         :ok <- AppServer.check_ticket_runtime(root) do
       {:ok, attrs, options}
     end
   end
@@ -2185,7 +2527,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
     result =
       Store.query!(
         context.store,
-        "SELECT * FROM runs WHERE execution_mode = 'TICKET_SUPERVISOR_V1' AND state NOT IN ('DELIVERED', 'AWAITING_VALIDATION', 'CANCELLED', 'FAILED') ORDER BY created_at, run_id"
+        "SELECT * FROM runs WHERE execution_mode = 'TICKET_SUPERVISOR_V1' AND (state NOT IN ('DELIVERED', 'AWAITING_VALIDATION', 'CANCELLED', 'FAILED') OR (state='FAILED' AND EXISTS (SELECT 1 FROM events a WHERE a.run_id=runs.run_id AND a.event_type='TICKET_VERIFIER_REPAIR_AUTHORIZED' AND NOT EXISTS (SELECT 1 FROM events p WHERE p.event_type='TICKET_VERIFIER_REPAIR_APPLIED' AND json_extract(p.payload_json,'$.authorization_event_id')=a.id)))) ORDER BY created_at, run_id"
       )
 
     runs =
@@ -2206,20 +2548,13 @@ defmodule SymphonyElixir.Factory.Scheduler do
       acc
     end
   rescue
-    error -> add_event(acc, run["issue_key"], "TICKET_DEFERRED", failure_code({:ticket_step_exception, error.__struct__}))
+    error ->
+      Logger.warning("Factory ticket deferred issue_identifier=#{run["issue_key"]} run_id=#{run["run_id"]} reason=ticket_step_exception:#{inspect(error.__struct__)}")
+      add_event(acc, run["issue_key"], "TICKET_DEFERRED", failure_code({:ticket_step_exception, error.__struct__}))
   end
 
   defp ticket_tick_result(context, run, options, acc) do
-    result =
-      case TicketChat.ready_for_run(context.store, run["run_id"]) do
-        {:ok, _} ->
-          if run["state"] in ~w(ADMITTING_WRITER PLANNING WRITING REPAIRING REVIEW_WRITING VERIFYING READY_FOR_REVIEW),
-            do: ticket_ready_parent_step(context, run, options),
-            else: ticket_delivery_pending(context, run, options)
-
-        {:error, _} ->
-          ticket_parent_step(context, run["run_id"], options)
-      end
+    result = ticket_tick_step(context, run, options)
 
     case result do
       {:ok, %{status: "LAUNCHED", launch: launch}} ->
@@ -2235,7 +2570,23 @@ defmodule SymphonyElixir.Factory.Scheduler do
         add_event(acc, run["issue_key"], "TICKET_" <> status, run["run_id"])
 
       {:error, reason} ->
+        Logger.warning("Factory ticket deferred issue_identifier=#{run["issue_key"]} run_id=#{run["run_id"]} reason=#{ticket_deferral_code(reason, 3)}")
         add_event(acc, run["issue_key"], "TICKET_DEFERRED", failure_code(reason))
+    end
+  end
+
+  defp ticket_tick_step(context, %{"state" => "FAILED"} = run, options),
+    do: ticket_step(context, run["run_id"], Keyword.put(options, :ordinary_controller_tick, true))
+
+  defp ticket_tick_step(context, run, options) do
+    case TicketChat.ready_for_run(context.store, run["run_id"]) do
+      {:ok, _} ->
+        if run["state"] in ~w(ADMITTING_WRITER PLANNING WRITING REPAIRING REVIEW_WRITING VERIFYING READY_FOR_REVIEW),
+          do: ticket_ready_parent_step(context, run, options),
+          else: ticket_delivery_pending(context, run, options)
+
+      {:error, _} ->
+        ticket_parent_step(context, run["run_id"], options)
     end
   end
 
@@ -2432,7 +2783,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
          review_run = Map.put(run, "state", "REVIEW_WRITING"),
          {:ok, authorization} <- ready_rework_authorization(context, run, options),
          :ok <- TicketWorkerRunner.validate_authorization(review_run, authorization),
-         {:ok, stage} <- ticket_stage(review_run, context.factory),
+         {:ok, stage} <- ticket_stage(review_run, context.factory, context.store),
          {:ok, base_prompt} <-
            TicketWorkerRunner.packet(context.store, run["run_id"], stage.role, Store.one!(context.store, "SELECT base_sha FROM ticket_review_bases WHERE run_id = ?", [run["run_id"]])["base_sha"]),
          prompt = TicketWorkerRunner.ready_rework_packet(base_prompt, command_key, input["body"]),
@@ -2445,7 +2796,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
              issue_from_snapshot(decode_json!(run["snapshot_json"])),
              run["worktree"],
              prompt,
-             StageSchemas.for_stage(stage.schema),
+             ReviewProtocol.schema_json(prompt, StageSchemas.for_stage(stage.schema)),
              opts
            ) do
       case result do
@@ -2469,6 +2820,8 @@ defmodule SymphonyElixir.Factory.Scheduler do
   end
 
   defp ready_rework_launch_options(context, run, stage, authorization, command_key, input, prompt, options) do
+    options = ticket_runtime_options(context, options)
+
     Keyword.merge(options,
       authorization: authorization,
       task_key: stage.key,
@@ -2678,7 +3031,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
   defp command_application_result({:error, reason}, _key), do: {:error, {:ticket_command_application_deferred, reason}}
 
   defp ticket_delivery_pending(context, %{"state" => state} = run, options) when state in ~w(PUSHING MR_CREATING CI_PUSHING CI_MR_CREATING CI_WAITING) do
-    options = options |> Keyword.put_new(:workspace_root, context.workspace_root) |> Keyword.put(:ci_preflight_authorized, ci_preflight?(route_for_run(context, run)))
+    options = ticket_runtime_options(context, options) |> Keyword.put(:workspace, controller_workspace(context)) |> Keyword.put(:ci_preflight_authorized, ci_preflight?(route_for_run(context, run)))
 
     lock = {{__MODULE__, :ticket_stage, run["run_id"]}, self()}
 
@@ -2692,6 +3045,11 @@ defmodule SymphonyElixir.Factory.Scheduler do
 
   defp ticket_delivery_step(context, %{"state" => state} = run, options) when state in ~w(PUSHING CI_PUSHING) do
     with {:ok, authorization} <- ticket_authorization(context, run, options) do
+      options =
+        options
+        |> Keyword.put(:ordinary_controller_tick, context[:ordinary_rejection_dispatch] == true)
+        |> Keyword.put(:push_authorization_reader, fn current, prior -> ticket_authorization(context, current, options, prior) end)
+
       TicketPush.step(context.store, run["run_id"], authorization, options)
     end
   end
@@ -2754,10 +3112,10 @@ defmodule SymphonyElixir.Factory.Scheduler do
 
   defp finalize_adopted_mr_delivery(context, run, options) do
     with {:ok, _receipt} <- TicketMrOperation.current_delivery_receipt(context.store, run["run_id"], context.factory, options),
-         {:ok, chat} <- TicketChat.ready_for_run(context.store, run["run_id"]) do
+         {:ok, _chat} <- TicketChat.ready_for_run(context.store, run["run_id"]) do
       finalization_options =
         options
-        |> Keyword.put(:workspace, chat["cwd"])
+        |> Keyword.put(:workspace, controller_workspace(context))
         |> Keyword.put_new(:jira_connector, Map.get(context, :jira_connector) || JiraMcpConnector)
         |> Keyword.put_new(:jira_app_server, Map.get(context, :jira_app_server, AppServer))
 
@@ -4816,6 +5174,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
     timestamp = DateTime.utc_now() |> DateTime.to_iso8601()
     next_state = if status == "COMPLETE", do: if(preflight?, do: "CI_PUSHING", else: "VERIFYING"), else: run["state"]
     verifier_round = run["verifier_round"] + if(status == "COMPLETE" and not preflight?, do: 1, else: 0)
+    retain_findings? = status == "CONTINUE"
 
     {:ok, _updated_run} =
       RunLedger.update(transaction, run["run_id"], %{
@@ -4823,7 +5182,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
         candidate_sha: sha,
         implementation_iteration: run["implementation_iteration"] + 1,
         verifier_round: verifier_round,
-        repair_findings_json: "[]"
+        repair_findings_json: if(retain_findings?, do: run["repair_findings_json"], else: "[]")
       })
 
     Store.query!(
@@ -4841,7 +5200,10 @@ defmodule SymphonyElixir.Factory.Scheduler do
       "worktree" => run["worktree"],
       "branch" => run["branch"],
       "candidate_sha" => run["candidate_sha"],
-      "implementation_iteration" => run["implementation_iteration"]
+      "implementation_iteration" => run["implementation_iteration"],
+      "code_repair_round" => run["code_repair_round"],
+      "verifier_round" => run["verifier_round"],
+      "repair_findings_json" => run["repair_findings_json"]
     }
 
     expected_task = %{"status" => "COMPLETE", "output_json" => output_json, "run_id" => run["run_id"]}
@@ -5856,6 +6218,19 @@ defmodule SymphonyElixir.Factory.Scheduler do
     |> inspect()
     |> String.slice(0, 200)
   end
+
+  defp ticket_deferral_code(reason, _depth) when is_atom(reason), do: Atom.to_string(reason)
+
+  defp ticket_deferral_code(reason, depth) when is_tuple(reason) and depth > 0 do
+    reason
+    |> Tuple.to_list()
+    |> Enum.take(3)
+    |> Enum.map(&ticket_deferral_code(&1, depth - 1))
+    |> Enum.reject(&(&1 == "unclassified"))
+    |> Enum.join(":")
+  end
+
+  defp ticket_deferral_code(_reason, _depth), do: "unclassified"
 
   defp escape_jira_text(value) do
     value |> String.replace("`", "'") |> String.replace(~r/\s+/, " ") |> String.slice(0, 1_000)

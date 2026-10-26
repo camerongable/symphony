@@ -27,6 +27,10 @@ defmodule SymphonyElixir.FactoryStageRunnerTest do
         opts[:on_message].(%{event: :session_started, thread_id: session.thread_id, turn_id: event_turn})
       end
 
+      if reason = Process.get(:factory_test_turn_error) do
+        throw({:fixture_failed_turn, reason})
+      end
+
       item = %{"type" => "agentMessage", "text" => Jason.encode!(output)}
       item = if opts[:event_scope] == :exact_turn, do: Map.put(item, "id", "item-789"), else: item
 
@@ -41,6 +45,8 @@ defmodule SymphonyElixir.FactoryStageRunnerTest do
       })
 
       {:ok, %{turn_id: "turn-456"}}
+    catch
+      {:fixture_failed_turn, reason} -> {:error, reason}
     end
 
     @spec stop_session(map()) :: term()
@@ -417,7 +423,7 @@ defmodule SymphonyElixir.FactoryStageRunnerTest do
     issue = %Issue{id: "100", identifier: "PPL-100", title: "Factory task"}
     Process.put(:factory_test_event_turn, "observed-other-turn")
 
-    assert {:error, {:factory_stage_turn_identity_mismatch, _, _, _}} =
+    assert {:error, {:worker_failed, {:factory_stage_turn_identity_mismatch, _, _, _}, _}} =
              StageRunner.run("/tmp/workspace", issue, "Review", StageSchemas.for_stage(:specification_critic),
                app_server: FakeAppServer,
                include_evidence: true,
@@ -427,20 +433,42 @@ defmodule SymphonyElixir.FactoryStageRunnerTest do
              )
   end
 
+  test "owned failed turn retains exact shutdown without fabricating output" do
+    error = {:worker_turn_error, %{"codexErrorInfo" => "serverOverloaded"}}
+    stop = %{"transport" => "owned_app_server", "thread_id" => "thread-123", "exit_status" => 0}
+    Process.put(:factory_test_turn_error, error)
+    Process.put(:factory_test_owner_stop, {:ok, stop})
+
+    assert {:error, {:worker_failed, ^error, observed}} =
+             StageRunner.run("/tmp/workspace", %Issue{identifier: "PPL-123"}, "Writer", StageSchemas.for_stage(:native_feature_writer),
+               app_server: FakeAppServer,
+               include_evidence: true,
+               event_scope: :exact_turn
+             )
+
+    assert observed.thread_id == "thread-123" and observed.turn_id == "turn-456"
+    assert observed.owner_stop == stop
+    refute Map.has_key?(observed, :output)
+
+    assert {:error, ^error} =
+             StageRunner.run("/tmp/workspace", %Issue{identifier: "PPL-123"}, "Writer", StageSchemas.for_stage(:native_feature_writer), app_server: FakeAppServer, event_scope: :exact_turn)
+  end
+
   test "owned ephemeral REVIEW stops its session when a downstream callback raises" do
     issue = %Issue{id: "100", identifier: "PPL-100", title: "Factory task"}
     Process.put(:factory_test_watch_stop, true)
 
-    assert_raise RuntimeError, "callback failed", fn ->
-      StageRunner.run("/tmp/workspace", issue, "Review", StageSchemas.for_stage(:specification_critic),
-        app_server: FakeAppServer,
-        include_evidence: true,
-        event_scope: :exact_turn,
-        worker_access: "REVIEW",
-        ephemeral: true,
-        on_message: fn _message -> raise "callback failed" end
-      )
-    end
+    assert {:error, {:worker_failed, {:worker_exception, :error, _}, observed}} =
+             StageRunner.run("/tmp/workspace", issue, "Review", StageSchemas.for_stage(:specification_critic),
+               app_server: FakeAppServer,
+               include_evidence: true,
+               event_scope: :exact_turn,
+               worker_access: "REVIEW",
+               ephemeral: true,
+               on_message: fn _message -> raise "callback failed" end
+             )
+
+    refute Map.has_key?(observed, :output)
 
     assert_received :factory_test_session_stopped
   end

@@ -167,12 +167,26 @@ defmodule SymphonyElixir.Factory.TicketJiraOperation do
     connector = Keyword.get(opts, :jira_connector, JiraMcpConnector)
 
     with {:ok, values} <- connector.call_list("jira_get_transitions", %{"issue_key" => issue_key}, opts) do
-      case Enum.filter(values, &(is_map(&1) and &1["to_status"] == "In Dev")) do
-        [%{"id" => id}] when is_binary(id) -> {:ok, id}
+      case Enum.filter(values, &(transition_destination(&1) == "In Dev")) do
+        [%{"id" => id}] -> transition_id(id)
         _ -> {:error, :ticket_jira_in_dev_transition_unproven}
       end
     end
   end
+
+  defp transition_destination(%{"to_status" => status}), do: status
+  defp transition_destination(%{"to" => %{"name" => status}}), do: status
+  defp transition_destination(%{"to" => _invalid}), do: nil
+  defp transition_destination(%{"name" => name}), do: name
+  defp transition_destination(_transition), do: nil
+
+  defp transition_id(id) when is_integer(id) and id > 0, do: {:ok, Integer.to_string(id)}
+
+  defp transition_id(id) when is_binary(id) do
+    if Regex.match?(~r/\A[1-9][0-9]*\z/, id), do: {:ok, id}, else: {:error, :ticket_jira_in_dev_transition_unproven}
+  end
+
+  defp transition_id(_id), do: {:error, :ticket_jira_in_dev_transition_unproven}
 
   defp reserve(store, run, first, authority, opts) do
     transaction(store, fn tx ->
@@ -309,7 +323,7 @@ defmodule SymphonyElixir.Factory.TicketJiraOperation do
   defp stringify(map), do: Map.new(map, fn {key, value} -> {to_string(key), value} end)
 
   defp transaction(store, operation) do
-    case Exqlite.transaction(store, &rollback_error(&1, operation.(&1))) do
+    case Exqlite.transaction(store, &rollback_error(&1, operation.(&1)), timeout: 60_000) do
       {:ok, result} -> result
       {:error, reason} -> {:error, reason}
     end

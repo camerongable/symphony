@@ -277,40 +277,64 @@ defmodule SymphonyElixir.Factory.Control do
   end
 
   defp renew_lease(connection, config, dispatcher_id, tick_id, opts, recovery) do
-    Store.transaction!(connection, fn transaction ->
-      row = fetch!(transaction, config.scope)
-      current_time = now(opts)
+    Store.transaction!(
+      connection,
+      fn transaction ->
+        row = fetch!(transaction, config.scope)
+        current_time = now(opts)
 
-      cond do
-        not lease_status_allowed?(row, recovery) ->
-          %{result: "PAUSED", control: row}
+        cond do
+          renewal_deadline_elapsed?(opts) ->
+            %{result: "RENEWAL_TIMEOUT"}
 
-        row["dispatcher_id"] != dispatcher_id or row["tick_id"] != tick_id ->
-          %{result: "LEASE_MISMATCH", control: row}
+          renewal_owner_stopped?(opts) ->
+            %{result: "RENEWAL_OWNER_UNAVAILABLE"}
 
-        true ->
-          expires_at = DateTime.add(current_time, Map.get(config, :lease_seconds, 240), :second)
+          not lease_status_allowed?(row, recovery) ->
+            %{result: "PAUSED", control: row}
 
-          Store.query!(
-            transaction,
-            """
-            UPDATE control
-            SET lease_expires_at = ?, updated_at = ?
-            WHERE scope = ?
-            """,
-            [iso(expires_at), iso(current_time), config.scope]
-          )
+          row["dispatcher_id"] != dispatcher_id or row["tick_id"] != tick_id ->
+            %{result: "LEASE_MISMATCH", control: row}
 
-          %{
-            result: "LEASE_RENEWED",
-            tick_id: tick_id,
-            lease_expires_at: iso(expires_at)
-          }
-      end
-    end)
+          true ->
+            expires_at = DateTime.add(current_time, Map.get(config, :lease_seconds, 240), :second)
+
+            Store.query!(
+              transaction,
+              """
+              UPDATE control
+              SET lease_expires_at = ?, updated_at = ?
+              WHERE scope = ?
+              """,
+              [iso(expires_at), iso(current_time), config.scope]
+            )
+
+            %{
+              result: "LEASE_RENEWED",
+              tick_id: tick_id,
+              lease_expires_at: iso(expires_at)
+            }
+        end
+      end,
+      Keyword.take(opts, [:timeout])
+    )
   end
 
   defp lease_status_allowed?(row, recovery), do: row["status"] == "ACTIVE" or (recovery and row["status"] == "PAUSED")
+
+  defp renewal_deadline_elapsed?(opts) do
+    case Keyword.get(opts, :renewal_deadline) do
+      nil -> false
+      deadline -> System.monotonic_time(:millisecond) >= deadline
+    end
+  end
+
+  defp renewal_owner_stopped?(opts) do
+    case Keyword.get(opts, :renewal_owner) do
+      nil -> false
+      owner -> not Process.alive?(owner)
+    end
+  end
 
   defp set_status(connection, config, dispatcher_id, target_status, opts) do
     Store.transaction!(connection, fn transaction ->

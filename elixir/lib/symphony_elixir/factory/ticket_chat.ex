@@ -3,6 +3,7 @@ defmodule SymphonyElixir.Factory.TicketChat do
 
   alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.Factory.{Contract, DesktopRequest, DesktopToolArgs, RunLedger, Store}
+  alias SymphonyElixir.Factory.SpecialistErrorNotice
   alias SymphonyElixir.Factory.TicketContextReader
   alias SymphonyElixir.Factory.TicketParentEvidence
   alias SymphonyElixir.PathSafety
@@ -17,6 +18,31 @@ defmodule SymphonyElixir.Factory.TicketChat do
   def directory_name(scope, issue_id, repo_key) do
     directory_name(identity_key(%{"scope_key" => scope, "issue_id" => issue_id, "repo_key" => repo_key}))
   end
+
+  @doc "Expands Desktop's dated output root in the host's local calendar."
+  @spec output_root(String.t()) :: String.t()
+  def output_root(root) do
+    date = :calendar.local_time() |> elem(0) |> Date.from_erl!() |> Date.to_iso8601()
+    String.replace(root, "{date}", date)
+  end
+
+  @doc "Rejects a dated CREATE reservation after midnight or a precreated leaf collision."
+  @spec creation_root_current(map(), map()) :: :ok | {:error, atom()}
+  def creation_root_current(%{"action" => "CREATE"} = request, policy) do
+    root = policy["parent_output_root"]
+
+    if is_binary(root) and String.contains?(root, "{date}") do
+      cond do
+        Path.dirname(request["cwd"]) != output_root(root) -> {:error, :ticket_chat_creation_date_changed}
+        File.exists?(request["cwd"]) -> {:error, :ticket_chat_creation_path_collision}
+        true -> :ok
+      end
+    else
+      :ok
+    end
+  end
+
+  def creation_root_current(_request, _policy), do: :ok
 
   @spec ordinary_delivery_eligibility(map()) :: :ok | {:error, atom()}
   def ordinary_delivery_eligibility(run) when is_map(run) do
@@ -109,7 +135,31 @@ defmodule SymphonyElixir.Factory.TicketChat do
          {:ok, native} <- reader.read_native_thread(thread_id, workspace: request["cwd"], complete_history: true),
          {:ok, receipt} <- observe_native_turn(store, request_key, broker_thread_id, native),
          true <- receipt["history_complete"] or {:error, :parent_native_history_incomplete} do
-      include_native_completion(native, receipt, Keyword.get(opts, :include_completion, false))
+      with {:ok, result} <- include_native_completion(native, receipt, Keyword.get(opts, :include_completion, false)) do
+        include_target_observation(native, result, request, Keyword.get(opts, :include_target_observation, false))
+      end
+    end
+  end
+
+  defp include_target_observation(_native, receipt, _request, false), do: {:ok, receipt}
+
+  defp include_target_observation(native, receipt, request, true) do
+    with {:ok, evidence} <- TicketParentEvidence.attachment_observation(native, receipt),
+         {:ok, metadata} <- Jason.decode(request["metadata_json"]),
+         {:ok, arguments} <- observed_arguments(request) do
+      proof = %{
+        "request_key" => request["request_key"],
+        "payload_sha256" => request["payload_sha256"],
+        "generation" => metadata["generation"],
+        "thread_id" => native["id"],
+        "project_id" => nil,
+        "cwd" => native["cwd"],
+        "tool_arguments" => arguments,
+        "worktree_attachments" => [],
+        "native_readback_sha256" => receipt["readback_sha256"]
+      }
+
+      {:ok, receipt |> Map.put("attachment_evidence", evidence) |> Map.put("target_observation", proof)}
     end
   end
 
@@ -193,6 +243,32 @@ defmodule SymphonyElixir.Factory.TicketChat do
 
     case Exqlite.transaction(store, &reserve_transaction(&1, run_id, attrs, expected_run)) do
       {:ok, result} -> result
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc "Explicitly repairs an unissued parent route; preserves immutable issued identities."
+  @spec rehome_unissued(Store.connection(), String.t(), map(), map()) :: {:ok, map()} | {:error, term()}
+  def rehome_unissued(store, run_id, attrs, expected_run) do
+    attrs = Map.new(attrs, fn {key, value} -> {to_string(key), value} end) |> Map.put_new("broker_thread_id", nil) |> Map.put_new("context_reader_json", nil)
+
+    result =
+      Exqlite.transaction(store, fn tx ->
+        with {:ok, run} <- RunLedger.get(tx, run_id),
+             true <- run == expected_run,
+             :ok <- preflight(tx, run, attrs),
+             {:ok, chat} <- for_run(tx, run_id),
+             true <- Map.take(chat, (@identity ++ @optional_identity) -- ["cwd"]) == Map.take(attrs, (@identity ++ @optional_identity) -- ["cwd"]),
+             nil <- Store.one!(tx, "SELECT request_key FROM ticket_parent_claims WHERE request_key = ?", [chat["create_request_key"]]),
+             {:ok, rebound} <- rehome_unissued_parent(tx, chat, attrs) do
+          {:ok, rebound}
+        else
+          _ -> Exqlite.rollback(tx, :ticket_chat_identity_conflict)
+        end
+      end)
+
+    case result do
+      {:ok, value} -> value
       {:error, reason} -> {:error, reason}
     end
   end
@@ -325,7 +401,7 @@ defmodule SymphonyElixir.Factory.TicketChat do
   def validate_request(store, request) do
     with {:ok, chat} <- get(store, request["target_key"]),
          {:ok, metadata} <- decode_metadata(request["metadata_json"]),
-         true <- metadata == request_metadata(chat) or {:error, :ticket_chat_binding_mismatch},
+         true <- metadata_matches?(store, chat, request, metadata) or {:error, :ticket_chat_binding_mismatch},
          :ok <- validate_payload_route(chat, request),
          true <- valid_schema?(request["schema_json"]) or {:error, :ticket_chat_schema_mismatch} do
       validate_thread(chat, request)
@@ -336,6 +412,15 @@ defmodule SymphonyElixir.Factory.TicketChat do
 
   defp decode_metadata(json) when is_binary(json), do: Jason.decode(json)
   defp decode_metadata(_json), do: {:error, :invalid_ticket_chat_metadata}
+
+  defp metadata_matches?(store, chat, request, metadata) do
+    linked = Store.query!(store, "SELECT run_id FROM ticket_chat_runs WHERE chat_key = ?", [chat["chat_key"]])
+
+    metadata == request_metadata(chat) or
+      (request["action"] == "FOLLOWUP" and
+         Map.drop(metadata, ~w(specialist_notice_ids specialist_notice_text)) == request_metadata(chat) and
+         Enum.any?(linked.rows, fn [run_id] -> SpecialistErrorNotice.valid_metadata?(store, run_id, metadata) end))
+  end
 
   defp valid_schema?(json) when is_binary(json), do: Jason.decode(json) == {:ok, @schema}
   defp valid_schema?(_json), do: false
@@ -550,6 +635,27 @@ defmodule SymphonyElixir.Factory.TicketChat do
 
         Store.query!(store, "INSERT INTO ticket_chats(#{Enum.join(fields, ", ")}) VALUES (#{Enum.map_join(fields, ", ", fn _ -> "?" end)})", Enum.map(fields, &values[&1]))
         get(store, key)
+    end
+  end
+
+  defp rehome_unissued_parent(store, chat, attrs) do
+    with true <- is_nil(chat["thread_id"]),
+         true <- is_nil(chat["observation_json"]),
+         false <- File.exists?(attrs["cwd"]),
+         {:ok, request} <- DesktopRequest.get(store, chat["create_request_key"]),
+         payload <- creation_attrs(Map.put(chat, "cwd", attrs["cwd"]), attrs),
+         {:ok, rebound} <- DesktopRequest.rebind_unissued_cwd(store, request, attrs["cwd"], payload["prompt"]) do
+      Store.query!(store, "UPDATE ticket_chats SET cwd = ?, updated_at = ? WHERE chat_key = ?", [attrs["cwd"], now(), chat["chat_key"]])
+
+      Store.query!(store, "INSERT INTO events(run_id, event_type, payload_json, occurred_at) SELECT run_id, 'ticket_parent_unissued_rehomed', ?, ? FROM ticket_chat_runs WHERE chat_key = ?", [
+        Jason.encode!(%{old_cwd: chat["cwd"], new_cwd: attrs["cwd"], old_payload_sha256: request["payload_sha256"], new_payload_sha256: rebound["payload_sha256"]}),
+        now(),
+        chat["chat_key"]
+      ])
+
+      get(store, chat["chat_key"])
+    else
+      _ -> {:error, :ticket_chat_identity_conflict}
     end
   end
 

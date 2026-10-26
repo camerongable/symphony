@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "kind": "AUDITED_V3_PREISSUANCE_AUTHORITY_CLOSED",
+  "run_id": "ab5ab1fe-32cc-48c1-985e-3c3800adcfa2",
+  "candidate_sha": "074cd2027e58cc221a847e4bd8506474b4b8555c",
+  "contract_sha256": "dffee9637fd2da9dbd9b101c028d82210cbaf3c8380e5fbff55916ae88f74c02",
+  "code_repair_round": 2,
+  "original_nonce": "99aae3482ff701b27537461b9ccc6247f704dc030df62ea64342ff4717a9dcf0",
+  "original_sha256": "72dca4caf96513a33a6441dcab220344565ac8b20d7fc47a1869427d3bf045b4",
+  "execution_sha256": "5c860895fcc59e9e831e71ac0937f8bd00723c78ec7fd3f334deef8ad0edfa07",
+  "helper_pid": 71869,
+  "helper_path": "/Users/cgable/Library/Application Support/ai-factory/releases/symphony-ci-traces-v2-mtu5mZXO/dev/lib/symphony_elixir/priv/ticket_push_executor_v3.py",
+  "helper_sha256": "4e83f3eb809c3b3d5b2f7b95df8972fc138db00fa3a19f7a70e3e6d7c751c2e1",
+  "companion_path": "/Users/cgable/Library/Application Support/ai-factory/releases/symphony-ci-traces-v2-mtu5mZXO/dev/lib/symphony_elixir/priv/worker_file_companion.py",
+  "companion_sha256": "87f3dd595ddc70205ed881b42ab5a9401b0705c13cdc8fda2c2b8b5bac4b0b3b",
+  "rejection_sha256": "c5cbeaef6d0b64b6739b1738cc3114f308d56781aed8f44a08d7415f6eb0288d",
+  "reason": "ci_repair_diagnosis_changed"
+}

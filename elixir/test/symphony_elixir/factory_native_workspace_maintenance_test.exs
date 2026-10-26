@@ -97,6 +97,14 @@ defmodule SymphonyElixir.FactoryNativeWorkspaceMaintenanceTest do
   end
 
   test "default disabled and dry-run never enqueue or write lifecycle state", c do
+    for cleanup <- [%{}, %{"native" => %{"enabled" => false}}] do
+      factory = struct!(SymphonyElixir.Config.Schema.Factory, cleanup: cleanup)
+      refute NativeWorkspaceMaintenance.enabled?(factory)
+      assert {:ok, :disabled} = NativeWorkspaceMaintenance.reconcile(c.store, factory)
+    end
+
+    enabled_factory = struct!(SymphonyElixir.Config.Schema.Factory, cleanup: %{"native" => %{"enabled" => true}})
+    assert NativeWorkspaceMaintenance.enabled?(enabled_factory)
     assert {:ok, :disabled} = NativeWorkspaceMaintenance.reconcile(c.store, %{cleanup: %{}})
     assert [%{eligible: true}] = NativeWorkspaceMaintenance.plan(c.store)
     assert NativeWorkspaceMaintenance.snapshot(c.store) == []

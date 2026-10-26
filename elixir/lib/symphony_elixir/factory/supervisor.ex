@@ -10,6 +10,7 @@ defmodule SymphonyElixir.Factory.Supervisor do
   alias SymphonyElixir.Factory.{Controller, ControlServer, Policy, Store}
 
   @store_name SymphonyElixir.Factory.Store
+  @read_store_name SymphonyElixir.Factory.ReadStore
   @control_name SymphonyElixir.Factory.ControlServer
   @task_supervisor_name SymphonyElixir.Factory.TaskSupervisor
 
@@ -34,6 +35,10 @@ defmodule SymphonyElixir.Factory.Supervisor do
 
     case validate_startup(factory) do
       :ok ->
+        memory_database = factory.database in [:memory, ":memory:"]
+        read_store = if memory_database, do: @store_name, else: @read_store_name
+        reader_children = if memory_database, do: [], else: [%{id: @read_store_name, start: {Store, :start_read_only, [[database: Path.expand(factory.database), name: @read_store_name]]}}]
+
         controller_options = [
           settings: settings,
           store: @store_name,
@@ -41,15 +46,24 @@ defmodule SymphonyElixir.Factory.Supervisor do
           task_supervisor: @task_supervisor_name
         ]
 
-        children = [
-          {Store, database: factory.database, name: @store_name},
-          {ControlServer, store: @store_name, factory: factory, name: @control_name},
-          Supervisor.child_spec(
-            {Task.Supervisor, name: @task_supervisor_name},
-            id: @task_supervisor_name
-          ),
-          {Controller, controller_options}
-        ]
+        children =
+          [{Store, database: factory.database, name: @store_name}] ++
+            reader_children ++
+            [
+              {ControlServer, store: @store_name, read_store: read_store, factory: factory, name: @control_name},
+              Supervisor.child_spec(
+                {Task.Supervisor, name: @task_supervisor_name},
+                id: @task_supervisor_name
+              ),
+              {Controller, controller_options}
+            ]
+
+        children =
+          if factory.task_transport == "desktop_broker" and factory.ticket_supervisor["enabled"] == true do
+            children ++ [{SymphonyElixir.Factory.BrokerRuntime, factory: factory, store: @store_name}]
+          else
+            children
+          end
 
         Supervisor.init(children, strategy: :one_for_one)
 
@@ -65,6 +79,9 @@ defmodule SymphonyElixir.Factory.Supervisor do
 
       if enabled do
         root = Map.get(policy, "parent_output_root", Map.get(policy, :parent_output_root))
+        dated = is_binary(root) and String.contains?(root, "{date}")
+        root = if is_binary(root), do: SymphonyElixir.Factory.TicketChat.output_root(root), else: root
+        if dated, do: File.mkdir_p!(root)
         AppServer.check_ticket_runtime(root)
       else
         :ok
@@ -77,6 +94,10 @@ defmodule SymphonyElixir.Factory.Supervisor do
   """
   @spec store_name() :: module()
   def store_name, do: @store_name
+
+  @doc "Returns the separate read-only connection used for factory status."
+  @spec read_store_name() :: module()
+  def read_store_name, do: @read_store_name
 
   @doc """
   Returns the registered durable-control server name.

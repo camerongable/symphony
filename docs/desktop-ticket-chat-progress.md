@@ -5,6 +5,91 @@ controller-launched role workers and one source checkout used sequentially.
 
 ## Current checkpoint
 
+### October 16 fresh MR observation — deployed; ticket progressed
+
+The existing controller BLOCK is now reconciled and preserved. An explicitly
+authorized same-MR close/reopen refreshed MR47818 to exact candidate074cd202
+without changing draft/reviewers or issuing a new push. Schema46 adds a narrowly
+bound immutable fresh-MR observation, not a rewritten controller PASS. A separate
+compile-pinned status-only origin preserves the actual completed v4 receipt
+after runtime relocation. Native recovery tests, provenance negatives, source
+review, additive migration and relocated actual-ledger rehearsal pass. Independently
+accepted PID60491/schema46 runs manifestbaec41fa. First normal tick adopted
+CI_WAITING at04:56:27.551253Z/event1857 with one immutable qualification; original
+BLOCK and historical UNKNOWN/CAS evidence remain unchanged. Actual dashboard
+refresh shows Active/CI waiting, zero delivery blockers and one known communication
+warning. Monitor remains active with this refreshed baseline. No current pipeline,
+CI PASS or full delivery is proven. See [recovery evidence and limits](factory-pilot-hardening.md#fresh-mr-observation-recovery--deployed-2026-10-16).
+
+### October 15 physical push boundary — deployed; remote converged
+
+PID17272/schema45 runs versioned manifest e665d090. Physical v3 had missed the
+reassessment qualification and rejected the exact round2 push before issuance.
+V4 and a one-case immutable disposition journal preserve that rejection and
+all old UNKNOWN history. Normal tick21:02:02UTC prepared a distinct successor.
+Actual Git timed out, but exact remote074cd202 is independently proven; normal
+reconciliation retained the timeout receipt and advanced to CI_MR_CREATING at
+21:05:26UTC without replay. Same-MR head/fresh CI remain pending, not delivered.
+Normal processing staged exact requestdesktop:22ebd916 at21:08:06UTC; existing
+broker active, request PENDING/no failure. No request resend or direct message.
+Source/lifecycle/rollback/
+restart/readback and independent release checks pass; full coverage unrun.
+See [boundary evidence and limits](factory-pilot-hardening.md#reassessment-aware-push-boundary--2026-10-15-2102-utc).
+
+### October 15 CI trace fix — deployed; round2 writer active
+
+PID56255/schema44 runs manifestf0f053dc. Normal polling preserved the blocked
+diagnosis, appended an exact REPAIRABLE reassessment, claimed round2 and resumed
+the canonical writer in native turn01a1413a at20:21:48UTC. Successful repository
+reads and the exact pinned CI-writer instruction packet are stored and verified.
+The writer completed the one-file interface repair; the controller committed
+candidate074cd202 and advanced to CI_PUSHING/iteration15 at20:24:11UTC. The
+worker was consumed after genuine owned shutdown. No new push or CI/delivery
+proven yet. The actual dashboard readback showed Active/Repairing before adoption.
+See [deployment and remaining limits](factory-pilot-hardening.md#ci-trace-fix-deployed-native-repair-resumed--2026-10-15-2023-utc).
+
+### October 15 bounded CI trace reassessment — prepared
+
+Complete actual failed-job evidence now passes the bounded collector and yields
+a repairable source-scoped diagnosis. Schema44 appends a versioned reassessment;
+old diagnoses/claims/UNKNOWN history stay immutable. Focused31/0 and both real
+scheduler lifecycle tests pass. Not deployed or live progress yet; see the
+[hardening record](factory-pilot-hardening.md#ci-trace-reassessment--implementation-prepared-2026-10-15).
+
+### October 15 historical-readback replacement — deployed
+
+PID1035/schema43 runs the independently reviewed replacement27b3e5e3. One
+guarded restart preserved all protected history/provenance; the first normal
+tick completed HEALTHY19:13:09UTC. Actual API/browser historical5bc is nonblocking
+history, current handoff stays Completed/SUCCEEDED, candidate/MR/CI unchanged.
+See [deployment evidence](factory-pilot-hardening.md#historical-readback-fix-deployed--2026-10-15-1913-utc).
+Native packet acceptance remains pending legitimate admissions; autopilot copy
+retained. Monitor active. CI still BLOCK, not delivery; full coverage unrun.
+
+### October 15 historical-readback replacement — preparation history
+
+The narrow status-path compatibility fix passes focused12/0, public specs,
+format, compile, Dialyzer0 and independent review. Its versioned replacement
+`symphony-history-readback-v1-nY0RN92Y/dev` restores exact historical receipt
+qualification and nonblocking historical5bc classification in a read-only
+probe against the actual ledger. It is **not deployed**; current61760/schema43
+is unchanged. Strict lint remains473 baseline findings/zero new; full coverage
+unrun. See [the hardening record](factory-pilot-hardening.md#open-rollout--materialized-release-historical-readback-2026-10-15).
+Fresh same-schema rollout authorization/readback and legitimate native packet
+acceptance remain pending; the autopilot compatibility copy is unchanged.
+
+### October 15 shared-skill release — activated, acceptance open
+
+The approved versioned shared-skill release is running at PID61760/schema43,
+first normal tick HEALTHY18:42:27UTC. Startup preservation independently passed;
+no historical rows, requests, receipts or product candidate changed. Monitoring
+is ACTIVE again. Full acceptance is held by the newly reproduced historical
+helper-path readback regression after materializing runtime resources; the
+current MR handoff remains SUCCEEDED. See
+[the hardening evidence and exit test](factory-pilot-hardening.md#open--materialized-release-historical-readback-2026-10-15-1842-utc).
+No compatibility fix, push replay or second restart was performed. Actual new
+native packet readback is pending, so the autopilot compatibility copy remains.
+
 ### October 12 runtime-update compatibility repair
 
 Installed Codex changed to `0.162.0-alpha.17.2`; the exact runtime whitelist
@@ -2612,3 +2697,800 @@ lint and public specs pass for the integration fixes. No new full suite was run;
 exact-current full-gate evidence, the PREPARED-route JSON replay edge, restricted
 broker replay proof and rollout remain separate unfinished acceptance items.
 Details: `plans/receipts/006-U11-fresh-amendment-packet.md`.
+
+## October 12 — first real-ticket trial and deferred specialist-chat cleanup
+
+The requester wants PPL-9881 through the current route before changing specialist
+session visibility. Do not reopen the saved native-subagent architecture branch
+or make this follow-up a prerequisite for current delivery.
+
+### Deferred: one persistent user-facing chat per ticket
+
+- Keep Symphony's current controller, stage roles, one source writer, independent
+  verifier, candidate identity checks, and controller-owned delivery effects.
+- Keep the ticket parent persistent and interactive. Specialists may remain
+  separate Codex CLI/app-server calls, but should not become standalone Desktop
+  chats. This is session-persistence/UI work, not a switch to native subagents.
+- Investigate supported ephemeral sessions using the installed runtime. Do not
+  merely flip the flag: current worker execution explicitly resumes stored thread
+  IDs, and recovery must no longer depend on a persisted specialist conversation.
+- Persist bounded worker results, tool/effect evidence, checkpoints, and diagnostic
+  records under Symphony ownership before a temporary session exits. Preserve
+  current authorization, sandbox, process-stop, and exact-candidate boundaries.
+- Reconstruct subsequent passes from the contract, plan, committed candidate,
+  remaining work, and durable evidence. Uncertain writes must reconcile rather
+  than replay. Do not silently restart implementation from the base commit.
+- User consequence: no direct opening/chatting with specialist sessions; progress,
+  questions, and rework requests remain available through the ticket parent.
+  Retain inspectable diagnostics without relying on specialist chat transcripts.
+- Acceptance: prove writer and independent verifier results reach the same parent;
+  actual Desktop listings gain no standalone role chats; restart/interruption
+  recovery retains the candidate and does not duplicate source or external writes.
+  Test this narrowly before rollout. Preserve existing chats until their evidence
+  is safely retained; this note does not authorize deleting or archiving them.
+
+Reference: https://learn.chatgpt.com/docs/cli/reference documents `codex exec
+--ephemeral` and JSON event output. Capability documentation alone is not acceptance
+of our app-server worker integration. This follow-up is explicitly deferred until
+the current-version real-ticket trial is complete.
+
+### Current PPL-9881 checkpoint (2026-10-12 23:31 UTC)
+
+The service was restarted with the admission fixes. The live dashboard API reports
+ACTIVE/HEALTHY, the planner is CONSUMED, START_IMPLEMENTATION's Jira journal is
+COMPLETE, and the run reached WRITING with a MATERIALIZED checkout. The first
+feature-writer turn completed with a structured BLOCKED result: its repository-only
+tools rejected required shared rule/skill reads outside the checkout. It made no
+edits; implementation iteration remains zero. A COMPLETE task row denotes terminal
+execution, not a passing slice. Controller adoption of this result was not yet
+observed at this checkpoint.
+
+The Desktop broker's existing presentation handoff remains awaiting native MCP
+approval. Scoped tool approval settings are saved, but no successful application
+to the owning live Desktop runtime has been proven. Do not describe approval-free
+automation as fixed, resend the uncertain handoff, or relax global permissions.
+The remaining instruction-access fix must expose approved read-only instructions
+without granting source workers arbitrary filesystem access.
+
+### Instruction delivery and first-slice recovery deployed; Desktop reload pending
+
+The controller now includes complete shared AGENTS/rules and the writer's required
+skills in its digest-bound packet. Repository-only tool access remains unchanged;
+missing or invalid instructions fail before launch. Actual writer-packet regression
+was RED for missing instructions, then GREEN; focused bundle/packet checks passed
+3/0. Independent read-only review found no must-fix in that change.
+
+First-slice blocked rework now accepts a nil candidate only at iteration zero when
+the stopped writer, pinned initial base, old/new reservation SHA and checkout
+identity agree, with genuine parent-input authorization. The new focused file
+passed 9/0; independent review caught throwing JSON decode on malformed reservation
+bindings, which was replaced with rejecting decoding. Its separate malformed/non-
+object regression passed 1/0. No live ledger was patched or contract amended.
+
+Observability now projects a current blocked writer as Needs attention, without
+changing delivery state. The dashboard explains that the stopped writer is not
+actively writing. The actual projection regression was RED (ACTIVE), then GREEN;
+the projection and existing parent-sync UI checks passed 2/0. Compilation, public
+specs and whitespace checks pass; no full suite was rerun.
+
+These changes were deployed through the existing LaunchAgent. The user has
+authorized forwarding the exact message `Rework the current candidate.` to the
+existing parent 01a1320c-074c-7f43-9a02-bc571e81a290. That exact message was forwarded
+once at 23:56 UTC after the user's Desktop restart. It arrived as delegated agent
+input, not a genuine human user message, and therefore cannot authorize source
+rework under the existing native-input gate. No command was staged and no source
+writer resumed. Preserve that distinction; do not resend or manufacture human
+provenance. The user must send the exact message directly in the existing parent
+after its currently pending shell approval is denied.
+
+Fresh read-only broker configuration proves both scoped tool overrides resolve to
+approve, exact cwd is trusted, plugin identity is correct, and no managed approval
+constraint is exposed. Owning Desktop policy remains unobserved; no public reload
+endpoint was found. The user agreed to restart Codex. Do not declare recurring
+approvals fixed until a normal broker mutation completes without a prompt.
+
+Separate remaining parent-sync issue: presentation 4 already completed, but summary
+read_thread omits the parent's real CREATE-side list_artifacts result. Full native
+history recovers that original empty observation; it is historical, not a fresh
+inventory. The collector/reference transport mismatch remains unresolved. Never
+resend presentation 4 or invent an empty attachment observation.
+
+Monitor `monitor-ppl-9881-delivery` is ACTIVE every 15 minutes, read-only and quiet
+on unchanged state. It alerts on material progression/new blockers and pauses
+itself on terminal state or one hour without progress; it does not control the
+scheduler or broker. The older PPL-9723/PPL-10035 monitor remains paused.
+
+### Ticket CLI socket rejection fixed (2026-10-13 00:12 UTC)
+
+The forwarded parent turn hit a separate launcher defect: bare `mise exec -- mix
+factory.ticket prepare-stage` lazily loads custom tasks via dependency load paths,
+starting Mix's TCP PubSub subscription. The native sandbox denied that socket and
+the parent requested escalation. This is distinct from broker MCP tool approvals.
+The user was asked to deny the pending escalation; no elevated retry is authorized.
+
+The supported prefix now preloads the existing compiled BEAM modules:
+`mise exec -- elixir -pa "_build/dev/lib/*/ebin" -S mix factory.ticket`. New protocol
+instructions, fresh context and generated staging commands agree on this prefix.
+Receipt parsing accepts only this exact additional launcher shape and preserves
+payload, command and genuine-human-input checks. Alternative module paths, eval
+arguments and shell composition remain rejected.
+
+An actual bare-Mix help invocation failed under network-denied Seatbelt; the new
+compiled launcher passed. Focused tests also exercised actual generated staging
+under network denial, followed by exact receipt admission, with 1/0. Prefix,
+parser-negative and bounded-context tests passed separately; compilation with
+warnings-as-errors and diff whitespace checks passed. No full suite was rerun.
+This proves the socket-free command path, not every permission in the owning
+Desktop sandbox or approval-free broker mutation. No source rework has been
+observed yet. Local service restart deploys these changes; the next direct human
+message is the real integration check.
+
+### Follow-on parent runtime and broker evidence fixes (2026-10-13)
+
+The user's direct message arrived in completed native turn
+01a1329e-4827-7260-98ee-3b0f571c8111. Context refresh succeeded, but the preparer
+started another Codex app-server, which attempted writes outside the parent's
+allowed runtime directories and exited with Operation not permitted/port_exit1.
+An isolated no-model invocation reproduced that exact error with writes to
+the Codex runtime directory denied; network denial alone did not reproduce it.
+
+Preparation now uses the existing service-owned mailbox, retaining normal
+staging and independent native receipt admission. A separate, narrowly bounded
+controller recovery recognizes this already-completed exact human request only
+at initial blocked WRITING/iteration0/nil candidate, with the matching ordered
+context refresh and exact failed preparer and no competing command. Its explicit
+recovery evidence is revalidated before source ownership transfer; no normal
+staging receipt is fabricated or backdated. The read-only live eligibility check
+confirmed the existing message and stored input readback digest agree, so another
+human message should not be necessary.
+
+Full-history broker readback can now return explicit historical target attachment
+evidence and a generated exact recording payload. The canonical broker reference
+uses both evidence flags; skill validation passed. Reconciliation keeps the same
+request/completed turn and changes no delivery evidence. Focused tests passed
+14/0 across initial writer transfer/recovery, mailbox routing and record/complete
+reconciliation, followed by additional malformed/tampered/competing-input checks.
+Compilation with warnings-as-errors, public specs and whitespace checks passed.
+No full suite was rerun. Independent adversarial review and local deployment are
+the next gates; do not treat this paragraph as deployment or live resumption proof.
+
+The existing monitor now runs every three minutes, remains quiet on unchanged
+state, and has the user's authority to repair confirmed blockers after explaining
+the exact change. It avoids competing repairs while the main thread is active.
+
+### Live recovery checkpoint and native ownership block (2026-10-13)
+
+Presentation 4 was reconciled from the attested historical target inventory and
+its existing completed turn: the same request is SUCCEEDED, with no resend.
+The genuine human rework request was accepted and APPLIED as
+TCMD-6c27893f1346b2166387ec80c38a6c6c33e972cd564fb1d06724c5a7a390954a.
+The controller preserved the prior stopped writer receipt and transferred the
+existing source reservation. Production capacity defaults and the initial
+nil-candidate/base-SHA resume gate were corrected; the normal-poll same-thread
+regression failed on each original defect and then passed. No planning restart,
+new checkout, or source edit was performed.
+
+The resulting same-writer startup at 00:58:08 UTC was rejected by Codex:
+`thread 01a13272-9eb0-7550-8411-9dbb54b09c57 already has an active writer`.
+Attempt desktop:d72d3da136d219e263520285d35b10020951b432259bb605d521ae7e6638365e
+is RECONCILE_REQUIRED without a bound session/turn or source operation. The task
+is STALE, not active implementation. Read-only lock-handle inspection attributed
+the native persistence owner to Desktop Codex PID11019, parent Desktop PID10427;
+the last actual writer turn is completed/idle. No supported Desktop tool can
+unsubscribe/unload that owning connection. The official app-server unsubscribe
+method affects only its own connection and uses a 30-minute unsubscribed idle
+grace period. Do not delete locks, modify Codex private state, kill Desktop,
+fork the writer, or infer ownership release from an idle status.
+
+The large recovery receipt (19,304 bytes) exposed another bounded-context defect:
+decision receipts were inline in a 16 KiB context. Decision receipts now use
+digest-pinned, ticket-scoped drilldown; failures have bounded UTF-8 summaries and
+exact drilldown. Native current-stage unresolved task failures now project Needs
+attention even without a Desktop request or usable context; historical-stage and
+consumed failures do not block progressed work. Both focused regressions failed
+on the original symptoms and passed after the fixes, with compilation/spec and
+whitespace checks. Monitoring remains every three minutes; service-owned workers
+are inspected through read-only ledger/history rather than loaded into Desktop.
+Ownership release and safe recovery of the same rejected request remain pending.
+
+Local restart deployed the projection fixes. Actual Codex-browser inspection
+confirmed Active work 0, Needs attention 1, PPL-9881's exact native rejection and
+the restored ticket-parent link/context. Independent review required excluding
+stale same-stage verifier rounds; the projection now pins the current role task
+key/round, and the focused regression covers old STALE versus current RUNNING.
+No source implementation or normal approval-free MCP mutation has been proven.
+
+### Rejected resume recovery and project grouping follow-up (2026-10-13)
+
+The user restarted Desktop. Old owner PID11019 is gone and the exact previously
+observed writer-lock path is absent. This does not by itself authorize arbitrary
+ledger edits or prove a successful writer turn.
+
+The scheduler now rearms the same request only for the exact native -32600
+`thread <bound writer> already has an active writer` rejection. Task and attempt
+failures must match; no session, turn, process, result or source operation may
+have been observed; immutable current input and workspace-generation checks must
+pass, with one filtered pending attempt and a three-minute cooldown. The original
+failure is retained in an append-only event before transactional rearm. Existing
+prepared blocked-rework launch still validates its APPLIED human command, transfer,
+fresh authorization, capacity and same-thread policy. Ambiguous failures never
+use this route. The narrow normal-poll regression proves same request/thread,
+preserved predecessor evidence, cooldown and observed-session/timeout/source-IO
+rejections. No full suite was run.
+
+Follow-up, explicitly requested: associate PPL-9881's Ticket, Feature Planner and
+Feature Writer chats with configured Grail project
+ad602dfe-91db-4efe-ba09-26513de01807 (/Users/cgable/Repos/grail), and apply this
+mapping to future ticket chats. Do not move them blindly: the parent identity
+guards currently require projectless observations, and restricted workers require
+nil execution project/root options. Sidebar membership must be an exact durable
+organizational binding, separate from execution cwd and capability settings.
+Preserve historical projectless CREATE/rework receipts without rewriting hashes.
+Use supported metadata-only association and read back unchanged cwd, checkout,
+permissions and source ownership. Parent seams: TicketChat, TicketParentEvidence,
+TicketParentGuard, TicketChatCommands, TicketReworkRecovery, DesktopToolArgs,
+DesktopRequest and TicketChatOutbox. Worker seams: TaskLauncher and AppServer's
+metadata project association, keeping restricted execution options unchanged.
+Prove exact-project positive/wrong-project rejection and no loaded-writer conflict
+before applying to these existing chats. Current writer recovery takes precedence.
+
+The first deployed rearm reached RESERVED but exposed
+blocked_resume_answer_replay_unproven before any native turn: the historical
+replay validator only recognized normal in-turn staging, not the distinct
+controller recovery receipt already accepted for initial transfer. Historical
+replay now revalidates that same exact recovery proof as an alternative to normal
+staging/timing evidence. Origin, body, client, ticket/generation and digest checks
+remain unchanged; no receipt bytes are rewritten. Focused application/replay and
+corruption-rejection tests passed, independent review found no must-fix, and live
+read-only validation of the existing APPLIED command returned :ok. The service
+was restarted to apply this delta; native turn startup must still be observed.
+
+Live confirmation at 01:39 UTC: the same request is TURN_BOUND in original writer
+thread 01a13272-9eb0-7550-8411-9dbb54b09c57, new turn
+01a132ea-2bcb-78e2-b21e-f621d2ba2c30, owned source process92691. The service reports
+HEALTHY, task RUNNING, without another planner, writer chat or checkout. This is
+new-turn startup proof, not yet an adopted implementation slice or delivery.
+Three-minute monitoring has this updated baseline and avoids Desktop-owned
+specialist reads. Project grouping remains an explicit separate follow-up.
+
+## Current follow-up backlog index — October 12, 2026
+
+October 13 update: the requester authorized local implementation of items 10,
+11 and 12 below, without deployment. See the
+[local priority hardening pass](factory-pilot-hardening.md#local-priority-hardening-pass--2026-10-13).
+All three are implemented locally with focused regressions and independent
+review. Format/specification checks and Dialyzer pass; wider strict lint and a
+fresh complete coverage gate remain repository-signoff limits (item 13).
+Do not interpret local tests as rollout or live acceptance.
+
+This index summarizes deferred work, not authorization to start it or a claim
+that every historical pilot defect is still open. Current priority remains the
+PPL-9881 end-to-end trial and any confirmed delivery blocker. Keep the trial's
+implementation/verification/delivery evidence separate from backlog completion.
+
+1. **Dashboard UX (new; deferred):** compact ticket rows with accessible inline
+   expandable details; evaluate one unified Tickets view with queue/progress
+   filters while preserving Jira snapshot versus durable workflow authority.
+   Acceptance and alternatives are recorded in
+   [the dashboard UX backlog item](factory-pilot-hardening.md#deferred-dashboard-ux-compact-records-and-expandable-details--2026-10-12).
+2. **Correct project grouping (open):** map existing and future ticket/role chats
+   to their configured repository Project, including Grail, without changing
+   cwd, restricted capabilities or historical receipt identity. See the exact
+   project-binding follow-up above; do not blindly move active chats.
+3. **One persistent visible ticket chat (deferred until this trial):** replace
+   standalone specialist Desktop chats with supported temporary internal role
+   sessions and durable Symphony evidence. Retain independent verification and
+   same-candidate recovery; avoid Desktop versus service ownership conflicts.
+4. **Storage lifecycle (unfinished acceptance):** complete safe automatic native
+   cleanup/restore and exact cache reclamation for the current checkout route;
+   audit remaining worktrees, Bazel bases and runtime caches. Existing maintenance
+   scaffolding is not proof of enabled production cleanup; retain chat access,
+   recovery evidence and protections for active/dirty/unrecoverable work.
+5. **Required manual validation (separately gated):** finish the controller-owned
+   non-production claim/deploy/test/restore/release path for `Required: yes`.
+   Ordinary `Required: no` delivery must not depend on this follow-on.
+6. **Measured cost and latency:** attribute tokens/cost to roles and retries;
+   separate implementation, model time, polling, checks and debugging. Revisit
+   review rigidity and unnecessary passes using measurements rather than adding
+   another universal agent stage or weakening safety gates by default.
+7. **Shared-skill consolidation (deferred):** refresh the inventory and agree on
+   keep/adapt/consolidate/retire choices; preserve callers and non-factory uses.
+   Details remain in the shared-skill consolidation backlog section.
+8. **Dependency advisories (open triage):** assess exposure and supported upgrades
+   for the existing dashboard/runtime dependencies separately from ticket work.
+9. **Tagged GitLab feedback (on hold):** revisit the review-comment workflow and
+   ergonomics before enabling it on the new route; do not revive it implicitly.
+10. **Retryable native-turn recovery (new; P0):** retain shutdown/error evidence
+    and automatically recover provider-capacity failures with bounded retries,
+    preserving partial edits and the original chat/checkout/contract/plan/model.
+    Keep failed attempts intact and transfer ownership through exact controller
+    receipts; ambiguous starts and pending approvals must remain fail-closed.
+    See [the recovery backlog item](factory-pilot-hardening.md#recover-retryable-failed-native-turns--2026-10-13).
+11. **Every specialist error visible in the main chat (new; P0):** extend beyond
+    validated writer BLOCKED results to native/provider, transport/tool, timeout,
+    malformed-output and permission-pending errors for all specialist roles used.
+    Retain exact error events, deduplicate notices, recover uncertain presentation
+    safely, and prove actual visible main-chat delivery. The capacity-recovery
+    repair did not fix this notification bug. See
+    [the specialist-error notification item](factory-pilot-hardening.md#surface-every-specialist-error-in-the-main-ticket-chat--2026-10-13).
+
+12. **Attribute/isolate invalid delivery registration (new; P1 triage):** a tick
+    failed at October13 15:05:54UTC with
+    `delivery_registration_failed:manual_validation_contract_missing` after the
+    sixth PPL-9881 slice was adopted. Intake identity and impact on the next writer
+    launch were initially unproven. It was subsequently attributed to POL-264;
+    the requester removed only its ai-ready label, with Jira readback confirmed.
+    The narrow guard passes local focused tests but is not deployed; durable
+    blocked-intake visibility remains deferred. Identify and visibly defer invalid registration
+    without weakening contract requirements or starving existing-run progress.
+    Evidence and exit criteria are in the pilot hardening table; no deployed isolation repair yet.
+    After the label removal, the scheduler completed HEALTHY at15:22:10.278986UTC
+    and issued the existing writer's seventh turn
+    01a135db-7f63-78a0-88d6-93a463d6eed5 in original thread
+    01a13272-9eb0-7550-8411-9dbb54b09c57. Ledger TURN_BOUND/taskRUNNING and
+    read-only native history inProgress agree; allocation remains gpt-6.1-sol/xhigh
+    and candidate4a0bba0 remains the sixth committed slice. No restart or direct
+    worker message was needed. This is seventh-turn startup, not slice7 adoption.
+
+13. **Repository-wide gate reliability (P1 follow-up):** separate the current
+    priority-pass checks from checkout-wide lint debt and crash/source-binding
+    fixture deadlines. Retain full-gate failures and targeted rerun evidence;
+    do not lower thresholds or claim a green gate from focused tests. See
+    [gate reliability](factory-pilot-hardening.md#repository-wide-gate-reliability--2026-10-13).
+
+14. **Service-owned interrupted-turn recovery (new live blocker):** thirteenth
+    PPL-9881 writer attempt is STALE/RECONCILE_REQUIRED after a closed-connection
+    error; native turn is interrupted with no result or genuine owned-stop
+    receipt. Twelfth commit remains intact. Legacy Desktop-request recovery and
+    capacity-only retry do not authorize this attempt. Current recovery also
+    encounters unrelated Desktop source-cwd holders and an exclusively held
+    native writer lock; neither may be bypassed. The combined
+    safe fixes were activated at 20:22 UTC (schema 38, healthy tick), but the
+    exact recovery command denied dispatch and preserved generation 18 and the
+    twelfth candidate. Subsequent contract review found the added global-CAS
+    prerequisite was an over-constraint; the correction restores existing
+    controller authority with persisted queue/revision and mandatory owned-session
+    prestart guards. Desktop ownership was released by the requester; checked
+    lock absence and delayed-launch guards are deployed. The exact recovery now
+    CLI permission denial was resolved by requester-approved Full Disk Access
+    and restart: recovery APPLIED at 21:31 UTC, generation 19 reserved. The
+    original writer then resumed and returned COMPLETE without edits. Its
+    result was consumed at 21:47 UTC and the controller advanced to CI_PUSHING,
+    iteration 13; no thirteenth commit or delivery is inferred. Required
+    validation and independent verification remain pending. Transient service
+    preflight denials have no proven exact cause; accepted diagnostic-only
+    logging remains undeployed after successful recovery.
+    See [corrected recovery and Desktop ownership](factory-pilot-hardening.md#interrupted-recovery-correction-and-desktop-ownership--2026-10-13) and
+    [interrupted source-turn evidence and exit criteria](factory-pilot-hardening.md#interrupted-source-turn-after-a-closed-connection--2026-10-13).
+
+15. **Native configuration effectiveness:** recovery startup reported disabled
+    untrusted-project configuration and eight ignored user settings. Do not
+    infer effective approval, tool or storage policy from those entries; no
+    trust/configuration change was made. Evidence and testable acceptance are
+    recorded under [recovery and Desktop ownership](factory-pilot-hardening.md#interrupted-recovery-correction-and-desktop-ownership--2026-10-13).
+
+16. **CI push admission and truthful progress:** eight DB-checkout expirations
+    occurred before intent persistence during transactional Git admission.
+    Actual push uses --no-verify. The two-phase local repair passes real delayed
+    Git and stale-replay/race regressions; full push lifecycle review accepted,
+    but the repair remains undeployed without a safe activation boundary.
+    Queued/error/active-push states need distinct
+    visibility. CI-first default expansion also requires Polaris's own
+    required-job policy, not Grail's Bazel assumption. See
+    [CI push admission timeout and visibility](factory-pilot-hardening.md#ci-push-admission-timeout-and-visibility--2026-10-13).
+
+17. **Missing original push outcome:** the unchanged service later persisted
+    PUSH_UNCERTAIN (helper 49088, generation 20), but exact status finds no
+    original claim/rejection/receipt and the bound remote branch is absent.
+    Original stderr/owned-stop proof was not retained, so supported recovery
+    cannot safely reissue. No rollout, blind retry or delivery claim was made.
+    Evidence, impact and pre-/post-spawn retention acceptance are captured in
+    [missing original push outcome](factory-pilot-hardening.md#missing-original-push-outcome--2026-10-13).
+    A separately reviewed blocker-only rollout was also withheld: fresh OS
+    evidence found five writer-cwd helpers under Desktop app-server 4760. They
+    were neither killed nor allowlisted; exact native helper ownership handoff
+    remains open alongside the missing historical push receipt.
+    Monitoring additionally observed two five-second state-endpoint timeouts at
+    23:04 UTC while PID 93233 and unchanged read-only ledger bindings remained
+    present; this does not establish a new worker failure. See the same backlog
+    evidence and timely-state-read acceptance below.
+    At 23:09 the endpoint responded, reporting start timestamp 23:05:21 despite
+    unchanged OS/launchctl PID 93233, plus a FAILED tick (`response_timeout` at
+    23:08:24). The protected push stayed unchanged. This identity discrepancy
+    does not establish a restart or rollout acceptance; the monitor did neither.
+    At 23:14 a distinct required-server error was reported for the 23:12:21
+    tick: `required_mcp_servers_unavailable:tick_failed`, consecutive failures
+    two. Exact missing server remains unproven; the push/result bindings did not
+    change. Evidence and required-capability acceptance are in the same backlog.
+    A successful HEALTHY tick was observed at 23:24:33, with zero consecutive
+    failures and responsive state read. This is scheduler recovery only; the
+    uncertain push and missing receipt/MR remain unchanged.
+
+18. **Unknown push recovery and truthful dashboard (live accepted):** direct
+    browser inspection reproduced Active / Needs attention 0 over a ledger
+    PUSH_UNCERTAIN. Independently reviewed same-candidate recovery must preserve
+    original uncertainty, use a new fenced CAS operation and genuine new receipt,
+    and prevent branch deletion/reset or candidate rollback while old outcome is
+    unknown. Dashboard projection must expose current uncertainty/errors/stalls
+    without confusing scheduler health or historical consumed failures. Design
+    acceptance is not deployment or live recovery. The six-file dashboard V2
+    implementation is independently accepted and locally integrated. Read-only
+    recovery qualification accepts all 18 retained writer records; historical
+    statuses and missing shutdowns remain intact. Blocker-only artifact/schema39
+    activation is freshly read back; full pre/post row equality is explicitly
+    unproven after the guard's lost process-local snapshot. Genuine CAS helper
+    exit0, receipt and separate exact remote-SHA readback advanced PPL-9881 to
+    CI_MR_CREATING at 2026-10-14T01:17:22Z. Original outcome remains UNKNOWN.
+    Actual browser now separates Completed handoff from the retained parent-only
+    warning; it no longer hides the push failure. A separately tracked ordinary
+    v2 descendant-push limitation remains open. See
+    [recovery and visible-status acceptance](factory-pilot-hardening.md#unknown-push-recovery-and-truthful-dashboard--2026-10-13).
+    The owner-only MR bridge is deployed and independently accepted; its protected
+    pre/post rows match. MR creation is not yet observed: the broker used wrong
+    sender arguments and then treated definitive unissued denials as ambiguity.
+    Exact request c634 remains PENDING/unclaimed. Corrected reference dry-run
+    passes; live broker correction and durable pre-claim dashboard diagnostics
+    remain open, as documented in the same hardening section.
+    Subsequent owner-policy option propagation and scheduler-bookkeeping race
+    defects are independently reviewed/tested/deployed with protected pre/post
+    rows unchanged. Current genuine blocker is controller native-cwd mismatch:
+    MR preparation bound connector workspace instead of the same existing
+    controller's dated native directory. Identity guard correctly denies;
+    request remains unclaimed and no MR/pipeline exists. Audited supported
+    binding correction, not a cwd waiver or ledger patch, is required. Broker
+    approval wait was observed and not bypassed. Exact evidence and acceptance
+    are retained in the linked hardening section.
+    Unnecessary automation-view approval during broker identity discovery is
+    separately fixed: reviewed runtime/local-heartbeat resolver,14 focused test
+    methods and actual broker exit0 without MCP automation lookup. Approval
+    policy/service guards remain unchanged; no service restart was needed.
+    The controller-directory blocker and a distinct controller Git read timeout
+    remain open. See [approval dependency acceptance](factory-pilot-hardening.md#unattended-broker-identity-discovery-approval--2026-10-13).
+    The requester resumed repair-through-MR authorization on October 14;
+    the connector/native-actor domain split and audited exact-request correction
+    were independently accepted and deployed schema40 at15:53 UTC, with exact
+    protected full-state before/after equality. The existing broker now has
+    explicit same-request/expected-SHA correction authorization; fresh normal
+    claim and MR acceptance remain pending. Live correction exposed native
+    projectId:null versus the ledger projectless sentinel; the narrow three-
+    seam representation fix and help regression are independently accepted
+    and deployed at16:32 UTC with identical protected full-state snapshots.
+    The existing broker has fresh exact-request continuation authorization;
+    correction/claim/MR live acceptance remains pending. The post-deployment
+    owner evidence expired during slow qualification; the reviewed two-phase
+    admission seam is being implemented, not yet accepted or deployed. Bounded
+    reads exposed a DNS-resolution timeout/delay, then ordinary SSH and configured
+    GitLab reads recovered without configuration changes, confirming the exact
+    candidate and no open MR. The deployed fixed Git helper also passed; a
+    subsequent deployed Jira authorization read and separate configured Jira
+    read failed to connect, leaving fresh Jira authority as a current external
+    admission blocker. The reviewed two-phase repair subsequently passed its full
+    local lifecycle/adversarial gates and was independently accepted/deployed
+    at17:53UTC, SymphonyPID19087/schema40, with exact protected pre/post snapshots
+    and zero guard writes. Canonical routing now prepares qualification before
+    obtaining fresh owner evidence. Live preparation succeeds, but separate
+    model/tool steps and finalization still exceed the admission expiry; the
+    exact request remains PENDING/unclaimed with no audit or MR. A concrete
+    single-invocation procedure passed45 executable cases and independent review,
+    then was adopted at18:35UTC as a one-reference policy overlay with every
+    other pin/build/PID unchanged and no restart. Natural broker loaded it and
+    began read-only capability preflight; live correction/claim/MR acceptance
+    is not yet proved. Actual single-invocation finalization still expired,
+    so a separately reviewed timing-only build was deployed at19:07UTC,
+    SymphonyPID60747/schema40, with exact protected snapshots and zero guard
+    writes. It measures the remaining delay; it is not the delivery fix. Actual
+    service logs now isolate source-fact checks at7.7–12.5seconds, exceeding the
+    remaining admission window; nested attribution and the bounded performance
+    fix remain active. Fresh19:25UTC readback still has the same pushed candidate,
+    pending unclaimed request and no MR. A bracketed read-only scheduling
+    differential reproduced facts9.0seconds background versus1.9foreground;
+    the independently accepted plist-only Standard correction restarted only
+    Symphony at19:39UTC (PID83508), same build/schema40/protected state and zero
+    guard writes. Actual correction and separate fresh claim now both passed
+    within unchanged windows (facts1.99/2.55seconds). One broker send is observed;
+    controller completedPASS and actual [draft MR!47818](https://gitlab.com/grailbio/grail/-/merge_requests/47818)
+    independently matches984a95a, reviewers0/assigneecgable/sourcebranchpreserved.
+    Broker durable completion and temporary diagnostic cleanup remain closeout;
+    no CI/independent-verification/AC-validation completion is claimed.
+    Broker's actual completion recording then denied broker_runtime_operation_forbidden:
+    service runtime route excludes typedMRcomplete although downstream claimed-MR
+    completion already exists. A bounded runtime-entry correction is active;
+    existing claim/send/MR must be reconciled, never reissued. Cleanup tests passed
+    and tagged instrumentation is removed in source, not yet redeployed.
+    That exact runtime-route fix passed actual bridge RED→GREEN and independent
+    review, then deployed with diagnostic cleanup at20:06UTC (PID95765),
+    Standard scheduling/schema40/fullaudit-claim-request snapshot unchanged and
+    zero guard writes. Normal broker receipt reconciliation remains awaited;
+    the verified MR is not a new send or new claim authorization.
+    Subsequent reviewed two-file broker policy clarification and four offline
+    forward cases made completed typed-MR reconciliation explicit with an empty
+    pending queue; the normal broker recorded exactc634 SUCCEEDED at20:21:59UTC,
+    retaining the original controller turn and without another claim/send.
+    Fresh GitLab readback confirms draftMR!47818 at984a95a and no pipeline.
+    At20:29UTC the healthy scheduler still has CI_MR_CREATING/null runMR fields
+    despite five MR_RESULT recovery attempts. Exact adoption cause remains
+    unproven and under read-only investigation; pushed+MR is achieved, but run
+    adoption, CI, independent verification and AC validation are not.
+    Deployed read-only claim/receipt/stopped-checkout qualification passed.
+    Independent inspection found collector information loss: removal flags are
+    stripped before the retained-hazard guard needs explicitfalse. The narrow
+    collector normalization preserves raw force_remove_source_branch and rejects
+    missing/null/malformed/conflicting retention proof, without changing the
+    guard. Old public collector and deep adoption replays fail as expected;
+    corrected collector+adoption pass20tests/0failures. Frozen review accepted
+    KZiGXl; one-BEAM artifact preparation is in progress, not yet live acceptance.
+    The independently accepted one-BEAM artifact was then activated at20:49UTC:
+    PID95765→44213, schema40/Standard unchanged, exact protected before/after
+    byte equality and zero guard ledger-row writes. Manifest736f69a6 reconciles
+    the earlier policy overlay. First normal reconciliation tick is running;
+    live MR adoption remains to be observed, not inferred from startup.
+    Live first normal tick adopted exactc634 at20:49:33.825296UTC into
+    CI_WAITING with MR!47818 and unchanged984a95a; tickHEALTHY20:49:35.718821UTC.
+    Actual dashboard20:50:17UTC shows the MRlink/CIwaiting and cleared progress
+    staleness. Original parent8/controller5bc historical warnings remain separate.
+    Fresh GitLabMR+remote-branch and deployed retained-history checks pass.
+    Pushed+draftMR milestone is achieved; no CI/independent-product-verification/
+    AC-validation/review-ready completion is implied and no duplicate was sent.
+    See
+    [current MR repair](factory-pilot-hardening.md#mr-connector-and-native-actor-domain-repair--2026-10-14).
+
+19. **CI-first default local handoff:** independently accepted unapplied source
+    and canonical-policy patches implement inherited draft_mr with explicit
+    verification_first. Grail/Polaris/Augusta/Blackburn ordinary-ticket policies
+    are supported; PrePost selector proof and legacy collection remain explicit
+    pre-mutation capability denials. Manual-required native tickets and optional
+    job certification are not silently enabled. Focused 63 tests, format/specs
+    and isolated Dialyzer passed; no live integration/default installation ran.
+    See [local default evidence and remaining acceptance](factory-pilot-hardening.md#ci-first-local-default-candidate--2026-10-13)
+    and the [durable patch handoff](../plans/patches/ci-first-default/README.md).
+
+20. **CI collection and dashboard hierarchy (deployed and live accepted):** the exact MR
+    pipeline2948090823 completed FAILED; bazel and quality-checks are required
+    failed jobs. Earlier "no pipeline" reporting was incorrect: the configured
+    MR tool omits the selector field rather than proving absence. Actual deployed
+    read-only collection reproduces ci_head_pipeline_not_observable. A bounded
+    explicit MR-list selector and truthful single-primary-action dashboard repair
+    passed83 targeted cases, independent review and guarded local rollout. First
+    normal tick adopted the exact failed CI at21:38:26UTC, retainingCI_WAITING
+    and candidate984a95; failed CI must not launch verification. Current CI/job
+    links lead the actual dashboard; historical/controller and
+    presentation warnings remain evidence, not cleared or replayed.
+    See [current evidence and acceptance](factory-pilot-hardening.md#ci-collection-and-dashboard-action-hierarchy--2026-10-14).
+
+21. **Automatic native-ticket CI repair (deployed/enabled; normal-tick claim proven):**
+    Current 2026-10-15 17:26 UTC evidence: narrow owner-admission metadata fix
+    deployed at PID41189/schema42, targeted actual-callsite RED/GREEN and
+    independent source/artifact/startup review accepted. Full protected history
+    before/after and fresh readback match exactly, zero guard ledger-row writes.
+    Existing request7e300498... is now SUCCEEDED17:32:31 UTC, same payload and
+    controller, completed turn01a1409d-b08e-7183-b34b-5784bcee595e with actual
+    GitLab calls and exact draftMR47818/be8/reviewers0 readback. Earlier spool and
+    expiry denials are retained; no uncertain send was replayed. Normal scheduler
+    adopted CI_WAITING17:33:34.584474 UTC and completed HEALTHY. Exact candidate,
+    MR and round1 unchanged. Pipeline2949408072 exactbe8 FAILED05:29:54 UTC;
+    no CI PASS, verification or delivery claim. Monitor remains deleted. See
+    [exact evidence and remaining acceptance](factory-pilot-hardening.md).
+    Earlier 2026-10-15 05:24 UTC evidence: the reviewed workspace/input-fence
+    recovery is deployed at PID25731/schema42. Exact original input was retired
+    once through the supported leased API, with immutable raw history retained;
+    the next normal controller tick genuinely pushed be8e3d896a2e... (receipt,
+    child exit0 and independent remote readback agree). Existing draftMR47818
+    now has that exact head, unchanged reviewers[]/assignee/draft state. New
+    MR pipeline2949408072 is running, independently read from GitLab; normal
+    local MR reconciliation remains CI_MR_CREATING at this observation. CI PASS,
+    independent product verification and full ticket delivery are not claimed.
+    The monitor remains deleted. See hardening evidence for exact pins, operator
+    autocompile recovery, fresh startup acceptance and preserved UNKNOWN history.
+    Earlier sequence follows. At04:11 UTC the reviewed selection-policy fix was deployed at
+    PID73637/schema41, exact protected startup snapshot preserved. Normal tick
+    FINALIZED actual gofmt and Gazelle, applying migrations/BUILD. Subsequent
+    git_failed was reproduced by non-writing dry run against a stale empty Git
+    index.lock; independent review and fresh idle/owner checks qualified one
+    atomic recoverable quarantine, leaving index/HEAD unchanged. The normal
+    controller then committed be8e3d896a2e... on the next normal tick, passed its
+    exact-candidate diff check, consumed the original result once and advanced
+    CI_PUSHING/iteration14 at04:17 UTC. Remote push/new CI and independent
+    verification remain separate pending gates.
+    The delivery monitor was deleted at the requester's direction; do not recreate.
+    See the hardening document's exact receipts and remaining acceptance.
+    At 2026-10-15 03:02 UTC, after the actual missing-capacity-policy callsite
+    regression and reviewed one-line correction, normal scheduling advanced
+    PPL-9881 to REPAIRING/round1 with a durable once-only claim. Candidate984a95...
+    and draftMR47818 remain unchanged. Actual PID24673/schema41 runs the scoped
+    corrected artifact. Writer output, generation/push, passing CI and independent
+    verification remain separate unproven steps. Earlier rollout history follows.
+    As of 2026-10-15 02:42 UTC, frozen correctness/runtime reviews and targeted
+    lifecycle checks passed; schema41 OFF startup and same-artifact single-leaf
+    enable both passed actual guarded acceptance. PID99651 runs the enabled
+    artifact. First normal tick was healthy but CI polling was not yet due;
+    no live repair claim or new product SHA is proven yet. See the current rollout
+    receipts in the hardening document; full-suite formatting/lint debt remains.
+    Historical implementation sequence follows. The requester
+    requires CI repair as a factory delivery step. Extend the existing bounded
+    same-writer repair path with real redacted job-log evidence and once-only
+    admission, then fresh descendant push and same-MR CI qualification. Completed
+    CAS history and the native controller's missing Gazelle-generation capability
+    are explicit required seams, not waived prerequisites. No live automatic
+    repair or product-source change is claimed yet. Core and ordinary native-push
+    fixtures pass; CAS/input/round source fixes now have independent conditional
+    acceptance and the old-code genuine-CAS failure is reproduced. Corrected
+    behavioral proof and both ordinary/CAS-predecessor framework fixtures now pass
+    through same-MR reuse, a new qualifying CI PASS and verifier dispatch. These
+    are isolated fixtures, not live product CI or verification. Final integration
+    and deployment remain unfinished. Development
+    worker hit provider capacity; source-writing retry was withheld after disk fell
+    below the 20 GB writer budget. Same-agent read-only retry returned the remaining
+    correction plan; provider responsiveness recovered, but disk is still only
+    18.28 GB at that historical gate. Requester then cleaned disk and asked to finish; fresh capacity passes
+    at 53.21 GB and the same sole writer resumed. Frozen v3 public-spec scan passes;
+    self-contained offline tool reconstruction has independent acceptance. After the interrupted turn, the requester
+    explicitly asked for a state testable by the next normal tick; capacity now
+    passes at 61.8 GB. Fresh GitLab proof still matches the same failed pipeline.
+    Runtime confinement and the corrected early-owner-loss launcher now have
+    independent acceptance,39 focused checks and5 durable relocation passes.
+    The actual FILE_SOURCE combined-tool empty-worker fixture and disabled-proof
+    original-receipt readback pass; current ordinary/CAS lifecycles and final
+    framework gates are still running. These are not live repair evidence.
+    Lifecycle, final review and rollout remain required. No model switch,
+    agent cleanup, production repair or rollout occurred. Work is preserved.
+    See [implementation contract and acceptance](factory-pilot-hardening.md#automatic-native-ticket-ci-repair--2026-10-14).
+
+Requester clarification (October 13): every trial problem not being fixed now
+must enter this backlog with evidence, impact and exit criteria. Review the
+accumulated backlog together after PPL-9881 clears delivery; do not silently drop
+gaps or start the whole backlog during the active ticket.
+
+The older model-allocation and opt-in fast-lane checkboxes in the pilot ledger
+predate subsequent allocation changes and the ai-ready/Specify Work entry path.
+Reconcile their status before treating them as new implementation requests; they
+are not prerequisites for the current trial. Older P0/P1 rows remain historical
+regression/live-acceptance references, not nine additional feature workstreams.
+
+### Main-ticket blocked notices — 2026-10-12
+
+Current validated feature-writer `BLOCKED` dispositions now request a visible
+final answer in the ticket parent: blocker, preserved versus unfinished work,
+and recorded next action, followed by the existing terminal acknowledgment.
+Ordinary progress presentations remain unchanged. Protocol fingerprint v6
+refreshes old instructions without rewriting an issued request. The focused
+blocked lifecycle, outbox, and terminal-ack checks passed (3 tests); this is not
+native rendering proof. Delivery status, source evidence and files are unchanged.
+
+The canonical broker handoff reference now distinguishes the pre-send
+`existing_thread_id` from the still-null target-readback `thread_id`. PPL-9881
+presentation 8 was successfully claimed, then its broker script incorrectly
+required the latter field before sending. Its claim remains unresolved: neither
+this display change nor missing target history authorizes a resend or claim
+reset. A separately audited pre-send-abort reconciliation is still required to
+retire that exact request before an ordinary new presentation can be delivered.
+
+### Exact reconciled-file-IO writer recovery — 2026-10-12
+
+`TicketInfrastructureRecovery.authorize/2` records an exact controller recovery
+grant separately from native human input. It admits only a stopped, recorded
+writer `BLOCKED` on the file-helper/reconciliation error class, with all changed
+paths covered by independently read-back APPLIED file receipts and no pending
+human question or command. The normal scheduler uses the existing blocked-source
+transfer: same writer thread, checkout, contract, plan and model allocation;
+fresh Jira authorization and the unchanged capacity gate still apply. Prior
+results remain immutable, and ambiguous native starts remain reconciliation-only.
+
+Prepared recovery survives reopening and rechecks HEAD, all partial file bytes,
+the exact pending-path set and human-input queues before a RESERVED launch.
+It does not use a forged client message or replay an already-applied human command.
+Focused transfer, source-drift, queued-input, restart and same-writer adoption
+checks passed; independent review identified the restart guards and confirmed
+their repairs. No full suite or real-ticket commit/push/MR action was run by this
+implementation chat. Live writer start is verified separately from these tests.
+
+Live acceptance at 2026-10-13 02:51 UTC: the exact stopped attempt was granted
+recovery `TINF-0baf69b32d8c11b822101aae3f0b8524c2b36e2bf1c10fd959c3186a973ed1a3`.
+The restarted scheduler applied its source transfer and started the existing
+writer thread in turn `01a1332b-adef-7c30-8c36-6e424129df81`, attempt
+`desktop:f13b73f9f361c4cc471b902b5d175daccb09f7f83b0e3a91ed3bd2df3d6fbc98`.
+Read-only stored native history confirmed `inProgress` and completed repository
+reads for migration BUILD, Job/AuditJob models and audit mapping. The writer
+explicitly resumed the storage increment with preserved edits. No new slice was
+yet committed; service health was synchronously HEALTHY. This is real writer
+activity, not merely a WRITING run label or a requested launch. Presentation 8's
+independent pre-send-abort reconciliation remains unresolved and does not block
+this source turn.
+
+### PPL-9881 tick-renewal repair — locally verified, rollout pending
+
+The two reported post-commit failures were five-second renewal RPC timeouts,
+not proven lease expiry. A real shared SQLite fixture reproduced the timeout.
+The repair gives renewal one finite deadline (65 seconds maximum, shortened for
+shorter leases/intervals), propagates its remaining budget to database checkout,
+and retries only pre-transaction queue rejections. One monitored helper keeps
+read-only control status responsive. Exact identity, expiry headroom, owner
+liveness and fail-closed behavior remain enforced; no global pool or source
+worker policy changes were made.
+
+Verification: 24 focused control/lease tests passed, including deadline
+exhaustion, pause/mismatch, zero-budget rejection, late recovery renewal,
+graceful helper shutdown and abnormal control death. The separate real
+60-second contention test passed with status readback available during the
+wait. The existing candidate-adoption/restart integration test passed without
+duplicate adoption. Warnings-as-errors compilation, public-spec checks and
+diff whitespace checks passed. Independent read-only review accepted the
+final scoped repair. No full test suite was run.
+
+The live service has **not** been restarted for this repair: PPL-9881 has an
+active fourth source turn in its original writer/checkout, after three adopted
+commits (latest `1a8406e6b8f0937791dcdd096d4a9b81edc649da`). Production
+activation must wait for a read-backed service-owned-turn/lease-safe boundary,
+then use the existing LaunchAgent restart and synchronous runtime-health
+readback. Compiled files on disk are not proof of runtime deployment.
+Longer-term shortening of Git-observing database transactions remains separate
+from this bounded repair.
+
+Live rollout at 2026-10-13 05:02 UTC: after the fourth writer stopped and its
+commit `c4dbf55db41f59ffdfcf3fa7e2b291e9fb4bb85b` was adopted, fresh guards
+proved zero active/uncertain worker owners, controller checks and pending file
+IO, with no tick lease. An earlier restart attempt was rejected when the next
+tick acquired its lease; no stop occurred on that attempt. The later safe
+boundary allowed the normal LaunchAgent restart; old PID 51725 was independently
+absent before bootstrap. New PID 42917 started at `05:02:08.132034Z`, using the
+same implementation checkout/workflow and new runtime fingerprint
+`6bca2d6cf6bfc380c9a5e17be4f39fd654ff9774f17562261db9e1e58d3e55aa`
+(previous `a017368e1db2fe52ba174de0d38aee2ecc9d95f377642afb355e91f62109909f`).
+The first completed tick was synchronously HEALTHY at `05:02:45.604313Z`.
+It started the fifth implementation turn `01a133a4-6b50-7191-b92b-bbd9bb15165f`
+in the original writer thread, at iteration4 with the fourth candidate intact.
+No scheduler/broker pause or Desktop restart was used. The next post-deployment
+source-result adoption remains to be observed; startup/launch health alone is
+not that acceptance evidence.
+
+First post-deployment adoption acceptance at `2026-10-13T05:32:26.891274Z`:
+the fifth writer returned CONTINUE and was CONSUMED at iteration5, with source
+commit `41ac234dfdb37b5e3ccd2571779db4bdd34af2cd` independently present at HEAD.
+The tick started at `05:30:52.041751Z` and completed HEALTHY after about 95
+seconds, crossing the normal 80-second renewal interval without the old
+renewal timeout. No duplicate commit or restart was required. This proves one
+live post-deployment adoption, not all future contention patterns. Product
+tests/generation/verification remain unrun and no MR exists yet.
+
+### PPL-9881 capacity-failed native turn — one-shot recovery, 2026-10-13
+
+The sixth source turn `01a133c1-174b-7dd2-b9fc-5a02a4717e56` failed with
+native `serverOverloaded`, without a final result or recorded owned-exit receipt.
+It is not a completed slice. Its original attempt and nine APPLIED file journals
+remain unchanged; process absence was not converted into a fake exit or BLOCKED
+result. Automatic bounded recovery/shutdown retention is now an explicit P0
+[backlog item](factory-pilot-hardening.md#recover-retryable-failed-native-turns--2026-10-13).
+
+The explicitly authorized repair adds `mix factory recover-failed-writer`:
+read-only latest-native-failure proof, exact source-cwd quiescence, genuine IO
+receipts and digest chains, unchanged HEAD/inputs, pending-human-input rejection,
+20 GB capacity admission, and an atomic distinct request/generation transfer.
+Recovery authorization is separate from human provenance. Replaying the command
+returns the same receipt, and a repeated overload of this retry cannot silently
+authorize another one. Seven focused recovery tests, two adjacent lifecycle
+tests, the refreshed controller-launch test and `mix specs.check` passed.
+Independent snapshot review found no remaining scoped blocker; no full suite.
+
+At a transaction-guarded idle boundary (no tick lease, active worker/check or
+pending file IO), only `com.cgable.symphony-factory` was restarted. Old PID42917
+was independently absent; replacement PID4088 started at
+`2026-10-13T14:39:42.096154Z`. Desktop and the scheduler/broker were not paused.
+The startup fingerprint remained unchanged because it samples only initially
+loaded factory modules; this repair's acceptance is actual recovery-path execution,
+not a claim that that fingerprint covers the new worker modules.
+
+Recovery `TFER-9da4d842eb81b828a6e360a126b8163d188323ad158a7115a345a9d6a8eaf2c1`
+was APPLIED at `14:47:20.433157Z`, transferring reservation generation10 to11.
+The new request is
+`desktop:988b4934c1e981ad57f4db20805a02fcdde0dab3f6cd79c34ca700cc931b347f`.
+The existing thread `01a13272-9eb0-7550-8411-9dbb54b09c57` then started turn
+`01a135bc-75cf-7e02-a900-8dbd2886cf9e`, with ledger TURN_BOUND/task RUNNING and
+read-only native stored status `inProgress`. Owned PID9651 was independently
+present with the original source cwd. Model `gpt-6.1-sol`, effort `xhigh`, plan,
+contract, checkout, candidate `41ac234dfdb37b5e3ccd2571779db4bdd34af2cd` and all
+five commits were retained. The launch tick completed HEALTHY at
+`14:48:03.764616Z`.
+
+This proves one same-chat recovery and native turn startup, not a returned slice,
+controller adoption, verification, MR or delivery. The next controller step is
+to await and independently adopt the writer's exact result. Human-requested
+monitoring remains stopped; no monitoring automation was recreated.

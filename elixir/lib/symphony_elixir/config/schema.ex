@@ -301,6 +301,8 @@ defmodule SymphonyElixir.Config.Schema do
     use Ecto.Schema
     import Ecto.Changeset
 
+    @type t :: %__MODULE__{}
+
     @primary_key false
     embedded_schema do
       field(:enabled, :boolean, default: false)
@@ -321,7 +323,9 @@ defmodule SymphonyElixir.Config.Schema do
       field(:maximum_validators, :integer, default: 2)
       field(:writer_disk_gb, :integer, default: 20)
       field(:maximum_implementation_iterations, :integer, default: 8)
-      field(:maximum_code_repair_rounds, :integer, default: 2)
+      field(:maximum_code_repair_rounds, :integer, default: 5)
+      field(:ci_repair_scope_extensions, :map, default: %{})
+      field(:prepared_push_requalifications, :map, default: %{})
       field(:maximum_validation_repair_rounds, :integer, default: 2)
       field(:controller_writer_stale_minutes, :integer, default: 15)
       field(:stale_task_minutes, :integer, default: 90)
@@ -330,6 +334,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:hibernation, :map, default: %{})
       field(:review_feedback, :map, default: %{})
       field(:manual_validation, :map, default: %{})
+      field(:jira_connector, :map, default: %{})
       field(:ticket_supervisor, :map, default: %{"enabled" => false, "pilot_issue_keys" => []})
       field(:models, :map, default: %{})
       field(:repositories, :map, default: %{})
@@ -360,6 +365,8 @@ defmodule SymphonyElixir.Config.Schema do
           :writer_disk_gb,
           :maximum_implementation_iterations,
           :maximum_code_repair_rounds,
+          :ci_repair_scope_extensions,
+          :prepared_push_requalifications,
           :maximum_validation_repair_rounds,
           :controller_writer_stale_minutes,
           :stale_task_minutes,
@@ -368,6 +375,7 @@ defmodule SymphonyElixir.Config.Schema do
           :hibernation,
           :review_feedback,
           :manual_validation,
+          :jira_connector,
           :ticket_supervisor,
           :models,
           :repositories
@@ -592,6 +600,7 @@ defmodule SymphonyElixir.Config.Schema do
         cleanup: normalize_keys(settings.factory.cleanup),
         hibernation: normalize_keys(settings.factory.hibernation),
         manual_validation: normalize_keys(settings.factory.manual_validation),
+        jira_connector: normalize_keys(settings.factory.jira_connector),
         ticket_supervisor: normalize_keys(settings.factory.ticket_supervisor)
     }
 

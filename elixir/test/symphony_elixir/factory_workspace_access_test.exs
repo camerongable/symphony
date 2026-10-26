@@ -4,6 +4,202 @@ defmodule SymphonyElixir.FactoryWorkspaceAccessTest do
   alias SymphonyElixir.Factory.{DesktopRequest, RunLedger, Store, TaskLedger, WorkspaceAccess}
   setup :setup_fixture
 
+  test "late observation follows both checkout inspections and leaves the database responsive", ctx do
+    caller = self()
+
+    options =
+      Keyword.put(opts(ctx), :after_acquisition_observation, fn ->
+        send(caller, :checkout_observed)
+        :ok
+      end)
+
+    proof = %{token: make_ref()}
+
+    capture = fn ->
+      assert_received :checkout_observed
+      reader = Task.async(fn -> Store.one!(ctx.store, "SELECT 1 AS responsive") end)
+      assert Task.await(reader, 1_000) == %{"responsive" => 1}
+      send(caller, :captured)
+      {:ok, proof}
+    end
+
+    assert {:ok, row} =
+             WorkspaceAccess.acquire_with_observation(ctx.store, attrs(ctx), options, capture, fn tx, access, captured ->
+               assert %DBConnection{} = tx
+               assert captured == proof
+               assert_received :captured
+               refute_received :captured
+               {:ok, access}
+             end)
+
+    assert {:ok, ^row} = WorkspaceAccess.get(ctx.store, row["reservation_key"])
+  end
+
+  test "late observation refusal cannot acquire or call the SQL commit", ctx do
+    assert {:error, :source_not_quiet} =
+             WorkspaceAccess.acquire_with_observation(ctx.store, attrs(ctx), opts(ctx), fn -> {:error, :source_not_quiet} end, fn _, _, _ -> flunk("observer refusal committed") end)
+
+    assert Store.one!(ctx.store, "SELECT * FROM workspace_access") == nil
+  end
+
+  test "late observation is not called for dirty checkout or outer transactions", ctx do
+    capture = fn -> flunk("invalid physical admission observed native state") end
+    commit = fn _, _, _ -> flunk("invalid admission committed") end
+
+    assert {:error, :workspace_observation_inside_transaction} =
+             Store.transaction!(ctx.store, fn tx -> WorkspaceAccess.acquire_with_observation(tx, attrs(ctx), opts(ctx), capture, commit) end)
+
+    File.write!(Path.join(ctx.path, "fixture.txt"), "changed\n")
+    assert {:error, :worktree_dirty} = WorkspaceAccess.acquire_with_observation(ctx.store, attrs(ctx), opts(ctx), capture, commit)
+    assert Store.one!(ctx.store, "SELECT * FROM workspace_access") == nil
+  end
+
+  test "late observation cannot hide task changes", ctx do
+    capture = fn ->
+      {:ok, _} = TaskLedger.update(ctx.store, "writer", %{prompt_sha256: String.duplicate("q", 64)})
+      {:ok, :observed}
+    end
+
+    assert {:error, :workspace_acquisition_task_changed} =
+             WorkspaceAccess.acquire_with_observation(ctx.store, attrs(ctx), opts(ctx), capture, fn _, _, _ -> flunk("changed task committed") end)
+
+    assert Store.one!(ctx.store, "SELECT * FROM workspace_access") == nil
+  end
+
+  test "late observation cannot hide physical root replacement", ctx do
+    capture = fn ->
+      File.rename!(ctx.path, ctx.path <> "-original")
+      File.mkdir!(ctx.path)
+      {:ok, :observed}
+    end
+
+    assert {:error, :workspace_root_identity_changed} =
+             WorkspaceAccess.acquire_with_observation(ctx.store, attrs(ctx), opts(ctx), capture, fn _, _, _ -> flunk("replaced root committed") end)
+
+    assert Store.one!(ctx.store, "SELECT * FROM workspace_access") == nil
+  end
+
+  test "malformed late observation cannot acquire or commit", ctx do
+    assert {:error, :workspace_observation_invalid} =
+             WorkspaceAccess.acquire_with_observation(ctx.store, attrs(ctx), opts(ctx), fn -> :ok end, fn _, _, _ -> flunk("malformed proof committed") end)
+
+    assert Store.one!(ctx.store, "SELECT * FROM workspace_access") == nil
+  end
+
+  test "slow real checkout admission does not retain SQLite checkout and rolls back caller failure", ctx do
+    parent = self()
+
+    observer = fn ->
+      send(parent, {:observing, self()})
+      receive do: (:continue -> :ok)
+    end
+
+    claim =
+      Task.async(fn ->
+        WorkspaceAccess.acquire_with(ctx.store, attrs(ctx), Keyword.put(opts(ctx), :before_acquisition_observation, observer), fn _tx, _access ->
+          {:error, :caller_rejected}
+        end)
+      end)
+
+    assert_receive {:observing, observer_pid}, 1_000
+    reader = Task.async(fn -> Store.one!(ctx.store, "SELECT 1 AS responsive") end)
+    responsive = Task.yield(reader, 1_000)
+    send(observer_pid, :continue)
+    assert Task.await(claim, 15_000) == {:error, :caller_rejected}
+    assert responsive == {:ok, %{"responsive" => 1}}
+    assert Store.one!(ctx.store, "SELECT * FROM workspace_access") == nil
+  end
+
+  test "observed acquisition denies changed input and task preimages", ctx do
+    for {change, reason} <- [
+          {fn -> RunLedger.update(ctx.store, "run", %{spec_revision: 2}) end, :workspace_acquisition_input_changed},
+          {fn -> TaskLedger.update(ctx.store, "writer", %{prompt_sha256: String.duplicate("q", 64)}) end, :workspace_acquisition_task_changed}
+        ] do
+      {:ok, _} = RunLedger.update(ctx.store, "run", %{spec_revision: 1})
+      {:ok, _} = TaskLedger.update(ctx.store, "writer", %{prompt_sha256: String.duplicate("p", 64)})
+
+      options =
+        Keyword.put(opts(ctx), :after_acquisition_observation, fn ->
+          change.()
+          :ok
+        end)
+
+      assert {:error, ^reason} = WorkspaceAccess.acquire_with(ctx.store, attrs(ctx), options, fn _, _ -> flunk("stale claim committed") end)
+      assert Store.one!(ctx.store, "SELECT * FROM workspace_access") == nil
+    end
+  end
+
+  test "observed acquisition rejects outer transactions and preserves exclusive generation", ctx do
+    assert {:error, :workspace_observation_inside_transaction} =
+             Store.transaction!(ctx.store, fn tx -> WorkspaceAccess.acquire_with(tx, attrs(ctx), opts(ctx), fn _, row -> {:ok, row} end) end)
+
+    claims =
+      for n <- 1..2 do
+        Task.async(fn -> WorkspaceAccess.acquire_with(ctx.store, attrs(ctx, "SOURCE", "observed-#{n}"), opts(ctx), fn _, row -> {:ok, row} end) end)
+      end
+
+    results = Enum.map(claims, &Task.await(&1, 15_000))
+    assert Enum.count(results, &match?({:ok, _}, &1)) == 1
+    assert Enum.count(results, &(&1 == {:error, :workspace_busy})) == 1
+  end
+
+  test "observed acquisition replay rejects changed acquired immutable inputs", ctx do
+    commit = fn _, row -> {:ok, row} end
+    assert {:ok, original} = WorkspaceAccess.acquire_with(ctx.store, attrs(ctx), opts(ctx), commit)
+    assert {:ok, ^original} = WorkspaceAccess.acquire_with(ctx.store, attrs(ctx), opts(ctx), commit)
+    {:ok, run} = RunLedger.get(ctx.store, "run")
+
+    for {field, changed, reason} <- [
+          {:spec_revision, 2, :workspace_input_changed},
+          {:contract_sha256, String.duplicate("f", 64), :workspace_input_changed},
+          {:candidate_sha, String.duplicate("f", 40), :workspace_candidate_binding_mismatch}
+        ] do
+      {:ok, _} = RunLedger.update(ctx.store, "run", %{field => changed})
+      assert {:error, ^reason} = WorkspaceAccess.acquire_with(ctx.store, attrs(ctx), opts(ctx), commit)
+      {:ok, _} = RunLedger.update(ctx.store, "run", %{field => run[Atom.to_string(field)]})
+    end
+
+    {:ok, _} = TaskLedger.update(ctx.store, "writer", %{prompt_sha256: String.duplicate("q", 64)})
+    assert {:error, :workspace_task_input_changed} = WorkspaceAccess.acquire_with(ctx.store, attrs(ctx), opts(ctx), commit)
+    assert {:ok, ^original} = WorkspaceAccess.get(ctx.store, original["reservation_key"])
+  end
+
+  test "observed acquisition retains real clean HEAD checks", ctx do
+    options =
+      Keyword.put(opts(ctx), :before_acquisition_observation, fn ->
+        File.write!(Path.join(ctx.path, "fixture.txt"), "changed\n")
+        :ok
+      end)
+
+    assert {:error, :worktree_dirty} = WorkspaceAccess.acquire_with(ctx.store, attrs(ctx), options, fn _, _ -> flunk("dirty claim committed") end)
+    assert Store.one!(ctx.store, "SELECT * FROM workspace_access") == nil
+  end
+
+  test "observed acquisition rejects HEAD changes after its first actual observation", ctx do
+    options =
+      Keyword.put(opts(ctx), :after_acquisition_observation, fn ->
+        File.write!(Path.join(ctx.path, "fixture.txt"), "new head\n")
+        git(ctx.path, ["add", "fixture.txt"])
+        git(ctx.path, ["commit", "--no-verify", "-m", "changed head"])
+        :ok
+      end)
+
+    assert {:error, _} = WorkspaceAccess.acquire_with(ctx.store, attrs(ctx), options, fn _, _ -> flunk("changed HEAD committed") end)
+    assert Store.one!(ctx.store, "SELECT * FROM workspace_access") == nil
+  end
+
+  test "observed acquisition denies physical root replacement after actual Git proof", ctx do
+    options =
+      Keyword.put(opts(ctx), :after_acquisition_observation, fn ->
+        File.rename!(ctx.path, ctx.path <> "-original")
+        File.mkdir!(ctx.path)
+        :ok
+      end)
+
+    assert {:error, :workspace_root_identity_changed} = WorkspaceAccess.acquire_with(ctx.store, attrs(ctx), options, fn _, _ -> flunk("replaced root committed") end)
+    assert Store.one!(ctx.store, "SELECT * FROM workspace_access") == nil
+  end
+
   test "review admission does not execute repository filesystem-monitor programs", ctx do
     marker = Path.join(ctx.root, "fsmonitor-executed")
     monitor = Path.join(ctx.root, "monitor")
@@ -229,7 +425,7 @@ defmodule SymphonyElixir.FactoryWorkspaceAccessTest do
   end
 
   defp isolated_review(ctx, environment) do
-    libraries = Path.wildcard(Path.expand("_build/test/lib/*/ebin")) |> Enum.flat_map(&["-pa", &1])
+    libraries = Path.wildcard(Path.join(Mix.Project.build_path(), "lib/*/ebin")) |> Enum.flat_map(&["-pa", &1])
     driver = Path.expand("test/support/workspace_identity_controller.exs")
     payload = attrs(ctx, "REVIEW") |> Jason.encode!() |> Base.encode64()
     arguments = ["--erl", "+S 2"] ++ libraries ++ [driver, ctx.database, payload]

@@ -6,12 +6,41 @@ defmodule SymphonyElixir.FactoryTicketContextTest do
 
   setup :setup_fixture
 
+  test "oversized native recovery receipts and Unicode task failures remain bounded with exact drilldown", ctx do
+    register_task(ctx, "run:feature-writer", "feature-writer", %{})
+    failure = String.duplicate("Native writer rejected 😀\n", 2000)
+    TaskLedger.update(ctx.store, "run:feature-writer", %{failure_code: failure, status: "STALE"})
+    {:ok, command} = stage(ctx, "proposal", "Rework the current candidate.", [%{"operation" => "request_rework"}])
+    receipt = Jason.encode!(%{"native_turn" => String.duplicate("recovery evidence\n", 2000)})
+    Store.query!(ctx.store, "UPDATE ticket_chat_commands SET status = 'ACCEPTED', receipt_json = ? WHERE command_key = ?", [receipt, command["command_key"]])
+    before = Store.query!(ctx.store, "SELECT * FROM ticket_chat_commands").rows
+
+    assert {:ok, packet} = TicketContext.context(ctx.store, "run")
+    assert byte_size(Jason.encode!(packet)) <= 16_384
+    [task] = packet.tasks
+    assert byte_size(task["failure_code"]) <= 512
+    assert String.valid?(task["failure_code"])
+    assert {:ok, failure_page} = TicketContext.details(ctx.store, ctx.chat["chat_key"], task["failure"].artifact_ref)
+    assert String.starts_with?(failure, failure_page.text)
+    assert failure_page.total_bytes == byte_size(failure)
+    [decision] = packet.decisions
+    refute Map.has_key?(decision, "receipt_json")
+    assert {:ok, receipt_page} = TicketContext.details(ctx.store, ctx.chat["chat_key"], decision["receipt"].artifact_ref)
+    assert String.starts_with?(receipt, receipt_page.text)
+    assert receipt_page.total_bytes == byte_size(receipt)
+    assert {:error, :artifact_not_in_ticket} = TicketContext.details(ctx.store, "other", decision["receipt"].artifact_ref)
+    assert before == Store.query!(ctx.store, "SELECT * FROM ticket_chat_commands").rows
+    TaskLedger.update(ctx.store, "run:feature-writer", %{failure_code: "changed"})
+    assert {:error, :stale_artifact} = TicketContext.details(ctx.store, ctx.chat["chat_key"], task["failure"].artifact_ref)
+  end
+
   test "context is bounded and read-only; UTF-8 details preserve all bytes and detect stale content", ctx do
     markdown = String.duplicate("Long contract 😀\n", 10_000)
     contract = Contract.bind("PPL-123", 1, markdown)
     Store.query!(ctx.store, "UPDATE runs SET contract_markdown = ?, contract_sha256 = ? WHERE run_id = 'run'", [contract.markdown, contract.sha256])
     before = Store.one!(ctx.store, "SELECT COUNT(*) AS count FROM events")
     assert {:ok, packet} = TicketContext.context(ctx.store, "run")
+    assert packet.ticket_cli.prefix =~ "elixir -pa \"_build/dev/lib/*/ebin\" -S mix factory.ticket"
     assert packet.contract.binding == "EXACT"
     assert byte_size(Jason.encode!(packet)) <= 16_384
     assert byte_size(packet.summary) <= 2048

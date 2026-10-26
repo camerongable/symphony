@@ -59,6 +59,63 @@ defmodule SymphonyElixir.FactoryTicketParentEvidenceTest do
     refute_receive {:read_native_thread, _, _}
   end
 
+  test "historical target attachment evidence reconciles a tool-free presentation without resending", ctx do
+    call = %{
+      "id" => "inventory",
+      "type" => "mcpToolCall",
+      "server" => "codex_app",
+      "tool" => "list_artifacts",
+      "arguments" => %{},
+      "status" => "completed",
+      "error" => nil,
+      "result" => %{"content" => [%{"type" => "text", "text" => ~s({"artifacts":[]})}]}
+    }
+
+    [turn] = ctx.native["turns"]
+    source = %{"id" => "bootstrap-inventory", "status" => "completed", "startedAt" => turn["startedAt"] - 2, "completedAt" => turn["startedAt"] - 1, "items" => [call]}
+    turn = Map.update!(turn, "items", &(&1 ++ [%{"id" => "ack", "type" => "agentMessage", "phase" => "final_answer", "text" => ~s({"acknowledged":true})}]))
+
+    native =
+      ctx.native
+      |> Map.put("turns", [source, turn])
+      |> Map.put("updatedAt", 42)
+      |> Map.put("history_observation", %{"mode" => "PAGED_FULL", "next_cursor" => nil, "turn_count" => 2, "updated_at" => 42})
+
+    Process.put(:native_read_fixture, native)
+    before = Store.one!(ctx.store, "SELECT * FROM runs WHERE run_id = 'run'")
+    assert {:ok, receipt} = TicketChat.read_native_turn(ctx.store, ctx.request["request_key"], "parent", @broker, reader: NativeReader, include_completion: true, include_target_observation: true)
+    assert receipt["attachment_evidence"]["historical"] == true
+    assert receipt["attachment_evidence"]["turn_id"] == "bootstrap-inventory"
+    assert receipt["attachment_evidence"]["item_id"] == "inventory"
+    proof = receipt["target_observation"]
+    assert proof["worktree_attachments"] == []
+    assert {:ok, recorded} = DesktopRequest.record_ticket_thread(ctx.store, ctx.request["request_key"], proof)
+    assert {:ok, completed} = DesktopRequest.complete(ctx.store, recorded["request_key"], receipt["completion"])
+    assert completed["status"] == "SUCCEEDED"
+    assert Store.one!(ctx.store, "SELECT * FROM runs WHERE run_id = 'run'") == before
+
+    for invalid <- [
+          put_in(native, ["turns", Access.at(0), "items", Access.at(0), "status"], "failed"),
+          put_in(native, ["turns", Access.at(0), "items", Access.at(0), "result", "content", Access.at(0), "text"], ~s({"artifacts":[{"type":"worktree"}]})),
+          update_in(native, ["turns", Access.at(1), "items"], &(&1 ++ [%{call | "id" => "later-conflict"}])),
+          update_in(
+            native,
+            ["turns", Access.at(1), "items"],
+            &(&1 ++ [%{"id" => "later-attachment", "type" => "mcpToolCall", "server" => "codex_app", "tool" => "attach_worktree", "status" => "completed"}])
+          ),
+          update_in(
+            native,
+            ["turns", Access.at(1), "items"],
+            &(&1 ++ [%{"id" => "later-handoff", "type" => "mcpToolCall", "server" => "codex_app", "tool" => "handoff_thread", "status" => "completed"}])
+          ),
+          update_in(native, ["turns", Access.at(1), "items"], &(&1 ++ [%{"id" => "later-collab", "type" => "collabAgentSpawnToolCall"}])),
+          put_in(native, ["history_observation", "turn_count"], 1)
+        ] do
+      assert {:error, :parent_attachment_history_unproven} =
+               TicketParentEvidence.attachment_observation(invalid, %{receipt | "readback_sha256" => :crypto.hash(:sha256, Jason.encode!(invalid)) |> Base.encode16(case: :lower)})
+    end
+  end
+
   test "opt-in completion returns the exact attested final JSON and observed successful tools only", ctx do
     items = [
       %{"id" => "commentary", "type" => "agentMessage", "phase" => "commentary", "text" => "Not the result"},

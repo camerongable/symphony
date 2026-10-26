@@ -100,8 +100,18 @@ defmodule SymphonyElixir.FactoryTicketChatOutboxTest do
     assert {:ok, %{request: %{"status" => "PENDING"}, delivery_unchanged: true}} = TicketChatOutbox.synchronization(ctx.store, "run")
   end
 
-  test "immutable presentation does not weaken direct human context-reader instructions" do
-    locator = Jason.encode!(%{cwd: "/repo", workflow: "/repo/WORKFLOW.md", run_id: "run", arguments: ["context", "run"]})
+  test "immutable presentation does not weaken direct human context-reader instructions", ctx do
+    workflow = Path.join(ctx.root, "Workflow with spaces µ 'quoted'.md")
+    File.write!(workflow, "---\ntracker:\n  kind: memory\nfactory:\n  database: #{ctx.database}\n---\n")
+    assert {:ok, locator} = TicketContextReader.bind(ctx.store, "run", ticket_cli_root: File.cwd!(), ticket_workflow: workflow)
+    reader = Jason.decode!(locator)
+    assert OptionParser.split(reader["command"]) == ["./scripts/factory-broker", "ticket", "context", "run", "--workflow", workflow]
+    raw = "./scripts/factory-broker ticket context run --workflow #{workflow}"
+    refute reader["command"] == raw
+    malformed = locator |> Jason.decode!() |> Map.put("command", raw) |> Jason.encode!()
+    assert {:error, :ticket_context_reader_unavailable} = TicketContextReader.execution_locator(malformed)
+    assert TicketContextReader.instructions(malformed) == TicketContextReader.instructions(nil)
+
     instructions = TicketContextReader.instructions(locator)
 
     assert instructions =~ "For each direct human message, run it successfully in that same turn before staging"

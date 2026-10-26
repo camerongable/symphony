@@ -9,6 +9,8 @@ defmodule SymphonyElixir.FactoryConfigTest do
     refute settings.factory.enabled
     assert settings.factory.lease_seconds == 240
     assert settings.factory.writer_disk_gb == 20
+    assert settings.factory.maximum_code_repair_rounds == 5
+    assert settings.factory.maximum_validation_repair_rounds == 2
     assert settings.factory.branch_prefix == "ai"
     assert settings.factory.hibernation == %{}
     assert settings.factory.controller_required_mcp_servers == []
@@ -18,6 +20,13 @@ defmodule SymphonyElixir.FactoryConfigTest do
     assert settings.factory.specification_authorization_mode == "auto_after_critic"
     refute settings.factory.native_session_discovery_enabled
     assert is_nil(settings.factory.controller_codex_project_id)
+  end
+
+  test "configured lower code repair limits remain exact" do
+    for cap <- [0, 1, 2, 5] do
+      assert {:ok, settings} = Schema.parse(%{"tracker" => %{"kind" => "memory"}, "factory" => %{"maximum_code_repair_rounds" => cap}})
+      assert settings.factory.maximum_code_repair_rounds == cap
+    end
   end
 
   test "an unresolved optional factory database environment reference stays unset" do

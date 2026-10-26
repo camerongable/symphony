@@ -36,6 +36,48 @@ defmodule SymphonyElixir.FactoryWorkerEvidenceTest do
     {attrs, observed, receipt}
   end
 
+  test "a bound session stopped before a turn retains only its genuine shutdown", ctx do
+    {attrs, evidence} = reserve(ctx)
+    key = evidence["request_key"]
+    {:ok, _} = WorkerEvidence.mark_start_sent(ctx.store, key)
+    {:ok, _} = WorkerEvidence.bind_thread(ctx.store, key, "worker", attrs["policy"])
+    {:ok, _} = WorkerEvidence.bind_owner_process(ctx.store, key, process_receipt())
+    observed = %{thread_id: "worker", turn_id: nil, policy: attrs["policy"], owner_stop: stop_receipt(ctx)}
+    {:ok, before_task} = TaskLedger.get(ctx.store, "writer")
+    assert {:ok, failed} = WorkerEvidence.reconcile_required(ctx.store, key, :interrupted_owned_session_preflight_failed, observed)
+    assert WorkerEvidence.owner_stopped?(ctx.store, failed)
+    assert failed["status"] == "RECONCILE_REQUIRED"
+    assert Enum.all?(~w(turn_id item_id output_json output_sha256), &is_nil(failed[&1]))
+    assert {:ok, ^failed} = WorkerEvidence.record_failed_stop(ctx.store, key, observed)
+    assert {:ok, ^before_task} = TaskLedger.get(ctx.store, "writer")
+    assert {:ok, %{"released_at" => nil}} = WorkspaceAccess.get(ctx.store, "reservation")
+    assert {:error, _} = WorkerEvidence.completed_result(ctx.store, key)
+    assert {:error, _} = WorkerEvidence.rearm_rejected_resume(ctx.store, key)
+    assert {:error, _} = SymphonyElixir.Factory.FailedTurnRecovery.prepare_automatic(ctx.store, key, "invented")
+  end
+
+  test "pre-turn shutdown rejects foreign thread, invented turn, policy and receipt identity", ctx do
+    {attrs, evidence} = reserve(ctx)
+    key = evidence["request_key"]
+    {:ok, _} = WorkerEvidence.mark_start_sent(ctx.store, key)
+    {:ok, _} = WorkerEvidence.bind_thread(ctx.store, key, "worker", attrs["policy"])
+    {:ok, _} = WorkerEvidence.bind_owner_process(ctx.store, key, process_receipt())
+    observed = %{thread_id: "worker", turn_id: nil, policy: attrs["policy"], owner_stop: stop_receipt(ctx)}
+
+    probes =
+      [Map.put(observed, :thread_id, "other"), Map.put(observed, :turn_id, "invented"), Map.put(observed, :policy, %{})] ++
+        Enum.map([{"pid", "different"}, {"invocation_nonce", String.duplicate("c", 64)}, {"cwd", ctx.root}, {"exit_status", nil}, {"transport", "not_owned"}], fn {field, value} ->
+          put_in(observed, [:owner_stop, field], value)
+        end)
+
+    for invalid <- probes do
+      assert {:ok, failed} = WorkerEvidence.reconcile_required(ctx.store, key, :interrupted_owned_session_preflight_failed, invalid)
+      refute WorkerEvidence.owner_stopped?(ctx.store, failed)
+      assert is_nil(failed["owner_stop_json"])
+      assert {:error, :worker_failed_stop_unproven} = WorkerEvidence.record_failed_stop(ctx.store, key, invalid)
+    end
+  end
+
   test "attempt binding replays exactly; starts and thread/turn binding cannot be repeated differently", ctx do
     {attrs, evidence} = reserve(ctx)
     assert {:ok, ^evidence} = WorkerEvidence.reserve(ctx.store, attrs)

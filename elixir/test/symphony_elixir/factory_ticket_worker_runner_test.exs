@@ -1,24 +1,39 @@
 defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
   use ExUnit.Case, async: true
   import SymphonyElixir.TicketWorkerFixture
-  alias SymphonyElixir.Factory.{Contract, RunLedger, Store, TaskLedger}
-  alias SymphonyElixir.Factory.StageSchemas
-  alias SymphonyElixir.Factory.TaskLauncher
-  alias SymphonyElixir.Factory.{TicketWorkerRunner, WorkerEvidence, WorkspaceAccess}
+
+  alias SymphonyElixir.Factory.{
+    Contract,
+    ControlServer,
+    Observability,
+    ReviewProtocol,
+    RunLedger,
+    Scheduler,
+    StageSchemas,
+    Store,
+    TaskLauncher,
+    TaskLedger,
+    TicketWorkerRunner,
+    WorkerEvidence,
+    WorkerInstructions,
+    WorkspaceAccess
+  }
+
   alias SymphonyElixir.Tracker.Issue
   setup :setup_fixture
 
   defmodule FakeWorkerServer do
     def start_session(workspace, opts) do
       send(self(), {:worker_options, opts})
-      opts[:on_thread_created].("worker")
+      thread = Process.get(:worker_thread, "worker")
+      opts[:on_thread_created].(thread)
 
       if Process.get(:fail_start),
         do: {:error, :connector_catalog_not_empty},
         else:
           {:ok,
            %{
-             thread_id: "worker",
+             thread_id: thread,
              worker_policy: Process.get(:observed_policy, TicketWorkerRunner.policy(opts[:worker_access], workspace)),
              worker_invocation: Base.encode16(:crypto.strong_rand_bytes(32), case: :lower),
              metadata: %{codex_app_server_pid: "fixture"}
@@ -62,10 +77,22 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
 
   defp prepare(ctx, role \\ "feature-writer") do
     bind_parent(ctx)
+
+    if ctx[:structured_writer] do
+      {contract, snapshot} = SymphonyElixir.TicketChatFixture.authorized_contract("PPL-123", "issue-id", "AC-1: fixture behavior.\n\n## Manual Validation\n- Required: no")
+      {:ok, _} = RunLedger.update(ctx.store, "run", %{contract_markdown: contract.markdown, contract_sha256: contract.sha256, snapshot_json: Jason.encode!(snapshot)})
+    end
+
     {:ok, _} = TicketWorkerRunner.bind_base(ctx.store, "run", ctx.sha)
     {:ok, prompt} = TicketWorkerRunner.packet(ctx.store, "run", role, ctx.sha)
     sha = :crypto.hash(:sha256, prompt) |> Base.encode16(case: :lower)
     {:ok, _} = TaskLedger.update(ctx.store, "writer", %{role: role, prompt_sha256: sha})
+
+    if ctx[:structured_writer] do
+      TaskLedger.update(ctx.store, "writer", %{stage: "WRITING"})
+      :ok = WorkerInstructions.bind_task(ctx.store, "writer", sha, Jason.decode!(prompt)["instruction_binding_sha256"])
+    end
+
     mode = if role == "feature-writer", do: "SOURCE", else: "REVIEW"
     {:ok, _} = WorkspaceAccess.acquire(ctx.store, attrs(ctx, mode), opts(ctx))
 
@@ -84,10 +111,65 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
     {prompt, options}
   end
 
+  @tag structured_writer: true
+  test "stopped rejected reports are visible read-only and disappear after consumption or generation drift", ctx do
+    {prompt, options} = prepare(ctx)
+    packet = Jason.decode!(prompt)
+    report = %{"version" => 1, "candidate_sha" => ctx.sha, "block_reason" => "NONE", "criteria" => [], "closures" => [], "boundary_sweeps" => [], "finding_classifications" => []}
+    output = %{"status" => "CONTINUE", "changed_paths" => [], "commit_message" => nil, "blockers" => [], "checks" => [], "review_report" => report}
+    Process.put(:worker_output, output)
+    schema = ReviewProtocol.schema(packet, StageSchemas.for_stage(:native_feature_writer))
+    assert {:ok, _} = TicketWorkerRunner.run(ctx.path, issue(), prompt, schema, options)
+    {:ok, pending} = WorkerEvidence.get(ctx.store, "reservation:request")
+    {:ok, _} = TaskLedger.update(ctx.store, "writer", Map.merge(Map.take(pending, ~w(output_json thread_id turn_id)), %{"status" => "COMPLETE"}))
+    {:ok, run} = RunLedger.get(ctx.store, "run")
+    before = Store.query!(ctx.store, "SELECT id FROM events ORDER BY id").rows
+    assert %{reason: "review_protocol_evidence_incomplete", request_key: "reservation:request"} = ReviewProtocol.pending_status(ctx.store, run)
+    assert %{reason: "review_protocol_evidence_incomplete"} = ReviewProtocol.pending_status(ctx.store, run)
+    assert Store.query!(ctx.store, "SELECT id FROM events ORDER BY id").rows == before
+
+    factory = %{enabled: true, scope: "fixture", dispatcher_id: "fixture", lease_seconds: 240, repositories: %{}}
+    factory = Map.merge(factory, %{maximum_specifiers: 2, maximum_validators: 2})
+    factory = Map.merge(factory, %{maximum_writers: 2, writer_disk_gb: 20})
+    server = start_supervised!({ControlServer, [store: ctx.store, factory: factory, name: nil]})
+    snapshot = Observability.snapshot(settings: %{factory: factory}, store: ctx.store, control_server: server)
+    assert [%{attention: %{source: "WORKER_RESULT", phase: "REPORT_REJECTED", next_action: action}}] = snapshot.current_runs
+    assert action =~ "Factory intervention"
+    assert action =~ "Do not restart"
+
+    Store.query!(ctx.store, "UPDATE worker_evidence SET status='CONSUMED' WHERE request_key='reservation:request'")
+    assert is_nil(ReviewProtocol.pending_status(ctx.store, run))
+    Store.query!(ctx.store, "UPDATE worker_evidence SET status='RESULT_RECORDED',binding_sha256='corrupt' WHERE request_key='reservation:request'")
+    assert is_nil(ReviewProtocol.pending_status(ctx.store, run))
+    Store.query!(ctx.store, "UPDATE worker_evidence SET binding_sha256=? WHERE request_key='reservation:request'", [pending["binding_sha256"]])
+    assert is_nil(ReviewProtocol.pending_status(ctx.store, Map.put(run, "candidate_sha", String.duplicate("0", 40))))
+    assert is_nil(ReviewProtocol.pending_status(ctx.store, Map.put(run, "contract_sha256", String.duplicate("0", 64))))
+    assert is_nil(ReviewProtocol.pending_status(ctx.store, Map.put(run, "state", "VERIFYING")))
+    assert is_nil(ReviewProtocol.pending_status(ctx.store, Map.update!(run, "verifier_round", &(&1 + 1))))
+    assert is_nil(ReviewProtocol.pending_status(ctx.store, Map.update!(run, "implementation_iteration", &(&1 + 1))))
+    assert %{reason: "review_protocol_evidence_incomplete"} = ReviewProtocol.pending_status(ctx.store, run)
+    Store.query!(ctx.store, "UPDATE factory_tasks SET turn_id='different-turn' WHERE task_key='writer'")
+    assert is_nil(ReviewProtocol.pending_status(ctx.store, run))
+    Store.query!(ctx.store, "UPDATE factory_tasks SET turn_id=? WHERE task_key='writer'", [pending["turn_id"]])
+
+    Store.query!(
+      ctx.store,
+      "INSERT INTO workspace_access(reservation_key,run_id,task_key,request_key,mode,generation,canonical_path,git_dir,common_dir,binding_json,acquired_at) VALUES('newer-reservation','run','writer','newer-attempt','SOURCE',2,'/fixture/newer','/fixture/newer/.git','/fixture/common','{}','2026-10-25T20:00:00Z')"
+    )
+
+    Store.query!(
+      ctx.store,
+      "INSERT INTO worker_evidence(request_key,task_key,run_id,reservation_key,binding_json,binding_sha256,status,owner_id,created_at) VALUES('newer-attempt','writer','run','newer-reservation','{}','none','RESERVED','fixture','2026-10-25T20:00:00Z')"
+    )
+
+    assert is_nil(ReviewProtocol.pending_status(ctx.store, run))
+  end
+
   defp prepare_verifier(ctx, candidate \\ nil) do
-    bind_parent(ctx)
+    unless ctx[:parent_bound], do: bind_parent(ctx)
     candidate = candidate || ctx.sha
-    contract = Contract.bind("PPL-123", 2, "Updated verifier contract.\n\n## Manual Validation\n- Required: no")
+    criteria = if ctx[:structured_review], do: "AC-1: fixture behavior and boundary coverage.", else: "Updated verifier contract."
+    contract = Contract.bind("PPL-123", 2, criteria <> "\n\n## Manual Validation\n- Required: no")
     {:ok, existing_run} = RunLedger.get(ctx.store, "run")
     snapshot = Jason.decode!(existing_run["snapshot_json"])
     snapshot = Map.put(snapshot, "comments", [%{"text" => Contract.draft_comment(contract)}, %{"text" => Contract.specification_skill_authorization_marker(contract)}])
@@ -105,15 +187,29 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
     {:ok, _} = TicketWorkerRunner.bind_base(ctx.store, "run", ctx.sha)
     {:ok, prompt} = TicketWorkerRunner.packet(ctx.store, "run", "change-verifier", ctx.sha)
     prompt_sha = :crypto.hash(:sha256, prompt) |> Base.encode16(case: :lower)
-    {:ok, _} = TaskLedger.update(ctx.store, "writer", %{stage: "VERIFYING", role: "change-verifier", prompt_sha256: prompt_sha, workspace_sha: candidate})
-    access = attrs(ctx, "REVIEW", "verifier:reservation") |> Map.merge(%{"request_key" => "verifier:request", "expected_sha" => candidate})
+    key = ctx[:verifier_task_key] || "writer"
+    request = ctx[:verifier_request_key] || "verifier:request"
+    reservation = ctx[:verifier_reservation_key] || "verifier:reservation"
+
+    if key != "writer" do
+      {:ok, template} = TaskLedger.get(ctx.store, "writer")
+      {:ok, _} = TaskLedger.register(ctx.store, Map.merge(template, %{"task_key" => key, "status" => "STARTING"}))
+    end
+
+    {:ok, _} = TaskLedger.update(ctx.store, key, %{stage: "VERIFYING", role: "change-verifier", prompt_sha256: prompt_sha, workspace_sha: candidate})
+
+    if ctx[:structured_review] do
+      assert :ok = WorkerInstructions.bind_task(ctx.store, key, prompt_sha, Jason.decode!(prompt)["instruction_binding_sha256"])
+    end
+
+    access = attrs(ctx, "REVIEW", reservation) |> Map.merge(%{"task_key" => key, "request_key" => request, "expected_sha" => candidate})
     {:ok, _} = WorkspaceAccess.acquire(ctx.store, access, opts(ctx))
 
     options = [
       store: ctx.store,
-      target_key: "writer",
-      request_key: "verifier:request",
-      reservation_key: "verifier:reservation",
+      target_key: key,
+      request_key: request,
+      reservation_key: reservation,
       owner_id: "verifier-owner",
       model: "gpt-6-luna",
       reasoning_effort: "medium",
@@ -331,6 +427,223 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
 
   test("BLOCK verifier adoption retains the non-PASS result without changing candidate", ctx, do: assert_nonpass_verifier(ctx, "BLOCK"))
 
+  @tag structured_review: true
+  test "controller admits two repairs across fresh reviews then durably stops without changing REPAIR", ctx do
+    assert_structured_loop(ctx, 2, "REPAIR_LIMIT")
+  end
+
+  @tag structured_review: true
+  test "controller stops early when independent review leaves a prior finding unresolved", ctx do
+    assert_structured_loop(ctx, 1, "UNRESOLVED_FINDING")
+  end
+
+  defp assert_structured_loop(ctx, last_round, reason) do
+    context = %{store: ctx.store, workspace_root: Path.join(ctx.root, "workspaces"), factory: %{maximum_code_repair_rounds: 25}}
+    {:ok, _} = TaskLedger.update(ctx.store, "writer", %{status: "CONSUMED"})
+
+    for round <- 0..last_round do
+      {:ok, _} = RunLedger.update(ctx.store, "run", %{state: "VERIFYING", verifier_round: round})
+      if round == 1, do: RunLedger.update(ctx.store, "run", %{code_repair_round: 11})
+      {:ok, before} = RunLedger.get(ctx.store, "run")
+      current = Map.merge(ctx, %{parent_bound: round > 0, verifier_task_key: "run:change-verifier:#{round}", verifier_request_key: "review:#{round}", verifier_reservation_key: "reservation:#{round}"})
+      Process.put(:worker_thread, "review-thread-#{round}")
+      {prompt, options, candidate} = prepare_verifier(current)
+      packet = Jason.decode!(prompt)
+      assert packet["review_protocol"]["repairs_used"] == round
+      output = structured_repair(packet, candidate, "new finding #{round}")
+      output = if reason == "UNRESOLVED_FINDING" and round == last_round, do: put_in(output, ["review_report", "closures", Access.at(0), "status"], "UNRESOLVED"), else: output
+      Process.put(:worker_output, output)
+      schema = ReviewProtocol.schema_json(prompt, StageSchemas.for_stage(:change_verifier))
+      assert {:ok, _} = TicketWorkerRunner.run(ctx.path, issue(), prompt, schema, options)
+      assert {:ok, %{status: "ADOPTED", run: run}} = Scheduler.ticket_step(context, "run", opts(ctx))
+      assert run["state"] == if(round < last_round, do: "REPAIRING", else: "FAILED")
+      assert run["code_repair_round"] == before["code_repair_round"] + if(round < last_round, do: 1, else: 0)
+      assert {:ok, evidence} = WorkerEvidence.get(ctx.store, "review:#{round}")
+      assert evidence["status"] == "CONSUMED" and Jason.decode!(evidence["output_json"])["status"] == "REPAIR"
+    end
+
+    decisions = Store.query!(ctx.store, "SELECT payload_json FROM events WHERE event_type='TICKET_REVIEW_DECISION' ORDER BY id").rows |> Enum.map(fn [raw] -> Jason.decode!(raw) end)
+    assert Enum.map(decisions, & &1["result"]) == List.duplicate("REPAIR_ADMITTED", last_round) ++ ["POLICY_STOPPED"]
+    assert List.last(decisions)["repairs_used_after"] == last_round
+    assert List.last(decisions)["stop"]["reason"] == reason
+    {:ok, run} = RunLedger.get(ctx.store, "run")
+    assert String.starts_with?(run["last_error"], "{:verification_policy_stopped,")
+    assert %{kind: "REVIEW_POLICY", recorded_ci: "NOT_PROVEN"} = ReviewProtocol.status(ctx.store, run)
+    passed = Map.put(run, "ci_evidence_json", Jason.encode!(%{"status" => "PASS", "sha" => run["candidate_sha"]}))
+    assert %{recorded_ci: "PASSED"} = ReviewProtocol.status(ctx.store, passed)
+    stale = Map.put(run, "ci_evidence_json", Jason.encode!(%{"status" => "PASS", "sha" => "another-candidate"}))
+    assert %{recorded_ci: "NOT_PROVEN"} = ReviewProtocol.status(ctx.store, stale)
+    {:ok, reopened} = Store.start_link(database: ctx.database)
+
+    try do
+      result = Scheduler.ticket_step(%{context | store: reopened}, "run", opts(ctx))
+      assert {:error, :ticket_role_stage_not_admitted} = result
+      assert {:ok, ^run} = RunLedger.get(reopened, "run")
+      rows = Store.query!(reopened, "SELECT id FROM events WHERE event_type='TICKET_REVIEW_DECISION'").rows
+      assert length(rows) == last_round + 1
+    after
+      GenServer.stop(reopened)
+    end
+  end
+
+  @tag structured_review: true
+  test "combined code-repair exhaustion is a distinct policy stop and cannot spend a review repair", ctx do
+    {:ok, _} = TaskLedger.update(ctx.store, "writer", %{status: "CONSUMED"})
+    ctx = Map.put(ctx, :verifier_task_key, "run:change-verifier:0")
+    {prompt, options, candidate} = prepare_verifier(ctx)
+    Process.put(:worker_output, structured_repair(Jason.decode!(prompt), candidate, "new finding"))
+    schema = ReviewProtocol.schema_json(prompt, StageSchemas.for_stage(:change_verifier))
+    assert {:ok, _} = TicketWorkerRunner.run(ctx.path, issue(), prompt, schema, options)
+    context = %{store: ctx.store, workspace_root: Path.join(ctx.root, "workspaces"), factory: %{maximum_code_repair_rounds: 0}}
+    assert {:ok, %{status: "ADOPTED", run: stopped}} = Scheduler.ticket_step(context, "run", opts(ctx))
+    assert %{kind: "REVIEW_POLICY", title: "Combined repair limit reached"} = ReviewProtocol.status(ctx.store, stopped)
+    assert Store.query!(ctx.store, "SELECT id FROM events WHERE event_type='TICKET_REVIEW_DECISION'").rows == []
+    assert {:ok, evidence} = WorkerEvidence.get(ctx.store, "verifier:request")
+    assert Jason.decode!(evidence["output_json"])["status"] == "REPAIR"
+    assert stopped["code_repair_round"] == 0
+  end
+
+  @tag structured_review: true
+  test "new review rejects schema downgrade before native start", ctx do
+    {prompt, options, _} = prepare_verifier(ctx)
+    assert {:error, :review_protocol_schema_changed} = TicketWorkerRunner.run(ctx.path, issue(), prompt, StageSchemas.for_stage(:change_verifier), options)
+    refute_received {:worker_options, _}
+    assert {:error, :unknown_worker_attempt} = WorkerEvidence.get(ctx.store, "verifier:request")
+  end
+
+  @tag structured_review: true
+  test "policy decision rolls back together with consumption when transition persistence fails", ctx do
+    {prompt, options, candidate} = prepare_verifier(ctx)
+    packet = Jason.decode!(prompt)
+    Process.put(:worker_output, structured_repair(packet, candidate, "new finding"))
+    schema = ReviewProtocol.schema_json(prompt, StageSchemas.for_stage(:change_verifier))
+    assert {:ok, _} = TicketWorkerRunner.run(ctx.path, issue(), prompt, schema, options)
+    assert {:ok, _} = TicketWorkerRunner.adoption(ctx.store, "verifier:request")
+    before = verifier_adoption_records(ctx.store)
+    Store.query!(ctx.store, "CREATE TEMP TRIGGER refuse_review_policy BEFORE UPDATE OF state ON runs WHEN NEW.state='REPAIRING' BEGIN SELECT RAISE(ABORT,'synthetic review policy failure'); END")
+    context = %{store: ctx.store, workspace_root: Path.join(ctx.root, "workspaces"), factory: %{maximum_code_repair_rounds: 25}}
+    assert_raise Exqlite.Error, ~r/synthetic review policy failure/, fn -> Scheduler.ticket_step(context, "run", opts(ctx)) end
+    assert verifier_adoption_records(ctx.store) == before
+    assert Store.query!(ctx.store, "SELECT id FROM events WHERE event_type='TICKET_REVIEW_DECISION'").rows == []
+    Store.query!(ctx.store, "DROP TRIGGER refuse_review_policy")
+    assert {:ok, %{status: "ADOPTED"}} = Scheduler.ticket_step(context, "run", opts(ctx))
+    assert length(Store.query!(ctx.store, "SELECT id FROM events WHERE event_type='TICKET_REVIEW_DECISION'").rows) == 1
+  end
+
+  defp structured_repair(packet, candidate, finding) do
+    rows = fn ids, status -> Enum.map(ids, &%{"id" => &1, "status" => status, "evidence" => ["fixture.txt:1; tested success and failure boundary"]}) end
+    protocol = packet["review_protocol"]
+
+    %{
+      "status" => "REPAIR",
+      "candidate_sha" => candidate,
+      "findings" => [finding],
+      "checks" => [],
+      "review_report" => %{
+        "version" => 1,
+        "candidate_sha" => candidate,
+        "block_reason" => "NONE",
+        "criteria" => rows.(protocol["criterion_ids"], "FAIL"),
+        "closures" => rows.(Enum.map(protocol["finding_obligations"], & &1["id"]), "ADDRESSED"),
+        "boundary_sweeps" => Enum.map(rows.(protocol["criterion_ids"], "CHECKED"), &Map.put(&1, "paths", ["fixture.txt"])),
+        "finding_classifications" => [%{"finding" => finding, "classification" => "NEW"}]
+      }
+    }
+  end
+
+  @tag verifier_terminal_adoption: true
+  test "scheduler atomically adopts a stopped BLOCK verifier as a terminal failure", ctx do
+    assert_terminal_verifier_adoption(ctx, "BLOCK", 2, "{:verification_blocked,")
+  end
+
+  @tag verifier_terminal_adoption: true
+  test "scheduler adopts an over-budget REPAIR without retrying or resetting the budget", ctx do
+    assert_terminal_verifier_adoption(ctx, "REPAIR", 0, "{:code_repair_limit,")
+  end
+
+  @tag verifier_terminal_adoption: true
+  test "scheduler preserves PASS progression through the same adoption transaction", ctx do
+    assert_progressing_verifier_adoption(ctx, "PASS", "PUSHING", 0)
+  end
+
+  @tag verifier_terminal_adoption: true
+  test "scheduler preserves in-budget REPAIR progression through the same adoption transaction", ctx do
+    assert_progressing_verifier_adoption(ctx, "REPAIR", "REPAIRING", 1)
+  end
+
+  @tag verifier_terminal_adoption: true
+  test "failed terminal persistence rolls back adoption, consumption and access release", ctx do
+    {_candidate, context} = recorded_verifier(ctx, "BLOCK", 2)
+    assert {:ok, _} = TicketWorkerRunner.adoption(ctx.store, "verifier:request")
+    assert {:ok, %{"status" => "COMPLETE"}} = TaskLedger.get(ctx.store, "writer")
+    before = verifier_adoption_records(ctx.store)
+
+    Store.query!(
+      ctx.store,
+      "CREATE TEMP TRIGGER refuse_terminal_verifier BEFORE UPDATE OF state ON runs WHEN NEW.state='FAILED' BEGIN SELECT RAISE(ABORT,'synthetic terminal persistence failure'); END"
+    )
+
+    assert_raise Exqlite.Error, ~r/synthetic terminal persistence failure/, fn ->
+      Scheduler.ticket_step(context, "run", opts(ctx))
+    end
+
+    assert verifier_adoption_records(ctx.store) == before
+    assert Store.query!(ctx.store, "SELECT id FROM events WHERE event_type='TICKET_NATIVE_VERIFIER_TERMINAL'").rows == []
+  end
+
+  defp assert_progressing_verifier_adoption(ctx, verdict, state, round) do
+    {candidate, context} = recorded_verifier(ctx, verdict, 2)
+    assert {:ok, %{status: "ADOPTED", run: run}} = Scheduler.ticket_step(context, "run", opts(ctx))
+    assert run["state"] == state and run["code_repair_round"] == round and run["candidate_sha"] == candidate
+    assert {:ok, %{"status" => "CONSUMED"}} = WorkerEvidence.get(ctx.store, "verifier:request")
+  end
+
+  defp recorded_verifier(ctx, verdict, limit) do
+    {prompt, options, candidate} = prepare_verifier(ctx)
+    Process.put(:worker_output, %{"status" => verdict, "candidate_sha" => candidate, "findings" => ["needs follow-up"], "checks" => []})
+    assert {:ok, _} = TicketWorkerRunner.run(ctx.path, issue(), prompt, StageSchemas.for_stage(:change_verifier), options)
+    {candidate, %{store: ctx.store, workspace_root: Path.join(ctx.root, "workspaces"), factory: %{maximum_code_repair_rounds: limit}}}
+  end
+
+  defp verifier_adoption_records(store) do
+    {RunLedger.get(store, "run"), TaskLedger.get(store, "writer"), WorkerEvidence.get(store, "verifier:request"), WorkspaceAccess.get(store, "verifier:reservation")}
+  end
+
+  defp assert_terminal_verifier_adoption(ctx, verdict, limit, failure_prefix) do
+    {_candidate, context} = recorded_verifier(ctx, verdict, limit)
+    assert {:ok, before} = RunLedger.get(ctx.store, "run")
+    assert {:ok, evidence} = WorkerEvidence.get(ctx.store, "verifier:request")
+
+    assert {:ok, %{status: "ADOPTED", run: blocked}} = Scheduler.ticket_step(context, "run", opts(ctx))
+    assert blocked["state"] == "FAILED"
+    assert String.starts_with?(blocked["failure_code"], failure_prefix)
+
+    assert Map.take(blocked, ~w(candidate_sha code_repair_round implementation_iteration verifier_round)) ==
+             Map.take(before, ~w(candidate_sha code_repair_round implementation_iteration verifier_round))
+
+    assert {:ok, consumed} = WorkerEvidence.get(ctx.store, "verifier:request")
+    assert consumed["status"] == "CONSUMED" and is_binary(consumed["consumed_at"])
+    assert consumed["output_json"] == evidence["output_json"] and consumed["output_sha256"] == evidence["output_sha256"]
+    assert {:ok, %{"status" => "CONSUMED"}} = TaskLedger.get(ctx.store, "writer")
+    assert {:ok, access} = WorkspaceAccess.get(ctx.store, "verifier:reservation")
+    assert is_binary(access["released_at"])
+    [disposition] = Store.query!(ctx.store, "SELECT payload_json FROM events WHERE event_type='TICKET_NATIVE_VERIFIER_TERMINAL'").rows
+    receipt = Jason.decode!(hd(disposition))
+    assert receipt["request_key"] == "verifier:request" and receipt["output_sha256"] == evidence["output_sha256"]
+    assert receipt["binding_sha256"] == evidence["binding_sha256"]
+    assert {:ok, reopened} = Store.start_link(database: ctx.database)
+
+    try do
+      reopened_context = %{context | store: reopened}
+      assert {:error, :ticket_role_stage_not_admitted} = Scheduler.ticket_step(reopened_context, "run", opts(ctx))
+      assert {:ok, ^blocked} = RunLedger.get(reopened, "run")
+      assert {:ok, ^consumed} = WorkerEvidence.get(reopened, "verifier:request")
+      assert Store.query!(reopened, "SELECT payload_json FROM events WHERE event_type='TICKET_NATIVE_VERIFIER_TERMINAL'").rows == [disposition]
+    after
+      GenServer.stop(reopened)
+    end
+  end
+
   test "ready rework authorization rejects non-READY state without changing the run", ctx do
     {:ok, run} = RunLedger.get(ctx.store, "run")
     snapshot = Jason.decode!(run["snapshot_json"]) |> Map.merge(%{"labels" => ["ai-review"], "status" => "In Review"})
@@ -387,6 +700,9 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
 
     ci = %{"status" => "PASS", "sha" => candidate, "pipeline_id" => 17}
     {:ok, _} = RunLedger.update(ctx.store, "run", %{ci_evidence_json: Jason.encode!(ci), ci_preflight_sha: candidate, ci_pipeline_id: 17})
+    assert {:error, :worker_instruction_snapshot_not_admitted} = TicketWorkerRunner.packet(ctx.store, "run", "change-verifier", ctx.sha)
+    assert {:error, :worker_instruction_snapshot_missing} = TicketWorkerRunner.read_packet(ctx.store, "run", "change-verifier", ctx.sha)
+    {:ok, _} = TaskLedger.update(ctx.store, "writer", %{status: "CONSUMED"})
     assert {:ok, with_ci} = TicketWorkerRunner.packet(ctx.store, "run", "change-verifier", ctx.sha)
     assert Jason.decode!(with_ci)["ci_evidence"] == ci
 
@@ -683,10 +999,32 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
     refute_received {:worker_options, _}
   end
 
+  defmodule GuardRejectedServer do
+    alias SymphonyElixir.FactoryTicketWorkerRunnerTest.FakeWorkerServer
+    defdelegate start_session(workspace, opts), to: FakeWorkerServer
+    defdelegate stop_session(session), to: FakeWorkerServer
+    def run_turn(_session, _prompt, _issue, _opts), do: {:error, :interrupted_owned_session_preflight_failed}
+  end
+
+  test "pre-turn guard denial retains the genuine stopped session without a turn or result", ctx do
+    {prompt, options} = prepare(ctx)
+    options = Keyword.put(options, :app_server, GuardRejectedServer)
+    assert {:error, :interrupted_owned_session_preflight_failed} = TicketWorkerRunner.run(ctx.path, issue(), prompt, schema(), options)
+    assert_received :owned_session_stopped
+    refute_received {:worker_prompt, _}
+    assert {:ok, failed} = WorkerEvidence.get(ctx.store, "reservation:request")
+    assert WorkerEvidence.owner_stopped?(ctx.store, failed)
+    assert failed["status"] == "RECONCILE_REQUIRED" and failed["thread_id"] == "worker"
+    assert Enum.all?(~w(turn_id item_id output_json output_sha256), &is_nil(failed[&1]))
+    assert {:ok, %{"released_at" => nil}} = WorkspaceAccess.get(ctx.store, "reservation")
+    assert Store.one!(ctx.store, "SELECT COUNT(*) AS n FROM worker_file_operations")["n"] == 0
+    assert File.read!(Path.join(ctx.path, "fixture.txt")) == "base\n"
+  end
+
   test "policy drift and callback errors retain reservations for reconciliation", ctx do
     {prompt, options} = prepare(ctx)
     Process.put(:observed_policy, %{"mode" => "SOURCE", "cwd" => ctx.path})
-    assert {:error, :worker_observation_failed} = TicketWorkerRunner.run(ctx.path, issue(), prompt, schema(), options)
+    assert {:error, {:worker_exception, :error, "{:badmatch, false}"}} = TicketWorkerRunner.run(ctx.path, issue(), prompt, schema(), options)
     refute_received {:worker_prompt, _}
     assert {:ok, %{"status" => "RECONCILE_REQUIRED"}} = WorkerEvidence.get(ctx.store, "reservation:request")
     assert {:ok, %{"released_at" => nil}} = WorkspaceAccess.get(ctx.store, "reservation")

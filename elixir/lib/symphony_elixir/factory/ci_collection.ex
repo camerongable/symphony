@@ -1,9 +1,10 @@
 defmodule SymphonyElixir.Factory.CiCollection do
   @moduledoc "Bounded read-only CI collection on an existing controller MCP session."
-  alias SymphonyElixir.Factory.GitLabMcpConnector
+  alias SymphonyElixir.Factory.{ControllerCi, GitLabMcpConnector}
 
-  @mr_fields ~w(iid project_id web_url sha diff_refs source_branch target_branch draft reviewers assignees state head_pipeline)
+  @mr_fields ~w(iid project_id web_url sha diff_refs source_branch target_branch draft reviewers assignees state head_pipeline remove_source_branch force_remove_source_branch has_conflicts detailed_merge_status blocking_discussions_resolved)
   @mr_delivery_fields @mr_fields -- ["head_pipeline"]
+  @mr_pipeline_call {"list_merge_request_pipelines", %{"project_id" => "string", "merge_request_iid" => "string", "page" => "number", "per_page" => "number"}}
   @calls [
     {"get_merge_request", %{"project_id" => "string", "merge_request_iid" => "string", "include_summaries" => "boolean"}},
     {"get_pipeline", %{"project_id" => "string", "pipeline_id" => "string"}},
@@ -43,16 +44,46 @@ defmodule SymphonyElixir.Factory.CiCollection do
          :ok <- schemas(catalog),
          args = %{"project_id" => Integer.to_string(pin), "merge_request_iid" => to_string(run["mr_iid"]), "include_summaries" => false},
          {:ok, first} <- read(connector, "get_merge_request", args, opts),
-         true <- Map.has_key?(first, "head_pipeline") or {:error, :ci_head_pipeline_not_observable},
+         {:ok, selector} <- observe_selector(first, run, pin, connector, catalog, args, opts),
          first = normalize_mr(first),
          true <- (first["project_id"] == pin and first["iid"] == run["mr_iid"]) or {:error, :ci_mr_binding_mismatch},
-         {:ok, pipeline, jobs, commit} <- pipeline(first["head_pipeline"], run, pin, connector, opts),
+         {:ok, pipeline, jobs, commit} <- pipeline(selector_head(first, selector), run, pin, connector, opts),
          {:ok, last} <- read(connector, "get_merge_request", args, opts),
-         true <- Map.has_key?(last, "head_pipeline") or {:error, :ci_head_pipeline_not_observable},
+         {:ok, current_selector} <- observe_selector(last, run, pin, connector, catalog, args, opts),
+         true <- selector == current_selector or {:error, :ci_mr_pipeline_changed_during_collection},
          true <- Map.take(first, @mr_fields) == Map.take(normalize_mr(last), @mr_fields) or {:error, :ci_mr_changed_during_collection} do
-      {:ok, %{"mr" => first, "pipeline" => pipeline, "jobs" => jobs, "merge_commit" => commit}}
+      snapshots = %{"mr" => first, "pipeline" => pipeline, "jobs" => jobs, "merge_commit" => commit}
+      {:ok, if(is_nil(selector), do: snapshots, else: Map.put(snapshots, "pipeline_selector", selector))}
     end
   end
+
+  defp observe_selector(mr, run, pin, connector, catalog, args, opts) do
+    if Map.has_key?(mr, "head_pipeline") do
+      {:ok, nil}
+    else
+      with :ok <- schemas(catalog, [@mr_pipeline_call]),
+           {:ok, records} <- mr_pipeline_records(connector, args, opts) do
+        ControllerCi.pipeline_list_selector(run, pin, records)
+      end
+    end
+  end
+
+  defp mr_pipeline_records(connector, args, opts) do
+    args = args |> Map.delete("include_summaries") |> Map.merge(%{"page" => 1, "per_page" => 100})
+
+    with {:ok, records} <- connector.call_list("list_merge_request_pipelines", args, opts),
+         true <- (is_list(records) and length(records) <= 100 and Enum.all?(records, &is_map/1)) or {:error, :ci_mr_pipelines_limit_or_shape},
+         {:ok, []} <- connector.call_list("list_merge_request_pipelines", Map.put(args, "page", 2), opts) do
+      {:ok, Enum.map(records, &(&1 |> normalize_ids(~w(id project_id)) |> Map.take(~w(id sha ref status created_at project_id source))))}
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :ci_mr_pipelines_limit_or_shape}
+    end
+  end
+
+  defp selector_head(mr, nil), do: mr["head_pipeline"]
+  defp selector_head(_mr, %{"selected_pipeline_id" => nil}), do: nil
+  defp selector_head(_mr, %{"selected_pipeline_id" => id}), do: %{"id" => id}
 
   defp read(connector, tool, args, opts) do
     case connector.call(tool, args, opts) do
@@ -127,7 +158,22 @@ defmodule SymphonyElixir.Factory.CiCollection do
     |> normalize_ids(~w(iid project_id))
     |> Map.update("assignees", nil, &people/1)
     |> Map.update("reviewers", nil, &people/1)
-    |> Map.update("head_pipeline", nil, &normalize_ids(&1, ~w(id project_id)))
+    |> normalize_optional_head()
+    |> normalize_branch_removal()
+  end
+
+  defp normalize_optional_head(mr) do
+    if Map.has_key?(mr, "head_pipeline"), do: Map.update!(mr, "head_pipeline", &normalize_ids(&1, ~w(id project_id))), else: mr
+  end
+
+  defp normalize_branch_removal(mr) do
+    # GitLab returns the requested removal setting as force_remove_source_branch;
+    # should_remove_source_branch is a separate merge-time decision, not its alias.
+    case {Map.fetch(mr, "remove_source_branch"), Map.fetch(mr, "force_remove_source_branch")} do
+      {:error, {:ok, value}} when is_boolean(value) -> Map.put(mr, "remove_source_branch", value)
+      {{:ok, false}, {:ok, value}} when value != false -> Map.put(mr, "remove_source_branch", nil)
+      _ -> mr
+    end
   end
 
   defp people(list) when is_list(list), do: Enum.map(list, &normalize_ids(&1, ~w(id)))

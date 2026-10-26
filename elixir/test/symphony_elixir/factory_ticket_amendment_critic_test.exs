@@ -464,12 +464,21 @@ defmodule SymphonyElixir.FactoryTicketAmendmentCriticTest do
     assert attempt["worker_thread_id"] == nil
     assert task["status"] == "RECONCILE_REQUIRED"
     assert Map.drop(task, ["status", "updated_at"]) == Map.drop(protected_before.task, ["status", "updated_at"])
-    assert Map.drop(protected_after, [:attempt, :task, :tasks]) == Map.drop(protected_before, [:attempt, :task, :tasks])
+    assert Map.drop(protected_after, [:attempt, :task, :tasks, :events]) == Map.drop(protected_before, [:attempt, :task, :tasks, :events])
+    assert Enum.reject(protected_after.events, fn [_id, _at, type, _run, _payload] -> type == "SPECIALIST_ERROR_RECORDED" end) == protected_before.events
 
     assert Enum.reject(protected_after.tasks, &(&1["task_key"] == attempt_before["task_key"])) ==
              Enum.reject(protected_before.tasks, &(&1["task_key"] == attempt_before["task_key"]))
 
     assert protected_after.authorization_effects == []
+
+    notice =
+      Store.one!(ctx.store, "SELECT payload_json FROM events WHERE run_id = ? AND event_type = 'SPECIALIST_ERROR_RECORDED'", [attempt["run_id"]]) |> Map.fetch!("payload_json") |> Jason.decode!()
+
+    assert notice["role"] == "specification-critic"
+    assert notice["request_key"] == command["command_key"]
+    assert notice["turn_id"] == nil
+    assert notice["category"] == "NATIVE_FAILURE"
     refute_received {:critic_session_started, _}
   end
 
@@ -1074,7 +1083,7 @@ defmodule SymphonyElixir.FactoryTicketAmendmentCriticTest do
     assert Store.query!(ctx.store, "SELECT version, applied_at FROM factory_schema_migrations WHERE version <= 35 ORDER BY version").rows == migrations_before_upgrade
     assert Store.one!(ctx.store, "PRAGMA foreign_keys")["foreign_keys"] == 1
     assert Store.one!(ctx.store, "PRAGMA legacy_alter_table")["legacy_alter_table"] == 0
-    assert Store.one!(ctx.store, "SELECT MAX(version) AS version FROM factory_schema_migrations")["version"] == 37
+    assert Store.one!(ctx.store, "SELECT MAX(version) AS version FROM factory_schema_migrations")["version"] == 38
     assert Store.one!(ctx.store, "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'one_active_contract_amendment_per_run'") != nil
     assert {:ok, _} = TicketContractAmendment.get(ctx.store, migration_command["command_key"])
     assert Store.one!(ctx.store, "SELECT * FROM ticket_contract_amendments WHERE command_key = ?", [command["command_key"]]) == superseded_before
@@ -1605,7 +1614,7 @@ defmodule SymphonyElixir.FactoryTicketAmendmentCriticTest do
     assert Map.take(after_migration, legacy_fields) == Map.take(before, legacy_fields)
     assert after_migration["worker_thread_id"] == nil
     assert after_migration["result_json"] == nil
-    assert Store.one!(ctx.store, "SELECT MAX(version) AS version FROM factory_schema_migrations")["version"] == 37
+    assert Store.one!(ctx.store, "SELECT MAX(version) AS version FROM factory_schema_migrations")["version"] == 38
   end
 
   test "a PASS receipt cannot be adopted before the exact turn callback is persisted", %{

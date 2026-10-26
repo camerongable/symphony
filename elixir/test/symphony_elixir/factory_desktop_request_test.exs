@@ -4,6 +4,29 @@ defmodule SymphonyElixir.FactoryDesktopRequestTest do
   alias SymphonyElixir.Factory.{Control, DesktopRequest, RunLedger, StageSchemas, Store, TaskLedger}
   alias SymphonyElixir.PathSafety
 
+  test "MR actor pin helper rejects superseded pending requests atomically", %{store: store} do
+    Control.initialize(store, %{scope: "scope", dispatcher_id: "fixture", controller_codex_project_id: "project-grail"})
+    Control.record_controller_task(store, %{scope: "scope", dispatcher_id: "fixture"}, "controller", "prior", %{project_id: "project-grail"})
+
+    attrs =
+      task_request()
+      |> Map.merge(%{
+        request_key: "mr:pin",
+        target_kind: "CONTROLLER",
+        target_key: "scope",
+        action: "FOLLOWUP",
+        existing_thread_id: "controller",
+        metadata: %{"delivery_operation" => %{"version" => 2}}
+      })
+
+    {:ok, request} = DesktopRequest.enqueue(store, attrs)
+    Store.query!(store, "UPDATE desktop_requests SET superseded_by = ? WHERE request_key = ?", ["other-request", request["request_key"]])
+    {:ok, superseded} = DesktopRequest.get(store, request["request_key"])
+    assert {:error, :ticket_mr_actor_requires_unissued_request} = Store.transaction!(store, fn tx -> DesktopRequest.pin_unissued_mr_actor(tx, superseded, "/tmp/native-actor") end)
+    assert {:ok, ^superseded} = DesktopRequest.get(store, request["request_key"])
+    assert Store.query!(store, "SELECT * FROM ticket_mr_actor_bindings").rows == []
+  end
+
   setup do
     token = "#{System.system_time(:nanosecond)}-#{System.unique_integer([:positive])}"
     database = Path.join(System.tmp_dir!(), "factory-desktop-request-#{token}.sqlite")

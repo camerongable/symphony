@@ -4,6 +4,92 @@ defmodule SymphonyElixir.FactoryStoreMigrationTest do
 
   alias SymphonyElixir.Factory.{RunLedger, Store, TicketChatCommands, TicketContractAmendment}
 
+  test "version 39 gains only immutable MR actor audit storage and preserves all existing rows and hazard guards" do
+    ctx = setup_fixture(%{})
+    old_triggers = Store.query!(ctx.store, "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'push_unknown_%' ORDER BY name").rows
+    original = Store.one!(ctx.store, "SELECT * FROM runs WHERE run_id = 'run'")
+    for name <- ~w(mr_actor_audit_update mr_actor_audit_delete mr_actor_schema_rollback), do: Store.query!(ctx.store, "DROP TRIGGER #{name}")
+    Store.query!(ctx.store, "DROP TABLE ticket_mr_actor_bindings")
+    Store.query!(ctx.store, "DELETE FROM factory_schema_migrations WHERE version = 40")
+    assert {:error, :factory_ledger_schema_not_current} = Store.start_read_only(database: ctx.database)
+    assert :ok = Store.initialize(ctx.store)
+    assert Store.one!(ctx.store, "SELECT * FROM runs WHERE run_id = 'run'") == original
+    assert Store.query!(ctx.store, "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'push_unknown_%' ORDER BY name").rows == old_triggers
+    assert Store.query!(ctx.store, "SELECT * FROM ticket_mr_actor_bindings").rows == []
+    definitions = Store.query!(ctx.store, "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'mr_actor_%' ORDER BY name").rows
+    assert length(definitions) == 3
+    assert :ok = Store.initialize(ctx.store)
+    assert Store.query!(ctx.store, "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'mr_actor_%' ORDER BY name").rows == definitions
+    assert {:ok, reader} = Store.start_read_only(database: ctx.database)
+    GenServer.stop(reader)
+  end
+
+  test "version 38 upgrades additively with stable push hazard triggers and unchanged run rows" do
+    ctx = setup_fixture(%{})
+    names = ~w(push_unknown_run_identity push_unknown_run_delete push_unknown_event_delete push_unknown_event_update push_unknown_schema_rollback)
+    before = Store.one!(ctx.store, "SELECT * FROM runs WHERE run_id = 'run'")
+    definitions = Store.query!(ctx.store, "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'push_unknown_%' ORDER BY name").rows
+    assert length(definitions) == 5
+    for name <- names, do: Store.query!(ctx.store, "DROP TRIGGER #{name}")
+    Store.query!(ctx.store, "DELETE FROM factory_schema_migrations WHERE version = 39")
+    assert {:error, :factory_ledger_schema_not_current} = Store.start_read_only(database: ctx.database)
+    assert :ok = Store.initialize(ctx.store)
+    assert Store.one!(ctx.store, "SELECT * FROM runs WHERE run_id = 'run'") == before
+    assert Store.query!(ctx.store, "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'push_unknown_%' ORDER BY name").rows == definitions
+    assert Store.query!(ctx.store, "SELECT version FROM factory_schema_migrations ORDER BY version").rows == Enum.map(1..43, &[&1])
+    assert :ok = Store.initialize(ctx.store)
+    assert Store.one!(ctx.store, "SELECT * FROM runs WHERE run_id = 'run'") == before
+  end
+
+  test "version 37 intake snapshots migrate without changing the observed Jira evidence" do
+    ctx = setup_fixture(%{})
+    Store.query!(ctx.store, "DROP TABLE intake_snapshots")
+    Store.query!(ctx.store, "CREATE TABLE intake_snapshots (scope TEXT PRIMARY KEY, observed_at TEXT NOT NULL, snapshot_json TEXT NOT NULL)")
+    Store.query!(ctx.store, "INSERT INTO intake_snapshots VALUES (?, ?, ?)", ["pilot", "2026-10-13T00:00:00Z", "[]"])
+    Store.query!(ctx.store, "DELETE FROM factory_schema_migrations WHERE version >= 38")
+    before = Store.one!(ctx.store, "SELECT * FROM intake_snapshots WHERE scope = 'pilot'")
+    assert {:error, :factory_ledger_schema_not_current} = Store.start_read_only(database: ctx.database)
+    assert Store.one!(ctx.store, "SELECT * FROM intake_snapshots WHERE scope = 'pilot'") == before
+    assert :ok = Store.initialize(ctx.store)
+    after_row = Store.one!(ctx.store, "SELECT * FROM intake_snapshots WHERE scope = 'pilot'")
+    assert Map.delete(after_row, "decisions_json") == before
+    assert after_row["decisions_json"] == "{}"
+    assert Store.one!(ctx.store, "SELECT MAX(version) AS version FROM factory_schema_migrations")["version"] == 43
+    assert :ok = Store.initialize(ctx.store)
+    assert Store.one!(ctx.store, "SELECT * FROM intake_snapshots WHERE scope = 'pilot'") == after_row
+    assert {:ok, reader} = Store.start_read_only(database: ctx.database)
+    GenServer.stop(reader)
+  end
+
+  test "concurrent ledger initialization preserves active-run indexes and existing rows" do
+    ctx = setup_fixture(%{})
+    second = start_supervised!({Store, database: ctx.database}, id: :second_store)
+    before = Store.one!(ctx.store, "SELECT * FROM runs WHERE run_id = 'run'")
+    schema_version = Store.one!(ctx.store, "PRAGMA schema_version")
+
+    tasks = for store <- [ctx.store, second], do: Task.async(fn -> for _ <- 1..10, do: Store.initialize(store) end)
+    assert Enum.all?(tasks, &(Task.await(&1, 30_000) == List.duplicate(:ok, 10)))
+    assert Store.one!(ctx.store, "PRAGMA schema_version") == schema_version
+    assert Store.one!(ctx.store, "SELECT * FROM runs WHERE run_id = 'run'") == before
+
+    assert Store.one!(ctx.store, "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'index' AND name IN ('one_active_run_per_issue_kind', 'one_active_factory_run_per_issue')") == %{
+             "count" => 2
+           }
+  end
+
+  test "legacy active-run index definitions upgrade atomically and only once" do
+    ctx = setup_fixture(%{})
+    Store.query!(ctx.store, "DROP INDEX one_active_factory_run_per_issue")
+    Store.query!(ctx.store, "CREATE UNIQUE INDEX one_active_factory_run_per_issue ON runs(issue_key) WHERE state NOT IN ('DELIVERED', 'CANCELLED', 'FAILED')")
+    assert :ok = Store.initialize(ctx.store)
+    index = Store.one!(ctx.store, "SELECT sql FROM sqlite_master WHERE name = 'one_active_factory_run_per_issue'")
+    assert index["sql"] =~ "'AWAITING_VALIDATION'"
+    assert index["sql"] =~ "'READY_FOR_REVIEW'"
+    version = Store.one!(ctx.store, "PRAGMA schema_version")
+    assert :ok = Store.initialize(ctx.store)
+    assert Store.one!(ctx.store, "PRAGMA schema_version") == version
+  end
+
   test "populated version 30 ledger rejects read-only without mutation and migrates through version 34" do
     ctx = setup_fixture(%{})
     {:ok, legacy_command} = stage(ctx, "v28-migration", "Rework: current candidate", [%{"operation" => "request_rework"}])
@@ -139,7 +225,7 @@ defmodule SymphonyElixir.FactoryStoreMigrationTest do
                "application_receipt_json" => nil
              }
 
-      assert Store.one!(reopened, "SELECT MAX(version) AS version FROM factory_schema_migrations")["version"] == 37
+      assert Store.one!(reopened, "SELECT MAX(version) AS version FROM factory_schema_migrations")["version"] == 43
     after
       GenServer.stop(reopened)
     end
@@ -315,7 +401,7 @@ defmodule SymphonyElixir.FactoryStoreMigrationTest do
         assert Map.drop(upgraded, ["execution_mode"]) == historical_before
         assert Store.query!(original, "SELECT * FROM events WHERE run_id = 'historical-run'").rows == events_before
         assert Store.one!(original, "SELECT * FROM desktop_requests WHERE request_key = 'historical-request'") == request_before
-        assert Store.one!(original, "SELECT MAX(version) AS version FROM factory_schema_migrations")["version"] == 37
+        assert Store.one!(original, "SELECT MAX(version) AS version FROM factory_schema_migrations")["version"] == 43
         version16_receipt["applied_at"]
       after
         GenServer.stop(original)

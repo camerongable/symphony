@@ -6,6 +6,312 @@ defmodule SymphonyElixir.FactoryWorkerFileToolsTest do
   alias SymphonyElixir.Factory.{WorkerEvidence, WorkerFileIO, WorkerFileTools, WorkspaceAccess}
   setup :setup_fixture
 
+  @tag :file_revision
+  test "base reads ignore dirty checkout bytes and cannot supply current write CAS", ctx do
+    pin_base(ctx)
+    File.write!(Path.join(ctx.path, "fixture.txt"), "candidate\n")
+    git(ctx.path, ["add", "fixture.txt"])
+    git(ctx.path, ["commit", "--no-verify", "-m", "candidate"])
+    sha = git(ctx.path, ["rev-parse", "HEAD"]) |> String.trim()
+    {:ok, _} = RunLedger.update(ctx.store, "run", %{candidate_sha: sha})
+    Store.query!(ctx.store, "UPDATE factory_tasks SET workspace_sha=? WHERE task_key='writer'", [sha])
+    cap = prepare(%{ctx | sha: sha})
+    File.write!(Path.join(ctx.path, "fixture.txt"), "dirty\n")
+    File.write!(Path.join(ctx.path, "other.txt"), "keep\n")
+    assert %{"success" => true} = result = revision(cap, "repo_read", %{"path" => "fixture.txt", "start_line" => 1})
+    historical = decoded(result)
+    assert historical["text"] == "base\n"
+    assert historical["revision"] == ctx.sha
+    assert historical["sha256"] == digest("base\n")
+    assert historical["mode"] == "100644"
+    assert %{"success" => false} = call(cap, "repo_write", edit(historical["sha256"], historical["text"]), identity("repo_write", "stale"))
+    current = read(cap) |> decoded()
+    assert %{"success" => true} = call(cap, "repo_write", edit(current["sha256"], historical["text"]), identity("repo_write", "restore"))
+    assert File.read!(Path.join(ctx.path, "fixture.txt")) == "base\n"
+    assert File.read!(Path.join(ctx.path, "other.txt")) == "keep\n"
+  end
+
+  @tag :file_revision
+  test "revision tools reject caller revisions, absent pins and foreign persisted bases", ctx do
+    cap = prepare(ctx)
+    args = %{"path" => "fixture.txt", "start_line" => 1}
+    assert %{"success" => false} = revision(cap, "repo_read", args)
+
+    for revision <- [ctx.sha, "HEAD", "master", "HEAD:fixture.txt", String.slice(ctx.sha, 0, 8)] do
+      assert %{"success" => false} = revision(cap, "repo_read", Map.put(args, "revision", revision))
+    end
+
+    pin_base(ctx)
+    assert %{"success" => false} = revision(cap, "repo_read", args)
+  end
+
+  @tag :file_revision
+  test "revision reads retain active owner, native identity and release fences", ctx do
+    pin_base(ctx)
+    cap = prepare(ctx)
+    args = %{"path" => "fixture.txt", "start_line" => 1}
+    assert %{"success" => true} = revision(cap, "repo_read", args)
+    assert %{"success" => false} = revision(cap, "repo_read", args, %{identity("repo_read") | "turnId" => "foreign"})
+    Store.query!(ctx.store, "UPDATE ticket_review_bases SET base_sha=? WHERE run_id='run'", [String.duplicate("a", 40)])
+    assert %{"success" => false} = revision(cap, "repo_read", args)
+    Store.query!(ctx.store, "UPDATE ticket_review_bases SET base_sha=? WHERE run_id='run'", [ctx.sha])
+    Store.query!(ctx.store, "UPDATE worker_evidence SET owner_stopped_at='stopped' WHERE request_key=?", [cap.key])
+    assert %{"success" => false} = revision(cap, "repo_read", args)
+    Store.query!(ctx.store, "UPDATE worker_evidence SET owner_stopped_at=NULL WHERE request_key=?", [cap.key])
+    Store.query!(ctx.store, "UPDATE workspace_access SET released_at='released' WHERE reservation_key='reservation'")
+    assert %{"success" => false} = revision(cap, "repo_read", args)
+  end
+
+  @tag :file_revision
+  test "revision binary pages preserve exact bytes and reject nonregular or oversized blobs", ctx do
+    bytes = <<0, 255, 13, 10>> <> String.duplicate("é", 5_000)
+    limit = String.duplicate("a", 262_144)
+    oversized = String.duplicate("b", 262_145)
+
+    for {path, raw} <- [{"binary", bytes}, {"limit", limit}, {"oversized", oversized}, {"utf8", "é\r\nlast\n"}] do
+      File.write!(Path.join(ctx.path, path), raw)
+    end
+
+    File.ln_s!("fixture.txt", Path.join(ctx.path, "link"))
+    git(ctx.path, ["add", "."])
+    git(ctx.path, ["commit", "--no-verify", "-m", "binary bases"])
+    sha = git(ctx.path, ["rev-parse", "HEAD"]) |> String.trim()
+    {:ok, _} = RunLedger.update(ctx.store, "run", %{candidate_sha: sha})
+    Store.query!(ctx.store, "UPDATE factory_tasks SET workspace_sha=? WHERE task_key='writer'", [sha])
+    pin_base(%{ctx | sha: sha})
+    cap = prepare(%{ctx | sha: sha})
+    pages = for offset <- [0, 8_192], do: revision(cap, "repo_read_binary", %{"path" => "binary", "offset" => offset}) |> decoded()
+    assert Enum.map_join(pages, &Base.decode64!(&1["content_base64"])) == bytes
+    assert hd(pages)["next_offset"] == 8_192
+    assert List.last(pages)["next_offset"] == nil
+    assert %{"success" => true} = revision(cap, "repo_read_binary", %{"path" => "limit", "offset" => 262_144})
+    assert %{"success" => true} = text = revision(cap, "repo_read", %{"path" => "utf8", "start_line" => 1})
+    assert decoded(text)["text"] == "é\r\nlast\n"
+
+    for path <- ["binary", "oversized", "link", "missing", ".", "../fixture.txt", ".git/config", ".env", "a/../fixture.txt"] do
+      assert %{"success" => false} = revision(cap, "repo_read", %{"path" => path, "start_line" => 1})
+    end
+
+    assert %{"success" => false} = revision(cap, "repo_read_binary", %{"path" => "oversized", "offset" => 0})
+  end
+
+  defp pin_base(ctx), do: Store.query!(ctx.store, "INSERT INTO ticket_review_bases VALUES ('run','refs/remotes/origin/master',?,'now')", [ctx.sha])
+
+  @tag :file_revision
+  test "virtual base namespace never falls back to disk or admits mutation or prefix aliases", ctx do
+    pin_base(ctx)
+    cap = prepare(ctx)
+    shadow = Path.join(ctx.path, ".symphony-base")
+    File.mkdir!(shadow)
+    File.write!(Path.join(shadow, "physical-only"), "not historical\n")
+    File.write!(Path.join(shadow, "fixture.txt"), "not base\n")
+    assert %{"success" => true} = historical = revision(cap, "repo_read", %{"path" => "fixture.txt", "start_line" => 1})
+    assert decoded(historical)["text"] == "base\n"
+    assert decoded(historical)["source"] == "CONTRACT_BASE"
+    assert decoded(historical)["write_cas_warning"] =~ "never use this historical SHA"
+    assert %{"success" => false} = revision(cap, "repo_read", %{"path" => "physical-only", "start_line" => 1})
+    File.rename!(shadow, shadow <> ".retained")
+    File.ln_s!(ctx.repo, shadow)
+    assert %{"success" => true} = revision(cap, "repo_read", %{"path" => "fixture.txt", "start_line" => 1})
+    assert %{"success" => false} = revision(cap, "repo_read", %{"path" => "physical-only", "start_line" => 1})
+
+    for path <- [
+          ".symphony-base",
+          ".SYMPHONY-base/fixture.txt",
+          ".symphony-basé/fixture.txt",
+          ".symphony-base//fixture.txt",
+          ".symphony-base/.symphony-base/fixture.txt",
+          ".symphony-base/../fixture.txt",
+          ".symphony-base//absolute",
+          ".symphony-base/a\\b",
+          ".symphony-base/a\n",
+          ".symphony-base/a\0",
+          ".symphony-base/.git/config"
+        ] do
+      assert %{"success" => false} = call(cap, "repo_read", %{"path" => path, "start_line" => 1})
+    end
+
+    lookalike = Path.join(ctx.path, ".ｓymphony-base")
+    File.mkdir!(lookalike)
+    File.write!(Path.join(lookalike, "fixture.txt"), "ordinary lookalike\n")
+    assert %{"success" => true} = ordinary = call(cap, "repo_read", %{"path" => ".ｓymphony-base/fixture.txt", "start_line" => 1})
+    assert decoded(ordinary)["text"] == "ordinary lookalike\n"
+    refute Map.has_key?(decoded(ordinary), "source")
+
+    for {tool, args} <- [
+          {"repo_write", edit("ABSENT", "forbidden", ".symphony-base/new")},
+          {"repo_write_binary", %{"path" => ".symphony-base/new", "expected_sha256" => "ABSENT", "content_base64" => "eA=="}},
+          {"repo_delete", %{"path" => ".symphony-base/fixture.txt", "expected_sha256" => digest("base\n")}},
+          {"repo_mkdir", %{"path" => ".symphony-base/new"}},
+          {"repo_list", %{"path" => ".symphony-base/"}}
+        ] do
+      assert %{"success" => false} = call(cap, tool, args)
+    end
+
+    assert Store.query!(ctx.store, "SELECT * FROM worker_file_operations").rows == []
+    assert File.read!(Path.join(ctx.path, "fixture.txt")) == "base\n"
+  end
+
+  for drift <- ~w(turn generation base stopped root spec contract branch prompt) do
+    @tag :file_revision
+    @revision_drift drift
+    test "post-I/O #{@revision_drift} drift cannot return historical bytes", ctx do
+      pin_base(ctx)
+      cap = prepare(ctx)
+      hook = {SymphonyElixir.Factory.Worktree, :before_identity_command}
+      Process.put(:revision_head_reads, 0)
+      on_exit(fn -> Process.delete(hook) end)
+
+      Process.put(hook, fn
+        ["rev-parse", "HEAD"] ->
+          count = Process.get(:revision_head_reads) + 1
+          Process.put(:revision_head_reads, count)
+
+          target = if @revision_drift in ~w(spec contract branch prompt), do: 6, else: 5
+
+          if count == target do
+            case @revision_drift do
+              "turn" ->
+                Store.query!(ctx.store, "UPDATE worker_evidence SET turn_id='foreign' WHERE request_key=?", [cap.key])
+
+              "generation" ->
+                Store.query!(ctx.store, "UPDATE workspace_access SET generation=generation+1 WHERE reservation_key='reservation'")
+
+              "base" ->
+                Store.query!(ctx.store, "UPDATE ticket_review_bases SET base_sha=? WHERE run_id='run'", [String.duplicate("a", 40)])
+
+              "stopped" ->
+                Store.query!(ctx.store, "UPDATE worker_evidence SET owner_stopped_at='stopped' WHERE request_key=?", [cap.key])
+
+              "root" ->
+                File.rename!(ctx.path, ctx.path <> ".retained")
+                File.mkdir!(ctx.path)
+
+              "spec" ->
+                Store.query!(ctx.store, "UPDATE runs SET spec_revision=spec_revision+1 WHERE run_id='run'")
+
+              "contract" ->
+                Store.query!(ctx.store, "UPDATE runs SET contract_sha256=? WHERE run_id='run'", [String.duplicate("a", 64)])
+
+              "branch" ->
+                Store.query!(ctx.store, "UPDATE runs SET branch='cgable/foreign' WHERE run_id='run'")
+
+              "prompt" ->
+                Store.query!(ctx.store, "UPDATE factory_tasks SET prompt_sha256=? WHERE task_key='writer'", [String.duplicate("a", 64)])
+            end
+          end
+
+        _ ->
+          :ok
+      end)
+
+      assert %{"success" => false} = revision(cap, "repo_read", %{"path" => "fixture.txt", "start_line" => 1})
+      assert Process.get(:revision_head_reads) >= 5
+      if @revision_drift in ~w(spec contract branch prompt), do: assert(Process.get(:revision_head_reads) >= 6)
+      Process.delete(hook)
+      path = if @revision_drift == "root", do: ctx.path <> ".retained", else: ctx.path
+      assert File.read!(Path.join(path, "fixture.txt")) == "base\n"
+      assert Store.query!(ctx.store, "SELECT * FROM worker_file_operations").rows == []
+    end
+  end
+
+  @tag :file_revision_compatibility
+  test "original seven-tool policy and stopped physical receipts remain unchanged and reconcilable", ctx do
+    cap = prepare(ctx)
+    assert %{"success" => true} = call(cap, "repo_write", edit(digest("base\n")))
+    old_tools = WorkerFileTools.tool_specs()
+    assert Enum.map(old_tools, & &1["name"]) == ~w(repo_read repo_list repo_write repo_delete repo_mkdir repo_read_binary repo_write_binary)
+    old_sha = old_tools |> Jason.encode!() |> digest()
+    assert old_sha == "44f58a614a4437a56c277c24b295d0cd8d529b3c197c9a820dda7dd7516a135e"
+    {:ok, evidence} = WorkerEvidence.get(ctx.store, cap.key)
+    assert get_in(Jason.decode!(evidence["binding_json"]), ["policy", "file_tools_sha256"]) == old_sha
+    Store.query!(ctx.store, "UPDATE worker_evidence SET owner_stopped_at='stopped' WHERE request_key=?", [cap.key])
+    original = Store.query!(ctx.store, "SELECT * FROM worker_file_operations").rows
+    assert :ok = WorkerFileTools.reconcile(ctx.store, cap.key)
+    assert Store.query!(ctx.store, "SELECT * FROM worker_file_operations").rows == original
+    {:ok, after_readback} = WorkerEvidence.get(ctx.store, cap.key)
+    assert after_readback["binding_json"] == evidence["binding_json"]
+    assert after_readback["binding_sha256"] == evidence["binding_sha256"]
+    assert %{"success" => false} = revision(cap, "repo_read", %{"path" => "fixture.txt", "start_line" => 1})
+    assert File.read!(Path.join(ctx.path, "fixture.txt")) == "edited\n"
+  end
+
+  @tag :file_revision
+  test "revision text refuses long or escaped output rather than returning an ambiguous prefix", ctx do
+    lines = Enum.map_join(1..101, "\n", &Integer.to_string/1)
+    long = String.duplicate("x", 16_385)
+    escaped = String.duplicate("\t", 9_000)
+
+    for {name, content} <- [{"long", long}, {"escaped", escaped}, {"lines", lines}] do
+      File.write!(Path.join(ctx.path, name), content)
+    end
+
+    git(ctx.path, ["add", "."])
+    git(ctx.path, ["commit", "--no-verify", "-m", "page limits"])
+    sha = git(ctx.path, ["rev-parse", "HEAD"]) |> String.trim()
+    {:ok, _} = RunLedger.update(ctx.store, "run", %{candidate_sha: sha})
+    Store.query!(ctx.store, "UPDATE factory_tasks SET workspace_sha=? WHERE task_key='writer'", [sha])
+    pin_base(%{ctx | sha: sha})
+    cap = prepare(%{ctx | sha: sha})
+
+    for path <- ~w(long escaped) do
+      assert %{"success" => false} = revision(cap, "repo_read", %{"path" => path, "start_line" => 1})
+      assert %{"success" => true} = revision(cap, "repo_read_binary", %{"path" => path, "offset" => 0})
+    end
+
+    assert %{"success" => true} = first = revision(cap, "repo_read", %{"path" => "lines", "start_line" => 1})
+    assert decoded(first)["next_line"] == 101
+    assert %{"success" => true} = last = revision(cap, "repo_read", %{"path" => "lines", "start_line" => 101})
+    assert decoded(last)["text"] == "101"
+    assert decoded(last)["next_line"] == nil
+  end
+
+  test "CI repair rejects out-of-scope mutations before journaling or dispatch", ctx do
+    cap = prepare(ctx)
+    {:ok, %{run: prior}} = RunLedger.update(ctx.store, "run", %{state: "REPAIRING", code_repair_round: 1, repair_findings_json: ~s({"kind":"TICKET_CI_REPAIR","claim_key":"ci-claim"})})
+    assert %{"success" => false} = missing = call(cap, "repo_write", edit(digest("base\n")))
+    assert decoded(missing)["error"] == ":ci_repair_scope_unproven"
+    assert Store.query!(ctx.store, "SELECT * FROM worker_file_operations").rows == []
+
+    claim = %{
+      "kind" => "TICKET_CI_REPAIR",
+      "claim_key" => "ci-claim",
+      "round" => 1,
+      "prior_run" => prior,
+      "source_task" => Store.one!(ctx.store, "SELECT * FROM factory_tasks WHERE task_key='writer'"),
+      "allowed_writer_paths" => ["fixture.txt"],
+      "required_generated_paths" => ["BUILD"]
+    }
+
+    raw = Jason.encode!(claim)
+    Store.query!(ctx.store, "INSERT INTO ticket_ci_repair_diagnoses VALUES ('ci-diagnosis', 'run', ?, 99, '{}', ?, '{}', ?, 'REPAIRABLE', 'now')", [ctx.sha, digest("{}"), digest("{}")])
+    Store.query!(ctx.store, "INSERT INTO ticket_ci_repair_claims VALUES ('ci-claim', 'ci-diagnosis', 'run', 1, ?, ?, 'now')", [raw, digest(raw)])
+    {:ok, _} = RunLedger.update(ctx.store, "run", %{code_repair_round: 2})
+    assert %{"success" => false} = wrong_round = call(cap, "repo_write", edit(digest("base\n")))
+    assert decoded(wrong_round)["error"] == ":ci_repair_scope_unproven"
+    assert Store.query!(ctx.store, "SELECT * FROM worker_file_operations").rows == []
+    {:ok, _} = RunLedger.update(ctx.store, "run", %{code_repair_round: 1})
+
+    for {tool, args} <- [
+          {"repo_write", edit("ABSENT", "unsafe\n", "other.go")},
+          {"repo_write", edit("ABSENT", "unsafe\n", ".gitlab-ci.yml")},
+          {"repo_write", edit("ABSENT", "unsafe\n", "BUILD")},
+          {"repo_delete", %{"path" => "other.go", "expected_sha256" => digest("x")}},
+          {"repo_mkdir", %{"path" => "new-dir"}},
+          {"repo_mkdir", %{"path" => "fixture.txt"}},
+          {"repo_write_binary", %{"path" => "fixture.txt", "expected_sha256" => digest("base\n"), "content_base64" => Base.encode64("unsafe")}},
+          {"repo_write_binary", %{"path" => "binary", "expected_sha256" => "ABSENT", "content_base64" => Base.encode64("unsafe")}}
+        ] do
+      assert %{"success" => false} = result = call(cap, tool, args)
+      assert decoded(result)["error"] == ":ci_repair_path_not_authorized"
+      assert Store.query!(ctx.store, "SELECT * FROM worker_file_operations").rows == []
+    end
+
+    assert File.read!(Path.join(ctx.path, "fixture.txt")) == "base\n"
+    assert %{"success" => true} = call(cap, "repo_write", edit(digest("base\n")))
+    assert File.read!(Path.join(ctx.path, "fixture.txt")) == "edited\n"
+  end
+
   defp starting(ctx) do
     {:ok, _} = WorkspaceAccess.acquire(ctx.store, attrs(ctx), opts(ctx))
     policy = TicketWorkerRunner.policy("SOURCE", ctx.path)
@@ -81,6 +387,7 @@ defmodule SymphonyElixir.FactoryWorkerFileToolsTest do
 
   defp identity(tool, call \\ "call"), do: %{"threadId" => "worker", "turnId" => "turn", "callId" => call, "tool" => tool}
   defp call(cap, tool, args, id \\ nil), do: WorkerFileTools.execute(cap, tool, args, id || identity(tool))
+  defp revision(cap, tool, args, id \\ nil), do: call(cap, tool, Map.update!(args, "path", &(".symphony-base/" <> &1)), id)
   defp decoded(%{"contentItems" => [%{"text" => text}]}), do: Jason.decode!(text)
   defp read(cap, path \\ "fixture.txt"), do: call(cap, "repo_read", %{"path" => path, "start_line" => 1})
   defp edit(hash, content \\ "edited\n", path \\ "fixture.txt"), do: %{"path" => path, "expected_sha256" => hash, "content" => content}
@@ -116,7 +423,9 @@ defmodule SymphonyElixir.FactoryWorkerFileToolsTest do
     assert %{"success" => false} = call(cap, "repo_write", args, identity("repo_write", "second"))
     assert Store.one!(ctx.store, "SELECT COUNT(*) AS count FROM worker_file_operations")["count"] == 1
     assert :ok = WorkerFileTools.reconcile(ctx.store, cap.key)
-    assert Enum.map(WorkerFileTools.tool_specs(), & &1["name"]) == ~w(repo_read repo_list repo_write repo_delete repo_mkdir repo_read_binary repo_write_binary)
+
+    assert Enum.map(WorkerFileTools.tool_specs(), & &1["name"]) ==
+             ~w(repo_read repo_list repo_write repo_delete repo_mkdir repo_read_binary repo_write_binary)
   end
 
   test "a real failed reader cannot report success or grant source authority", ctx do

@@ -5,6 +5,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   require Logger
   alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH}
+  alias SymphonyElixir.Codex.OutputSchema
   alias SymphonyElixir.Factory.WorkerFileTools
 
   @initialize_id 1
@@ -34,7 +35,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @thread_list_source_kinds ~w(cli vscode exec appServer subAgent subAgentReview subAgentCompact subAgentThreadSpawn subAgentOther unknown)
   @thread_unsubscribe_timeout_ms 1_000
   @port_line_bytes 1_048_576
-  @ticket_worker_runtime_versions ~w(0.160.0 0.162.0-alpha.2 0.162.0-alpha.17.2)
+  @ticket_worker_runtime_versions ~w(0.160.0 0.162.0-alpha.2 0.162.0-alpha.17.2 0.163.0-alpha.10.2 0.163.0-alpha.11 0.163.0-alpha.11.1 0.163.0-alpha.11.2 0.164.0-alpha.11.1)
   @max_stream_log_bytes 1_000
   @mcp_startup_statuses_key {__MODULE__, :mcp_startup_statuses}
   @mcp_approval_state_key {__MODULE__, :mcp_approval_state}
@@ -56,6 +57,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           reasoning_effort: String.t() | nil,
           worker_policy: map() | nil,
           worker_files: map() | nil,
+          native_recovery: map() | nil,
+          recovery_preflight: (map() -> :ok | {:error, term()}) | nil,
           worker_invocation: String.t() | nil,
           workspace: Path.t(),
           worker_host: String.t() | nil,
@@ -120,6 +123,7 @@ defmodule SymphonyElixir.Codex.AppServer do
            start_session(workspace,
              ephemeral: true,
              required_mcp_servers: ["Jira"],
+             factory_jira_controller: true,
              mcp_startup_timeout_ms: 60_000,
              service_name: "symphony-factory-connector",
              thread_source: "symphonyFactoryConnector"
@@ -223,6 +227,8 @@ defmodule SymphonyElixir.Codex.AppServer do
       thread_source: Keyword.get(opts, :thread_source, "symphony"),
       worker_access: Keyword.get(opts, :worker_access),
       worker_files: Keyword.get(opts, :worker_files),
+      native_recovery: Keyword.get(opts, :native_recovery),
+      recovery_preflight: Keyword.get(opts, :recovery_preflight),
       worker_policy: nil,
       worker_overrides: []
     }
@@ -232,7 +238,8 @@ defmodule SymphonyElixir.Codex.AppServer do
     try do
       binding = DynamicTool.bind()
 
-      with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
+      with {:ok, connector_overrides} <- factory_connector_overrides(opts, worker_host),
+           {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
            {:ok, thread_options, binding} <- prepare_worker(expanded_workspace, worker_host, thread_options, binding),
            {:ok, port} <-
              start_port(
@@ -240,7 +247,8 @@ defmodule SymphonyElixir.Codex.AppServer do
                worker_host,
                binding,
                thread_options.gitlab_mcp_startup_timeout_sec,
-               thread_options.worker_overrides
+               thread_options.worker_overrides,
+               connector_overrides
              ) do
         metadata = port_metadata(port, worker_host)
 
@@ -273,6 +281,8 @@ defmodule SymphonyElixir.Codex.AppServer do
                reasoning_effort: thread_options.reasoning_effort,
                worker_policy: thread_options.worker_policy,
                worker_files: thread_options.worker_files,
+               native_recovery: thread_options.native_recovery,
+               recovery_preflight: thread_options.recovery_preflight,
                worker_invocation: worker_invocation(thread_options.worker_policy),
                workspace: expanded_workspace,
                worker_host: worker_host,
@@ -307,12 +317,19 @@ defmodule SymphonyElixir.Codex.AppServer do
     with :ok <- WorkerFileTools.turn_preflight(session[:worker_files], session),
          :ok <- file_worker_session_owned(session),
          :ok <- file_worker_runtime(session.port, session.workspace),
-         :ok <- worker_catalog_empty(session.port, session) do
+         :ok <- worker_catalog_empty(session.port, session),
+         :ok <- recovery_turn_preflight(session) do
       run_allowed_turn(session, prompt, issue, opts)
     end
   end
 
-  def run_turn(session, prompt, issue, opts), do: run_allowed_turn(session, prompt, issue, opts)
+  def run_turn(session, prompt, issue, opts) do
+    with :ok <- recovery_turn_preflight(session), do: run_allowed_turn(session, prompt, issue, opts)
+  end
+
+  defp recovery_turn_preflight(%{native_recovery: proof, recovery_preflight: callback} = session) when is_map(proof) and is_function(callback, 1), do: callback.(session)
+  defp recovery_turn_preflight(%{native_recovery: proof}) when is_map(proof), do: {:error, :native_recovery_guard_missing}
+  defp recovery_turn_preflight(_session), do: :ok
 
   defp run_allowed_turn(
          %{
@@ -626,6 +643,33 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   def read_native_thread(_thread_id, _opts), do: {:error, :invalid_native_thread_id}
 
+  @doc "Reads latest-turn and queue evidence using the worker's existing owned native actor."
+  @spec read_owned_native_thread(session()) :: {:ok, map()} | {:error, term()}
+  def read_owned_native_thread(%{port: port, thread_id: thread} = session) do
+    with :ok <- file_worker_session_owned(session),
+         true <- is_nil(Process.get(@turn_event_state_key)) or {:error, :native_recovery_session_busy} do
+      Process.put(@native_read_deadline_key, System.monotonic_time(:millisecond) + 20_000)
+
+      try do
+        send_message(port, %{"method" => "thread/read", "id" => @thread_read_id, "params" => %{"threadId" => thread, "includeTurns" => false}})
+        opts = [include_latest_turn: true, include_queue: true]
+
+        with {:ok, %{"thread" => %{"id" => ^thread} = observed}} <- await_response(port, @thread_read_id),
+             {:ok, observed} <- maybe_read_latest_turn(port, observed, opts),
+             {:ok, observed} <- maybe_read_native_queue(port, observed, opts) do
+          recheck_latest_queue_version(port, observed, opts)
+        else
+          {:error, _} = error -> error
+          _ -> {:error, :native_read_identity_or_history_mismatch}
+        end
+      after
+        Process.delete(@native_read_deadline_key)
+      end
+    end
+  end
+
+  def read_owned_native_thread(_session), do: {:error, :file_worker_session_not_owned}
+
   @doc "Checks the configured runtime without a thread, model turn, connector call or transferable authority."
   @spec check_ticket_runtime(Path.t()) :: :ok | {:error, term()}
   def check_ticket_runtime(workspace) when is_binary(workspace) do
@@ -660,7 +704,11 @@ defmodule SymphonyElixir.Codex.AppServer do
   def check_ticket_runtime(_workspace), do: {:error, :ticket_runtime_cwd_unproven}
 
   defp inspect_ticket_runtime(port) do
-    with {:ok, response} <- initialization_response(port), do: qualify_ticket_runtime_identity(response)
+    with {:ok, response} <- initialization_response(port),
+         :ok <- qualify_ticket_runtime_identity(response) do
+      send_message(port, %{"method" => "initialized", "params" => %{}})
+      :ok
+    end
   rescue
     _ -> {:error, :ticket_runtime_initialization_failed}
   catch
@@ -717,6 +765,55 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp maybe_read_complete_history(port, thread, opts) do
+    if anchor = Keyword.get(opts, :history_after_turn) do
+      with true <- (is_binary(anchor) and byte_size(anchor) in 1..256) or {:error, :native_history_anchor_invalid},
+           true <- is_number(thread["updatedAt"]) or {:error, :native_history_version_missing},
+           {:ok, turns} <- read_anchored_turn_pages(port, thread["id"], anchor, nil, [], [], 0),
+           :ok <- unchanged_native_history(port, thread) do
+        {:ok,
+         thread
+         |> Map.put("turns", turns)
+         |> Map.put("history_observation", %{"mode" => "PAGED_AFTER_ANCHOR", "anchor_turn_id" => anchor, "turn_count" => length(turns), "updated_at" => thread["updatedAt"]})}
+      end
+    else
+      read_complete_history(port, thread, opts)
+    end
+  end
+
+  defp read_anchored_turn_pages(_port, _thread, _anchor, _cursor, _seen, _turns, pages) when pages >= 20, do: {:error, :native_history_anchor_budget_exhausted}
+
+  defp read_anchored_turn_pages(port, thread, anchor, cursor, seen, turns, pages) do
+    params = %{"threadId" => thread, "limit" => 5, "sortDirection" => "desc", "itemsView" => "full"}
+    params = if is_nil(cursor), do: params, else: Map.put(params, "cursor", cursor)
+    send_message(port, %{"method" => "thread/turns/list", "id" => @native_turn_list_id, "params" => params})
+
+    with {:ok, %{"data" => page, "nextCursor" => next}} when is_list(page) <- await_response(port, @native_turn_list_id),
+         :ok <- validate_full_turn_items(page),
+         all = turns ++ page,
+         :ok <- validate_native_turn_ids(all) do
+      case Enum.find_index(all, &(&1["id"] == anchor)) do
+        index when is_integer(index) ->
+          {:ok, all |> Enum.take(index + 1) |> Enum.reverse()}
+
+        nil when is_binary(next) and next != "" ->
+          continue_anchored_pages(port, thread, anchor, next, seen, all, pages)
+
+        _ ->
+          {:error, :native_history_anchor_missing}
+      end
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :native_history_page_invalid}
+    end
+  end
+
+  defp continue_anchored_pages(port, thread, anchor, next, seen, all, pages) do
+    if next in seen,
+      do: {:error, :native_history_cursor_invalid},
+      else: read_anchored_turn_pages(port, thread, anchor, next, [next | seen], all, pages + 1)
+  end
+
+  defp read_complete_history(port, thread, opts) do
     if Keyword.get(opts, :complete_history, false) do
       with true <- is_number(thread["updatedAt"]) or {:error, :native_history_version_missing},
            {:ok, turns} <- read_turn_pages(port, thread["id"], nil, [], [], 0),
@@ -970,19 +1067,36 @@ defmodule SymphonyElixir.Codex.AppServer do
     do: start_port(workspace, worker_host, dynamic_tool_binding, gitlab_mcp_startup_timeout_sec, [])
 
   defp start_port(workspace, nil, dynamic_tool_binding, gitlab_mcp_startup_timeout_sec, overrides) do
+    start_port(workspace, nil, dynamic_tool_binding, gitlab_mcp_startup_timeout_sec, overrides, [])
+  end
+
+  defp start_port(_workspace, host, _binding, _timeout, [_ | _]) when is_binary(host), do: {:error, :worker_remote_profile_unsupported}
+
+  defp start_port(workspace, worker_host, dynamic_tool_binding, gitlab_mcp_startup_timeout_sec, [])
+       when is_binary(worker_host) do
+    remote_command = remote_launch_command(workspace, dynamic_tool_binding, gitlab_mcp_startup_timeout_sec)
+    SSH.start_port(worker_host, remote_command, line: @port_line_bytes)
+  end
+
+  defp start_port(workspace, host, binding, timeout, overrides, []) when is_binary(host),
+    do: start_port(workspace, host, binding, timeout, overrides)
+
+  defp start_port(_workspace, host, _binding, _timeout, _overrides, [_ | _]) when is_binary(host),
+    do: {:error, :factory_connector_remote_unsupported}
+
+  defp start_port(workspace, nil, dynamic_tool_binding, gitlab_mcp_startup_timeout_sec, overrides, connector_overrides) do
     executable = System.find_executable("bash")
 
     if is_nil(executable) do
       {:error, :bash_not_found}
     else
-      arguments = Enum.map_join(overrides, "", &(" --config " <> shell_escape(&1)))
+      arguments = Enum.map_join(overrides ++ connector_overrides, "", &(" --config " <> shell_escape(&1)))
       command = local_launch_command(dynamic_tool_binding, gitlab_mcp_startup_timeout_sec) <> arguments
 
       port =
         Port.open({:spawn_executable, String.to_charlist(executable)}, [
           :binary,
           :exit_status,
-          :stderr_to_stdout,
           args: [~c"-lc", String.to_charlist(command)],
           cd: String.to_charlist(workspace),
           env: worker_port_env(dynamic_tool_binding, overrides),
@@ -993,13 +1107,28 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_port(_workspace, host, _binding, _timeout, [_ | _]) when is_binary(host), do: {:error, :worker_remote_profile_unsupported}
-
-  defp start_port(workspace, worker_host, dynamic_tool_binding, gitlab_mcp_startup_timeout_sec, [])
-       when is_binary(worker_host) do
-    remote_command = remote_launch_command(workspace, dynamic_tool_binding, gitlab_mcp_startup_timeout_sec)
-    SSH.start_port(worker_host, remote_command, line: @port_line_bytes)
+  defp factory_connector_overrides(opts, worker_host) do
+    if Keyword.get(opts, :factory_jira_controller, false) do
+      if is_nil(worker_host) and is_nil(opts[:worker_access]) and opts[:ephemeral] == true and opts[:required_mcp_servers] == ["Jira"],
+        do: jira_connector_overrides(Config.settings!().factory.jira_connector),
+        else: {:error, :factory_connector_route_invalid}
+    else
+      {:ok, []}
+    end
   end
+
+  defp jira_connector_overrides(config) when config == %{}, do: {:ok, []}
+
+  defp jira_connector_overrides(%{"command" => command, "args" => args} = config) when is_binary(command) and is_list(args) do
+    if Enum.sort(Map.keys(config)) == ~w(args command) and not String.contains?(command, <<0>>) and Path.type(command) == :absolute and File.regular?(command) and
+         Enum.all?(args, &(is_binary(&1) and not String.contains?(&1, <<0>>))) do
+      {:ok, ["mcp_servers.Jira.command=" <> Jason.encode!(command), "mcp_servers.Jira.args=" <> Jason.encode!(args)]}
+    else
+      {:error, :factory_jira_connector_invalid}
+    end
+  end
+
+  defp jira_connector_overrides(_config), do: {:error, :factory_jira_connector_invalid}
 
   defp local_launch_command(dynamic_tool_binding, gitlab_mcp_startup_timeout_sec) do
     [
@@ -1900,7 +2029,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       }
       |> put_if_present("model", turn_options.model)
       |> put_if_present("effort", turn_options.reasoning_effort)
-      |> put_if_present("outputSchema", turn_options.output_schema)
+      |> put_if_present("outputSchema", OutputSchema.for_provider(turn_options.output_schema))
       |> worker_params(turn_options.worker_policy)
 
     request_id = turn_options.request_id

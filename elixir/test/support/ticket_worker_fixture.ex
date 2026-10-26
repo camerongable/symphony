@@ -16,18 +16,52 @@ defmodule SymphonyElixir.TicketWorkerFixture do
     git(repo, ["config", "user.email", "fixture@example.test"])
     File.write!(Path.join(repo, "fixture.txt"), "base\n")
     git(repo, ["add", "fixture.txt"])
+
+    if context[:ordinary_go_generation] || context[:qualified_go_routing] do
+      for package <- ~w(dep pkg moved), do: File.mkdir_p!(Path.join(repo, package))
+
+      files = %{
+        "WORKSPACE" => "workspace(name = \"fixture\")\n",
+        "BUILD" => "# gazelle:prefix example.invalid/fixture\n",
+        "dep/dep.go" => "package dep\n\nconst Value = 1\n",
+        "dep/BUILD" =>
+          "load(\"@io_bazel_rules_go//go:def.bzl\", \"go_library\")\n\ngo_library(\n    name = \"dep\",\n    srcs = [\"dep.go\"],\n    importpath = \"example.invalid/fixture/dep\",\n    visibility = [\"//visibility:public\"],\n)\n",
+        "pkg/old.go" => "package pkg\n\nconst Value = 0\n",
+        "pkg/BUILD" =>
+          "load(\"@io_bazel_rules_go//go:def.bzl\", \"go_library\")\n\ngo_library(\n    name = \"pkg\",\n    srcs = [\"old.go\"],\n    importpath = \"example.invalid/fixture/pkg\",\n    visibility = [\"//visibility:public\"],\n)\n"
+      }
+
+      Enum.each(files, fn {path, content} -> File.write!(Path.join(repo, path), content) end)
+      git(repo, ["add" | Map.keys(files)])
+    end
+
     git(repo, ["commit", "--no-verify", "-m", "base"])
     git(repo, ["branch", "-M", "master"])
     git(repo, ["update-ref", "refs/remotes/origin/master", "HEAD"])
     path = Path.join(root, "workspaces/source")
     git(repo, ["worktree", "add", "-b", "cgable/fixture", path, "HEAD"])
+    if context[:ordinary_go_generation] || context[:qualified_go_routing], do: File.mkdir_p!(Path.join(path, "moved"))
     sha = git(path, ["rev-parse", "HEAD"]) |> String.trim()
     database = Path.join(root, "factory.sqlite")
     store = ExUnit.Callbacks.start_supervised!({Store, database: database})
-    ExUnit.Callbacks.on_exit(fn -> File.rm_rf!(root) end)
+
+    ExUnit.Callbacks.on_exit(fn ->
+      if retain_fixture?(context),
+        do: IO.puts("retained owned lifecycle fixture: #{root}"),
+        else: File.rm_rf!(root)
+    end)
+
     ctx = Map.merge(context, %{store: store, root: root, repo: repo, path: path, sha: sha, database: database})
     if context[:unregistered] != true, do: register(ctx, "run", "PPL-123", "writer")
     ctx
+  end
+
+  defp retain_fixture?(context) do
+    (context[:ordinary_go_generation] == true and System.get_env("RETAIN_ORDINARY_GENERATION_FIXTURE") == "1") or
+      (context[:late_ten_budget] == true and System.get_env("RETAIN_LATE_TEN_FIXTURE") == "1") or
+      (context[:push_packet_history] == true and System.get_env("RETAIN_PUSH_PACKET_FIXTURE") == "1") or
+      (context[:push_prepared_requalification] == true and System.get_env("RETAIN_PREPARED_PUSH_FIXTURE") == "1") or
+      context[:ci_generated_only] == true
   end
 
   def register(ctx, run_id, issue, task_key, path \\ nil, branch \\ "cgable/fixture") do

@@ -4,9 +4,9 @@ defmodule Mix.Tasks.Factory.Desktop do
   alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.Factory.{ContractChat, DesktopRequest, DesktopToolArgs, NativeSessionDiscovery}
   alias SymphonyElixir.Factory.{DesktopMrHandshake, NativeMaintenanceEvidence}
-  alias SymphonyElixir.Factory.NativeWorkspaceMaintenance
-  alias SymphonyElixir.Factory.{Policy, Store, TicketChat, TicketMrOperation}
-  alias SymphonyElixir.Workflow
+  alias SymphonyElixir.Factory.{NativeWorkspaceMaintenance, TicketMrCompletion}
+  alias SymphonyElixir.Factory.{Policy, RunLedger, Store, TicketChat, TicketMrCwdCorrection, TicketMrOperation}
+  alias SymphonyElixir.{Config, Workflow}
 
   @shortdoc "Exchange durable factory requests with a Codex Desktop broker"
 
@@ -23,15 +23,32 @@ defmodule Mix.Tasks.Factory.Desktop do
       mix factory.desktop claim-ticket-followup REQUEST_KEY --source-thread-id BROKER_THREAD_ID --payload-base64 OWNER_OBSERVATION --workflow /path/to/WORKFLOW.md
       mix factory.desktop claim-ticket-mr REQUEST_KEY --source-thread-id BROKER_THREAD_ID --payload-base64 GUARD_OBSERVATION --workflow /path/to/WORKFLOW.md
       mix factory.desktop claim-ticket-mr-interactive REQUEST_KEY --source-thread-id BROKER_THREAD_ID --workflow /path/to/WORKFLOW.md
+      mix factory.desktop claim-ticket-mr-owner REQUEST_KEY --source-thread-id BROKER_THREAD_ID --payload-base64 OWNER_OBSERVATION --workflow /path/to/WORKFLOW.md
+      mix factory.desktop correct-ticket-mr-owner REQUEST_KEY EXPECTED_OLD_PAYLOAD_SHA --source-thread-id BROKER_THREAD_ID --payload-base64 OWNER_OBSERVATION --workflow /path/to/WORKFLOW.md
+      mix factory.desktop mr-actor-audit REQUEST_KEY --workflow /path/to/WORKFLOW.md
+      mix factory.desktop prepare-ticket-mr-correction REQUEST_KEY EXPECTED_OLD_PAYLOAD_SHA --source-thread-id BROKER_THREAD_ID --workflow /path/to/WORKFLOW.md
+      mix factory.desktop finalize-ticket-mr-correction REQUEST_KEY HANDLE --source-thread-id BROKER_THREAD_ID --payload-base64 OWNER_OBSERVATION --workflow /path/to/WORKFLOW.md
+      mix factory.desktop prepare-ticket-mr-claim REQUEST_KEY --source-thread-id BROKER_THREAD_ID --workflow /path/to/WORKFLOW.md
+      mix factory.desktop finalize-ticket-mr-claim REQUEST_KEY HANDLE --source-thread-id BROKER_THREAD_ID --payload-base64 OWNER_OBSERVATION --workflow /path/to/WORKFLOW.md
+      mix factory.desktop prepare-ticket-mr-recovery REQUEST_KEY --source-thread-id BROKER_THREAD_ID --workflow /path/to/WORKFLOW.md
+      mix factory.desktop finalize-ticket-mr-recovery REQUEST_KEY HANDLE --source-thread-id BROKER_THREAD_ID --payload-base64 OWNER_OBSERVATION --workflow /path/to/WORKFLOW.md
+
       mix factory.desktop record-thread REQUEST_KEY THREAD_ID VERIFIED_PROJECT_ID --verified-cwd PATH --verified-head-sha SHA --workflow /path/to/WORKFLOW.md
       mix factory.desktop record-ticket-thread REQUEST_KEY --payload-base64 BASE64_JSON --workflow /path/to/WORKFLOW.md
-      mix factory.desktop read-ticket-turn REQUEST_KEY THREAD_ID --source-thread-id BROKER_THREAD_ID --include-completion --workflow /path/to/WORKFLOW.md
+      mix factory.desktop read-ticket-turn REQUEST_KEY THREAD_ID --source-thread-id BROKER_THREAD_ID --include-completion --include-target-observation --workflow /path/to/WORKFLOW.md
       mix factory.desktop reconcile-negative-ticket-presentation REQUEST_KEY THREAD_ID --source-thread-id BROKER_THREAD_ID --workflow /path/to/WORKFLOW.md
       mix factory.desktop complete REQUEST_KEY --payload-base64 BASE64_JSON --workflow /path/to/WORKFLOW.md
+      mix factory.desktop complete-ticket-mr REQUEST_KEY TURN_ID --source-thread-id BROKER_THREAD_ID --workflow /path/to/WORKFLOW.md
       mix factory.desktop record-maintenance-evidence REQUEST_KEY --payload-base64 BASE64_JSON --workflow /path/to/WORKFLOW.md
       mix factory.desktop record-user-reply TASK_KEY --payload-base64 BASE64_JSON --workflow /path/to/WORKFLOW.md
       mix factory.desktop fail REQUEST_KEY FAILURE_CODE --workflow /path/to/WORKFLOW.md
       mix factory.desktop fail REQUEST_KEY CREATE_THREAD_INVALID_ARGUMENTS --rejected-tool-call-id ID --tool-error "create_thread received invalid arguments" --workflow /path/to/WORKFLOW.md
+
+  Correction only pins an audited unissued request; it does not claim or send.
+  Prepare only qualifies; it does not correct, claim or send. Obtain fresh owner evidence
+  after prepare. Handles are single-use and lost on service restart. Finalize correction
+  still does not claim or send; finalize claim returns send arguments only after commit.
+  Read the audit back, then obtain fresh owner evidence for the separate claim command.
 
   `claim` makes the external operation uncertain before it is issued. Read back
   the native task and its project after creation before `record-thread`; read
@@ -47,6 +64,7 @@ defmodule Mix.Tasks.Factory.Desktop do
     sessions_root: :string,
     source_thread_id: :string,
     include_completion: :boolean,
+    include_target_observation: :boolean,
     rejected_tool_call_id: :string,
     tool_error: :string,
     help: :boolean
@@ -76,7 +94,7 @@ defmodule Mix.Tasks.Factory.Desktop do
     try do
       Workflow.set_workflow_file_path(path)
       factory = load_factory!(path)
-      {:ok, store} = Store.start_link(database: factory.database)
+      {:ok, store} = start_store(action, factory.database)
       ticket_policy = if Policy.validate(factory) == :ok, do: factory.ticket_supervisor, else: %{}
       mr_factory = if Policy.validate(factory) == :ok, do: factory, else: nil
 
@@ -104,6 +122,84 @@ defmodule Mix.Tasks.Factory.Desktop do
     end
   end
 
+  defp start_store([command | _], database) when command in ~w(list maintenance-plan show mr-actor-audit create-thread-args followup-args) do
+    if database != ":memory:" and File.exists?(database),
+      do: Store.start_read_only(database: Path.expand(database)),
+      else: Store.start_link(database: database)
+  end
+
+  defp start_store(_action, database), do: Store.start_link(database: database)
+
+  @doc "Executes bounded ticket-parent and owner-only typed MR operations in the service environment."
+  @spec runtime_operation([String.t()], Store.connection(), Schema.Factory.t()) :: term()
+  def runtime_operation(args, store, factory) do
+    {opts, action, invalid} = OptionParser.parse(args, strict: @switches)
+    allowed = ~w(claim claim-ticket-followup claim-ticket-mr-owner correct-ticket-mr-owner complete-ticket-mr read-ticket-turn record-ticket-thread complete reconcile-negative-ticket-presentation)
+
+    with [command, key | _] <- action,
+         true <- command in allowed and invalid == [] and valid_action?(action, opts),
+         true <- Path.expand(opts[:workflow] || "") == factory.ticket_supervisor["ticket_workflow"],
+         :ok <- Policy.validate(factory),
+         {:ok, request} <- DesktopRequest.get(store, key),
+         true <- runtime_request?(command, request) do
+      opts = opts |> Keyword.put(:ticket_policy, factory.ticket_supervisor) |> Keyword.put(:factory, factory)
+      execute_guarded(action, store, opts)
+    else
+      _ -> {:error, :broker_runtime_operation_forbidden}
+    end
+  end
+
+  @doc false
+  @spec owner_runtime_args([String.t()], Store.connection(), Schema.Factory.t()) :: {:ok, map()} | {:error, term()}
+  def owner_runtime_args(args, store, factory) do
+    {opts, action, invalid} = OptionParser.parse(args, strict: @switches)
+
+    with true <- invalid == [] and valid_action?(action, opts),
+         true <- Enum.all?(Keyword.keys(opts), &(&1 in [:workflow, :source_thread_id, :payload_base64])),
+         true <- Path.expand(opts[:workflow] || "") == factory.ticket_supervisor["ticket_workflow"],
+         :ok <- Policy.validate(factory),
+         {:ok, input} <- owner_action(action),
+         {:ok, request} <- DesktopRequest.get(store, input.key),
+         true <- TicketMrOperation.typed_request?(request),
+         {:ok, delivery_opts} <- owner_prepare_options(input, store, input.key, factory) do
+      {:ok, Map.merge(input, %{broker: opts[:source_thread_id], owner_payload: opts[:payload_base64], opts: delivery_opts})}
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :broker_runtime_operation_forbidden}
+    end
+  end
+
+  defp owner_action(["prepare-ticket-mr-correction", key, sha]), do: {:ok, %{phase: :prepare, action: :correct, key: key, expected_sha: sha}}
+  defp owner_action(["prepare-ticket-mr-claim", key]), do: {:ok, %{phase: :prepare, action: :claim, key: key, expected_sha: nil}}
+  defp owner_action(["prepare-ticket-mr-recovery", key]), do: {:ok, %{phase: :prepare, action: :recover, key: key, expected_sha: nil}}
+  defp owner_action(["finalize-ticket-mr-correction", key, handle]), do: {:ok, %{phase: :finalize, action: :correct, key: key, handle: handle}}
+  defp owner_action(["finalize-ticket-mr-claim", key, handle]), do: {:ok, %{phase: :finalize, action: :claim, key: key, handle: handle}}
+  defp owner_action(["finalize-ticket-mr-recovery", key, handle]), do: {:ok, %{phase: :finalize, action: :recover, key: key, handle: handle}}
+  defp owner_action(_action), do: {:error, :broker_runtime_operation_forbidden}
+
+  defp owner_prepare_options(%{phase: :prepare, action: :recover}, store, key, factory), do: owner_delivery_options(store, key, factory, :recover)
+  defp owner_prepare_options(%{phase: :prepare}, store, key, factory), do: owner_delivery_options(store, key, factory)
+  defp owner_prepare_options(%{phase: :finalize}, _store, _key, _factory), do: {:ok, []}
+
+  @doc false
+  @spec owner_runtime_observation(map()) :: {:ok, map()} | {:error, term()}
+  def owner_runtime_observation(input) do
+    with {:ok, json} <- Base.decode64(input.owner_payload),
+         {:ok, owner} <- DesktopMrHandshake.parse(json, input.key, input.broker) do
+      {:ok, owner}
+    else
+      :error -> {:error, :mr_owner_input_invalid}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp runtime_request?("claim-ticket-mr-owner", request), do: TicketMrOperation.typed_request?(request)
+  defp runtime_request?("correct-ticket-mr-owner", request), do: TicketMrOperation.typed_request?(request)
+  defp runtime_request?("complete-ticket-mr", request), do: TicketMrOperation.typed_request?(request)
+  defp runtime_request?("complete", %{"target_kind" => "CONTROLLER"} = request), do: TicketMrOperation.typed_request?(request)
+  defp runtime_request?(_command, %{"target_kind" => "TICKET_CHAT"}), do: true
+  defp runtime_request?(_command, _request), do: false
+
   defp execute_guarded([command, key | _] = action, store, opts)
        when command in ["find-thread", "record-thread", "record-maintenance-evidence", "record-ticket-thread", "read-ticket-turn", "complete", "fail"] do
     case DesktopRequest.get(store, key) do
@@ -128,6 +224,17 @@ defmodule Mix.Tasks.Factory.Desktop do
   defp valid_action?(["list"], _opts), do: true
   defp valid_action?(["maintenance-plan"], _opts), do: true
   defp valid_action?(["show", key], _opts), do: key != ""
+  defp valid_action?(["mr-actor-audit", key], _opts), do: key != ""
+
+  defp valid_action?(["prepare-ticket-mr-correction", key, sha], opts),
+    do: key != "" and String.match?(sha, ~r/\A[0-9a-f]{64}\z/) and is_binary(opts[:source_thread_id]) and is_nil(opts[:payload_base64])
+
+  defp valid_action?([command, key], opts) when command in ["prepare-ticket-mr-claim", "prepare-ticket-mr-recovery"],
+    do: key != "" and is_binary(opts[:source_thread_id]) and is_nil(opts[:payload_base64])
+
+  defp valid_action?([command, key, handle], opts) when command in ["finalize-ticket-mr-correction", "finalize-ticket-mr-claim", "finalize-ticket-mr-recovery"],
+    do: key != "" and String.match?(handle, ~r/\A[0-9a-f]{64}\z/) and is_binary(opts[:source_thread_id]) and is_binary(opts[:payload_base64])
+
   defp valid_action?(["create-thread-args", key], _opts), do: key != ""
   defp valid_action?(["followup-args", key], _opts), do: key != ""
   defp valid_action?(["read-ticket-turn", key, thread], opts), do: key != "" and thread != "" and is_binary(opts[:source_thread_id])
@@ -136,12 +243,21 @@ defmodule Mix.Tasks.Factory.Desktop do
   defp valid_action?(["claim", key], _opts), do: key != ""
   defp valid_action?(["claim-ticket-followup", key], opts), do: key != "" and is_binary(opts[:source_thread_id]) and is_binary(opts[:payload_base64])
   defp valid_action?(["claim-ticket-mr", key], opts), do: key != "" and is_binary(opts[:source_thread_id]) and is_binary(opts[:payload_base64])
+  defp valid_action?(["claim-ticket-mr-owner", key], opts), do: key != "" and is_binary(opts[:source_thread_id]) and is_binary(opts[:payload_base64])
+
+  defp valid_action?(["correct-ticket-mr-owner", key, sha], opts),
+    do: key != "" and String.match?(sha, ~r/\A[0-9a-f]{64}\z/) and is_binary(opts[:source_thread_id]) and is_binary(opts[:payload_base64])
+
   defp valid_action?(["claim-ticket-mr-interactive", key], opts), do: key != "" and is_binary(opts[:source_thread_id]) and is_nil(opts[:payload_base64])
 
   defp valid_action?(["record-thread", key, thread_id, project_id], _opts),
     do: key != "" and thread_id != "" and project_id != ""
 
   defp valid_action?(["complete", key], opts), do: key != "" and is_binary(opts[:payload_base64])
+
+  defp valid_action?(["complete-ticket-mr", key, turn], opts),
+    do: key != "" and turn != "" and is_binary(opts[:source_thread_id]) and Enum.all?(Keyword.keys(opts), &(&1 in [:workflow, :source_thread_id]))
+
   defp valid_action?(["record-ticket-thread", key], opts), do: key != "" and is_binary(opts[:payload_base64])
   defp valid_action?(["record-maintenance-evidence", key], opts), do: key != "" and is_binary(opts[:payload_base64])
   defp valid_action?(["record-user-reply", key], opts), do: key != "" and is_binary(opts[:payload_base64])
@@ -168,12 +284,13 @@ defmodule Mix.Tasks.Factory.Desktop do
   end
 
   defp execute(["show", key], store, _opts), do: DesktopRequest.get(store, key)
+  defp execute(["mr-actor-audit", key], store, _opts), do: TicketMrCwdCorrection.readback(store, key)
 
   defp execute(["create-thread-args", key], store, opts), do: DesktopToolArgs.create_thread(store, key, opts)
   defp execute(["followup-args", key], store, opts), do: DesktopToolArgs.followup(store, key, opts)
 
   defp execute(["read-ticket-turn", key, thread], store, opts) do
-    read_opts = [include_completion: opts[:include_completion] || false]
+    read_opts = [include_completion: opts[:include_completion] || false, include_target_observation: opts[:include_target_observation] || false]
     TicketChat.read_native_turn(store, key, thread, opts[:source_thread_id], read_opts)
   end
 
@@ -233,6 +350,58 @@ defmodule Mix.Tasks.Factory.Desktop do
     end
   end
 
+  defp execute(["claim-ticket-mr-owner", key], store, opts) do
+    factory = Keyword.fetch!(opts, :factory)
+    broker = opts[:source_thread_id]
+
+    with :ok <- Policy.validate(factory),
+         true <- factory.ticket_supervisor["enabled"] == true or {:error, :ticket_mr_new_admission_disabled},
+         {:ok, json} <- Base.decode64(opts[:payload_base64]),
+         {:ok, owner} <- DesktopMrHandshake.parse(json, key, broker),
+         {:ok, delivery_opts} <- owner_delivery_options(store, key, factory) do
+      TicketMrOperation.claim_with_owner(store, key, factory, broker, fn _request -> {:ok, owner} end, delivery_opts)
+      |> compact_mr_claim()
+    else
+      :error -> {:error, :mr_owner_input_invalid}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp execute([command | _] = action, _store, opts)
+       when command in [
+              "prepare-ticket-mr-correction",
+              "prepare-ticket-mr-claim",
+              "prepare-ticket-mr-recovery",
+              "finalize-ticket-mr-correction",
+              "finalize-ticket-mr-claim",
+              "finalize-ticket-mr-recovery"
+            ] do
+    args =
+      Enum.reduce([:workflow, :source_thread_id, :payload_base64], action, fn option, result ->
+        case opts[option] do
+          value when is_binary(value) -> result ++ ["--" <> (option |> Atom.to_string() |> String.replace("_", "-")), value]
+          _ -> result
+        end
+      end)
+
+    SymphonyElixir.Factory.BrokerRuntime.call(args)
+  end
+
+  defp execute(["correct-ticket-mr-owner", key, sha], store, opts) do
+    factory = Keyword.fetch!(opts, :factory)
+    broker = opts[:source_thread_id]
+
+    with :ok <- Policy.validate(factory),
+         {:ok, json} <- Base.decode64(opts[:payload_base64]),
+         {:ok, owner} <- DesktopMrHandshake.parse(json, key, broker),
+         {:ok, delivery_opts} <- owner_delivery_options(store, key, factory) do
+      TicketMrCwdCorrection.correct(store, key, sha, factory, broker, owner, delivery_opts)
+    else
+      :error -> {:error, :mr_owner_input_invalid}
+      {:error, _} = error -> error
+    end
+  end
+
   defp execute(["record-thread", key, thread_id, project_id], store, opts) do
     with {:ok, proof} <- record_proof(opts) do
       DesktopRequest.record_thread(store, key, thread_id, project_id, proof)
@@ -251,6 +420,9 @@ defmodule Mix.Tasks.Factory.Desktop do
       {:error, reason} -> {:error, {:invalid_completion_payload, reason}}
     end
   end
+
+  defp execute(["complete-ticket-mr", key, turn], store, opts),
+    do: TicketMrCompletion.complete(store, key, turn, opts[:source_thread_id])
 
   defp execute(["record-maintenance-evidence", key], store, opts) do
     with {:ok, json} <- Base.decode64(opts[:payload_base64]),
@@ -291,6 +463,22 @@ defmodule Mix.Tasks.Factory.Desktop do
       reason -> Mix.raise("Unable to resolve factory configuration: #{inspect(reason)}")
     end
   end
+
+  defp owner_delivery_options(store, key, factory, action \\ :claim) do
+    with {:ok, request} <- DesktopRequest.get(store, key),
+         :ok <- owner_discovery(action, store, request, factory),
+         {:ok, metadata} <- Jason.decode(request["metadata_json"]),
+         {:ok, run} <- RunLedger.get(store, metadata["delivery_operation"]["run_id"]),
+         {:ok, route} <- Map.fetch(factory.repositories, run["repo_key"]) do
+      {:ok, [workspace_root: Config.local_workspace_root(), capacity_policy: factory, ci_preflight_authorized: route["ci_preflight"] == "draft_mr"]}
+    else
+      :error -> {:error, :ticket_mr_request_binding_mismatch}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp owner_discovery(:recover, store, request, factory), do: TicketMrOperation.authorize_recovery_discovery(store, request, factory)
+  defp owner_discovery(_, store, request, factory), do: TicketMrOperation.authorize_discovery(store, request, factory)
 
   defp compact_mr_claim({:ok, %{request: request, arguments: arguments}}) do
     {:ok, %{request_key: request["request_key"], status: request["status"], arguments: arguments}}

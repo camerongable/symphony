@@ -3,7 +3,19 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
   Resolves model policy, records it before launch, and starts a visible Codex task.
   """
 
-  alias SymphonyElixir.Factory.{DesktopStageRunner, ModelRouter, RunLedger, StageRunner, Store, TaskLedger}
+  alias SymphonyElixir.Factory.{
+    DesktopStageRunner,
+    ModelRouter,
+    ReviewProtocol,
+    RunLedger,
+    SpecialistErrorNotice,
+    StageRunner,
+    Store,
+    TaskLedger,
+    TicketCapabilityRecovery,
+    WorkerInstructions
+  }
+
   alias SymphonyElixir.Factory.{StageSchemas, TicketChat, TicketWorkerRunner, WorkerEvidence, WorkspaceAccess}
   alias SymphonyElixir.Factory.{TicketChatCommands, TicketContractAmendment, TicketPush}
 
@@ -153,6 +165,9 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
       is_map(launch.opts[:blocked_resume]) ->
         begin_ticket_task(launch)
 
+      is_map(launch.opts[:ci_evidence_successor]) ->
+        begin_ticket_task(launch)
+
       task["run_id"] != launch.run["run_id"] or task["role"] != launch.route.requested_role ->
         {:error, :factory_task_route_mismatch}
 
@@ -188,16 +203,32 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
          {:ok, _} <- TicketChat.ready_for_run(launch.store, launch.run["run_id"]),
          :ok <- TicketWorkerRunner.admitted_stage(admitted_run, launch.route.requested_role),
          true <- launch.stage == admitted_run["state"] or {:error, :ticket_worker_stage_changed},
-         {:ok, packet} <- TicketWorkerRunner.packet(launch.store, launch.run["run_id"], launch.route.requested_role, launch.opts[:review_base_sha]),
+         {:ok, packet} <- ticket_base_packet(launch),
+         :ok <- ReviewProtocol.validate_admission(packet, launch.output_schema),
          true <-
            ((packet == launch.prompt or launch.opts[:blocked_resume_prompt] == launch.prompt or
+               (is_map(launch.opts[:ci_evidence_successor]) and launch.opts[:ci_evidence_successor].prompt == launch.prompt and launch.opts[:ci_evidence_successor].run == launch.run) or
+               (is_map(launch.opts[:failed_turn_recovery]) and launch.opts[:failed_turn_recovery]["prompt"] == launch.prompt) or
                (is_map(launch.opts[:ready_rework]) and launch.opts[:ready_rework][:prompt] == launch.prompt)) and
-              launch.output_schema == ticket_schema(launch.route.requested_role)) or
+              launch.output_schema == ReviewProtocol.schema_json(packet, ticket_schema(launch.route.requested_role))) or
              {:error, :ticket_worker_packet_mismatch},
          true <- launch.workspace == launch.run["worktree"] or {:error, :ticket_worker_scope_mismatch},
-         {:ok, prepared} <- prepare_ticket_task(launch),
+         admitted_options =
+           launch.opts |> Keyword.put(:instruction_binding_sha256, Jason.decode!(packet)["instruction_binding_sha256"]) |> Keyword.put(:instruction_mapping_required, same_prepared_prompt?(launch)),
+         admitted_launch = %{launch | opts: admitted_options},
+         {:ok, prepared} <- prepare_ticket_task(admitted_launch),
          {:ok, pid} <- start_task(launch.store, launch.task_supervisor, prepared) do
       {:ok, %{pid: pid, ref: Process.monitor(pid), task_key: prepared.task["task_key"], route: prepared.route}}
+    end
+  end
+
+  defp ticket_base_packet(launch) do
+    case launch.opts[:blocked_resume] do
+      %{"operational_recovery_key" => "TCAP-" <> _} = resume ->
+        TicketCapabilityRecovery.retained_packet(launch.store, launch.run, launch.opts[:review_base_sha], resume)
+
+      _ ->
+        TicketWorkerRunner.read_packet(launch.store, launch.run["run_id"], launch.route.requested_role, launch.opts[:review_base_sha])
     end
   end
 
@@ -207,13 +238,65 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
   defp ticket_schema(_role), do: nil
 
   defp prepare_ticket_task(launch) do
-    result =
-      Exqlite.transaction(launch.store, fn tx ->
-        case prepare_ticket_task_transaction(tx, launch) do
-          {:error, reason} -> Exqlite.rollback(tx, reason)
-          success -> success
+    if is_map(launch.opts[:ci_evidence_successor]) do
+      prepare_ci_successor_task(launch)
+    else
+      with {:ok, launch} <- observe_failed_start(launch) do
+        prepare_observed_ticket_task(launch)
+      end
+    end
+  end
+
+  defp prepare_ci_successor_task(launch) do
+    with {:ok, admitted} <- SymphonyElixir.Factory.TicketCiRepairSuccessor.admit(launch.store, launch.opts[:ci_evidence_successor], launch.opts),
+         true <- admitted.prompt == launch.prompt do
+      options =
+        Keyword.merge(launch.opts,
+          request_key: admitted.destination["request_key"],
+          reservation_key: admitted.access["reservation_key"],
+          expected_sha: launch.run["candidate_sha"],
+          owner_id: admitted.destination["owner_id"],
+          resume_thread_id: admitted.task["thread_id"],
+          instruction_binding_sha256: admitted.instruction_sha,
+          instruction_mapping_required: true,
+          ci_successor_key: admitted.row["successor_key"],
+          model: admitted.task["model"],
+          reasoning_effort: admitted.task["reasoning_effort"]
+        )
+
+      {:ok,
+       %{launch | opts: options, route: %{launch.route | resolved_role: admitted.task["role"]}, workspace: admitted.access["canonical_path"]}
+       |> Map.merge(%{task: admitted.task, resume_thread_id: admitted.task["thread_id"]})}
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :ci_successor_packet_unproven}
+    end
+  end
+
+  defp observe_failed_start(launch) do
+    case launch.opts[:failed_turn_recovery] do
+      proof when is_map(proof) ->
+        with {:ok, opts} <- SymphonyElixir.Factory.FailedTurnRecovery.start_observation(launch.store, proof, launch.opts) do
+          {:ok, %{launch | opts: opts}}
         end
-      end)
+
+      _ ->
+        {:ok, launch}
+    end
+  end
+
+  defp prepare_observed_ticket_task(launch) do
+    result =
+      Exqlite.transaction(
+        launch.store,
+        fn tx ->
+          case prepare_ticket_task_transaction(tx, launch) do
+            {:error, reason} -> Exqlite.rollback(tx, reason)
+            {:ok, prepared} -> bind_task_instructions(tx, prepared)
+          end
+        end,
+        timeout: 60_000
+      )
 
     case result do
       {:ok, prepared} -> prepared
@@ -221,12 +304,64 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
     end
   end
 
+  defp bind_task_instructions(store, prepared) do
+    key = prepared.opts[:instruction_binding_sha256]
+
+    result =
+      if prepared.opts[:instruction_mapping_required] do
+        case WorkerInstructions.task_binding(store, prepared.task) do
+          {:ok, %{"instruction_binding_sha256" => ^key}} -> :ok
+          _ -> {:error, :worker_instruction_task_binding_unproven}
+        end
+      else
+        WorkerInstructions.bind_task(store, prepared.task["task_key"], digest(prepared.prompt), key)
+      end
+
+    case result do
+      :ok -> {:ok, prepared}
+      {:error, reason} -> Exqlite.rollback(store, reason)
+    end
+  end
+
+  defp same_prepared_prompt?(launch) do
+    case TaskLedger.get(launch.store, launch.opts[:task_key]) do
+      {:ok, task} -> task["status"] in @in_flight_states and task["prompt_sha256"] == digest(launch.prompt)
+      _ -> false
+    end
+  end
+
   defp prepare_ticket_task_transaction(store, launch) do
     cond do
+      is_map(launch.opts[:failed_turn_recovery]) -> prepare_failed_turn_retry(store, launch)
       is_map(launch.opts[:blocked_resume]) -> prepare_blocked_resume_transaction(store, launch)
       is_map(launch.opts[:ready_rework]) and launch.opts[:ready_rework][:prepared] -> reuse_prepared_ready_rework_transaction(store, launch)
       is_map(launch.opts[:ready_rework]) -> prepare_ready_rework_transaction(store, launch)
       true -> prepare_ordinary_ticket_task_transaction(store, launch)
+    end
+  end
+
+  defp prepare_failed_turn_retry(store, launch) do
+    receipt = launch.opts[:failed_turn_recovery]
+
+    with :ok <- SymphonyElixir.Factory.FailedTurnRecovery.start_preflight_observed(store, receipt, launch.opts),
+         :ok <- WorkspaceAccess.source_capacity(store, launch.run, Keyword.take(launch.opts, [:capacity_policy, :free_bytes])),
+         true <- launch.prompt == receipt["prompt"] or {:error, :failed_retry_packet_changed},
+         {:ok, task} <- TaskLedger.get(store, launch.opts[:task_key]),
+         true <- task["status"] == "STARTING" or {:error, :failed_retry_task_changed},
+         {:ok, attempt} <- WorkerEvidence.get(store, receipt["new_request_key"]),
+         true <- attempt["status"] == "RESERVED" or {:error, :failed_retry_already_issued} do
+      opts =
+        Keyword.merge(launch.opts,
+          request_key: attempt["request_key"],
+          reservation_key: attempt["reservation_key"],
+          owner_id: attempt["owner_id"],
+          model: task["model"],
+          reasoning_effort: task["reasoning_effort"]
+        )
+
+      {:ok, %{launch | opts: opts} |> Map.merge(%{task: task, resume_thread_id: task["thread_id"]})}
+    else
+      {:error, _} = error -> error
     end
   end
 
@@ -471,7 +606,7 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
     with {:ok, current} <- RunLedger.get(store, launch.run["run_id"]),
          :ok <- current_ticket_launch(current, launch.run),
          :ok <- TicketWorkerRunner.validate_authorization(current, launch.opts[:authorization]),
-         :ok <- WorkspaceAccess.source_capacity(store, current, Keyword.take(launch.opts, [:capacity_policy, :free_bytes])),
+         :ok <- blocked_capacity(store, current, launch.opts),
          {:ok, task} <- TaskLedger.get(store, key),
          request = DesktopStageRunner.request_key(key, task["turn_id"], launch.prompt),
          reservation = "workspace:" <> request,
@@ -481,7 +616,7 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
          evidence = completed.evidence,
          true <- completed.output["status"] == "BLOCKED" or {:error, :blocked_resume_result_invalid},
          true <- launch.prompt == launch.opts[:blocked_resume_prompt] or {:error, :blocked_resume_prompt_mismatch},
-         :ok <- TicketChatCommands.preflight_rework_transfer(store, resume["command_key"]),
+         :ok <- blocked_transfer_authority(store, resume),
          proof =
            Map.merge(resume, %{
              "request_key" => evidence["request_key"],
@@ -502,7 +637,7 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
            "allowed_root" => launch.opts[:workspace_root],
            "expected_sha" => expected_sha
          },
-         {:ok, access} <- WorkspaceAccess.transfer_blocked_source(store, evidence["reservation_key"], proof["reservation_generation"], attrs, proof),
+         {:ok, access} <- transfer_blocked_access(store, evidence, proof, attrs),
          {:ok, prepared_task} <-
            TaskLedger.update(store, key, %{
              stage: launch.stage,
@@ -515,15 +650,19 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
            }),
          policy = TicketWorkerRunner.policy("SOURCE", access["canonical_path"]),
          {:ok, _attempt} <-
-           WorkerEvidence.reserve(store, %{
-             "request_key" => request,
-             "task_key" => key,
-             "reservation_key" => reservation,
-             "input_sha256" => digest(launch.prompt),
-             "owner_id" => "owner:" <> request,
-             "schema" => launch.output_schema,
-             "policy" => policy
-           }),
+           reserve_blocked_attempt(
+             store,
+             %{
+               "request_key" => request,
+               "task_key" => key,
+               "reservation_key" => reservation,
+               "input_sha256" => digest(launch.prompt),
+               "owner_id" => "owner:" <> request,
+               "schema" => launch.output_schema,
+               "policy" => policy
+             },
+             resume
+           ),
          transfer = %{
            "kind" => "BLOCKED_SOURCE_TRANSFER",
            "old_request_key" => evidence["request_key"],
@@ -534,9 +673,10 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
            "disposition_key" => resume["disposition_key"],
            "output_sha256" => evidence["output_sha256"],
            "amendment_command_key" => resume["amendment_command_key"],
+           "operational_recovery_key" => resume["operational_recovery_key"],
            "checkout_head_sha" => expected_sha
          },
-         {:ok, _command} <- TicketChatCommands.record_rework_transfer(store, resume["command_key"], transfer) do
+         {:ok, _command} <- record_blocked_transfer(store, resume, transfer) do
       worker_opts =
         Keyword.merge(launch.opts,
           request_key: request,
@@ -555,6 +695,59 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
     else
       {:error, _} = error -> error
     end
+  end
+
+  defp transfer_blocked_access(store, evidence, %{"operational_recovery_key" => "TCAP-" <> _} = proof, attrs),
+    do: WorkspaceAccess.transfer_capability_source(store, evidence["reservation_key"], proof["reservation_generation"], attrs, proof)
+
+  defp transfer_blocked_access(store, evidence, proof, attrs),
+    do: WorkspaceAccess.transfer_blocked_source(store, evidence["reservation_key"], proof["reservation_generation"], attrs, proof)
+
+  defp reserve_blocked_attempt(store, attrs, %{"operational_recovery_key" => "TCAP-" <> _} = resume),
+    do: WorkerEvidence.reserve_capability(store, attrs, resume)
+
+  defp reserve_blocked_attempt(store, attrs, _resume), do: WorkerEvidence.reserve(store, attrs)
+
+  defp blocked_capacity(store, run, opts) do
+    case opts[:blocked_resume] do
+      %{"operational_recovery_key" => "TCAP-" <> _, "prepared" => true} = resume ->
+        with {:ok, _} <- TicketCapabilityRecovery.prepared_access(store, resume), do: :ok
+
+      %{"operational_recovery_key" => "TCAP-" <> _} = resume ->
+        with {:ok, _} <- TicketCapabilityRecovery.checked(store, resume), do: :ok
+
+      _ ->
+        WorkspaceAccess.source_capacity(store, run, Keyword.take(opts, [:capacity_policy, :free_bytes]))
+    end
+  end
+
+  defp blocked_transfer_authority(store, %{"operational_recovery_key" => "TCAP-" <> _} = resume) do
+    with {:ok, _} <- TicketCapabilityRecovery.checked(store, resume), do: :ok
+  end
+
+  defp blocked_transfer_authority(store, %{"operational_recovery_key" => key}) when is_binary(key),
+    do: SymphonyElixir.Factory.TicketInfrastructureRecovery.preflight(store, key)
+
+  defp blocked_transfer_authority(store, resume), do: TicketChatCommands.preflight_rework_transfer(store, resume["command_key"])
+
+  defp record_blocked_transfer(store, %{"operational_recovery_key" => "TCAP-" <> _} = resume, transfer),
+    do: TicketCapabilityRecovery.transferred(store, resume, transfer)
+
+  defp record_blocked_transfer(store, %{"operational_recovery_key" => key}, transfer) when is_binary(key),
+    do: SymphonyElixir.Factory.TicketInfrastructureRecovery.record_transfer(store, key, transfer)
+
+  defp record_blocked_transfer(store, resume, transfer), do: TicketChatCommands.record_rework_transfer(store, resume["command_key"], transfer)
+
+  defp applied_blocked_transfer(store, %{"operational_recovery_key" => "TCAP-" <> _ = key}),
+    do: TicketCapabilityRecovery.applied(store, key)
+
+  defp applied_blocked_transfer(store, %{"operational_recovery_key" => key}) when is_binary(key),
+    do: SymphonyElixir.Factory.TicketInfrastructureRecovery.applied(store, key)
+
+  defp applied_blocked_transfer(store, resume) do
+    with {:ok, %{"status" => "APPLIED", "application_receipt_json" => raw}} <- TicketChatCommands.get(store, resume["command_key"]),
+         :ok <- TicketChatCommands.validate_rework_replay(store, resume["command_key"]),
+         do: Jason.decode(raw)
   end
 
   defp blocked_source_task?(task, resume),
@@ -590,6 +783,12 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
     end
   end
 
+  defp blocked_resume_result(store, task, run, %{"operational_recovery_key" => "TCAP-" <> _} = resume) do
+    with {:ok, verified} <- TicketCapabilityRecovery.checked(store, resume),
+         true <- completed_result_matches?(verified.facts, task, run, resume) or {:error, :blocked_resume_result_changed},
+         do: {:ok, verified.facts, nil}
+  end
+
   defp blocked_resume_result(store, task, run, resume) do
     with {:ok, completed} <- WorkerEvidence.completed_result(store, resume["request_key"]),
          true <- completed_result_matches?(completed, task, run, resume) or {:error, :blocked_resume_result_changed} do
@@ -608,6 +807,19 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
       {:ok, expected}
     else
       {:error, :blocked_resume_expected_sha_unproven}
+    end
+  end
+
+  defp blocked_resume_expected_sha(completed, _resume, %{"state" => "WRITING", "candidate_sha" => nil, "implementation_iteration" => 0}, opts) do
+    base = opts[:review_base_sha]
+
+    with true <- valid_sha?(base) and opts[:expected_sha] == base,
+         {:ok, binding} when is_map(binding) <- Jason.decode(completed.evidence["binding_json"] || "null"),
+         true <- {binding["role"], binding["mode"], binding["expected_sha"], binding["base_sha"], binding["candidate_sha"]} == {"feature-writer", "SOURCE", base, base, nil},
+         true <- Map.get(completed, :checkout_head_sha) in [nil, base] do
+      {:ok, base}
+    else
+      _ -> {:error, :blocked_resume_expected_sha_unproven}
     end
   end
 
@@ -630,10 +842,10 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
     with {:ok, current} <- RunLedger.get(store, launch.run["run_id"]),
          :ok <- current_ticket_launch(current, launch.run),
          :ok <- TicketWorkerRunner.validate_authorization(current, launch.opts[:authorization]),
-         :ok <- WorkspaceAccess.source_capacity(store, current, Keyword.take(launch.opts, [:capacity_policy, :free_bytes])),
+         :ok <- blocked_capacity(store, current, launch.opts),
          {:ok, task} <- TaskLedger.get(store, key),
          true <- prepared_task_matches?(task, launch, resume) or {:error, :blocked_resume_prepared_task_mismatch},
-         {:ok, access} <- WorkspaceAccess.validate(store, reservation, resume["prepared_reservation_generation"]),
+         {:ok, access} <- prepared_blocked_access(store, reservation, resume),
          :ok <- prepared_resume_head_current(access, resume),
          true <-
            prepared_access_matches?(access, request, key, current["run_id"]) or
@@ -644,21 +856,23 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
              {:error, :blocked_resume_prepared_attempt_mismatch},
          policy = TicketWorkerRunner.policy("SOURCE", access["canonical_path"]),
          {:ok, attempt} <-
-           WorkerEvidence.reserve(store, %{
-             "request_key" => request,
-             "task_key" => key,
-             "reservation_key" => reservation,
-             "input_sha256" => digest(launch.prompt),
-             "owner_id" => "owner:" <> request,
-             "schema" => launch.output_schema,
-             "policy" => policy
-           }),
+           reserve_prepared_blocked_attempt(
+             store,
+             %{
+               "request_key" => request,
+               "task_key" => key,
+               "reservation_key" => reservation,
+               "input_sha256" => digest(launch.prompt),
+               "owner_id" => "owner:" <> request,
+               "schema" => launch.output_schema,
+               "policy" => policy
+             },
+             resume
+           ),
          true <-
            WorkerEvidence.superseded_blocked_attempt?(store, Store.one!(store, "SELECT * FROM worker_evidence WHERE request_key = ?", [resume["request_key"]])) or
              {:error, :blocked_resume_supersession_unproven},
-         {:ok, %{"status" => "APPLIED", "application_receipt_json" => receipt_json}} <- TicketChatCommands.get(store, resume["command_key"]),
-         :ok <- TicketChatCommands.validate_rework_replay(store, resume["command_key"]),
-         {:ok, receipt} <- Jason.decode(receipt_json),
+         {:ok, receipt} <- applied_blocked_transfer(store, resume),
          true <-
            (receipt["request_key"] == request and receipt["prior_request_key"] == resume["request_key"] and receipt["disposition_key"] == resume["disposition_key"]) or
              {:error, :blocked_resume_command_link_mismatch} do
@@ -676,9 +890,27 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
       {:ok, %{launch | opts: worker_opts, route: %{launch.route | resolved_role: task["role"]}} |> Map.merge(%{task: task, resume_thread_id: task["thread_id"]})}
     else
       {:error, _} = error -> error
-      _ -> {:error, :blocked_resume_prepared_attempt_unproven}
     end
   end
+
+  defp prepared_blocked_access(store, _reservation, %{"operational_recovery_key" => "TCAP-" <> _} = resume),
+    do: TicketCapabilityRecovery.prepared_access(store, resume)
+
+  defp prepared_blocked_access(store, reservation, resume),
+    do: WorkspaceAccess.validate(store, reservation, resume["prepared_reservation_generation"])
+
+  defp reserve_prepared_blocked_attempt(store, attrs, %{"operational_recovery_key" => "TCAP-" <> _} = resume) do
+    with {:ok, attempt} <- WorkerEvidence.get(store, attrs["request_key"]),
+         {:ok, binding} <- Jason.decode(attempt["binding_json"]),
+         true <- Map.take(binding, ~w(input_sha256 schema policy)) == Map.take(attrs, ~w(input_sha256 schema policy)) do
+      TicketCapabilityRecovery.admit_prepared(store, resume)
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :capability_recovery_prepared_unproven}
+    end
+  end
+
+  defp reserve_prepared_blocked_attempt(store, attrs, _resume), do: WorkerEvidence.reserve(store, attrs)
 
   defp prepared_resume_head_current(access, %{"amendment_command_key" => command_key, "checkout_head_sha" => expected})
        when is_binary(command_key) and is_binary(expected) do
@@ -940,6 +1172,17 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
         if(Keyword.get(launch.opts, :task_transport) == "desktop_broker", do: DesktopStageRunner, else: StageRunner)
       )
 
+    request_key = DesktopStageRunner.request_key(task_key, launch.task["turn_id"], launch.prompt)
+
+    on_message = fn
+      %{event: :session_started, thread_id: thread, turn_id: turn} ->
+        identity = %{status: "RUNNING", thread_id: thread, turn_id: turn}
+        TaskLedger.update_if_current(store, task_key, launch_prompt_sha256, @in_flight_states, identity)
+
+      message ->
+        SpecialistErrorNotice.observe_task(store, task_key, request_key, launch_prompt_sha256, message)
+    end
+
     result =
       stage_runner.run(launch.workspace, launch.issue, launch.prompt, launch.output_schema,
         format_repair_attempts: Keyword.get(launch.opts, :format_repair_attempts, 0),
@@ -956,10 +1199,11 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
         thread_source: "symphonyFactory",
         thread_name: Keyword.fetch!(launch.opts, :thread_name),
         on_thread_started: on_thread_started,
+        on_message: on_message,
         store: store,
         target_kind: "TASK",
         target_key: task_key,
-        request_key: DesktopStageRunner.request_key(task_key, launch.task["turn_id"], launch.prompt),
+        request_key: request_key,
         previous_turn_id: launch.task["turn_id"],
         issue_key: launch.issue.identifier,
         branch: launch.run["branch"],
@@ -972,11 +1216,13 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
         model_policy: Keyword.get(launch.opts, :model_policy, %{})
       )
 
-    persist_result(store, task_key, launch_prompt_sha256, result)
+    persist_result(store, task_key, launch_prompt_sha256, result, request_key)
     send(parent, {:factory_task_finished, task_key, result})
   end
 
-  defp persist_result(store, task_key, prompt_sha256, {:ok, result}) do
+  defp persist_result(store, task_key, prompt_sha256, result), do: persist_result(store, task_key, prompt_sha256, result, nil)
+
+  defp persist_result(store, task_key, prompt_sha256, {:ok, result}, _request_key) do
     TaskLedger.update_if_current(store, task_key, prompt_sha256, @in_flight_states, %{
       status: "COMPLETE",
       thread_id: result.thread_id,
@@ -986,18 +1232,42 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
     })
   end
 
-  defp persist_result(store, task_key, prompt_sha256, {:error, reason}) do
-    TaskLedger.update_if_current(store, task_key, prompt_sha256, @in_flight_states, %{
-      status:
-        cond do
-          retryable_writer_conflict?(reason) -> "WAITING_FOR_WRITER"
-          match?({:desktop_request_pending, _, _}, reason) -> "WAITING_FOR_BROKER"
-          match?({:desktop_request_reconciliation_required, _}, reason) -> "WAITING_FOR_BROKER"
-          true -> "FAILED"
-        end,
-      failure_code: inspect(reason)
-    })
+  defp persist_result(store, task_key, prompt_sha256, {:error, reason}, request_key) do
+    Store.transaction!(store, fn tx ->
+      result =
+        TaskLedger.update_if_current(tx, task_key, prompt_sha256, @in_flight_states, %{
+          status: failed_task_status(reason),
+          failure_code: inspect(reason)
+        })
+
+      maybe_record_task_failure(tx, task_key, request_key, reason, result)
+
+      result
+    end)
   end
+
+  defp failed_task_status(reason) do
+    cond do
+      retryable_writer_conflict?(reason) -> "WAITING_FOR_WRITER"
+      broker_wait?(reason) -> "WAITING_FOR_BROKER"
+      true -> "FAILED"
+    end
+  end
+
+  defp broker_wait?({:desktop_request_pending, _, _}), do: true
+  defp broker_wait?({:desktop_request_reconciliation_required, _}), do: true
+  defp broker_wait?(_reason), do: false
+
+  defp maybe_record_task_failure(tx, task_key, request_key, reason, {:ok, _}) when is_binary(request_key) do
+    unless broker_wait?(reason) do
+      case SpecialistErrorNotice.record_task(tx, task_key, request_key, reason) do
+        {:ok, _} -> :ok
+        {:error, error} -> Exqlite.rollback(tx, error)
+      end
+    end
+  end
+
+  defp maybe_record_task_failure(_tx, _task, _request, _reason, _result), do: :ok
 
   @doc "Whether Codex refused to resume a task because another writer still owns it."
   @spec retryable_writer_conflict?(term()) :: boolean()

@@ -254,7 +254,7 @@ broker cannot atomically commit a Codex send and a local SQLite update. If it
 stops in that narrow handoff window, it searches for the exact request marker
 in the bound task; ambiguous or absent readback remains an operator-recovery
 state, never an automatic duplicate send or replacement task. The shared
-`service-factory-desktop-requests` skill defines the Codex-side broker tick;
+`broker-symphony-desktop-requests` skill defines the Codex-side broker tick;
 it must run separately from the local Symphony scheduler tick. A malformed
 result may receive only the request's persisted `format_repair_attempts`
 same-task repair turns. A checkout-backed Project task first receives a
@@ -385,6 +385,21 @@ mise exec -- mix factory pause --workflow WORKFLOW.local.md
 records, including their reopenable Codex thread IDs. The control row starts in
 `PAUSED`. Activation and pausing fail while an unexpired tick lease exists.
 
+Tick renewal has a finite end-to-end deadline, capped at 65 seconds and one
+third of the configured lease lifetime, further shortened to leave expiry
+headroom after the renewal interval. This accommodates adoption's existing
+60-second transaction limit without extending the lease or changing global
+connection-pool policy. Only a database queue rejection before transaction
+execution is retried, within the same deadline. Expired queued requests cannot
+extend a lease; exhaustion, other database failures, pause, and exact-identity
+mismatch still stop the tick. Direct control callers retain their five-second
+default unless they supply an explicit bounded renewal timeout.
+One monitored helper owns the pending renewal; control status continues using
+the read-only connection while the helper waits. Control shutdown terminates
+that helper, and a concurrent renewal is rejected rather than spawning another.
+The renewal also checks the original control process is alive inside the
+transaction; an orphan after abnormal control death cannot extend its old lease.
+
 When a Desktop controller has a proven no-tool-call connector failure, an
 operator can migrate to one read-backed projectless controller without
 restarting ticket tasks. Pause the dispatcher and broker, prove the new task's
@@ -488,6 +503,77 @@ hibernation, delivery links, and recent events. Configure `server.host` as
 `127.0.0.1` and `server.port` as `4000` for a local-only operator view at
 `http://127.0.0.1:4000`; the dashboard has no authentication boundary of its own.
 
+The Scheduler pill reports observed tick health, not just the durable ACTIVE
+dispatch setting. A returned error, failed launch or monitored crash shows Error
+with a bounded error code, consecutive failure count and last successful tick.
+Starting a retry or completing paused recovery-only work does not clear the
+failure. Health starts unknown after a controller restart and becomes healthy
+only after an ordinary successful tick; Paused still takes display precedence.
+This process-local diagnostic does not modify delivery state or tick leasing.
+The JSON API exposes the same observation as `factory.control.tick_health`.
+
+The Desktop broker invokes `elixir/scripts/factory-broker status|desktop ...`
+against the deployed compiled application. This preserves the existing task
+argument validation and ledger gates while avoiding Mix's TCP compilation
+coordination in its sandbox. Missing compiled code is a deployment error; the
+broker does not compile, request broader access, or bypass request guards.
+
+Ticket-parent runtime checks, native history/queue reads and guarded recording
+are transported through a bounded file exchange next to the ledger, serviced by
+the existing local process. The exchange accepts only existing ticket-parent
+operations and the configured workflow; it cannot issue model turns, shell
+commands, or arbitrary thread actions. Native create/send stays with Desktop.
+Interrupted running exchanges are uncertain and are never replayed on restart;
+an already-published receipt is retained. Desktop permissions remain unchanged.
+
+Historical push validation preserves the controller's completion contract: a
+structurally valid terminal receipt can contain timeout, signal, overflow, or
+nonzero-exit diagnostics when exact remote-SHA reconciliation already completed
+the push. Acceptance still requires the immutable completed envelope and its exact
+released maintenance reservation; a timeout alone never proves success. Corrected
+push executors are versioned, with older helpers retained for status-only reads.
+An audited null-child preissuance rejection can be retired once by a normal tick
+into a fresh reservation and nonce, without rewriting or replaying the rejected
+operation.
+
+For unattended native handoffs, the trusted broker directory's local
+`.codex/config.toml` sets plugin-scoped `approval_mode = "approve"` only for
+`codex_app.create_thread` and `codex_app.send_message_to_thread`, under
+`plugins."codex-app-tools@openai-bundled".mcp_servers.codex_app.tools`.
+The current broker directory is
+`/Users/cgable/Documents/Codex/2026-09-24/you-are-a-candidate-replacement-for`.
+This is separate from shell sandbox/approval policy: do not enable global
+auto-approval or full filesystem access. Other tools retain their existing
+approval behavior. A replacement broker must receive this local configuration
+and be trusted before activation. Verify the effective configuration for that
+cwd and an unrelated cwd, then prove a real handoff without a prompt; config
+readback alone is not proof of live Desktop tool behavior. Removing these two
+local tool overrides restores the inherited approval policy on the next turn.
+
+Desktop projectless parents use the host-local dated output directory
+`/Users/cgable/Documents/Codex/{date}`. Create only that parent directory, never
+the ticket leaf. A still-unissued, unobserved PENDING CREATE may be transactionally
+rehomed with a refreshed payload digest and an audit event; issued/bound parents
+retain their exact original cwd. Claim rechecks date rollover and leaf collisions.
+The parent context locator uses deployed compiled Elixir code without the Mix
+build socket; historical context locators remain valid evidence.
+
+Active-run uniqueness indexes are upgraded together in an immediate transaction
+only when their definitions differ. Opening another CLI connection no longer
+drops/recreates these indexes or exposes a transient uniqueness gap.
+
+The local deployment's authoritative ledger is
+`/Users/cgable/Documents/Codex/factory-state/factory.sqlite`, inside the Desktop
+broker's existing writable workspace. The 2026-10-12 migration retained the
+previous `Library/Application Support/ai-factory/factory.sqlite` as a paused
+recovery copy; do not operate both ledgers. Restore requires stopping both owners
+and deliberately changing the workflow database path, never merging rows.
+Source workspaces and recovery artifacts retain their existing paths.
+
+Contract and authorization marker `issue-hex` values accept upper/lowercase hex
+spellings of the same issue key. Contract payload bytes, revision and SHA-256
+remain exact; casing normalization never authorizes changed contract content.
+
 Install or refresh the checked-in user service from `elixir/`:
 
 ```bash
@@ -524,3 +610,223 @@ markers are digest-bound so a stale or ambiguous observation fails closed.
    and any required validation evidence before enabling the persistent local
    schedule.
 6. Retire the old dispatcher only after the pilot and recovery checks pass.
+
+## Initial ticket checkout recovery
+
+Initial materialization has a ten-minute Git budget with eight parallel checkout
+workers. Transport waits ten additional seconds for the terminal receipt;
+readback remains separately bounded. A timeout never authorizes creation replay.
+If creation finishes after its starting authorization expires, a later tick must
+obtain fresh Jira authorization before admitting the checkout.
+
+`TicketCheckout.recover_materialization/4` admits a separately repaired initial
+checkout only after a bound timeout/SIGKILL receipt, inactive helper and child,
+unchanged parent/run/repository/root identity, no source task or reservation,
+fresh authorization and capacity, and an independently clean registered checkout
+at the exact branch/base. It preserves the original negative receipt, execution
+and nonce, recording `TICKET_CHECKOUT_MATERIALIZATION_RECOVERED` separately. It
+does not clear locks, repair files, create branches or launch source work.
+
+Unavailable factory snapshots render an unavailable dashboard state without
+assuming control or intake data exist. Ticket-deferral logs contain bounded
+error tags, not connector/native error payloads.
+
+Factory status uses a separately supervised read-only connection to the same
+WAL ledger so source transactions do not occupy its only database connection.
+Control mutations, leases, reservations and migrations retain the original
+single writable connection; this does not increase source-writer concurrency.
+Broker status and queue-discovery commands also use read-only connections for
+existing initialized ledgers. Initial missing-ledger/control bootstrap retains
+its prior initialization behavior; commands never migrate a live initialized
+ledger merely to report its status. Jira admission, reconciliation and delivery
+finalization sessions run in the scoped controller directory, not the ticket
+parent's Desktop output folder.
+
+Native checkout finalization, role reservation/adoption, worker evidence and Jira
+ownership have scoped sixty-second transaction budgets for repeated monorepo
+identity/cleanliness scans and atomic reservation release. These change only the
+named transactions' deadlines, not their predicates or the default query budget.
+Git subprocess deadlines remain a separate concern; a timeout retains the
+completed result for reconciliation rather than replaying the worker.
+
+`factory.jira_connector` optionally supplies exactly `command` (an existing
+absolute executable path) and `args` (a string array) for controller-owned Jira
+sessions. Configure the tested `integrations/jira-mcp/factory_provider.py` with
+the existing pinned provider interpreter to expose atomic factory-label updates.
+Only those sessions override Jira's process-local command/args; global MCP
+configuration, authentication, other connectors and restricted worker secret
+scrubbing are unchanged. The controller still validates the actual native tool
+catalogue and independently reads back both status and label effects. An empty
+map preserves the original provider; malformed nonempty configuration fails closed.
+
+Ticket `prepare-stage` uses the same bounded service-owned mailbox as broker
+native readback. The ticket CLI reads its bound route locally, then asks the
+service to read the active native turn and prepare literal bytes. Only the
+configured workflow and a ready ticket-parent route qualify. Preparation remains
+read-only and does not stage or start work; the parent still executes the returned
+stage command and normal native receipt admission remains unchanged.
+
+An initial writer stopped at iteration zero with no candidate can recover one
+already-completed direct rework message when its same-turn context refresh
+succeeded and the exact preparer failed with the runtime permission denial.
+The collector records `CONTROLLER_NATIVE_REWORK_RECOVERY` separately, without
+backdating a command or inventing a stage execution receipt. It requires a single
+genuine human input, exact grammar, unchanged refresh/contract/run binding,
+matching blocked disposition, and no competing command. Admission and source
+transfer both revalidate that evidence; stopped-owner, base, branch and checkout
+gates still apply. Contract revisions and other answers retain normal staging.
+
+`read-ticket-turn --include-completion --include-target-observation` returns the
+actual target-side empty attachment call with its original turn/item/timestamp
+and `historical: true`, alongside the generated typed recording payload. It does
+not attest current attachment emptiness or live idle ownership. Missing, failed,
+nonempty, conflicting or incomplete observations reject. A tool-free presentation
+can reconcile using the proven creation-time inventory, without resending it.
+# Native worker observability
+
+Current-stage native tasks with unresolved startup/retry failures project Needs
+attention independently of Desktop-request reconciliation. Completed or
+historical-stage failures do not hold progressed runs in attention. Large command
+receipts and task failures remain in the ledger with digest-pinned ticket-scoped
+details; they do not overflow the bounded ticket context.
+
+An exact native writer ownership rejection before any observed session or source
+operation may rearm the same request after three minutes. Repeated rejection
+restarts that cooldown; other errors remain reconciliation-only. Rearm retains
+the original failure event and immutable request binding; normal launch still
+enforces fresh authorization, capacity, transfer proof and same-thread ownership.
+It does not take over a Desktop-owned chat or create a replacement writer.
+
+## Ordinary verifier repair after CI history
+
+Historical CI repair claims do not make every later repair a CI repair. The
+current pinned writer packet selects the repair type. An ordinary verifier
+repair retains its original findings across `CONTINUE` slices and does not
+consume a CI-repair attempt. Deterministic issuance refusal occurs before a new
+worker-evidence attempt is reserved; uncertain already-issued actions still
+require reconciliation rather than replay.
+
+`RepairObligations` authenticates the consumed verifier result and admitted
+instruction bytes before carrying stable finding IDs, the prior reviewed SHA,
+and closure guidance into new packets. Previously admitted packets remain
+byte-for-byte readable. For an older ordinary repair packet without review
+context, preflight derives the missing context from its exact pinned, consumed
+verifier round and rechecks the original findings and CI result; it never
+rewrites the packet or selects an arbitrary latest review. Finding closure remains an independent verifier judgment
+recorded in the existing string findings/checks schema, not a machine-enforced
+structured closure verdict. A writer's addressed claim is not acceptance.
+
+An ordinary preflight push requires the stopped, consumed `COMPLETE` SOURCE
+result, exact current candidate/contract/round, immutable packet, and accepted
+`REPAIR` provenance. New versioned v9/v6 physical helpers independently validate
+that scope and source ancestry, including when there are no CI evidence
+successors. This proof grants preflight scope only. Fresh exact-candidate CI and
+an independently consumed verifier `PASS` remain required for delivery rollover.
+Existing physical helpers and receipts retain their original readback semantics.
+New ordinary-proof refusals use `ordinary_verifier_repair_unproven`, distinct
+from refusal of historical CI-successor proof.
+
+New issuance uses v11/v8 physical helpers and policy V3, with a combined hard
+ceiling of ten CI claims plus evidence successors. The default stays five;
+archived V1 and V2 retain five and seven respectively. Increasing configuration
+never resets consumed attempts, repair rounds or receipts. The shared
+`maximum_code_repair_rounds` knob also limits ordinary verifier-repair rounds;
+ordinary rounds do not themselves consume the CI-attempt budget.
+
+Ordinary Go repair completion now uses a distinct SOURCE/verifier-bound
+generation journal, reusing the confined controller generation engine. It
+includes Go packages changed by earlier `CONTINUE` slices, supports missing
+BUILD files, and excludes deleted Go files from gofmt. Only authenticated
+generated byte-CAS outputs join the controller commit and new physical proof;
+pending or uncertain effects hold SOURCE rather than permitting a push.
+
+New CI claims may additionally pin a generated-only capability for an exact
+strict-dependency diagnostic. It intersects authenticated changed Go files with
+the writer's allowed paths and pins the failed-candidate Go blobs and their
+existing regular sibling BUILD files. It never changes the old diagnosis,
+claim scope arrays or already-admitted packets. An unavailable qualified toolset
+simply omits this optional capability; general CI source repair remains available
+for all failure types.
+
+Only a stopped, unchanged-candidate, no-edit `COMPLETE` without `CONTINUE` slices
+selects this mode. The controller's v3 generation executor uses the existing CI
+journal and confined Gazelle boundary, allowing only those pinned BUILD outputs.
+Partial CAS effects resume from their owned journal across restart; they do not
+rerun Gazelle or authorize worker BUILD edits. Exact nonempty finalized outputs
+join one controller commit and the new physical history proof. This generation
+step spends no additional repair attempt. Source-edit repairs retain their
+original generation scope, and older helpers, packets and receipts remain
+unchanged and readable.
+
+The broker's typed MR completion route is `desktop complete-ticket-mr`. It
+selects complete native items after the bound previous-turn anchor, validates
+the exact delegation and unchanged native version, derives canonical call
+records from actual MCP completion/error states, then invokes the existing
+strict completion validator under request/claim CAS. It never repeats the MR
+operation, invents a completed status or changes a genuine `BLOCK` result.
+The separate v3 readback-origin resource registers only the exact retained v9
+release manifest/helper/companion tuple; older resources remain unchanged.
+
+Historical v3 source-origin and v8 release-origin receipts also have a narrowly
+attested status-only relocation reader. The v2 origin resource pins the original
+release manifest and embeds its hash-bound compile proof for the v3 source
+mapping. Readback validates the original execution, claim and receipt bytes,
+the retained artifact bytes and the current physical artifact files. It does
+not require the retired source or temporary compile-proof file to remain
+present, import old helper code, issue a child, rewrite evidence, or authorize
+new legacy execution. Unregistered identical copies remain untrusted. The v1
+origin resource and all older helpers remain unchanged.
+
+Push transport keeps its 256 KiB execution/request limit separate from a 1 MiB
+receipt/frame limit. Admission checks the worst terminal and preissuance response,
+including Python's Unicode escaping, before binding execution. Push-local
+validation retains exact execution/PID/key/type/output checks without widening
+the shared checkout validator. A status-only v2 reader authenticates current v11
+resources or the exact historical release in the v4 origin registry and reads the
+same immutable claim/receipt/nonce. It cannot issue a push or rewrite evidence.
+Timeout or signaled terminal receipts still require fresh exact remote-SHA
+equality before the existing once-only reconciliation may complete; receipt
+size, process existence or timeout alone never authorizes a retry.
+
+## Released MR broker driver
+
+`scripts/factory-broker mr-driver` exports the compile-pinned, versioned MR broker
+program from the deployed application's canonical `priv` directory without
+opening the ledger. The Desktop wrapper executes this released resource rather
+than rebuilding claim/read/send logic. The compact committed claim response stays
+`{request_key,status,arguments}`; it does not contain raw request-row fields.
+
+Before preparation, the driver admits only claim acknowledgements whose
+conservative ASCII-escaped pretty-JSON projection plus a 512-byte framing margin
+fits 8 KiB, below its requested 30,000-token CLI output budget. Larger responses
+fail with `MR_CLAIM_RESPONSE_BUDGET_EXCEEDED` before any claim. This is a driver
+transport admission limit, not a change to stored request or service prompt
+limits. A lost finalization response or failed send remains uncertain and never
+causes an automatic retry.
+
+The incident-bound recovery route is a delayed first send, not a claim reset or
+a generic retry. It requires the exact reviewed historical guard rejection,
+complete stable classified session suffix, fresh owning-Desktop observation,
+unchanged original controller version, and current delivery qualification. The
+only permitted unfinished broker action is the pinned recovery loader. Unknown
+later executable input, truncated history, transport loss or ambiguity refuses
+recovery. The session checkpoint is held only in the service's exact active owner
+context; CLI callers cannot supply it.
+
+Recovery v2 additionally derives source activity from retained owning-Desktop
+`read_thread` MCP events inside the exact unfinished loader. A separate persisted
+AppServer `interrupted/notLoaded` view is not active authority by itself. The
+reader authenticates the actual released-driver export, then fresh owning reads
+before preparation and after the exact handle-bearing prepare result. The
+original three-observation/20-second budget and qualification expiry remain.
+Four separately bounded instruction reads must complete in order before the
+loader; only enumerated LF/no-final-LF input variants are accepted. The known
+failed earlier loader has its own exact historical rejection proof, never a
+generic terminal-error retry rule.
+
+Schema 52 adds immutable `ticket_mr_presend_consumptions`, uniquely binding the
+original request/claim and historical invocation. Consumption commits before send
+arguments are returned, without changing the original request, payload or claim.
+A lost response, replay or restart cannot mint another send capability. The
+broker-binding helper still requires its automation to be ACTIVE; maintenance
+pausing does not itself authorize a manual send.

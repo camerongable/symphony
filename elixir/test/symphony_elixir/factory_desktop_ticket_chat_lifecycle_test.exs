@@ -55,6 +55,17 @@ defmodule SymphonyElixir.FactoryDesktopTicketChatLifecycleTest do
     def apply(store, policy, run_id, opts), do: Cleanup.apply(store, policy, run_id, opts)
   end
 
+  defmodule AdmissionWorkspaceReader do
+    def issue(_key, opts) do
+      send(self(), {:admission_connector_workspace, opts[:workspace]})
+      {:error, :diagnostic_read_finished}
+    end
+  end
+
+  defmodule FailingNativeReader do
+    def read_native_thread(_thread_id, _opts), do: {:error, {:native_read_failed, "private-error-payload"}}
+  end
+
   setup context do
     ordinary_ticket_intake? = context[:ordinary_ticket_intake] == true
     fixture_context = context |> Map.put(:broker_thread_id, "019fa5b7-27fa-7660-ab47-7c3abb867c91") |> Map.put(:unregistered, ordinary_ticket_intake?)
@@ -98,6 +109,41 @@ defmodule SymphonyElixir.FactoryDesktopTicketChatLifecycleTest do
     git(ctx.root, ["init", "--bare", remote])
     git(ctx.repo, ["remote", "add", "origin", remote])
     ctx
+  end
+
+  test "writer admission reads Jira from the controller directory rather than the source workspace root", ctx do
+    context = controller(ctx)
+    expected = Path.join([context.workspace_root, "factory-controller", context.factory.scope])
+    File.mkdir_p!(expected)
+    before = Store.query!(ctx.store, "SELECT * FROM ticket_checkout_intents").rows
+
+    assert {:error, :diagnostic_read_finished} =
+             Scheduler.ticket_step(context, "run", Keyword.put(context.ticket_options, :jira_reader, AdmissionWorkspaceReader))
+
+    assert_received {:admission_connector_workspace, ^expected}
+    refute expected == context.workspace_root
+    assert Store.query!(ctx.store, "SELECT * FROM ticket_checkout_intents").rows == before
+  end
+
+  test "ticket deferral diagnostics expose error tags without native error payloads", ctx do
+    context = controller(ctx)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, result} =
+                 Scheduler.tick(context,
+                   jira_reader: JiraReader,
+                   jira_connector: JiraConnector,
+                   cleanup: FixtureCleanup,
+                   ticket_options: [ticket_chat_reader: FailingNativeReader]
+                 )
+
+        assert Enum.any?(result.events, &(&1.event == "TICKET_DEFERRED"))
+      end)
+
+    assert log =~ "Factory ticket deferred"
+    assert log =~ "native_read_failed"
+    refute log =~ "private-error-payload"
   end
 
   @tag timeout: 600_000
@@ -1402,7 +1448,12 @@ defmodule SymphonyElixir.FactoryDesktopTicketChatLifecycleTest do
     Control.initialize(ctx.store, factory)
     Control.record_controller_task(ctx.store, factory, "controller-thread", "original-turn", %{project_id: "project-grail"})
     {:ok, _} = Control.activate(ctx.store, factory, "fixture")
-    scope = fn _cwd, callback -> callback.(%{thread_id: "jira-fixture"}) end
+    expected_jira_workspace = Path.join([ctx.root, "workspaces", "factory-controller", "scope"])
+
+    scope = fn cwd, callback ->
+      assert cwd == expected_jira_workspace
+      callback.(%{thread_id: "jira-fixture"})
+    end
 
     parent_output_root = Path.join(ctx.root, "ticket-parents")
     File.mkdir_p!(parent_output_root)

@@ -32,11 +32,12 @@ defmodule SymphonyElixir.Factory.IntakeLedger do
           Store.query!(
             connection,
             """
-            INSERT INTO intake_snapshots(scope, observed_at, snapshot_json)
-            VALUES (?, ?, ?)
+            INSERT INTO intake_snapshots(scope, observed_at, snapshot_json, decisions_json)
+            VALUES (?, ?, ?, '{}')
             ON CONFLICT(scope) DO UPDATE SET
               observed_at = excluded.observed_at,
-              snapshot_json = excluded.snapshot_json
+              snapshot_json = excluded.snapshot_json,
+              decisions_json = '{}'
             """,
             [scope, observed_at, snapshot_json]
           )
@@ -48,12 +49,12 @@ defmodule SymphonyElixir.Factory.IntakeLedger do
 
   @doc "Returns the last successful Jira intake snapshot for one factory scope."
   @spec get(Store.connection(), String.t()) ::
-          {:ok, %{scope: String.t(), observed_at: String.t(), snapshots: [map()]} | nil}
+          {:ok, %{scope: String.t(), observed_at: String.t(), snapshots: [map()], decisions: map()} | nil}
           | {:error, term()}
   def get(connection, scope) when is_binary(scope) do
     case Store.one!(
            connection,
-           "SELECT scope, observed_at, snapshot_json FROM intake_snapshots WHERE scope = ?",
+           "SELECT scope, observed_at, snapshot_json, decisions_json FROM intake_snapshots WHERE scope = ?",
            [String.trim(scope)]
          ) do
       nil ->
@@ -61,12 +62,15 @@ defmodule SymphonyElixir.Factory.IntakeLedger do
 
       row ->
         with {:ok, snapshots} when is_list(snapshots) <- Jason.decode(row["snapshot_json"]),
-             true <- Enum.all?(snapshots, &is_map/1) do
+             true <- Enum.all?(snapshots, &is_map/1),
+             {:ok, decisions} when is_map(decisions) <- Jason.decode(row["decisions_json"]),
+             true <- valid_decisions?(decisions) do
           {:ok,
            %{
              scope: row["scope"],
              observed_at: row["observed_at"],
-             snapshots: snapshots
+             snapshots: snapshots,
+             decisions: decisions
            }}
         else
           _other -> {:error, :invalid_stored_intake_snapshot}
@@ -75,4 +79,36 @@ defmodule SymphonyElixir.Factory.IntakeLedger do
   end
 
   def get(_connection, _scope), do: {:error, :invalid_intake_scope}
+
+  @doc "Records a controller rejection only against the exact saved intake observation."
+  @spec record_blocked(Store.connection(), String.t(), map(), String.t(), :manual_validation_contract_missing) ::
+          :ok | {:error, term()}
+  def record_blocked(connection, scope, snapshot, observed_at, :manual_validation_contract_missing) do
+    Store.transaction!(connection, fn tx ->
+      with {:ok, %{observed_at: ^observed_at, snapshots: snapshots, decisions: decisions}} <- get(tx, scope),
+           issue_key when is_binary(issue_key) <- snapshot["key"],
+           true <- Enum.find(snapshots, &(&1["key"] == issue_key)) == snapshot do
+        decision = %{
+          "code" => "manual_validation_contract_missing",
+          "message" => "Confirmed delivery contract must explicitly declare whether manual validation is required."
+        }
+
+        Store.query!(tx, "UPDATE intake_snapshots SET decisions_json = ? WHERE scope = ?", [Jason.encode!(Map.put(decisions, issue_key, decision)), String.trim(scope)])
+        :ok
+      else
+        _ -> {:error, :intake_observation_changed}
+      end
+    end)
+  end
+
+  defp valid_decisions?(decisions) do
+    Enum.all?(decisions, fn
+      {key, %{"code" => "manual_validation_contract_missing", "message" => message}}
+      when is_binary(key) and is_binary(message) ->
+        true
+
+      _ ->
+        false
+    end)
+  end
 end

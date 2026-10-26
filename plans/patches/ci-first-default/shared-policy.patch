@@ -1,0 +1,151 @@
+--- /Users/cgable/.agents/AGENTS.md
++++ /Users/cgable/.agents/AGENTS.md
+@@ -31,7 +31,11 @@
+ The software-factory boundary is strict: Jira specifications authorize work;
+ `draft-feature-cycle` creates incremental implementation candidates;
+ `verify-feature-delivery` independently gates delivery; only the factory
+-controller/dispatcher may then push and create a draft MR. A delivery worker
++controller/dispatcher may push and create a reviewer-free draft MR. Factory
++`ci_preflight: draft_mr` defaults to controller-only exact-SHA push with `--no-verify`
++to start required CI, then fresh independent verification before delivery.
++Explicit validated `verification_first` keeps verification before push.
++A delivery worker
+ must not push, create the MR, merge, or manage human review.
+ 
+ When a confirmed contract requires manual validation, the controller keeps the
+--- /Users/cgable/.agents/rules/gitlab-preferences.mdc
++++ /Users/cgable/.agents/rules/gitlab-preferences.mdc
+@@ -22,8 +22,15 @@
+ **NEVER run `git push` unless the user explicitly asks you to push.** Commit locally and wait for the user to request the push. This applies to all branches and all contexts.
+ 
+ **Autonomous-delivery exception.** An explicitly-started loop or an `ai-ready`
+-factory delivery task may push and create/update one draft MR only after the
+-mandatory independent delivery verifier passes. Push-at-delivery is the default,
++factory delivery task authorizes only the factory controller to push and create/update
++one reviewer-free draft MR. Factory `ci_preflight: draft_mr` is the default:
++the controller may push the exact committed SHA with `--no-verify` solely to start
++required repository CI, then must bind successful CI to that SHA and obtain a fresh
++independent verifier PASS before delivery. Explicit validated `verification_first`
++routes retain verifier-before-push ordering. Contract-required manual validation
++remains mandatory before human review. Workers never push or create an MR.
++Unknown CI policy or unsupported collection denies CI-first admission before push.
++Standalone autonomous loops retain verifier-before-push ordering. Push-at-delivery is the default,
+ provided work is on a dedicated feature branch — **never** push from
+ `main`/`master`. The user may explicitly opt out, in which case the task stops at
+ verified local commits. Outside that scope, the default (ask first) still holds.
+--- /Users/cgable/.agents/skills/draft-mr/SKILL.md
++++ /Users/cgable/.agents/skills/draft-mr/SKILL.md
+@@ -44,9 +44,13 @@
+   `git cat-file -e <verified-sha>^{commit}` succeeds locally.
+ - In factory controller mode, independent delivery verification passed for the
+   exact pushed SHA, except for an explicitly authorized controller `ci-preflight`
+-  operation. That exception requires the configured repository route to opt in
++  operation. Factory routes inherit `ci_preflight: draft_mr` unless explicitly
++  configured with validated `verification_first`. The CI-first exception requires
++  a controller-validated repository CI policy and supported deterministic collector
+   and the controller to prove the candidate is reachable locally and pushed
+-  exactly. In interactive current-checkout mode, verification is optional unless
++  exactly. Unknown policies, unobservable required selectors, and unsupported runtime
++  collection must deny CI-first admission before push; use an explicit
++  `verification_first` route instead. In interactive current-checkout mode, verification is optional unless
+   the user asks for it; if a requested review returns non-PASS, proceed only when
+   the user explicitly authorizes continuing despite its findings.
+ - GitLab tools are available. Inspect the callable tool schema before building
+--- /Users/cgable/.agents/skills/draft-feature-cycle/SKILL.md
++++ /Users/cgable/.agents/skills/draft-feature-cycle/SKILL.md
+@@ -58,7 +58,9 @@
+   may be committed with `git commit --no-verify`. In factory mode, the
+   controller validates and commits the returned slice; the worker edits source
+   and runs checks without writing Git metadata. Neither mode authorizes a
+-  worker push or MR before independent verification.
++  worker push or MR. Factory CI-first delivery permits only the controller to push
++  the exact committed candidate with `--no-verify` and create a reviewer-free draft
++  MR to start required CI; independent verification remains mandatory afterward.
+ 
+ If the contract revision changed, another writer is active, or the checkout has
+ unrelated user work, return `BLOCKED` without editing.
+@@ -152,7 +154,9 @@
+   commit them before independent verification.
+ 
+ `IMPLEMENTATION_CANDIDATE` is not `DONE`. After this skill returns, the caller
+-must invoke `verify-feature-delivery`, which creates a detached review worktree
++must obtain required repository CI and invoke `verify-feature-delivery` in factory
++CI-first mode; explicit `verification_first` and standalone mode invoke verification
++first. The verifier creates a detached review worktree
+ and launches a fresh reviewer context. In factory mode, use verifier controller
+ mode and let the factory controller own push/MR actions. In standalone mode,
+ the interactive caller remains the delivery owner but still waits for verifier
+--- /Users/cgable/.agents/skills/verify-feature-delivery/SKILL.md
++++ /Users/cgable/.agents/skills/verify-feature-delivery/SKILL.md
+@@ -84,5 +84,10 @@
+ 
+ Return evidence followed by the exact JSON contract. A parseable `PASS` with no
+ blocking issues is required before a factory dispatcher pushes and drafts the
+-MR. Outside factory delivery, the user controls whether this review runs and
++MR under explicit `verification_first`. The default factory `draft_mr` CI-first
++exception lets only the controller push the exact SHA and create a reviewer-free
++draft to start CI; it must then bind all required repository CI to that SHA, obtain
++a fresh independent PASS, and complete any contract-required manual validation
++before human review or delivery. No verifier PASS can replace required CI or manual
++validation. Outside factory delivery, the user controls whether this review runs and
+ whether to proceed after its findings.
+--- /Users/cgable/.agents/factory/config.toml
++++ /Users/cgable/.agents/factory/config.toml
+@@ -127,6 +127,7 @@
+ allow_database_ddl = false
+ 
+ [repositories.grail]
++ci_preflight = "draft_mr"
+ codex_project_id = "ad602dfe-91db-4efe-ba09-26513de01807"
+ path = "/Users/cgable/Repos/grail"
+ base_branch = "master"
+@@ -135,6 +136,7 @@
+ route_labels = ["repo-grail"]
+ 
+ [repositories.blackburn]
++ci_preflight = "draft_mr"
+ codex_project_id = "a8dd4cc6-5ac5-44f6-9577-3af014984e71"
+ path = "/Users/cgable/Repos/blackburn"
+ base_branch = "main"
+@@ -143,6 +145,7 @@
+ route_labels = ["repo-blackburn"]
+ 
+ [repositories.augusta]
++ci_preflight = "draft_mr"
+ codex_project_id = "ba5c5f50-2d55-4919-ae88-860e6f7e7f73"
+ path = "/Users/cgable/Repos/augusta"
+ base_branch = "main"
+@@ -151,6 +154,7 @@
+ route_labels = ["repo-augusta"]
+ 
+ [repositories.polaris]
++ci_preflight = "draft_mr"
+ codex_project_id = "0c602f12-ad80-4185-a90a-4269fbe4020a"
+ path = "/Users/cgable/Repos/polaris"
+ base_branch = "main"
+@@ -159,6 +163,7 @@
+ route_labels = ["repo-polaris"]
+ 
+ [repositories.prepost]
++ci_preflight = "verification_first"
+ codex_project_id = "4d64e744-d7f8-441c-9493-afacd497c0e2"
+ path = "/Users/cgable/Repos/prepost"
+ base_branch = "main"
+--- /Users/cgable/Repos/symphony/elixir/WORKFLOW.local.md
++++ /Users/cgable/Repos/symphony/elixir/WORKFLOW.local.md
+@@ -49,6 +49,7 @@
+   task_transport: desktop_broker
+   native_session_discovery_enabled: true
+   branch_prefix: cgable
++  ci_preflight: draft_mr
+   lease_seconds: 240
+   controller_required_mcp_servers:
+     - Jira
+@@ -156,6 +157,7 @@
+       route_labels:
+         - repo-polaris
+     prepost:
++      ci_preflight: verification_first
+       codex_project_id: 4d64e744-d7f8-441c-9493-afacd497c0e2
+       path: /Users/cgable/Repos/prepost
+       base_branch: main

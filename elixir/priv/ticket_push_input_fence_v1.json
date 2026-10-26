@@ -1,0 +1,80 @@
+{
+  "original_runtime": {
+    "pid": 73637,
+    "uid": 505,
+    "os_start": "Wed Oct 14 21:11:10 2026",
+    "artifact_path": "/Users/cgable/Library/Application Support/ai-factory/releases/ppl9881-ci-selection-7ZqkTI7h/dev",
+    "manifest_path": "/private/tmp/ppl9881-generation-policy.g8gxz4gx/manifest.json",
+    "manifest_sha256": "afc50c2eaeb69b84ca5aedb026997d301f83715cf5e9776330454c19d8304089",
+    "source_pins": {
+      "/private/tmp/ci-selection-policy-final.oZqw5h/lib/symphony_elixir/factory/ticket_push.ex": "cbef13a93b90d5985201b7a652599a58091b904b24c29e5897b8d4a90b707d57",
+      "/private/tmp/ci-selection-policy-final.oZqw5h/lib/symphony_elixir/factory/ticket_push_io.ex": "92cfe20669b07a8975c10c75b95315167c576b68a9d43dc1593df1eddeb2f17b"
+    },
+    "beam_pins": {
+      "/Users/cgable/Library/Application Support/ai-factory/releases/ppl9881-ci-selection-7ZqkTI7h/dev/lib/symphony_elixir/ebin/Elixir.SymphonyElixir.Factory.TicketPush.beam": "774fa16f5c361ee14909455ee81d946c9d1989bce98a293e3db9760b7277fb6a",
+      "/Users/cgable/Library/Application Support/ai-factory/releases/ppl9881-ci-selection-7ZqkTI7h/dev/lib/symphony_elixir/ebin/Elixir.SymphonyElixir.Factory.TicketPushIO.beam": "bf6b37d614157d065cb238a17a5c2d15666fd32f806f88d6d273d30213328f19"
+    },
+    "v3_sha256": "4e83f3eb809c3b3d5b2f7b95df8972fc138db00fa3a19f7a70e3e6d7c751c2e1"
+  },
+  "operation": {
+    "run_id": "ab5ab1fe-32cc-48c1-985e-3c3800adcfa2",
+    "candidate_sha": "be8e3d896a2edf84705f208f356bd8a2cfd6f513",
+    "nonce": "46b832b3b745bb388396f57129abd092ddc9beca62b3b16fcc45d10c0db564a3",
+    "binding_sha256": "7740a9f19863c5554dee1ca9e48ced4df29f90d5b3d0be4bd34017d00295010c",
+    "envelope_sha256": "be4af04327f868557d923511ae1aa55497377dfa41b741e245dda6233fecfd04",
+    "reservation_key": "ticket-push:7740a9f19863c5554dee1ca9e48ced4df29f90d5b3d0be4bd34017d00295010c",
+    "reservation_generation": 22
+  },
+  "guard": {
+    "core_sha256": "d176d1882458c6e9c82bbc89db3b199f092839aa12b795afd297ca8a15101769",
+    "interpreter": {
+      "path": "/usr/bin/python3",
+      "version": "3.9.6",
+      "sha256": "b8763cf250e607a778bb4603cecb5b90338814d0a3dfcba0d57b1de242f610e9",
+      "executable_path": "/Library/Developer/CommandLineTools/usr/bin/python3",
+      "binary_path": "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9",
+      "executable_sha256": "e7276a0ac27acdd53135450bd3038e8a6d77aad9df9ee06b05ef311ce9955db9"
+    },
+    "reviewed_scopes": {
+      "source_pins": [
+        "mix/tasks/factory.ex",
+        "symphony_elixir/factory/admin.ex",
+        "symphony_elixir/factory/scheduler.ex",
+        "symphony_elixir/factory/store.ex",
+        "symphony_elixir/factory/ticket_push.ex",
+        "symphony_elixir/factory/ticket_push_io.ex",
+        "symphony_elixir/factory/workspace_access.ex"
+      ],
+      "beam_pins": [
+        "lib/symphony_elixir/ebin/Elixir.Mix.Tasks.Factory.beam",
+        "lib/symphony_elixir/ebin/Elixir.SymphonyElixir.Factory.Admin.beam",
+        "lib/symphony_elixir/ebin/Elixir.SymphonyElixir.Factory.Scheduler.beam",
+        "lib/symphony_elixir/ebin/Elixir.SymphonyElixir.Factory.Store.beam",
+        "lib/symphony_elixir/ebin/Elixir.SymphonyElixir.Factory.TicketPush.beam",
+        "lib/symphony_elixir/ebin/Elixir.SymphonyElixir.Factory.TicketPushIO.beam",
+        "lib/symphony_elixir/ebin/Elixir.SymphonyElixir.Factory.WorkspaceAccess.beam"
+      ],
+      "test_pins": [
+        "/Users/cgable/Repos/symphony-ticket-chat-implementation/elixir/test/symphony_elixir/factory_push_input_fence_test.exs",
+        "/Users/cgable/Repos/symphony-ticket-chat-implementation/elixir/test/symphony_elixir/factory_push_input_retirement_test.exs",
+        "/Users/cgable/Repos/symphony-ticket-chat-implementation/elixir/test/symphony_elixir/factory_ticket_worker_lifecycle_test.exs"
+      ],
+      "file_pins": [
+        "/Users/cgable/Repos/symphony-ticket-chat-implementation/elixir/priv/ticket_push_input_fence_v1.json",
+        "/Users/cgable/Repos/symphony-ticket-chat-implementation/elixir/priv/ticket_push_input_fence_v1.py"
+      ],
+      "source_additions": [],
+      "beam_additions": [],
+      "manifest_additions": [
+        "/Users/cgable/Repos/symphony-ticket-chat-implementation/elixir/priv/ticket_push_input_fence_v1.json",
+        "/Users/cgable/Repos/symphony-ticket-chat-implementation/elixir/priv/ticket_push_input_fence_v1.py",
+        "/Users/cgable/Repos/symphony-ticket-chat-implementation/elixir/test/symphony_elixir/factory_push_input_fence_test.exs",
+        "/Users/cgable/Repos/symphony-ticket-chat-implementation/elixir/test/symphony_elixir/factory_push_input_retirement_test.exs"
+      ]
+    }
+  },
+  "original_snapshot": {
+    "path": "/private/tmp/ppl9881-held-push-snapshot-UwU7mIbs/protected-baseline.json",
+    "sha256": "2144b2aaf54322f2efdf8bc465707f0caa2550f842293d9dd552c4bae01317d9"
+  }
+}

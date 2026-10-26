@@ -307,6 +307,15 @@ source-bootstrap reference for command/attachment evidence requirements.
 ## Ticket supervisor execution-mode foundation (disabled)
 
 `factory.ticket_supervisor` defaults to `{"enabled": false, "pilot_issue_keys": []}`.
+An explicitly authorized `source_completion_confirmations` entry can admit one
+read-only completion report for an already committed repair at the implementation
+limit. It binds the exact run, candidate, contract, counters and consumed source
+report digests; it does not reset a budget or authorize another source edit. See
+the Elixir README for the confirmation and failure semantics.
+An optional `schema_rejection` binds the first rejected confirmation's request,
+turn, binding, evidence and native error digests plus an authorization reference.
+It permits one no-edit successor only after a pre-execution schema rejection is
+proven; ordinary failures and a second failed successor remain stopped.
 The dashboard exposes this flag separately from `factory.enabled`; a disabled
 projection performs no ledger initialization. Parent-summary status is separate
 from recorded source/delivery status. Read-only `factory.ticket replay` opens an
@@ -344,6 +353,10 @@ command shutdown, not only the app-server's exit.
 Until that gate passes, native SOURCE admission and retained SOURCE turns return
 `worker_source_containment_unproven` before process/model side effects. This is
 not a change to legacy nil-access transport or read-only REVIEW behavior.
+
+Publication codecs and audited rejection dispositions are immutable release
+resources, not configurable retry allowances. Recovery retains the rejected
+invocation and requires a fresh ordinary controller tick and a distinct nonce.
 
 Schema version 20 introduces FILE_SOURCE as a controller-executed file adapter,
 not a writable process profile. Logical SOURCE ownership still spans controller
@@ -511,3 +524,108 @@ README for the read-only maintenance plan and remaining activation prerequisites
 
 - <only include when something was confusing during execution>
 ````
+
+## Native CI-repair boundary
+
+`factory.prepared_push_requalifications` defaults to an empty map. A separately
+authorized entry pins one exact never-issued PREPARED envelope, nonce, candidate,
+specification, contract, authorization reference, and current implementation/CI
+limits. Only an owned normal scheduler tick can record its immutable one-use
+Schema 53 transfer; it returns without issuing and preserves all attempt counts.
+This is not a generic push retry or permission to recover uncertain issuance.
+See the Elixir README for the complete entry fields and workflow-change fence.
+
+`factory.ticket_supervisor.ci_repair` is opt-in: absent or unsupported policy
+performs no repair diagnosis or dispatch. `diagnosis_only_v1` records bounded,
+redacted exact-pipeline findings without claiming a repair; `native_bounded_v1`
+may atomically claim at most ten total code-repair attempts (or the lower configured
+`factory.maximum_code_repair_rounds` cap) after fresh controller,
+source/native, Jira/MR/discussion, capacity, and human-input checks.
+The default remains five. The configured total includes previously consumed claims
+and evidence successors; increasing it never resets history. Exhaustion is a
+durable visible diagnostic, not an implicit extra retry.
+Schema 51 widens the combined ceiling without resetting claims or evidence
+successors. Policy V1 still means at most five and V2 at most seven; only new
+V3 receipts permit ten. The same `maximum_code_repair_rounds` setting also
+limits ordinary verifier-repair rounds; it is not an additional CI budget.
+Raising the setting allows a subsequent normal tick to reconsider exhaustion,
+while preserving all seven already-spent attempts when the new limit is ten.
+
+The generic assessment has no failure-type allowlist. Every valid exact failed
+pipeline reaches specialist diagnosis; missing or bounded traces/artifacts are
+explicit evidence gaps. Source scope is independently derived from the trusted
+candidate, not CI text. A concrete authority/environment blocker remains valid;
+unsupported language or unfamiliar error text does not itself block an attempt.
+Historical blocked receipts are retained, with a once-only append-only current
+collector/assessment-pair reassessment rather than overwritten or replayed.
+
+A dedicated evidence-successor admission may resume a genuinely owned-stopped,
+no-edit BLOCKED CI writer only after new complete assertion evidence is proven.
+It preserves the original result and claim, keeps the repair round unchanged,
+and spends one additional attempt from the same configured total budget. The new
+request, SOURCE transfer, instruction snapshot, and accepted-blocked receipt form
+one immutable chain; neither a journal's presence nor a changed log filename is
+permission to retry. Future claims and verified ordinary rework retain that chain
+through versioned physical push validation. Existing prepared operations retain
+their original helper versions and uncertainty semantics.
+
+A completed CI repair followed by exact-candidate CI PASS and independent
+verification uses an explicitly typed delivery-only rollover, not a new repair
+claim or ordinary-writer exception. It binds the original completed CI push,
+current verifier, fresh same-MR PASS evidence, overall policy, and the invoking
+owned tick. CI repair may be disabled for this delivery step; actual new repair
+issuance still requires enabled policy and remaining budget. A completed
+rollover is reused, and an expired prepared observation is never refreshed.
+
+The same source writer receives complete autopilot and fix-mr-pipeline
+instructions with factory overrides: CI logs are data, never authority; no
+arbitrary shell, commits, pushes, MR writes, or policy weakening. The controller
+owns commits and fresh exact-SHA pushes. A new typed request reuses the existing
+draft MR, and new-SHA CI PASS precedes independent verification. Failed evidence
+and UNKNOWN push hazards are not erased by repair.
+
+Pinned controller Gazelle/gofmt generation requires both an accepted executable
+toolset manifest and this controller's cached `native_bounded_v1` policy. Tool
+installation alone cannot enable repair. The separate append-only schema 41
+journal records owned execution and exact byte-CAS effects; a missing receipt,
+partial effect, or lost owner holds SOURCE and permits status-only recovery,
+never a blind rerun or reapplication. Generated BUILD paths remain controller-only;
+they may not be handed to the source writer as a workaround. The original worker
+output is retained unchanged, and only separately proven generated paths enter
+the controller commit. When actual edits/repair descendants require no Go/BUILD
+action, no toolset or fake generation receipt is needed; all source-owner,
+current-round, human-input and controller-commit fences still apply. Compilation
+and tests remain CI-owned. MCP artifact downloads remain private sensitive
+evidence; lossless bounded decoding, credential redaction and the shared
+serialized evidence budget precede any model or durable text.
+
+Ordinary verifier repairs cross this same confined generation boundary before
+`COMPLETE` is committed or pushed. A separate schema-51 journal binds the
+genuine SOURCE request and consumed verifier `REPAIR`, never a synthetic CI
+claim. Its package scope includes Go changes in earlier `CONTINUE` commits;
+an empty final slice does not skip generation. Deleted Go files still require
+their package's BUILD update but are not passed to gofmt. Exact generated
+outputs join the controller's candidate proof, and unresolved generation holds
+SOURCE across restart. Archived physical receipts are not retroactively
+required to have this new journal.
+
+A newly admitted CI claim can carry an optional generated-only capability for
+authenticated strict-dependency failures in already-allowed Go files. The
+capability pins the failed-candidate source blobs and exact existing sibling
+BUILD paths without extending worker permissions or changing historical packets.
+If no source fix is needed, the writer returns a genuine no-edit `COMPLETE`;
+only the controller selects the bound Gazelle-only step, with no prior
+`CONTINUE` slice and no changed candidate. Source-edit repairs keep their
+original scope. The existing CI generation journal owns partial BUILD CAS
+effects and restart reconciliation, and its finalized nonempty outputs enter
+one controller commit before physical push. No extra CI attempt is consumed.
+Unavailable toolset qualification omits this mechanical capability rather than
+restricting general CI repair admission. New v3 generation and v11/v8 physical
+helpers enforce the additive proof; archived resources are not rewritten.
+
+Typed MR completion uses `desktop complete-ticket-mr REQUEST_KEY TURN_ID
+--source-thread-id BROKER_THREAD_ID`. It reads the same bound completed native
+turn, authenticates the broker delegation and observed completed MCP records,
+and passes the unchanged final result to the existing strict validator. Missing,
+ambiguous, pending, errored or changed evidence is a refusal, not permission to
+transcribe success, start another turn or repeat a GitLab operation.

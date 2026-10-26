@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "manifest_path": "/Users/cgable/Library/Application Support/ai-factory/releases/symphony-push-reassessment-v4-Qz6Uesin/evidence/release-manifest.json",
+      "manifest_sha256": "e665d0900b4c55d71ab2af98f0457390e22942d0ed69c3502c1c95b5c15db5d6",
+      "helper_path": "/Users/cgable/Library/Application Support/ai-factory/releases/symphony-push-reassessment-v4-Qz6Uesin/dev/lib/symphony_elixir/priv/ticket_push_executor_v4.py",
+      "helper_sha256": "dc7ac631720ab9cdd167b186eef24fb5944047dc4f091e0b2fc29c83cb3a68f5",
+      "companion_path": "/Users/cgable/Library/Application Support/ai-factory/releases/symphony-push-reassessment-v4-Qz6Uesin/dev/lib/symphony_elixir/priv/worker_file_companion.py",
+      "companion_sha256": "87f3dd595ddc70205ed881b42ab5a9401b0705c13cdc8fda2c2b8b5bac4b0b3b"
+    },
+    {
+      "manifest_path": "/Users/cgable/Library/Application Support/ai-factory/releases/symphony-ci-session-v1-0ea20948ab/evidence/release-manifest.json",
+      "manifest_sha256": "9911c0511d0f598e54196366116eec099266893d38212167b634b5268a7eac24",
+      "helper_path": "/Users/cgable/Library/Application Support/ai-factory/releases/symphony-ci-session-v1-0ea20948ab/dev/lib/symphony_elixir/priv/ticket_push_executor_v5.py",
+      "helper_sha256": "5fd606f4ce9d4f41994a96ec87590be635a3845e18968f5e5fa647680189f49e",
+      "companion_path": "/Users/cgable/Library/Application Support/ai-factory/releases/symphony-ci-session-v1-0ea20948ab/dev/lib/symphony_elixir/priv/worker_file_companion.py",
+      "companion_sha256": "87f3dd595ddc70205ed881b42ab5a9401b0705c13cdc8fda2c2b8b5bac4b0b3b"
+    },
+    {
+      "manifest_path": "/Users/cgable/Library/Application Support/ai-factory/releases/symphony-ci-seven-v1-dce616fc81/evidence/release-manifest.json",
+      "manifest_sha256": "de4baa3b6b8706c7b29051c7345c1d5df739074b3c6ff23fa9e62e920a1ebec5",
+      "helper_path": "/Users/cgable/Library/Application Support/ai-factory/releases/symphony-ci-seven-v1-dce616fc81/dev/lib/symphony_elixir/priv/ticket_push_executor_v6.py",
+      "helper_sha256": "7ca52f7bed65a85a0dfe6c5d585369514c306dc9bc66251aa12e716c00411584",
+      "companion_path": "/Users/cgable/Library/Application Support/ai-factory/releases/symphony-ci-seven-v1-dce616fc81/dev/lib/symphony_elixir/priv/worker_file_companion.py",
+      "companion_sha256": "87f3dd595ddc70205ed881b42ab5a9401b0705c13cdc8fda2c2b8b5bac4b0b3b"
+    }
+    , {
+      "manifest_path": "/Users/cgable/Library/Application Support/ai-factory/releases/symphony-empty-child-v1-adb105bb13/evidence/release-manifest.json",
+      "manifest_sha256": "68dfb2b5970ab1eebd49cb18e2196328efbe9b1d323f710cc0e721316e9d4dff",
+      "helper_path": "/Users/cgable/Library/Application Support/ai-factory/releases/symphony-empty-child-v1-adb105bb13/dev/lib/symphony_elixir/priv/ticket_push_executor_v7.py",
+      "helper_sha256": "0a508832da9ae8dac08f4a7eabcf7699f9ce395a9355af2b67f8f10da514db2d",
+      "companion_path": "/Users/cgable/Library/Application Support/ai-factory/releases/symphony-empty-child-v1-adb105bb13/dev/lib/symphony_elixir/priv/worker_file_companion.py",
+      "companion_sha256": "87f3dd595ddc70205ed881b42ab5a9401b0705c13cdc8fda2c2b8b5bac4b0b3b"
+    }
+  ]
+}

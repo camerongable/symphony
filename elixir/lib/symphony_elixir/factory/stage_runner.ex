@@ -41,6 +41,8 @@ defmodule SymphonyElixir.Factory.StageRunner do
         :ephemeral,
         :worker_access,
         :worker_files,
+        :native_recovery,
+        :recovery_preflight,
         :fork_on_active_writer,
         :model,
         :mcp_startup_timeout_ms,
@@ -87,8 +89,8 @@ defmodule SymphonyElixir.Factory.StageRunner do
       owned_result(result, stopped, session, collector)
     catch
       kind, reason ->
-        app_server.stop_session(session)
-        :erlang.raise(kind, reason, __STACKTRACE__)
+        stopped = app_server.stop_session(session)
+        owned_result({:error, {:worker_exception, kind, inspect(reason)}}, stopped, session, collector)
     after
       Agent.stop(collector)
     end
@@ -98,7 +100,28 @@ defmodule SymphonyElixir.Factory.StageRunner do
     {:ok, %{thread_id: session.thread_id, turn_id: turn.turn_id, output: output, item_id: Agent.get(collector, & &1.item_id), policy: session.worker_policy, owner_stop: stop}}
   end
 
-  defp owned_result({:error, _} = error, _stopped, _session, _collector), do: error
+  defp owned_result({:error, reason}, stopped, session, collector) do
+    identity = Agent.get(collector, & &1.identity)
+
+    turn =
+      case identity do
+        {thread, turn} when thread == session.thread_id -> turn
+        _ -> nil
+      end
+
+    observed = %{
+      thread_id: session.thread_id,
+      turn_id: turn,
+      policy: session.worker_policy,
+      owner_stop:
+        case stopped do
+          {:ok, proof} -> proof
+          _ -> nil
+        end
+    }
+
+    {:error, {:worker_failed, reason, observed}}
+  end
 
   defp owned_result({:ok, turn, output}, stopped, session, collector) do
     observed = %{thread_id: session.thread_id, turn_id: turn.turn_id, output: output, item_id: Agent.get(collector, & &1.item_id), policy: session.worker_policy}

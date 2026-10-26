@@ -10,6 +10,38 @@ defmodule SymphonyElixir.FactoryTicketChatTest do
     assert "prompt" in missing
   end
 
+  test "only an unissued parent can be rehomed with audited request rebinding", ctx do
+    original = attrs(ctx.root)
+    {:ok, first} = TicketChat.reserve(ctx.store, "run-one", original)
+    root = Path.join(ctx.root, "desktop-date")
+    File.mkdir_p!(root)
+    relocated = %{original | cwd: Path.join(root, first.chat["directory_name"])}
+    {:ok, run} = RunLedger.get(ctx.store, "run-one")
+    assert {:error, :ticket_chat_identity_conflict} = TicketChat.reserve(ctx.store, "run-one", relocated)
+    assert {:ok, _} = TicketChat.rehome_unissued(ctx.store, "run-one", relocated, run)
+    assert {:ok, rebound} = TicketChat.reserve(ctx.store, "run-one", relocated)
+    assert rebound.chat["chat_key"] == first.chat["chat_key"]
+    assert rebound.request["request_key"] == first.request["request_key"]
+    assert rebound.request["payload_sha256"] != first.request["payload_sha256"]
+    assert DesktopRequest.payload_intact?(rebound.request)
+    assert {:ok, ^run} = RunLedger.get(ctx.store, "run-one")
+    assert Store.one!(ctx.store, "SELECT COUNT(*) AS count FROM events WHERE event_type = 'ticket_parent_unissued_rehomed'") == %{"count" => 1}
+    simulate_claim(ctx.store, rebound.request)
+    assert {:error, :ticket_chat_identity_conflict} = TicketChat.reserve(ctx.store, "run-one", original)
+    assert {:error, :ticket_chat_identity_conflict} = TicketChat.rehome_unissued(ctx.store, "run-one", original, run)
+  end
+
+  test "dated parent creation refuses yesterday's binding and occupied leaf", ctx do
+    root = Path.join(ctx.root, "{date}")
+    policy = %{"parent_output_root" => root}
+    assert {:error, :ticket_chat_creation_date_changed} = TicketChat.creation_root_current(%{"action" => "CREATE", "cwd" => Path.join(ctx.root, "old-date/parent")}, policy)
+    cwd = Path.join(TicketChat.output_root(root), "parent")
+    assert :ok = TicketChat.creation_root_current(%{"action" => "CREATE", "cwd" => cwd}, policy)
+    File.mkdir_p!(cwd)
+    assert {:error, :ticket_chat_creation_path_collision} = TicketChat.creation_root_current(%{"action" => "CREATE", "cwd" => cwd}, policy)
+    assert :ok = TicketChat.creation_root_current(%{"action" => "FOLLOWUP", "cwd" => cwd}, policy)
+  end
+
   setup do
     token = "#{System.pid()}-#{System.system_time(:nanosecond)}-#{System.unique_integer([:positive])}"
     root = Path.join(System.tmp_dir!(), "ticket-chat-#{token}")

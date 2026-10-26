@@ -6,16 +6,24 @@ defmodule SymphonyElixirWeb.DashboardLive do
   use Phoenix.LiveView, layout: {SymphonyElixirWeb.Layouts, :app}
 
   alias SymphonyElixir.Factory.Observability, as: FactoryObservability
-  alias SymphonyElixirWeb.{Endpoint, ObservabilityPubSub, Presenter}
+  alias SymphonyElixirWeb.{DashboardTickets, Endpoint, ObservabilityPubSub, Presenter}
   @runtime_tick_ms 1_000
   @payload_refresh_ms 5_000
 
   @impl true
   def mount(_params, _session, socket) do
+    payload = bounded_initial_payload()
+
     socket =
       socket
-      |> assign(:payload, load_payload())
+      |> assign(:payload, payload)
       |> assign(:now, DateTime.utc_now())
+      |> assign(:snapshot_observed_at, if(payload_failure(payload), do: nil, else: DateTime.utc_now()))
+      |> assign(:snapshot_error, payload_failure(payload))
+      |> assign(:snapshot_refresh, nil)
+      |> assign(:expanded_workflows, MapSet.new())
+      |> assign(:theme, "dark")
+      |> assign(:ticket_filter, "ALL")
 
     if connected?(socket) do
       :ok = ObservabilityPubSub.subscribe()
@@ -27,6 +35,31 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   @impl true
+  def handle_event("dashboard_theme", %{"theme" => theme}, socket) when theme in ~w(dark light),
+    do: {:noreply, assign(socket, :theme, theme)}
+
+  def handle_event("dashboard_theme", _params, socket), do: {:noreply, socket}
+
+  def handle_event("ticket_filter", %{"bucket" => bucket}, socket)
+      when bucket in ~w(ALL NEEDS_ATTENTION ACTIVE QUEUED REVIEW_READY VALIDATION_PENDING),
+      do: {:noreply, assign(socket, :ticket_filter, bucket)}
+
+  def handle_event("ticket_filter", _params, socket), do: {:noreply, socket}
+
+  def handle_event("workflow_details", %{"run_id" => id}, socket) do
+    factory = socket.assigns.payload[:factory] || %{}
+    tickets = DashboardTickets.project(factory).tickets
+    expanded = socket.assigns.expanded_workflows
+
+    if Enum.any?(tickets, &(&1.key == id)) do
+      next = if MapSet.member?(expanded, id), do: MapSet.delete(expanded, id), else: MapSet.put(expanded, id)
+      {:noreply, assign(socket, :expanded_workflows, next)}
+    else
+      {:noreply, socket}
+    end
+  end
+
+  @impl true
   def handle_info(:runtime_tick, socket) do
     schedule_runtime_tick()
     {:noreply, assign(socket, :now, DateTime.utc_now())}
@@ -34,67 +67,89 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   @impl true
   def handle_info(:observability_updated, socket) do
-    {:noreply,
-     socket
-     |> assign(:payload, load_payload())
-     |> assign(:now, DateTime.utc_now())}
+    {:noreply, start_snapshot_refresh(socket)}
   end
 
   def handle_info(:payload_refresh, socket) do
     schedule_payload_refresh()
 
-    {:noreply,
-     socket
-     |> assign(:payload, load_payload())
-     |> assign(:now, DateTime.utc_now())}
+    {:noreply, start_snapshot_refresh(socket)}
   end
+
+  def handle_info({:snapshot_timeout, token}, %{assigns: %{snapshot_refresh: %{token: token}}} = socket) do
+    {:noreply, socket |> cancel_async({:snapshot, token}) |> assign(:snapshot_refresh, nil) |> assign(:snapshot_error, "Snapshot refresh timed out; displayed data is last known, not current.")}
+  end
+
+  def handle_info({:snapshot_timeout, _token}, socket), do: {:noreply, socket}
+
+  @impl true
+  def handle_async({:snapshot, token}, result, %{assigns: %{snapshot_refresh: %{token: token, timer: timer}}} = socket) do
+    Process.cancel_timer(timer)
+    socket = assign(socket, :snapshot_refresh, nil)
+
+    case result do
+      {:ok, payload} when is_map(payload) ->
+        case payload_failure(payload) do
+          nil -> {:noreply, socket |> assign(:payload, payload) |> assign(:snapshot_error, nil) |> assign(:snapshot_observed_at, DateTime.utc_now())}
+          failure -> {:noreply, assign(socket, :snapshot_error, failure)}
+        end
+
+      _ ->
+        {:noreply, assign(socket, :snapshot_error, "Snapshot refresh failed; displayed data is last known, not current.")}
+    end
+  end
+
+  def handle_async({:snapshot, _token}, _result, socket), do: {:noreply, socket}
+
+  defp start_snapshot_refresh(%{assigns: %{snapshot_refresh: nil}} = socket) do
+    token = make_ref()
+    timer = Process.send_after(self(), {:snapshot_timeout, token}, refresh_timeout_ms())
+    socket |> assign(:snapshot_refresh, %{token: token, timer: timer}) |> start_async({:snapshot, token}, fn -> load_payload() end)
+  end
+
+  defp start_snapshot_refresh(socket), do: socket
+
+  defp bounded_initial_payload do
+    task = Task.Supervisor.async_nolink(SymphonyElixir.TaskSupervisor, fn -> load_payload() end)
+
+    case Task.yield(task, refresh_timeout_ms()) || Task.shutdown(task, :brutal_kill) do
+      {:ok, payload} when is_map(payload) -> payload
+      _ -> %{error: %{code: "snapshot_timeout", message: "Initial snapshot unavailable; waiting for a bounded refresh."}}
+    end
+  end
+
+  defp refresh_timeout_ms, do: Endpoint.config(:dashboard_refresh_timeout_ms) || 5_000
+  defp payload_failure(%{error: error}), do: error.message
+
+  defp payload_failure(%{factory: %{available: false} = factory}),
+    do: if(Map.get(factory, :disabled) == true, do: nil, else: "Factory snapshot unavailable; displayed data is last known, not current.")
+
+  defp payload_failure(_payload), do: nil
 
   @impl true
   def render(assigns) do
-    assigns = assign(assigns, :factory_operability, factory_operability(assigns.payload))
+    assigns = assign(assigns, :factory_operability, if(assigns.snapshot_error, do: "unknown", else: factory_operability(assigns.payload)))
 
     ~H"""
-    <section class="dashboard-shell" data-factory-operability={@factory_operability}>
+    <section class="dashboard-shell" data-factory-operability={@factory_operability} data-theme={@theme}>
       <header class="dashboard-header">
         <div>
-          <p class="eyebrow">Symphony</p>
-          <h1 class="hero-title">Software factory</h1>
-          <p class="hero-copy">
-            Follow Jira work from intake through agent execution, verification, and a draft merge request.
-          </p>
+          <h1 class="hero-title">Symphony</h1>
+          <p class="hero-copy">Tickets</p>
+          <div class="theme-switcher" role="group" aria-label="Dashboard appearance">
+            <button :for={theme <- ~w(dark light)} type="button" phx-click="dashboard_theme" phx-value-theme={theme} aria-pressed={to_string(@theme == theme)}><%= String.capitalize(theme) %></button>
+          </div>
         </div>
 
-        <div class="status-cluster" aria-label="Dashboard status">
-          <span class="status-badge status-badge-connected">
-            <span class="status-badge-dot"></span>
-            Dashboard connected
-          </span>
-          <span class="status-badge status-badge-offline">
-            <span class="status-badge-dot"></span>
-            Reconnecting
-          </span>
-          <span
-            :if={@payload[:factory] && @payload.factory.available}
-            class={state_badge_class(factory_controller_health(@payload.factory.control))}
-          >
-            Scheduler <%= String.downcase(factory_controller_health(@payload.factory.control)) %>
-          </span>
-          <span
-            :if={@payload[:factory] && @payload.factory.available && @payload.factory[:broker]}
-            class={broker_badge_class(broker_request_status(@payload.factory.broker))}
-            title="Desktop request state only; the Codex automation heartbeat is not verified here."
-          >
-            <%= broker_status_label(broker_request_status(@payload.factory.broker)) %>
-          </span>
-          <span
-            :if={@payload[:factory] && @payload.factory.available}
-            class={capacity_badge_class(capacity_health(shared_capacity(@payload.factory)))}
-            title="Availability for one more source-writing task; specification and validation slots are listed below."
-          >
-            Writer capacity <%= String.downcase(capacity_health(shared_capacity(@payload.factory))) %>
-          </span>
+        <div class="scheduling-indicator" aria-label="Factory scheduling control observation">
+          <span class={"status-mark #{scheduling_tone(@payload, @snapshot_error)}"} aria-hidden="true"></span>
+          <strong>Factory scheduling: <%= scheduling_label(@payload, @snapshot_error) %></strong>
+          <small>Polling and admission control</small>
         </div>
       </header>
+      <p :if={@snapshot_error} class="factory-alert factory-alert-danger" role="alert" data-snapshot-stale="true">Dashboard data stale: <%= @snapshot_error %></p>
+      <p :if={!@snapshot_observed_at} class="section-copy">Ticket counts unknown until a successful dashboard observation.</p>
+      <p class="section-copy snapshot-caption">Snapshot observed <.local_time id="dashboard-observed-at" value={if @snapshot_observed_at, do: DateTime.to_iso8601(@snapshot_observed_at)} /></p>
 
       <%= if @payload[:error] do %>
         <section class="error-card">
@@ -106,34 +161,16 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </p>
         </section>
       <% else %>
-        <section class="metric-grid overview-grid" aria-label="Factory overview">
-          <article class="metric-card">
-            <p class="metric-label">Active work</p>
-            <p class="metric-value numeric"><%= active_work_count(@payload) %></p>
-            <p class="metric-detail"><%= active_work_detail(@payload) %></p>
-          </article>
-
-          <article class="metric-card">
-            <p class="metric-label">Jira queue</p>
-            <p class="metric-value numeric"><%= factory_intake_count(@payload) %></p>
-            <p class="metric-detail">Eligible tickets waiting for a worker.</p>
-          </article>
-
-          <article class="metric-card">
-            <p class="metric-label">Ready for review</p>
-            <p class="metric-value numeric"><%= factory_review_ready(@payload) %></p>
-            <p class="metric-detail">Draft merge requests ready for a human.</p>
-          </article>
-
-          <article class="metric-card">
-            <p class="metric-label">Needs attention</p>
-            <p class="metric-value numeric"><%= attention_count(@payload) %></p>
-            <p class="metric-detail"><%= attention_detail(@payload) %></p>
-          </article>
+        <section class="ticket-buckets" aria-label="Ticket buckets">
+          <button :for={{bucket, label, count} <- ticket_buckets(@payload)} type="button" phx-click="ticket_filter" phx-value-bucket={bucket} aria-pressed={to_string(@ticket_filter == bucket)} class="ticket-bucket metric-card">
+            <span><%= label %></span><strong class="numeric"><%= if @snapshot_observed_at, do: count, else: "Unknown" %></strong>
+          </button>
         </section>
+        <p class="queue-guide">Five queue filters classify tickets in this snapshot; they are not the seven lifecycle phases.</p>
       <% end %>
 
-      <.factory_dashboard :if={@payload[:factory]} factory={@payload.factory} now={@now} />
+      <.factory_dashboard :if={@payload[:factory]} factory={@payload.factory} now={@now} snapshot_stale={@snapshot_error != nil} expanded_workflows={@expanded_workflows} ticket_filter={@ticket_filter}>
+        <:runtime>
 
       <details
         :if={!@payload[:error]}
@@ -147,8 +184,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <small>Agent sessions, retry details, token use, and upstream rate limits.</small>
           </span>
           <span class="disclosure-label">
-            <span class="disclosure-closed-label">Show details</span>
-            <span class="disclosure-open-label">Hide details</span>
+            <span class="disclosure-closed-label">Show runtime</span>
+            <span class="disclosure-open-label">Hide runtime</span>
           </span>
         </summary>
 
@@ -333,6 +370,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </section>
         </div>
       </details>
+        </:runtime>
+      </.factory_dashboard>
     </section>
     """
   end
@@ -391,10 +430,16 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   attr(:factory, :map, required: true)
   attr(:now, :any, required: true)
+  attr(:snapshot_stale, :boolean, default: false)
+  attr(:expanded_workflows, :any, required: true)
+  attr(:ticket_filter, :string, required: true)
+  slot(:runtime, required: true)
 
   defp factory_dashboard(assigns) do
+    assigns = if assigns.snapshot_stale and assigns.factory.available, do: assign(assigns, :factory, put_in(assigns.factory, [:control, :snapshot_stale], true)), else: assigns
+
     factory =
-      if Map.get(assigns.factory, :disabled, false) do
+      if Map.get(assigns.factory, :disabled, false) or not Map.get(assigns.factory, :available, false) do
         assigns.factory
       else
         assigns.factory
@@ -407,11 +452,21 @@ defmodule SymphonyElixirWeb.DashboardLive do
       |> assign(:factory, factory)
       |> assign(:shared_capacity, List.first(factory[:capacity] || []))
       |> assign(:repository_keys, repository_keys(factory[:capacity] || []))
-      |> assign(:current_runs, current_runs(factory[:current_runs] || factory[:runs] || []))
+      |> assign(:ticket_projection, DashboardTickets.project(factory))
 
     ~H"""
     <section class="factory-workspace">
       <%= if @factory.available do %>
+        <div :if={controller_blocking_attention?(@factory.control)} class="factory-alert" role="alert">
+          <strong>Scheduling handoff needs attention</strong>
+          <p><%= @factory.control.handoff_attention[:reason] %></p>
+          <p><%= @factory.control.handoff_attention[:next_action] %></p>
+        </div>
+
+        <div :if={get_in(@factory.control, [:tick_health, :status]) == "FAILED"} class="factory-alert" role="alert">
+          <strong>Last factory tick failed</strong>
+          <p>Queued tickets may not advance until recovery. Last error: <%= @factory.control.tick_health.last_error %></p>
+        </div>
         <div
           :if={@factory.control.controller_writer_conflict_count > 0}
           class="factory-alert factory-alert-danger"
@@ -431,177 +486,145 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </span>
         </div>
 
-        <div class="workflow-heading">
-          <div>
-            <p class="eyebrow">Work</p>
-            <h2>From Jira to review</h2>
+        <section class="tickets-section runs-section" aria-labelledby="tickets-heading">
+          <header class="tickets-heading">
+            <div><h2 id="tickets-heading">Tickets</h2><p>Current bounded snapshot · <%= length(@ticket_projection.tickets) %> identifiable tickets · <%= length(filtered_tickets(@ticket_projection.tickets, @ticket_filter)) %> shown</p></div>
+            <nav class="ticket-list-filters" aria-label="Additional ticket filters">
+              <button type="button" phx-click="ticket_filter" phx-value-bucket="ALL" aria-pressed={to_string(@ticket_filter == "ALL")}>All tickets</button>
+            </nav>
+          </header>
+          <div :if={!intake_available?(@factory)} class="factory-alert" role="alert" data-intake-unavailable="true">
+            <strong>Partial ticket snapshot · intake backlog unknown</strong>
+            <p :if={get_in(@factory, [:intake, :error])} class="full-text bounded-reading" tabindex="0" role="region" aria-label="Intake read failure">Jira intake history could not be read: <%= intake_read_error(@factory) %></p>
+            <p :if={!get_in(@factory, [:intake, :error])}>No successful Jira intake snapshot has been recorded yet.</p>
+            <p>Recorded workflows remain visible. Missing intake data does not mean there are no queued tickets.</p>
           </div>
-          <p>Tickets enter through Jira, become durable workflows, and finish as draft merge requests.</p>
-          <p class="section-copy">Ordinary factory: <%= config_flag(@factory[:ordinary_factory_enabled]) %> · Ticket supervisor: <%= config_flag(@factory[:ticket_supervisor_enabled]) %> (defaults to disabled).</p>
-        </div>
+          <p :if={intake_available?(@factory) && get_in(@factory, [:intake, :issues]) == []} class="list-note" data-intake-empty="true">The last successful poll found no factory-labelled issues. Recorded workflows may still be present.</p>
+          <p class="phase-guide">Seven lifecycle phases: Intake · Specify · Build · Verify · Publish · Validate · Review. Other positions do not prove completion.</p>
+          <p :if={@ticket_filter == "QUEUED"} class="list-note">Tracked intake tickets; not all are ready to start.</p>
+          <div :if={@ticket_projection.diagnostics != []} class="projection-notice" role="status"><p :for={note <- @ticket_projection.diagnostics}><%= note %></p></div>
+          <p :if={filtered_tickets(@ticket_projection.tickets, @ticket_filter) == []} class="empty-state"><%= if @ticket_filter in ["ALL", "QUEUED"] && !intake_available?(@factory), do: "No identifiable tickets are available in this view; the intake backlog is unknown.", else: "No tickets in #{bucket_label(@ticket_filter)} in this snapshot. Global counts are unchanged." %></p>
 
-        <section class="section-card primary-section intake-section">
-          <div class="section-header">
-            <div>
-              <h2 class="section-title">Jira intake</h2>
-              <p class="section-copy">
-                Factory-labelled tickets from the last successful Jira poll, including work already in progress.
-                <span :if={@factory.intake.observed_at} class="snapshot-note">
-                  Snapshot taken <.local_time id="intake-observed-at" value={@factory.intake.observed_at} />
-                </span>
-              </p>
-              <p :if={@factory.intake.stale} class="section-copy factory-inline-error" data-intake-stale="true">
-                Stale snapshot: polling is paused, so this saved intake may no longer match Jira.
-              </p>
+          <article :for={ticket <- filtered_tickets(@ticket_projection.tickets, @ticket_filter)} class="ticket-record" data-ticket-record={ticket.key} data-bucket={ticket.bucket}>
+            <div class="ticket-summary workflow-summary">
+              <div class="ticket-identity">
+                <.issue_identifier identifier={ticket.key} url={ticket_issue_url(ticket)} />
+                <span class="ticket-bucket-label"><span class={ticket_mark(ticket)} aria-hidden="true"></span><%= bucket_label(ticket.bucket) %></span>
+                <h3 class="compact-text"><%= ticket_title(ticket) %></h3>
+                <small><%= if ticket.run, do: "Recorded workflow", else: "Intake" %></small>
+              </div>
+              <div class="ticket-phase">
+                <span class="field-label">Current phase</span>
+                <ol class="stage-map" aria-label="Recorded current phase only; other stages are not completion evidence">
+                  <li :for={stage <- ~w(Intake Specify Build Verify Publish Validate Review)} data-phase-slot={stage} aria-current={if ticket_stage(ticket) == stage, do: "step"} class={if ticket_stage(ticket) == stage, do: "current-stage"}><span class="phase-dot" aria-hidden="true"></span><span class="phase-name"><%= stage %></span></li>
+                </ol>
+                <p class={["current-phase-label", is_nil(ticket_stage(ticket)) && "phase-unavailable"]}><%= ticket_stage(ticket) || "Phase unavailable" %></p>
+                <p><%= ticket_activity_summary(ticket) %></p>
+              </div>
+              <div class="ticket-action">
+                <div :if={ticket.run && ticket.run[:review_stop]} class="review-stop" data-review-stop={ticket.key}>
+                  <strong><%= ticket.run.review_stop.title %></strong>
+                  <p><%= ticket.run.review_stop.rule %></p>
+                  <small><%= if ticket.run.review_stop.recorded_ci == "PASSED", do: "CI passed for this candidate. ", else: "Passing CI is not proven in this snapshot. " %>Factory scheduling health is shown separately.</small>
+                </div>
+                <span class="field-label">Next step</span><strong class="compact-text"><%= ticket_action(ticket) %></strong>
+                <p :if={ticket_blocker(ticket)} class="compact-text"><span class="status-mark mark-attention" aria-hidden="true"></span><%= ticket_blocker(ticket) %></p>
+                <p :if={ticket.diagnostics != []}><%= Enum.join(ticket.diagnostics, " ") %></p>
+                <small :if={communication_warning?(ticket)}>Communication warning recorded; not a delivery blocker.</small>
+                <strong :if={(ticket_context(ticket)[:actionable_question_count] || 0) > 0} class="decision-count"><%= ticket_context(ticket).actionable_question_count %> current decision(s) need an answer</strong>
+                <small :if={ticket.run && get_in(ticket, [:intake, :admission_error])}>Last-polled intake issue recorded; not current delivery authority.</small>
+                <small class="responsibility"><%= ticket_responsibility(ticket) || "Action owner not recorded" %></small>
+                <nav class="next-step-links" aria-label={"Next-step links for #{ticket.key}"}>
+                  <div :if={ticket_suggested_prompt(ticket)} class="suggested-prompt-actions" id={ticket_dom_id(ticket.key) <> "-prompt"} phx-hook="CopySuggestedPrompt">
+                    <button type="button" data-copy-suggested-prompt data-prompt-base64={Base.encode64(ticket_suggested_prompt(ticket))}>Copy suggested prompt</button>
+                    <a href={ticket_chat(ticket)} class="text-link">Open ticket chat</a>
+                    <small class="copy-note" role="status" aria-live="polite">Copy does not send. Open chat to paste and review.</small>
+                  </div>
+                  <a :if={ticket_chat(ticket) && !ticket_suggested_prompt(ticket)} href={ticket_chat(ticket)} class="text-link">Open ticket chat</a>
+                  <a :if={ticket_mr(ticket)} href={ticket_mr(ticket)} class="text-link">Open MR <%= if ticket.run[:mr_iid], do: "!#{ticket.run.mr_iid}" %></a>
+                </nav>
+              </div>
+              <div class="ticket-links">
+                <.local_time id={ticket_dom_id(ticket.key) <> "-updated"} value={ticket_updated(ticket)} />
+                <button type="button" class="workflow-disclosure" phx-click="workflow_details" phx-value-run_id={ticket.key} aria-expanded={to_string(MapSet.member?(@expanded_workflows, ticket.key))} aria-controls={ticket_dom_id(ticket.key)}><%= if MapSet.member?(@expanded_workflows, ticket.key), do: "Hide details", else: "Details" %></button>
+              </div>
             </div>
-            <span class="state-badge">
-              <%= if @factory.intake.available, do: "#{@factory.intake.count} tracked", else: "Awaiting poll" %>
-            </span>
-          </div>
 
-          <p :if={@factory.intake.error} class="factory-inline-error">
-            Jira intake history could not be read: <%= @factory.intake.error.message %>
-          </p>
-          <p :if={!@factory.intake.available && !@factory.intake.error} class="empty-state">
-            No successful Jira intake snapshot has been recorded yet.
-          </p>
-          <p :if={@factory.intake.available && @factory.intake.issues == []} class="empty-state">
-            The last successful poll found no factory-labelled issues.
-          </p>
+            <section class="ticket-details" id={ticket_dom_id(ticket.key)} hidden={!MapSet.member?(@expanded_workflows, ticket.key)} aria-label={"Details for #{ticket.key}"}>
+              <h3 class="compact-text"><%= ticket_title(ticket) %></h3>
+              <details class="long-text-disclosure"><summary>Full ticket title</summary><div class="bounded-reading" tabindex="0" role="region" aria-label="Full ticket title"><%= ticket_title(ticket) %></div></details>
+              <div class="ticket-detail-grid">
+                <section class="ticket-detail-section">
+                  <h4>Next action and decisions</h4>
+                  <p :if={ticket.run && ticket_context(ticket)[:available] == false}>Ticket context unavailable; delivery state remains recorded separately.</p>
+                  <p class="full-text bounded-reading" tabindex="0" role="region" aria-label="Full next action"><%= ticket_action(ticket) %></p>
+                  <p :if={ticket_blocker(ticket)} class="full-text bounded-reading" tabindex="0" role="region" aria-label="Full recorded blocker" data-workflow-attention={ticket.key} data-intake-blocker={if is_nil(ticket.run) && intake_error(ticket), do: ticket.key}><strong><%= if ticket.run, do: humanize_factory_code(ticket_attention(ticket)[:phase] || "RECORDED_BLOCKER"), else: "Last-polled intake issue" %>:</strong> <%= ticket_blocker(ticket) %></p>
+                  <p :for={note <- ticket.diagnostics}><%= note %></p>
+                  <details :if={ticket.run && ticket.run[:review_stop]} class="long-text-disclosure"><summary>Recorded verification findings</summary><ol><li :for={finding <- ticket.run.review_stop.findings} class="full-text bounded-reading"><%= finding %></li></ol></details>
+                  <div :for={question <- ticket_questions(ticket)} class="decision-record">
+                    <strong>Decision <%= question["question_key"] %> · <%= question["binding"] %></strong>
+                    <p>Question body: <%= artifact_availability(question["body"]) %> · Answer: <%= artifact_availability(question["answers"]) %></p>
+                  </div>
+                  <p :if={ticket.run && ticket_context(ticket)[:next_action]}><strong>Saved context guidance:</strong> <%= ticket_context(ticket)[:next_action] %></p>
+                </section>
 
-          <div :if={@factory.intake.issues != []} class="table-wrap">
-            <table class="data-table responsive-table factory-intake-table">
-              <thead>
-                <tr>
-                  <th>Issue</th>
-                  <th>Ticket</th>
-                  <th>Intent</th>
-                  <th>Routing</th>
-                  <th>Updated</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr :for={issue <- @factory.intake.issues}>
-                  <td data-label="Issue"><.issue_identifier identifier={issue.issue_key} url={issue.issue_url} /></td>
-                  <td data-label="Ticket">
-                    <div class="detail-stack factory-intake-summary">
-                      <strong><%= issue.summary %></strong>
-                      <span class="muted"><%= Enum.join(issue.labels, " · ") %></span>
-                    </div>
-                  </td>
-                  <td data-label="Intent">
-                    <div class="detail-stack">
-                      <strong class="table-value"><%= humanize_factory_code(issue.classification) %></strong>
-                      <span class="muted"><%= issue.status %> · <%= humanize_factory_code(issue.local_state) %></span>
-                    </div>
-                  </td>
-                  <td data-label="Routing">
-                    <div class="detail-stack">
-                      <strong class="table-value"><%= issue.repo_key || humanize_factory_code(issue.routing_status) %></strong>
-                      <span :if={issue.repo_key} class="muted"><%= humanize_factory_code(issue.routing_status) %></span>
-                    </div>
-                  </td>
-                  <td data-label="Updated">
-                    <.local_time id={"intake-#{issue.issue_key}-updated-at"} value={issue.updated_at} />
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
+                <section class="ticket-detail-section">
+                  <h4>Progress</h4>
+                  <dl class="ticket-facts">
+                    <div><dt>Recorded phase</dt><dd data-source-stage={ticket.key}><%= ticket_phase(ticket) %></dd></div>
+                    <div><dt>Worker activity</dt><dd data-worker-execution={ticket.key}><%= ticket_activity(ticket) %></dd></div>
+                    <div><dt>Recorded responsibility</dt><dd><%= ticket_responsibility(ticket) || "Owner not recorded" %></dd></div>
+                    <div :if={ticket.run && ticket.run[:implementation_iteration_limit]}><dt>Implementation iterations</dt><dd data-implementation-iterations={ticket.key}><%= ticket.run[:implementation_iteration] %>/<%= ticket.run[:implementation_iteration_limit] %></dd></div>
+                    <div :if={ticket.run && ticket.run[:ci_repair_attempt_limit]}><dt>CI repair attempts</dt><dd data-ci-repair-attempts={ticket.key}><%= ticket.run[:ci_repair_attempts_used] || 0 %>/<%= ticket.run[:ci_repair_attempt_limit] %> · separate budget</dd></div>
+                    <div :if={ticket.run}><dt>Workspace</dt><dd><%= workspace_label(ticket.run[:workspace_state]) %></dd></div>
+                    <div :if={ticket.intake}><dt>Jira status at last poll</dt><dd><%= ticket.intake[:status] || "Not recorded" %></dd></div>
+                    <div :if={ticket.intake}><dt>Intake intent / routing</dt><dd><%= humanize_factory_code(ticket.intake[:classification]) %> · <%= humanize_factory_code(ticket.intake[:routing_status]) %> · <%= ticket.intake[:repo_key] || "Repository not routed" %></dd></div>
+                  </dl>
+                  <p class="secondary-note"><%= if @factory.intake[:stale] || @snapshot_stale, do: "Jira metadata is a stale saved snapshot.", else: "Jira metadata is from the last poll, not a fresh eligibility check." %></p>
+                  <p :if={ticket.run && get_in(ticket, [:intake, :admission_error])} class="full-text"><strong>Last-polled intake issue; not current delivery authority:</strong> <%= intake_error(ticket) %></p>
+                </section>
+
+                <section class="ticket-detail-section">
+                  <h4>Delivery and evidence</h4>
+                  <p :if={!ticket.run}>No durable delivery record is attached to this intake ticket.</p>
+                  <dl :if={ticket.run} class="ticket-facts">
+                    <div><dt>Candidate commit</dt><dd data-candidate-sha={ticket.key}><%= ticket.run[:candidate_sha] || "Not recorded" %></dd></div>
+                    <div><dt>Merge request</dt><dd><a :if={ticket_mr(ticket)} href={ticket_mr(ticket)}>Open draft MR</a><span :if={!ticket_mr(ticket)}>Not recorded</span></dd></div>
+                    <div :if={ticket_attention(ticket)[:pipeline_url]}><dt>Current pipeline</dt><dd><a href={ticket_attention(ticket).pipeline_url}>Open pipeline</a></dd></div>
+                    <div :for={job <- ticket_attention(ticket)[:failed_jobs] || []}><dt>Failed job</dt><dd><a :if={job[:url]} href={job.url}><%= job[:name] || "Open job" %></a></dd></div>
+                    <div :if={ticket_context(ticket)[:ci]}><dt>CI evidence</dt><dd><%= artifact_availability(ticket_context(ticket).ci[:artifact]) %> · checked <.local_time id={ticket_dom_id(ticket.key) <> "-ci"} value={ticket_context(ticket).ci[:checked_at]} /></dd></div>
+                    <div :if={ticket_context(ticket)[:validation]}><dt>Manual validation</dt><dd><%= validation_summary(ticket_context(ticket).validation) %></dd></div>
+                    <div :if={ticket_context(ticket)[:source_stage]}><dt>Saved context stage</dt><dd><%= humanize_factory_code(ticket_context(ticket).source_stage) %></dd></div>
+                  </dl>
+                </section>
+
+                <section class="ticket-detail-section">
+                  <h4>History and diagnostics</h4>
+                  <ul :if={ticket.run && (ticket.run[:tasks] || []) != []} class="recorded-task-links">
+                    <li :for={task <- ticket.run[:tasks] || []}><a :if={is_binary(task[:thread_id]) && task[:thread_id] != ""} href={codex_thread_url(task.thread_id)}>Open recorded worker task</a> · <%= humanize_factory_code(task[:role]) %> · recorded <%= humanize_factory_code(task[:status]) %></li>
+                  </ul>
+                  <details :if={ticket.run && ticket.run[:historical_failure]} class="raw-disclosure" data-workflow-history={ticket.key}><summary>Historical repair exhaustion — superseded</summary><p><%= ticket.run.historical_failure[:reason] %></p><p><%= ticket.run.historical_failure[:evidence_at] %></p></details>
+                  <div :for={signal <- ticket_signals(ticket)} class="recorded-warning"><strong><%= humanize_factory_code(signal[:source]) %> · <%= humanize_factory_code(signal[:phase]) %></strong><p><%= signal[:reason] %></p><p><%= signal[:next_action] %></p></div>
+                  <details :if={ticket.run && ticket.run[:last_error]} class="raw-disclosure"><summary>Full recorded error</summary><p :if={readable_ticket_error(ticket)}><%= readable_ticket_error(ticket) %></p><pre class="full-text" tabindex="0" role="region" aria-label="Full recorded error"><%= ticket.run.last_error %></pre></details>
+                  <details class="raw-disclosure"><summary>Technical IDs and complete snapshot evidence</summary><pre class="full-text" tabindex="0" role="region" aria-label="Complete snapshot evidence"><%= complete_ticket_evidence(ticket) %></pre></details>
+                </section>
+              </div>
+            </section>
+          </article>
         </section>
 
-        <section class="section-card primary-section runs-section">
-          <div class="section-header">
-            <div>
-              <h2 class="section-title">Ticket workflows</h2>
-              <p class="section-copy">Durable work currently moving through specification, implementation, verification, and delivery.</p>
-            </div>
-            <span class="state-badge"><%= counted(length(@current_runs), "ticket") %></span>
-          </div>
-
-          <p :if={@current_runs == []} class="empty-state">No ticket workflows recorded yet.</p>
-          <div :if={@current_runs != []} class="table-wrap">
-            <table class="data-table responsive-table factory-runs-table">
-              <thead>
-                <tr>
-                  <th>Issue</th>
-                  <th>Progress</th>
-                  <th>Workspace</th>
-                  <th>Delivery</th>
-                  <th>Updated</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr :for={run <- @current_runs}>
-                  <td data-label="Issue"><.issue_identifier identifier={run.issue_key} url={run.issue_url} /></td>
-                  <td data-label="Progress">
-                    <div class="detail-stack">
-                      <strong class={[
-                        "ticket-status",
-                        ticket_lifecycle(@factory, run) == "NEEDS_ATTENTION" && "danger-text"
-                      ]}>
-                        <%= humanize_factory_code(ticket_lifecycle(@factory, run)) %>
-                      </strong>
-                      <span class="muted">
-                        <%= humanize_factory_code(run.state) %> · <%= humanize_factory_code(run.kind) %> · <%= run.repo_key || "Unrouted" %>
-                      </span>
-                      <a
-                        :if={active_task_thread_id(run) && !contract_chat_thread_id(run)}
-                        class="subtle-link"
-                        href={codex_thread_url(active_task_thread_id(run))}
-                      >Open active task</a>
-                      <a
-                        :if={contract_chat_thread_id(run)}
-                        class="subtle-link"
-                        href={codex_thread_url(contract_chat_thread_id(run))}
-                      >Open contract chat</a>
-                      <a :if={context_available?(run) && run.ticket_context.parent_thread_id} class="subtle-link" href={codex_thread_url(run.ticket_context.parent_thread_id)}>Open ticket parent</a>
-                      <span :if={context_available?(run)} class="muted">Source stage: <%= humanize_factory_code(run.ticket_context.source_stage) %> · Parent sync: <%= humanize_factory_code(run.ticket_context.synchronization.status) %></span>
-                      <span :if={context_unavailable?(run)} class="muted">Ticket context unavailable; delivery state remains recorded separately.</span>
-                      <span :if={context_available?(run) && run.ticket_context.candidate_sha} class="muted">Candidate: <%= run.ticket_context.candidate_sha %> · contract <%= run.ticket_context.contract_revision || "unknown" %></span>
-                      <span :if={context_available?(run)} class="muted">CI evidence: <%= artifact_availability(run.ticket_context.ci.artifact) %> · checked <%= run.ticket_context.ci.checked_at || "unknown" %></span>
-                      <span :if={context_available?(run)} class="muted">Manual validation: <%= validation_requirement(run.ticket_context.validation.required) %> · <%= humanize_factory_code(run.ticket_context.validation.status || "NOT_RECORDED") %> · <%= humanize_factory_code(run.ticket_context.validation.publication) %></span>
-                      <span :if={Map.get(run, :ticket_context) && run.ticket_context.next_action} class="muted">Next action: <%= run.ticket_context.next_action %></span>
-                      <span :if={context_available?(run) && run.ticket_context.actionable_question_count > 0} class="muted"><%= run.ticket_context.actionable_question_count %> current decision(s) need an answer</span>
-                      <div :if={context_available?(run) && run.ticket_context.questions != []} class="detail-stack muted">
-                        <span :for={question <- run.ticket_context.questions}>Decision <%= question["question_key"] %>: <%= question["binding"] %> · body <%= artifact_availability(question["body"]) %> · answers <%= artifact_availability(question["answers"]) %></span>
-                      </div>
-                      <span :if={context_available?(run) && run.ticket_context.attributed_usage.status == "UNKNOWN"} class="muted">Factory-role tokens/cost: unknown</span>
-                      <span :if={run.state == "AWAITING_CONTRACT_INPUT"} class="muted">
-                        Answer the question in that Codex chat to continue this ticket.
-                      </span>
-                      <span :if={run.last_error} class="danger-text"><%= task_failure_summary(run.last_error) %></span>
-                      <div :if={Map.get(run, :handoff_attention)} class="detail-stack danger-text">
-                        <strong><%= run.handoff_attention.label %></strong>
-                        <span><%= run.handoff_attention.reason %></span>
-                        <span class="muted">Request: <%= run.handoff_attention.request_key %></span>
-                      </div>
-                    </div>
-                  </td>
-                  <td data-label="Workspace">
-                    <div class="detail-stack">
-                      <strong class="table-value" title={"Recorded workspace state: #{run.workspace_state || "UNMATERIALIZED"}"}>
-                        <%= workspace_label(run.workspace_state) %>
-                      </strong>
-                      <span :if={run.branch} class="muted"><%= run.branch %></span>
-                      <span :if={run.candidate_sha} class="muted"><%= short_sha(run.candidate_sha) %></span>
-                    </div>
-                  </td>
-                  <td data-label="Delivery">
-                    <a :if={run.mr_url} class="subtle-link" href={run.mr_url} target="_blank" rel="noopener noreferrer">
-                      Open MR <%= if run.mr_iid, do: "!#{run.mr_iid}", else: "" %>
-                    </a>
-                    <span :if={!run.mr_url} class="muted">Draft MR not created</span>
-                  </td>
-                  <td data-label="Updated">
-                    <.local_time id={"run-#{run.run_id}-updated-at"} value={run.updated_at} />
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-        </section>
-
+        <section class="operations-group" id="operations-history" aria-labelledby="operations-heading">
+          <header><h2 id="operations-heading">Operations &amp; history</h2><p>Technical observations and recorded history. Ticket decisions remain above.</p></header>
+        <details class="diagnostics-panel system-health" id="system-health-disclosure" phx-hook="PersistentDisclosure">
+          <summary><span><strong>System health and capacity</strong><small>Factory control, last tick, broker and machine observations</small></span><span class="disclosure-label"><span class="disclosure-closed-label">Show health</span><span class="disclosure-open-label">Hide health</span></span></summary>
+          <section class="poll-observation">
+            <h3>Jira poll and dashboard transport</h3>
+            <p>Last successful Jira poll: <.local_time id="intake-observed-at" value={@factory.intake[:observed_at]} /> · <%= if @factory.intake[:stale] || @snapshot_stale, do: "Stale saved snapshot", else: "Saved poll metadata, not current eligibility" %></p>
+            <span class="status-badge status-badge-connected">Dashboard transport connected</span>
+            <span class="status-badge status-badge-offline">Reconnecting</span>
+            <p>Dashboard transport is not a worker heartbeat.</p>
+            <p>Factory scheduling is a control observation, not ticket health. Enabled scheduling does not prove a successful tick or an active worker.</p>
+          </section>
         <div class="workflow-heading secondary-heading">
           <div>
             <p class="eyebrow">Control and resources</p>
@@ -622,6 +645,25 @@ defmodule SymphonyElixirWeb.DashboardLive do
               </span>
             </div>
 
+            <p :if={get_in(@factory.control, [:tick_health, :status]) == "FAILED"} class="danger-text scheduler-tick-error">
+              Last completed scheduler tick failed; queued tickets may not advance until recovery. Last error: <%= @factory.control.tick_health.last_error %>
+            </p>
+            <p :if={get_in(@factory.control, [:tick_observation, :status]) in ["STALE", "UNKNOWN", "IN_PROGRESS"]} class="muted" data-tick-observation="true">
+              Scheduler observation: <%= humanize_factory_code(@factory.control.tick_observation.status) %>. Last completed tick status is recorded separately.
+            </p>
+            <details :if={get_in(@factory.control, [:handoff_attention, :category]) == "HISTORY"} data-controller-history="true">
+              <summary>Recorded controller failure (terminal)</summary>
+              <span><%= @factory.control.handoff_attention.recorded_phase %> · <%= @factory.control.handoff_attention.request_key %> · <%= @factory.control.handoff_attention.evidence_at || "not recorded" %></span>
+              <p><%= @factory.control.handoff_attention.reason %></p>
+              <p><%= @factory.control.handoff_attention.next_action %></p>
+            </details>
+            <div :if={controller_blocking_attention?(@factory.control)} class="detail-stack danger-text" data-controller-attention="true">
+              <strong>Controller handoff: <%= humanize_factory_code(@factory.control.handoff_attention.phase) %></strong>
+              <span><%= @factory.control.handoff_attention.reason %></span>
+              <span><%= @factory.control.handoff_attention.next_action %></span>
+              <span>Evidence: <%= @factory.control.handoff_attention.evidence_at || "not recorded" %> · <%= @factory.control.handoff_attention.request_key %></span>
+            </div>
+
             <dl class="control-summary">
               <div>
                 <dt>Last update</dt>
@@ -634,6 +676,17 @@ defmodule SymphonyElixirWeb.DashboardLive do
               <div>
                 <dt>Model</dt>
                 <dd><%= @factory.control.controller_model || "n/a" %> · <%= @factory.control.controller_reasoning_effort || "n/a" %></dd>
+              </div>
+            </dl>
+
+            <dl :if={@factory.control[:tick_health]} class="control-summary">
+              <div>
+                <dt>Last successful tick</dt>
+                <dd><.local_time id="scheduler-last-success" value={@factory.control.tick_health.last_success_at} /></dd>
+              </div>
+              <div>
+                <dt>Consecutive tick failures</dt>
+                <dd><%= @factory.control.tick_health.consecutive_failures %></dd>
               </div>
             </dl>
 
@@ -674,14 +727,19 @@ defmodule SymphonyElixirWeb.DashboardLive do
                   <dd><%= @factory.control.controller_writer_conflict_count %></dd>
                 </div>
                 <div>
-                  <dt>Process started</dt>
-                  <dd><.local_time id="factory-process-started-at" value={@factory.control.runtime_identity[:process_started_at]} /></dd>
+                  <dt>Control server started</dt>
+                  <dd><.local_time id="factory-control-server-started-at" value={@factory.control.runtime_identity[:control_server_started_at]} /></dd>
                 </div>
                 <div>
-                  <dt>Factory BEAM fingerprint</dt>
+                  <dt>BEAM process started (runtime-derived)</dt>
+                  <dd><.local_time id="factory-beam-started-at" value={@factory.control.runtime_identity[:beam_started_at]} /> · PID <%= @factory.control.runtime_identity[:os_pid] || "unknown" %></dd>
+                </div>
+                <div>
+                  <dt>Factory BEAM artifact fingerprint</dt>
                   <dd class="mono" title={@factory.control.runtime_identity[:factory_beam_fingerprint]}>
                     <%= String.slice(@factory.control.runtime_identity[:factory_beam_fingerprint] || "", 0, 16) %>
                     · <%= @factory.control.runtime_identity[:factory_beam_module_count] || 0 %> modules
+                    <span class="muted">Code-path artifact observation at control-server initialization; not deployment proof.</span>
                   </dd>
                 </div>
               </dl>
@@ -705,8 +763,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
                 <dd class="numeric"><%= @factory.broker.pending %></dd>
               </div>
               <div>
-                <dt>Claimed</dt>
+                <dt>Claimed / unverified (not worker activity)</dt>
                 <dd class="numeric"><%= @factory.broker.claimed_unverified %></dd>
+              </div>
+              <div :if={Map.has_key?(@factory.broker, :uncertain)}>
+                <dt>Outcome uncertain</dt>
+                <dd class="numeric"><%= @factory.broker.uncertain %></dd>
               </div>
               <div>
                 <dt>Needs reconciliation</dt>
@@ -761,6 +823,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
             </div>
           </article>
         </section>
+
+        </details>
 
         <details
           id="factory-task-history"
@@ -867,6 +931,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
             </section>
           </div>
         </details>
+        <%= render_slot(@runtime) %>
+        </section>
       <% else %>
         <section class="error-card">
           <%= if Map.get(@factory, :disabled, false) do %>
@@ -878,6 +944,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <p class="error-copy"><%= @factory.error.message %></p>
           <% end %>
         </section>
+        <section class="operations-group"><header><h2>Operations &amp; history</h2></header><%= render_slot(@runtime) %></section>
       <% end %>
     </section>
     """
@@ -988,41 +1055,10 @@ defmodule SymphonyElixirWeb.DashboardLive do
     Process.send_after(self(), :payload_refresh, @payload_refresh_ms)
   end
 
-  defp active_work_count(%{factory: %{available: true, overview: %{active: count}}}) when is_integer(count),
-    do: count
-
-  defp active_work_count(_payload), do: 0
-
-  defp active_work_detail(payload) do
-    counted(active_work_count(payload), "active ticket")
-  end
-
-  defp factory_intake_count(%{factory: %{available: true, overview: %{queued: count}}}) when is_integer(count),
-    do: count
-
-  defp factory_intake_count(_payload), do: 0
-
-  defp factory_review_ready(%{factory: %{available: true, overview: %{review_ready: count}}})
-       when is_integer(count),
-       do: count
-
-  defp factory_review_ready(_payload), do: 0
-
-  defp attention_count(%{factory: %{available: true, overview: %{needs_attention: count}}})
-       when is_integer(count),
-       do: count
-
-  defp attention_count(_payload), do: 0
-
-  defp attention_detail(payload) do
-    case attention_count(payload) do
-      1 -> "1 ticket needs attention"
-      count -> "#{count} tickets need attention"
-    end
-  end
-
-  defp counted(1, singular), do: "1 #{singular}"
-  defp counted(count, singular), do: "#{count} #{singular}s"
+  defp blocking_attention?(attention) when is_map(attention), do: Map.get(attention, :blocking, true)
+  defp blocking_attention?(_attention), do: false
+  defp controller_blocking_attention?(control) when is_map(control), do: blocking_attention?(Map.get(control, :handoff_attention))
+  defp controller_blocking_attention?(_control), do: false
 
   defp task_without_thread_label(status) when status in ["FAILED", "BLOCKED", "CANCELLED"],
     do: "Not created"
@@ -1031,22 +1067,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp codex_thread_url(thread_id), do: "codex://threads/#{URI.encode(thread_id)}"
 
-  defp context_available?(run), do: match?(%{available: true}, Map.get(run, :ticket_context))
-  defp context_unavailable?(run), do: match?(%{available: false}, Map.get(run, :ticket_context))
   defp config_flag(true), do: "enabled"
   defp config_flag(false), do: "disabled"
   defp config_flag(_value), do: "unknown"
-  defp validation_requirement(true), do: "required"
-  defp validation_requirement(false), do: "not required"
-  defp validation_requirement(1), do: "required"
-  defp validation_requirement(0), do: "not required"
-  defp validation_requirement(_value), do: "unknown"
   defp artifact_availability(%{availability: availability}), do: humanize_factory_code(availability)
   defp artifact_availability(%{"availability" => availability}), do: humanize_factory_code(availability)
   defp artifact_availability(_artifact), do: "not recorded"
-
-  defp short_sha(nil), do: "n/a"
-  defp short_sha(sha) when is_binary(sha), do: String.slice(sha, 0, 12)
 
   defp format_gb(value) when is_number(value), do: "#{value} GB"
   defp format_gb(_value), do: "n/a"
@@ -1062,17 +1088,13 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp capacity_badge_class(_health), do: "state-badge"
 
   defp broker_request_status(%{needs_reconciliation: count}) when count > 0, do: "Needs attention"
+  defp broker_request_status(%{uncertain: count}) when count > 0, do: "Outcome uncertain"
   defp broker_request_status(%{claimed_unverified: count}) when count > 0, do: "Claimed"
   defp broker_request_status(%{pending: count}) when count > 0, do: "Pending"
   defp broker_request_status(_broker), do: "Unknown"
 
   defp broker_badge_class("Needs attention"), do: "state-badge state-badge-danger"
   defp broker_badge_class(_status), do: "state-badge"
-
-  defp broker_status_label("Needs attention"), do: "Broker needs attention"
-  defp broker_status_label("Claimed"), do: "Broker request claimed"
-  defp broker_status_label("Pending"), do: "Broker requests pending"
-  defp broker_status_label(_status), do: "Broker status unknown"
 
   defp factory_operability(%{factory: %{available: true} = factory}) do
     cond do
@@ -1116,39 +1138,215 @@ defmodule SymphonyElixirWeb.DashboardLive do
     |> Enum.sort()
   end
 
-  defp current_runs(runs) do
-    runs
-    |> Enum.uniq_by(& &1.issue_key)
-    |> Enum.reject(&(&1.state in ["DELIVERED", "CANCELLED"]))
+  defp filtered_tickets(tickets, "ALL"), do: tickets
+  defp filtered_tickets(tickets, bucket), do: Enum.filter(tickets, &(&1.bucket == bucket))
+
+  defp ticket_buckets(payload) do
+    overview = get_in(payload, [:factory, :overview]) || %{}
+
+    [
+      {"NEEDS_ATTENTION", "Needs attention", overview[:needs_attention] || 0},
+      {"ACTIVE", "In progress", overview[:active] || 0},
+      {"QUEUED", "Intake backlog", if(intake_available?(payload[:factory] || %{}), do: overview[:queued] || 0, else: "Unknown")},
+      {"VALIDATION_PENDING", "Awaiting validation", validation_count(payload[:factory] || %{})},
+      {"REVIEW_READY", "Ready for review", overview[:review_ready] || 0}
+    ]
   end
 
-  defp active_task_thread_id(%{tasks: tasks}) when is_list(tasks) do
-    tasks
-    |> Enum.find(&(&1.status in ["STARTING", "RUNNING"] && is_binary(&1.thread_id)))
-    |> case do
-      nil -> nil
-      task -> task.thread_id
+  defp intake_available?(factory), do: get_in(factory, [:intake, :available]) == true && is_nil(get_in(factory, [:intake, :error]))
+
+  defp intake_read_error(factory) do
+    case get_in(factory, [:intake, :error]) do
+      %{message: message} -> message
+      error -> inspect(error)
     end
   end
 
-  defp active_task_thread_id(_run), do: nil
+  defp validation_count(factory), do: Enum.count(get_in(factory, [:overview, :by_issue]) || %{}, fn {_key, bucket} -> bucket == "VALIDATION_PENDING" end)
+  defp bucket_label("ALL"), do: "all snapshot tickets"
+  defp bucket_label("NEEDS_ATTENTION"), do: "Needs attention"
+  defp bucket_label("ACTIVE"), do: "In progress"
+  defp bucket_label("QUEUED"), do: "Intake backlog"
+  defp bucket_label("REVIEW_READY"), do: "Ready for review"
+  defp bucket_label("VALIDATION_PENDING"), do: "Awaiting validation"
+  defp bucket_label(_bucket), do: "Unrecognized classification"
 
-  defp contract_chat_thread_id(%{tasks: tasks}) when is_list(tasks) do
-    tasks
-    |> Enum.find(&(&1.stage == "CONTRACT_DISCUSSING" && is_binary(&1.thread_id)))
-    |> case do
-      nil -> nil
-      task -> task.thread_id
+  defp ticket_dom_id(key), do: "ticket-" <> Base.url_encode64(key, padding: false)
+  defp ticket_context(ticket), do: get_in(ticket, [:run, :ticket_context]) || %{}
+  defp ticket_title(ticket), do: get_in(ticket, [:intake, :summary]) || get_in(ticket, [:run, :summary]) || "Title not recorded in this snapshot"
+  defp ticket_issue_url(ticket), do: get_in(ticket, [:run, :issue_url]) || get_in(ticket, [:intake, :issue_url])
+  defp ticket_updated(ticket), do: get_in(ticket, [:run, :updated_at]) || get_in(ticket, [:intake, :updated_at])
+  defp ticket_mr(ticket), do: external_issue_url(get_in(ticket, [:run, :mr_url]))
+
+  defp ticket_chat(ticket) do
+    case ticket_context(ticket) do
+      %{available: true, parent_thread_id: id} when is_binary(id) and id != "" -> codex_thread_url(id)
+      _other -> nil
     end
   end
 
-  defp contract_chat_thread_id(_run), do: nil
+  defp ticket_questions(ticket), do: ticket_context(ticket)[:questions] || []
 
-  defp ticket_lifecycle(%{overview: %{by_issue: by_issue}}, run) when is_map(by_issue) do
-    Map.get(by_issue, run.issue_key, run.state)
+  defp ticket_suggested_prompt(ticket) do
+    case ticket_context(ticket)[:suggested_prompt] do
+      %{kind: "TICKET_CHAT_SUGGESTED_PROMPT_V1", body: body} when is_binary(body) and byte_size(body) in 1..12_288 ->
+        if String.valid?(body) and String.trim(body) != "" and ticket_chat(ticket), do: body
+
+      _ ->
+        nil
+    end
   end
 
-  defp ticket_lifecycle(_factory, run), do: run.state
+  defp ticket_responsibility(%{run: %{review_stop: %{owner: owner}}}), do: owner
+
+  defp ticket_responsibility(%{run: run} = ticket) when is_map(run) do
+    current_question =
+      ticket_context(ticket)[:available] == true and
+        Enum.any?(ticket_questions(ticket), fn question ->
+          is_map(question) and question["binding"] == "CURRENT" and is_binary(question["question_key"]) and question["question_key"] != ""
+        end)
+
+    cond do
+      run[:state] == "READY_FOR_REVIEW" and ticket_mr(ticket) -> "Human review"
+      run[:state] == "AWAITING_CONTRACT_INPUT" and current_question -> "Human decision"
+      get_in(run, [:worker_execution, :running_proven]) === true -> "Factory · recorded observation, not a current heartbeat"
+      true -> nil
+    end
+  end
+
+  defp ticket_responsibility(_ticket), do: nil
+
+  defp ticket_phase(%{run: run}) when is_map(run), do: if(run[:review_stop], do: "Review stopped", else: humanize_factory_code(run[:state]))
+  defp ticket_phase(%{diagnostics: [_ | _]}), do: "Current record unproven"
+  defp ticket_phase(_ticket), do: "Intake observed"
+  defp ticket_stage(%{run: run}) when is_map(run), do: if(run[:review_stop], do: "Verify", else: workflow_stage(run[:state]))
+  defp ticket_stage(%{run_records: [_ | _]}), do: nil
+  defp ticket_stage(%{intake: issue}) when is_map(issue), do: "Intake"
+  defp ticket_stage(_ticket), do: nil
+  defp ticket_activity(%{run: run}) when is_map(run), do: worker_execution_label(get_in(run, [:worker_execution, :status]))
+  defp ticket_activity(_ticket), do: "No worker activity is established by this intake record."
+
+  defp ticket_activity_summary(%{run: run}) when is_map(run) do
+    case get_in(run, [:worker_execution, :status]) do
+      "WAITING" -> "No current worker turn recorded"
+      "STOPPED" -> "Stopped / result recorded"
+      "STARTING" -> "Worker admission recorded"
+      "RECONCILE_REQUIRED" -> "Outcome needs reconciliation"
+      "NOT_APPLICABLE" -> "No source-worker activity implied"
+      _other -> "Worker activity unconfirmed"
+    end
+  end
+
+  defp ticket_activity_summary(_ticket), do: "No worker activity established"
+
+  defp ticket_action(%{diagnostics: [_ | _]}), do: "Inspect the conflicting or missing snapshot records."
+
+  defp ticket_action(%{run: run} = ticket) when is_map(run),
+    do:
+      run[:primary_next_action] || ticket_attention(ticket)[:next_action] ||
+        if(ticket_chat(ticket), do: "Open the ticket chat for recorded guidance.", else: "Inspect the recorded delivery evidence; no ticket chat is bound.")
+
+  defp ticket_action(%{intake: issue}) when is_map(issue) do
+    cond do
+      issue[:admission_error] -> "Resolve the recorded intake admission issue."
+      is_nil(issue[:repo_key]) -> "Configure repository routing before work can start."
+      issue[:classification] == "SPECIFICATION" -> "Specification is required before implementation."
+      true -> "Await normal scheduling; the last poll does not prove current eligibility."
+    end
+  end
+
+  defp ticket_action(_ticket), do: "Inspect snapshot diagnostics; current work is unproven."
+
+  defp ticket_blocker(ticket) do
+    ticket_attention(ticket)[:reason] || if(is_nil(ticket.run), do: intake_error(ticket))
+  end
+
+  defp intake_error(ticket) do
+    case get_in(ticket, [:intake, :admission_error]) do
+      error when is_map(error) -> Enum.join(Enum.reject([error[:code], error[:message]], &is_nil/1), ": ")
+      _other -> nil
+    end
+  end
+
+  defp ticket_attention(ticket) do
+    attention = get_in(ticket, [:run, :attention])
+    if blocking_attention?(attention), do: attention, else: get_in(ticket, [:run, :handoff_attention]) || %{}
+  end
+
+  defp ticket_signals(ticket) do
+    (get_in(ticket, [:run, :attention_signals]) || [])
+    |> Enum.reject(&blocking_attention?/1)
+  end
+
+  defp communication_warning?(ticket), do: ticket_signals(ticket) != []
+  defp ticket_mark(%{bucket: "NEEDS_ATTENTION"}), do: "status-mark mark-attention"
+  defp ticket_mark(%{bucket: "REVIEW_READY"}), do: "status-mark mark-ready"
+  defp ticket_mark(_ticket), do: "status-mark mark-neutral"
+
+  defp validation_summary(%{required: required}) when required in [false, 0], do: "Not required"
+  defp validation_summary(validation), do: humanize_factory_code(validation[:status] || "UNKNOWN")
+
+  defp complete_ticket_evidence(ticket) do
+    case Jason.encode(ticket, pretty: true) do
+      {:ok, json} -> json
+      {:error, _reason} -> inspect(ticket, pretty: true, limit: :infinity, printable_limit: :infinity)
+    end
+  end
+
+  defp readable_ticket_error(ticket) do
+    error = get_in(ticket, [:run, :last_error])
+    readable = task_failure_summary(error)
+    if readable != error, do: readable
+  end
+
+  defp scheduling_label(_payload, error) when not is_nil(error), do: "Unknown — snapshot stale"
+
+  defp scheduling_label(payload, _error) do
+    control = get_in(payload, [:factory, :control]) || %{}
+
+    cond do
+      scheduling_attention?(control) -> "Needs attention"
+      control[:status] == "PAUSED" -> "Paused — existing work may continue"
+      true -> scheduling_observation(control)
+    end
+  end
+
+  defp scheduling_attention?(control) do
+    controller_blocking_attention?(control) || (control[:controller_writer_conflict_count] || 0) > 0 ||
+      get_in(control, [:tick_health, :status]) == "FAILED"
+  end
+
+  defp scheduling_observation(%{tick_observation: %{status: "STALE"}}), do: "Stale"
+  defp scheduling_observation(%{tick_observation: %{status: "IN_PROGRESS"}}), do: "Tick in progress"
+  defp scheduling_observation(%{status: "ACTIVE", tick_observation: %{status: "FRESH"}}), do: "Enabled"
+  defp scheduling_observation(_control), do: "Unknown"
+
+  defp scheduling_tone(payload, error) do
+    case scheduling_label(payload, error) do
+      "Enabled" -> "mark-ready"
+      "Needs attention" -> "mark-attention"
+      _other -> "mark-neutral"
+    end
+  end
+
+  defp workflow_stage(state)
+       when state in ~w(PLANNING SPECIFYING SPEC_DRAFTING CONTRACT_DISCUSSING SPEC_WRITING AWAITING_JIRA_READBACK SPEC_REVIEW CRITIQUING SPEC_READY_WRITE AWAITING_CONFIRMATION AWAITING_SPEC_INPUT AWAITING_CONTRACT_INPUT),
+       do: "Specify"
+
+  defp workflow_stage(state) when state in ~w(WRITING REPAIRING REVIEW_WRITING), do: "Build"
+  defp workflow_stage("VERIFYING"), do: "Verify"
+  defp workflow_stage("READY_FOR_REVIEW"), do: "Review"
+  defp workflow_stage(state) when state in ~w(PUSHING CI_PUSHING MR_CREATING CI_MR_CREATING), do: "Publish"
+  defp workflow_stage(state) when state in ~w(CI_WAITING AWAITING_VALIDATION), do: "Validate"
+  defp workflow_stage(_state), do: nil
+
+  defp worker_execution_label("WAITING"), do: "Waiting for worker; no current native turn recorded."
+  defp worker_execution_label("TURN_BOUND"), do: "Native turn bound; live activity unconfirmed."
+  defp worker_execution_label("STARTING"), do: "Worker admission recorded; no current native turn yet."
+  defp worker_execution_label("STOPPED"), do: "Worker stopped or result recorded; not actively writing."
+  defp worker_execution_label("RECONCILE_REQUIRED"), do: "Worker outcome needs reconciliation."
+  defp worker_execution_label("NOT_APPLICABLE"), do: "This stage does not imply a running source worker."
+  defp worker_execution_label(_), do: "Worker execution unknown; no current activity proven."
 
   defp summarize_error(error) when is_binary(error) do
     summary = error |> String.replace(~r/\s+/, " ") |> String.trim()
@@ -1202,8 +1400,18 @@ defmodule SymphonyElixirWeb.DashboardLive do
     end
   end
 
+  defp factory_controller_health(%{snapshot_stale: true}), do: "STALE"
+  defp factory_controller_health(%{status: "PAUSED"}), do: "PAUSED"
+  defp factory_controller_health(%{tick_observation: %{status: "STALE"}}), do: "STALE"
+  defp factory_controller_health(%{tick_observation: %{status: "UNKNOWN"}}), do: "UNKNOWN"
+  defp factory_controller_health(%{tick_observation: %{status: "IN_PROGRESS"}}), do: "TICK_IN_PROGRESS"
+
+  defp factory_controller_health(%{tick_health: %{status: "FAILED"}}), do: "ERROR"
+
   defp factory_controller_health(%{controller_writer_conflict_count: count}) when count > 0,
     do: "DEGRADED"
+
+  defp factory_controller_health(%{tick_health: %{status: "UNKNOWN"}}), do: "STARTING"
 
   defp factory_controller_health(control), do: control.status
 

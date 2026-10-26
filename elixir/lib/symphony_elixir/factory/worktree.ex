@@ -333,6 +333,88 @@ defmodule SymphonyElixir.Factory.Worktree do
     end
   end
 
+  @doc "Observes the exact pre-generation tree without staging, committing, or ignoring hidden inputs."
+  @spec generation_inputs(map(), Path.t(), String.t(), String.t(), [String.t()]) :: {:ok, map()} | {:error, term()}
+  def generation_inputs(route, path, branch, parent_sha, paths) when is_list(paths) do
+    with true <- paths == [] or valid_slice_paths?(paths) or {:error, :native_slice_intent_invalid},
+         {:ok, workspace} <- validate_native(route, path, clean: false, detached: false, expected_branch: branch),
+         true <- workspace.sha == parent_sha or {:error, :controller_generation_head_changed},
+         {:ok, staged} <- git_paths(path, ["diff", "--cached", "--name-only", "-z", "--no-renames"]),
+         {:ok, unstaged} <- git_paths(path, ["diff", "--name-only", "-z", "--no-renames"]),
+         {:ok, untracked} <- git_paths(path, ["ls-files", "--others", "--exclude-standard", "-z"]),
+         {:ok, ignored} <- git_paths(path, ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"]),
+         true <- ignored == [] or {:error, :controller_generation_ignored_input},
+         :ok <- validate_native_slice_changes(staged, unstaged, untracked, paths) do
+      {:ok, Map.put(workspace, :dirty_paths, sorted_paths(paths))}
+    else
+      {:error, _} = error -> error
+    end
+  end
+
+  def generation_inputs(_, _, _, _, _), do: {:error, :native_slice_intent_invalid}
+
+  @doc "Pins tracked Go files and their sole existing regular BUILD sibling at an unchanged clean candidate."
+  @spec generation_scope_inputs(map(), Path.t(), String.t(), String.t(), [String.t()]) ::
+          {:ok, map()} | {:error, term()}
+  def generation_scope_inputs(route, path, branch, candidate, paths) do
+    with true <- length(paths) in 1..16 and Enum.all?(paths, &String.ends_with?(&1, ".go")),
+         {:ok, before} <- generation_inputs(route, path, branch, candidate, []),
+         {:ok, go} <- generation_scope_files(path, candidate, paths),
+         {:ok, builds} <- generation_build_siblings(path, candidate, paths),
+         {:ok, ^before} <- generation_inputs(route, path, branch, candidate, []) do
+      {:ok, %{"go_inputs" => go, "build_inputs" => builds}}
+    else
+      _ -> {:error, :ci_generated_scope_candidate_unproven}
+    end
+  end
+
+  defp generation_scope_files(root, candidate, paths) do
+    Enum.reduce_while(Enum.sort(Enum.uniq(paths)), {:ok, []}, fn path, {:ok, files} ->
+      case generation_scope_file(root, candidate, path) do
+        {:ok, file} -> {:cont, {:ok, files ++ [file]}}
+        _ -> {:halt, {:error, :ci_generated_scope_candidate_unproven}}
+      end
+    end)
+  end
+
+  defp generation_scope_file(root, candidate, path) do
+    target = Path.join(root, path)
+
+    with true <- valid_slice_paths?([path]),
+         {:ok, tree} <- identity_git(root, ["ls-tree", "-z", candidate, "--", path]),
+         [_, mode, blob, ^path] <- Regex.run(~r/\A(100644|100755) blob ([0-9a-f]{40})\t([^\x00]+)\x00\z/, tree),
+         {:ok, bytes} <- identity_git(root, ["cat-file", "blob", blob]),
+         true <- byte_size(bytes) in 1..262_144,
+         {:ok, ^target} <- PathSafety.canonicalize(target),
+         {:ok, %File.Stat{type: :regular, size: size}} <- File.lstat(target),
+         true <- size == byte_size(bytes),
+         {:ok, ^bytes} <- File.read(target) do
+      {:ok, %{"path" => path, "mode" => mode, "git_blob_sha" => blob, "sha256" => Base.encode16(:crypto.hash(:sha256, bytes), case: :lower), "size" => size}}
+    else
+      _ -> {:error, :ci_generated_scope_candidate_unproven}
+    end
+  end
+
+  defp generation_build_siblings(root, candidate, paths) do
+    packages = paths |> Enum.map(&Path.dirname/1) |> Enum.uniq() |> Enum.sort()
+
+    Enum.reduce_while(packages, {:ok, []}, fn package, {:ok, builds} ->
+      candidates = Enum.map(~w(BUILD BUILD.bazel), &Path.join(package, &1))
+      tracked = Enum.filter(candidates, fn path -> match?({:ok, raw} when raw != "", identity_git(root, ["ls-tree", "-z", candidate, "--", path])) end)
+
+      generation_build_sibling(root, candidate, tracked, builds)
+    end)
+  end
+
+  defp generation_build_sibling(root, candidate, [path], builds) do
+    case generation_scope_file(root, candidate, path) do
+      {:ok, file} -> {:cont, {:ok, builds ++ [file]}}
+      _ -> {:halt, {:error, :ci_generated_scope_candidate_unproven}}
+    end
+  end
+
+  defp generation_build_sibling(_root, _candidate, _tracked, _builds), do: {:halt, {:error, :ci_generated_scope_candidate_unproven}}
+
   @doc "Commits one declared native writer slice, or adopts its exact prior commit after a restart."
   @spec commit_native_slice(map(), Path.t(), String.t(), String.t(), [String.t()], String.t()) ::
           {:ok, %{sha: String.t()}} | {:error, term()}
@@ -420,6 +502,68 @@ defmodule SymphonyElixir.Factory.Worktree do
          true <- actual_message == message or {:error, :native_slice_message_mismatch},
          :ok <- require_clean(path) do
       {:ok, %{sha: sha}}
+    end
+  end
+
+  @doc "Lists pending tracked and untracked source paths without invoking repository configuration."
+  @spec pending_source_paths(Path.t()) :: {:ok, [String.t()]} | {:error, term()}
+  def pending_source_paths(path) do
+    with {:ok, changed} <- identity_git(path, ["diff", "--name-only", "-z", "--no-renames", "HEAD"]),
+         {:ok, untracked} <- identity_git(path, ["ls-files", "--others", "--exclude-standard", "-z"]),
+         true <- byte_size(changed) + byte_size(untracked) <= 16_384 or {:error, :pending_source_paths_too_large} do
+      {:ok, String.split(changed <> untracked, "\0", trim: true) |> Enum.uniq() |> Enum.sort()}
+    end
+  end
+
+  @doc "Reads exact committed candidate paths from a provider-pinned MR diff base, without rename inference."
+  @spec committed_candidate_paths(map(), Path.t(), String.t(), String.t(), String.t()) :: {:ok, [String.t()]} | {:error, term()}
+  def committed_candidate_paths(route, path, branch, base, candidate) do
+    with true <- Enum.all?([base, candidate], &(is_binary(&1) and Regex.match?(~r/\A[0-9a-f]{40}\z/, &1))) or {:error, :ci_repair_diff_unproven},
+         {:ok, _} <- checkout_identity(route, path, clean: true, detached: false, expected_branch: branch, expected_sha: candidate),
+         {:ok, _} <- identity_git(path, ["merge-base", "--is-ancestor", base, candidate]),
+         {:ok, raw} <- identity_git(path, ["diff", "--name-only", "-z", "--no-renames", base <> "..." <> candidate]),
+         true <- byte_size(raw) <= 16_384 or {:error, :ci_repair_diff_too_large} do
+      {:ok, String.split(raw, "\0", trim: true) |> Enum.uniq() |> Enum.sort()}
+    end
+  end
+
+  @doc "Reads committed paths while independently fencing the one declared, stopped writer's dirty slice."
+  @spec generation_candidate_paths(map(), Path.t(), String.t(), String.t(), String.t(), [String.t()]) :: {:ok, [String.t()]} | {:error, term()}
+  def generation_candidate_paths(route, path, branch, base, candidate, dirty_paths) do
+    with true <- Enum.all?([base, candidate], &(is_binary(&1) and Regex.match?(~r/\A[0-9a-f]{40}\z/, &1))) or {:error, :ci_repair_diff_unproven},
+         {:ok, before} <- generation_inputs(route, path, branch, candidate, dirty_paths),
+         {:ok, _} <- identity_git(path, ["merge-base", "--is-ancestor", base, candidate]),
+         {:ok, raw} <- identity_git(path, ["diff", "--name-only", "-z", "--no-renames", base <> "..." <> candidate]),
+         true <- byte_size(raw) <= 16_384 or {:error, :ci_repair_diff_too_large},
+         {:ok, ^before} <- generation_inputs(route, path, branch, candidate, dirty_paths) do
+      {:ok, String.split(raw, "\0", trim: true) |> Enum.uniq() |> Enum.sort()}
+    end
+  end
+
+  @doc "Reads earlier generation inputs after the exact controller slice was already committed."
+  @spec generation_committed_parent_paths(
+          map(),
+          Path.t(),
+          String.t(),
+          String.t(),
+          String.t(),
+          [String.t()],
+          String.t()
+        ) ::
+          {:ok, map()} | {:error, term()}
+  def generation_committed_parent_paths(route, path, branch, base, parent, paths, message) do
+    with :ok <- validate_native_expected_sha(base),
+         :ok <- validate_native_expected_sha(parent),
+         :ok <- validate_slice_intent(paths, message),
+         {:ok, workspace} <- validate_native(route, path, clean: true, detached: false, expected_branch: branch),
+         true <- workspace.sha != parent or {:error, :native_slice_parent_mismatch},
+         {:ok, _} <- adopt_native_slice(path, workspace.sha, parent, paths, message),
+         {:ok, _} <- identity_git(path, ["merge-base", "--is-ancestor", base, parent]),
+         {:ok, raw} <- identity_git(path, ["diff", "--name-only", "-z", "--no-renames", base <> "..." <> parent]),
+         true <- byte_size(raw) <= 16_384 or {:error, :ci_repair_diff_too_large},
+         {:ok, _} <- adopt_native_slice(path, workspace.sha, parent, paths, message),
+         {:ok, ^workspace} <- validate_native(route, path, clean: true, detached: false, expected_branch: branch) do
+      {:ok, %{sha: workspace.sha, paths: String.split(raw, "\0", trim: true) |> Enum.uniq() |> Enum.sort()}}
     end
   end
 
@@ -933,11 +1077,24 @@ defmodule SymphonyElixir.Factory.Worktree do
 
     arguments = ["-p", @identity_profile, @identity_git, "--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-C", path | args]
 
+    before_identity_command(args)
+
     case System.cmd("/usr/bin/sandbox-exec", arguments, env: cleared ++ environment, stderr_to_stdout: true) do
       {output, 0} -> {:ok, output}
       {output, status} -> {:error, {:git_failed, status, args, String.trim(output)}}
     end
   rescue
     error in ErlangError -> {:error, {:native_identity_git_unavailable, error.original}}
+  end
+
+  if Mix.env() == :test do
+    defp before_identity_command(args) do
+      case Process.get({__MODULE__, :before_identity_command}) do
+        fun when is_function(fun, 1) -> fun.(args)
+        _ -> :ok
+      end
+    end
+  else
+    defp before_identity_command(_args), do: :ok
   end
 end

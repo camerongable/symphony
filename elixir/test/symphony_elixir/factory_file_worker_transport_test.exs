@@ -1,8 +1,67 @@
 defmodule SymphonyElixir.FactoryFileWorkerTransportTest do
   use SymphonyElixir.TestSupport
   import SymphonyElixir.TicketWorkerFixture
-  alias SymphonyElixir.Factory.{TicketWorkerRunner, WorkerEvidence, WorkerFileTools, WorkspaceAccess}
+  alias SymphonyElixir.Factory.{Store, TicketWorkerRunner, WorkerEvidence, WorkerFileTools, WorkspaceAccess}
   setup :setup_fixture
+
+  for entry <- ~w(start resume) do
+    @tag :file_revision
+    @revision_entry entry
+    test "restricted native #{@revision_entry} keeps seven tools and restores exact base bytes using current-file CAS", ctx do
+      Store.query!(ctx.store, "INSERT INTO ticket_review_bases VALUES ('run','refs/remotes/origin/master',?,'now')", [ctx.sha])
+      files = starting_files(ctx)
+      File.write!(Path.join(ctx.path, "fixture.txt"), "dirty\r\n")
+      for name <- ~w(logging.go logging_test.go BUILD), do: File.write!(Path.join(ctx.path, name), "preserve #{name}\n")
+      trace = configure_server(Map.put(ctx, :revision_restore, true))
+      policy = TicketWorkerRunner.policy("SOURCE", ctx.path)
+      assert policy["file_tools_sha256"] == "44f58a614a4437a56c277c24b295d0cd8d529b3c197c9a820dda7dd7516a135e"
+      bind = fn thread -> WorkerEvidence.bind_thread(ctx.store, files.key, thread, policy) end
+      resume = if @revision_entry == "resume", do: "file-worker"
+
+      options = [
+        worker_access: "FILE_SOURCE",
+        worker_files: files,
+        model: "gpt-6-luna",
+        reasoning_effort: "medium",
+        on_thread_created: bind,
+        resume_thread_id: resume
+      ]
+
+      assert {:ok, session} = AppServer.start_session(ctx.path, options)
+
+      try do
+        process = %{"pid" => session.metadata.codex_app_server_pid, "invocation_nonce" => session.worker_invocation}
+        assert {:ok, _} = WorkerEvidence.bind_owner_process(ctx.store, files.key, process)
+
+        callback = fn
+          %{event: :session_started, thread_id: thread, turn_id: turn} -> WorkerEvidence.bind_turn(ctx.store, files.key, thread, turn)
+          _ -> :ok
+        end
+
+        options = [event_scope: :exact_turn, on_message: callback]
+        assert {:ok, %{turn_id: "file-turn"}} = AppServer.run_turn(session, "Restore the base preimage only", %Issue{}, options)
+        assert File.read!(Path.join(ctx.path, "fixture.txt")) == "base\n"
+        for name <- ~w(logging.go logging_test.go BUILD), do: assert(File.read!(Path.join(ctx.path, name)) == "preserve #{name}\n")
+        requests = trace |> File.read!() |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!/1)
+        params = Enum.find(requests, &(&1["method"] == "thread/" <> @revision_entry))["params"]
+
+        if @revision_entry == "start" do
+          assert params["dynamicTools"] == WorkerFileTools.tool_specs()
+        else
+          refute Map.has_key?(params, "dynamicTools")
+        end
+
+        assert Jason.decode!(File.read!(trace <> ".catalog")) == WorkerFileTools.tool_specs()
+        assert params["permissions"] == "symphony_ticket_file_source_v1"
+        assert session.thread_sandbox == "read-only"
+        assert Enum.any?(requests, &(&1["id"] == 79 and get_in(&1, ["result", "success"]) == false))
+        assert Enum.any?(requests, &(&1["id"] == 80 and get_in(&1, ["result", "success"]) == true))
+        assert Store.one!(ctx.store, "SELECT COUNT(*) AS n FROM worker_file_operations")["n"] == 1
+      after
+        assert {:ok, %{"exit_status" => 143}} = AppServer.stop_session(session)
+      end
+    end
+  end
 
   test "file-source startup and retained sessions remain fenced before process and model effects" do
     path = Path.join(System.tmp_dir!(), "file-worker-fenced-#{System.unique_integer([:positive])}")
@@ -170,7 +229,7 @@ defmodule SymphonyElixir.FactoryFileWorkerTransportTest do
       "codexHome" => System.get_env("CODEX_HOME") || Path.join(System.user_home!(), ".codex"),
       "platformFamily" => "unix",
       "platformOs" => "macos",
-      "userAgent" => "symphony-orchestrator/0.160.0 (fixture)"
+      "userAgent" => "symphony-orchestrator/0.163.0-alpha.11 (fixture)"
     }
 
     File.write!(trace <> ".initialize", Jason.encode!(%{"id" => 1, "result" => runtime}))
@@ -211,7 +270,15 @@ defmodule SymphonyElixir.FactoryFileWorkerTransportTest do
     """)
 
     File.chmod!(binary, 0o755)
-    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: ctx.root, codex_command: "#{binary} app-server", codex_turn_timeout_ms: 5_000, codex_read_timeout_ms: 5_000)
+
+    if ctx[:revision_restore] do
+      server = Path.expand("../support/revision_worker_server.py", __DIR__)
+      File.write!(binary, "#!/bin/sh\nexec /usr/bin/python3 -I -S -B '#{server}' '#{trace}'\n")
+      File.write!(trace <> ".catalog", Jason.encode!(WorkerFileTools.tool_specs()))
+    end
+
+    timeout = if ctx[:revision_restore], do: 30_000, else: 5_000
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: ctx.root, codex_command: "#{binary} app-server", codex_turn_timeout_ms: timeout, codex_read_timeout_ms: timeout)
     trace
   end
 end

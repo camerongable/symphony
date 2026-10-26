@@ -8,7 +8,7 @@ defmodule SymphonyElixir.Factory.NativeWorkspaceMaintenance do
   @unresolved ~w(PENDING CREATE_UNCERTAIN FOLLOWUP_UNCERTAIN THREAD_RECORDED RECONCILE_REQUIRED)
 
   @spec enabled?(map()) :: boolean()
-  def enabled?(factory), do: get_in(factory, [:cleanup, "native", "enabled"]) == true
+  def enabled?(factory), do: get_in(Map.get(factory, :cleanup, %{}), ["native", "enabled"]) == true
 
   @spec snapshot(Store.connection()) :: [map()]
   def snapshot(store), do: rows(store, "SELECT * FROM native_workspace_maintenance ORDER BY checked_at, run_id", [])
@@ -58,6 +58,7 @@ defmodule SymphonyElixir.Factory.NativeWorkspaceMaintenance do
       WHERE run.kind = 'DELIVERY' AND run.workspace_state = 'CODEX_NATIVE' AND run.factory_owned = 0
         AND run.state IN ('READY_FOR_REVIEW', 'DELIVERED')
         AND COALESCE(run.execution_mode, 'LEGACY') = 'LEGACY'
+        AND NOT EXISTS (SELECT 1 FROM events WHERE run_id = run.run_id AND event_type = 'TICKET_PUSH_UNKNOWN_HAZARD')
         AND NOT EXISTS (SELECT 1 FROM runs AS supervisor WHERE supervisor.issue_key = run.issue_key AND supervisor.execution_mode = 'TICKET_SUPERVISOR_V1')
       ORDER BY COALESCE(maintenance.checked_at, ''), run.updated_at, run.run_id
       """,
@@ -228,7 +229,8 @@ defmodule SymphonyElixir.Factory.NativeWorkspaceMaintenance do
   end
 
   defp candidate_binding(store, run, require_idle \\ true) do
-    with :ok <- require_legacy_issue(store, run),
+    with true <- not SymphonyElixir.Factory.TicketPushHazard.active?(store, run["run_id"]) or {:error, :push_unknown_hazard_retained},
+         :ok <- require_legacy_issue(store, run),
          {:ok, writer} <- TaskLedger.get(store, run["run_id"] <> ":feature-writer"),
          true <- writer["status"] in ~w(COMPLETE CONSUMED) or {:error, :writer_not_terminal},
          true <- (writer["workspace"] == run["worktree"] and writer["workspace_sha"] == run["candidate_sha"]) or {:error, :writer_binding_stale},

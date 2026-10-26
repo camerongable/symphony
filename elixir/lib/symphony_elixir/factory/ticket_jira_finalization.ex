@@ -155,10 +155,16 @@ defmodule SymphonyElixir.Factory.TicketJiraFinalization do
   end
 
   defp prepare(store, run, key, factory, qualified, observation, authority, opts) do
+    with {:ok, facts} <- TicketWorkerRunner.delivery_facts(store, run, opts) do
+      prepare_captured(store, run, key, factory, {qualified, facts}, observation, authority, opts)
+    end
+  end
+
+  defp prepare_captured(store, run, key, factory, {qualified, facts}, observation, authority, opts) do
     transaction(store, fn tx ->
       with :ok <- validate_authority(tx, run, key, observation, authority, opts),
            :ok <- TicketMrOperation.validate_delivery_receipt(tx, qualified, factory, mr_options(opts)),
-           {:ok, facts} <- TicketWorkerRunner.delivery_facts(tx, run, opts),
+           :ok <- TicketWorkerRunner.recheck_delivery_facts(tx, run, opts, facts),
            {:ok, row, access} <- prepare_owned_operation(tx, run, key, facts, opts) do
         {:ok, row, Keyword.put(opts, :reservation, %{key: key, generation: access["generation"]})}
       end
@@ -328,7 +334,7 @@ defmodule SymphonyElixir.Factory.TicketJiraFinalization do
   defp stringify(map), do: Map.new(map, fn {key, value} -> {to_string(key), value} end)
 
   defp transaction(store, operation) do
-    case Exqlite.transaction(store, &rollback(&1, operation.(&1))) do
+    case Exqlite.transaction(store, &rollback(&1, operation.(&1)), timeout: 60_000) do
       {:ok, result} -> result
       {:error, reason} -> {:error, reason}
     end

@@ -8,13 +8,14 @@ defmodule SymphonyElixir.Factory.Admin do
   """
 
   alias SymphonyElixir.Factory.{Control, Recovery, RunLedger, Store}
+  alias SymphonyElixir.Factory.TicketPushUnattachedRetirement
 
   @doc """
   Reads the local control record.
   """
   @spec status(struct() | map()) :: {:ok, map()} | {:error, term()}
   def status(factory) do
-    with_store(factory, fn connection, config ->
+    with_read_store(factory, fn connection, config ->
       {:ok, Control.status(connection, config.scope)}
     end)
   end
@@ -22,7 +23,7 @@ defmodule SymphonyElixir.Factory.Admin do
   @doc "Returns local control, run, and reopenable Codex-task state for diagnostics."
   @spec overview(struct() | map()) :: {:ok, map()} | {:error, term()}
   def overview(factory) do
-    with_store(factory, fn connection, config ->
+    with_read_store(factory, fn connection, config ->
       runs = rows(connection, "SELECT * FROM runs ORDER BY updated_at DESC LIMIT 100")
 
       tasks =
@@ -261,6 +262,211 @@ defmodule SymphonyElixir.Factory.Admin do
     end)
   end
 
+  @doc "Authorizes one exact failed writer retry at an idle tick boundary without fabricating human input."
+  @spec recover_failed_writer(struct() | map(), String.t(), String.t()) :: {:ok, map()} | {:error, term()}
+  def recover_failed_writer(factory, request, turn) do
+    recover_writer(factory, request, turn, :capacity)
+  end
+
+  @doc "Authorizes one exact interrupted writer retry at an idle boundary without inventing an exit receipt."
+  @spec recover_interrupted_writer(struct() | map(), String.t(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def recover_interrupted_writer(factory, request, turn, opts \\ []) do
+    with_store(factory, fn connection, config ->
+      recovery_opts = opts |> Keyword.put(:capacity_policy, factory) |> Keyword.put(:idle_scope, config.scope)
+      SymphonyElixir.Factory.FailedTurnRecovery.prepare_interrupted(connection, request, turn, recovery_opts)
+    end)
+  end
+
+  @doc "Explicit same-candidate CAS reconciliation of a lost push outcome, with a fresh controller Jira read."
+  @spec recover_push_cas(struct() | map(), String.t(), String.t(), atom()) :: {:ok, map()} | {:error, term()}
+  def recover_push_cas(factory, run_id, expected_nonce, action) when action in [:prepare, :execute, :reconcile] do
+    with_store(factory, fn connection, config ->
+      with {:ok, run} <- RunLedger.get(connection, run_id),
+           {:ok, intent} <- Jason.decode(run["candidate_handoff"] || "null"),
+           true <- (is_map(intent) and intent["owner_nonce"] == expected_nonce) or {:error, :push_recovery_nonce_changed} do
+        recover_push_leased(connection, config, factory, run_id, expected_nonce, action)
+      end
+    end)
+  end
+
+  @doc "Explicit exact-envelope input-fence preparation or one leased retirement; never issues a push."
+  @spec retire_push_input(struct() | map(), String.t(), String.t(), String.t(), String.t(), String.t(), String.t(), String.t() | nil) :: {:ok, map()} | {:error, term()}
+  def retire_push_input(factory, run_id, nonce, envelope_sha, receipt, receipt_sha, guard, plan_sha) do
+    with :ok <- existing_retirement_ledger(factory) do
+      with_store(factory, fn connection, config ->
+        recover_push_leased(connection, config, factory, run_id, nonce, {:input_fence, envelope_sha, receipt, receipt_sha, guard, plan_sha})
+      end)
+    end
+  end
+
+  @spec retire_unattached_push(struct() | map(), String.t(), String.t(), String.t(), String.t(), String.t(), String.t() | nil) :: {:ok, map()} | {:error, term()}
+  def retire_unattached_push(factory, run_id, nonce, envelope_sha, receipt, receipt_sha, plan_sha) do
+    with :ok <- existing_retirement_ledger(factory) do
+      with_store(factory, fn connection, config ->
+        recover_push_leased(connection, config, factory, run_id, nonce, {:unattached, envelope_sha, receipt, receipt_sha, plan_sha})
+      end)
+    end
+  end
+
+  @spec retire_preissuance_push(struct() | map(), String.t(), String.t(), String.t(), String.t(), String.t(), String.t() | nil) :: {:ok, map()} | {:error, term()}
+  def retire_preissuance_push(factory, run_id, nonce, envelope_sha, receipt, receipt_sha, plan_sha) do
+    with :ok <- existing_retirement_ledger(factory) do
+      with_store(factory, fn connection, config ->
+        recover_push_leased(connection, config, factory, run_id, nonce, {:preissuance, envelope_sha, receipt, receipt_sha, plan_sha})
+      end)
+    end
+  end
+
+  defp existing_retirement_ledger(factory) do
+    with :ok <- validate_factory(factory),
+         {:ok, reader} <- Store.start_read_only(database: Map.fetch!(factory, :database)) do
+      try do
+        if is_map(Control.status(reader, factory.scope)), do: :ok, else: {:error, :existing_factory_control_required}
+      after
+        GenServer.stop(reader)
+      end
+    end
+  end
+
+  defp recover_push_leased(connection, config, factory, run_id, expected_nonce, action) do
+    name = {:global, {__MODULE__, :push_cas_lease, make_ref()}}
+    factory = Map.put_new(factory, :lease_seconds, config.lease_seconds)
+
+    with {:ok, server} <- SymphonyElixir.Factory.ControlServer.start_link(store: connection, factory: factory, name: name) do
+      try do
+        result =
+          SymphonyElixir.Factory.TickLease.run(
+            factory,
+            fn ->
+              tick = Control.status(connection, config.scope) |> Map.take(~w(scope dispatcher_id generation tick_id))
+              recover_push_action(connection, config, factory, run_id, expected_nonce, action, tick)
+            end,
+            control_server: server
+          )
+
+        case result do
+          {:ran, value} -> value
+          {:skipped, reason} -> {:error, {:push_recovery_lease_unavailable, reason}}
+        end
+      after
+        GenServer.stop(server)
+      end
+    end
+  end
+
+  defp recover_push_action(connection, config, factory, run_id, expected_nonce, action, tick) do
+    root = SymphonyElixir.Config.local_workspace_root()
+    workspace = Path.join([root, "factory-controller", String.replace(config.scope, ~r/[^A-Za-z0-9._-]/, "-")])
+
+    with {:ok, run} <- RunLedger.get(connection, run_id),
+         {:ok, route} <- Map.fetch(factory.repositories, run["repo_key"]),
+         opts = [workspace_root: root, capacity_policy: factory, ci_preflight_authorized: route["ci_preflight"] == "draft_mr", operator_tick: tick],
+         {:ok, snapshot} <- SymphonyElixir.Factory.JiraMcpReader.issue(run["issue_key"], workspace: workspace, store: connection),
+         {:ok, authorization} <- SymphonyElixir.Factory.TicketWorkerRunner.delivery_authorization(connection, run, snapshot, DateTime.utc_now(), opts) do
+      result =
+        case action do
+          {:unattached, envelope_sha, receipt, receipt_sha, plan_sha} ->
+            input_opts = Keyword.put(opts, :workspace, workspace)
+            operation = %{run_id: run_id, nonce: expected_nonce, envelope_sha256: envelope_sha}
+            shutdown_receipt = %{path: receipt, sha256: receipt_sha}
+
+            if is_nil(plan_sha) do
+              with {:ok, plan} <- TicketPushUnattachedRetirement.prepare(connection, operation, shutdown_receipt, authorization, input_opts) do
+                {:ok, %{status: "UNATTACHED_RETIREMENT_PREPARED", run_id: run_id, plan_sha256: plan.plan_sha256, successor_nonce: plan.successor["owner_nonce"]}}
+              end
+            else
+              TicketPushUnattachedRetirement.execute(connection, operation, shutdown_receipt, plan_sha, authorization, input_opts)
+            end
+
+          {:preissuance, envelope_sha, receipt, receipt_sha, plan_sha} ->
+            input_opts = Keyword.put(opts, :workspace, workspace)
+            operation = %{run_id: run_id, nonce: expected_nonce, envelope_sha256: envelope_sha}
+            shutdown_receipt = %{path: receipt, sha256: receipt_sha}
+
+            if is_nil(plan_sha) do
+              with {:ok, plan} <- TicketPushUnattachedRetirement.prepare_preissuance(connection, operation, shutdown_receipt, authorization, input_opts) do
+                {:ok, %{status: "PREISSUANCE_RETIREMENT_PREPARED", run_id: run_id, plan_sha256: plan.plan_sha256, successor_nonce: plan.successor["owner_nonce"]}}
+              end
+            else
+              TicketPushUnattachedRetirement.execute_preissuance(connection, operation, shutdown_receipt, plan_sha, authorization, input_opts)
+            end
+
+          {:input_fence, envelope_sha, receipt, receipt_sha, guard, plan_sha} ->
+            input_opts = opts |> Keyword.put(:workspace, workspace) |> Keyword.put(:input_fence_guard, guard)
+
+            if is_nil(plan_sha) do
+              case SymphonyElixir.Factory.TicketPush.prepare_input_retirement(connection, run_id, expected_nonce, envelope_sha, receipt, receipt_sha, authorization, input_opts) do
+                {:ok, plan} ->
+                  {:ok,
+                   %{
+                     status: "INPUT_RETIREMENT_PREPARED",
+                     run_id: run_id,
+                     plan_sha256: plan["plan_sha256"],
+                     original_sha256: envelope_sha,
+                     successor_nonce: plan["successor_nonce"],
+                     reservation_key: plan["successor_reservation_key"]
+                   }}
+
+                error ->
+                  error
+              end
+            else
+              SymphonyElixir.Factory.TicketPush.execute_input_retirement(connection, run_id, expected_nonce, envelope_sha, receipt, receipt_sha, plan_sha, authorization, input_opts)
+            end
+
+          _ ->
+            apply(SymphonyElixir.Factory.TicketPushRecovery, action, [connection, run_id, expected_nonce, authorization, opts])
+        end
+
+      push_recovery_result(result, run_id)
+    else
+      :error -> {:error, :push_recovery_repository_unconfigured}
+      {:error, _} = error -> error
+    end
+  end
+
+  @doc false
+  @spec push_recovery_result({:ok, map()} | {:error, term()}, String.t()) :: {:ok, map()} | {:error, term()}
+  def push_recovery_result(result, run_id) do
+    case result do
+      {:ok, %{status: status} = result}
+      when status in [
+             "INPUT_RETIREMENT_PREPARED",
+             "INPUT_NOT_ISSUED_RETIRED",
+             "UNATTACHED_RETIREMENT_PREPARED",
+             "UNATTACHED_PUSH_RETIRED",
+             "PREISSUANCE_RETIREMENT_PREPARED",
+             "PREISSUANCE_PUSH_RETIRED"
+           ] ->
+        {:ok, result}
+
+      {:ok, %{"owner_nonce" => nonce} = intent} ->
+        {:ok, %{status: "PUSH_RECOVERY_PREPARED", run_id: run_id, owner_nonce: nonce, recovery_attempt: intent["recovery_attempt"], old_outcome: "UNKNOWN"}}
+
+      {:ok, %{status: status} = result} ->
+        {:ok, Map.take(result, [:status, :old_outcome, :new_exit_code]) |> Map.merge(%{run_id: run_id, state: result.run["state"]}) |> Map.put(:status, status)}
+
+      error ->
+        error
+    end
+  end
+
+  defp recover_writer(factory, request, turn, kind) do
+    with_store(factory, fn connection, config ->
+      transaction = fn tx ->
+        case Control.status(tx, config.scope) do
+          %{"tick_id" => nil} -> recover_writer_attempt(tx, request, turn, kind, factory)
+          _ -> {:error, :live_tick_lease}
+        end
+      end
+
+      Store.transaction!(connection, transaction, timeout: 60_000)
+    end)
+  end
+
+  defp recover_writer_attempt(store, request, turn, :capacity, factory),
+    do: SymphonyElixir.Factory.FailedTurnRecovery.prepare(store, request, turn, capacity_policy: factory)
+
   @doc "Claims a previously authorized controller receipt repair before the broker sends it."
   @spec claim_controller_format_repair(struct() | map(), String.t()) :: {:ok, map()} | {:error, term()}
   def claim_controller_format_repair(factory, request_key) when is_binary(request_key) do
@@ -406,6 +612,31 @@ defmodule SymphonyElixir.Factory.Admin do
         operation.(connection, config)
       after
         GenServer.stop(connection)
+      end
+    end
+  end
+
+  defp with_read_store(factory, operation) do
+    with :ok <- validate_factory(factory) do
+      database = Map.fetch!(factory, :database)
+
+      if database == ":memory:" or not File.exists?(database) do
+        with_store(factory, operation)
+      else
+        with {:ok, connection} <- Store.start_read_only(database: Path.expand(database)) do
+          result =
+            try do
+              config = control_config(factory)
+
+              if is_nil(Control.status(connection, config.scope)),
+                do: :control_initialization_required,
+                else: operation.(connection, config)
+            after
+              GenServer.stop(connection)
+            end
+
+          if result == :control_initialization_required, do: with_store(factory, operation), else: result
+        end
       end
     end
   end

@@ -3,6 +3,52 @@ defmodule SymphonyElixir.FactoryContractTest do
 
   alias SymphonyElixir.Factory.Contract
 
+  test "marker case tolerance never rewrites modern or legacy contract payloads before digest checking" do
+    payload = "## Ticket Delivery Contract\nAI FACTORY AUTHORIZED issue-hex=ab revision=1 sha256=example"
+    original = Contract.bind("PPL-9881", 3, payload)
+    altered = Contract.bind("PPL-9881", 3, String.replace(payload, "issue-hex=ab", "issue-hex=AB"))
+
+    legacy = """
+    <!-- AI FACTORY CONTRACT BEGIN issue=PPL-9881 revision=3 sha256=#{original.sha256} -->
+    #{payload}
+    <!-- AI FACTORY CONTRACT END issue=PPL-9881 revision=3 sha256=#{original.sha256} -->
+    """
+
+    for draft <- [Contract.draft_comment(original), legacy] do
+      authorization = Contract.specification_skill_authorization_marker(original)
+      snapshot = %{"comments" => [%{"text" => draft}, %{"text" => authorization}]}
+      assert {:ok, decoded} = Contract.authorized_from_snapshot(snapshot, "PPL-9881")
+      assert decoded.markdown == payload
+      assert decoded.sha256 == original.sha256
+
+      tampered = String.replace(draft, original.sha256, altered.sha256)
+      forged_marker = Contract.specification_skill_authorization_marker(altered)
+      forged = %{"comments" => [%{"text" => tampered}, %{"text" => forged_marker}]}
+      assert {:error, :confirmed_authorization_missing} = Contract.authorized_from_snapshot(forged, "PPL-9881")
+    end
+  end
+
+  test "hexadecimal issue-marker casing does not change contract authorization or payload integrity" do
+    contract = Contract.bind("PPL-9881", 3, "## Ticket Delivery Contract\n\n- Preserve accepted inputs")
+    canonical = "issue-hex=" <> Base.encode16("PPL-9881")
+
+    for hex <- ["50504c2d39383831", "50504C2d39383831", "50504C2D39383831"] do
+      draft = String.replace(Contract.draft_comment(contract), canonical, "issue-hex=" <> hex)
+
+      authorization =
+        contract |> Contract.specification_skill_authorization_marker() |> String.replace(canonical, "issue-hex=" <> hex)
+
+      snapshot = %{"comments" => [%{"text" => draft}, %{"text" => authorization}]}
+
+      assert {:ok, ^contract} = Contract.authorized_from_snapshot(snapshot, "PPL-9881")
+      assert Contract.draft_comment_equivalent?(Contract.draft_comment(contract), draft, "PPL-9881")
+      assert {:error, :confirmed_authorization_missing} = Contract.authorized_from_snapshot(snapshot, "PPL-9882")
+      altered_draft = String.replace(draft, "Preserve accepted inputs", "Changed inputs")
+      changed = put_in(snapshot, ["comments"], [%{"text" => altered_draft}, %{"text" => authorization}])
+      assert {:error, :confirmed_authorization_missing} = Contract.authorized_from_snapshot(changed, "PPL-9881")
+    end
+  end
+
   @validation_markdown """
   ## Manual Validation
   - Required: yes

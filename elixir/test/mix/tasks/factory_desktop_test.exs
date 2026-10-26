@@ -8,6 +8,15 @@ defmodule Mix.Tasks.Factory.DesktopTest do
   alias SymphonyElixir.PathSafety
   alias SymphonyElixir.TicketChatFixture
 
+  test "help documents audited MR correction and readonly audit commands" do
+    help = capture_io(fn -> Mix.Tasks.Help.run(["factory.desktop"]) end)
+    assert help =~ "correct-ticket-mr-owner REQUEST_KEY EXPECTED_OLD_PAYLOAD_SHA"
+    assert help =~ "mr-actor-audit REQUEST_KEY --workflow"
+    assert help =~ "does not claim or send"
+    for command <- ~w(prepare-ticket-mr-correction finalize-ticket-mr-correction prepare-ticket-mr-claim finalize-ticket-mr-claim), do: assert(help =~ command)
+    assert help =~ "only after commit"
+  end
+
   setup do
     token = "#{System.pid()}-#{System.system_time(:nanosecond)}-#{System.unique_integer([:positive])}"
     root = Path.join(System.tmp_dir!(), "desktop-cli-#{token}")

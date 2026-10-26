@@ -1,5 +1,13 @@
 # Symphony Elixir
 
+Capability recovery reuses the stopped predecessor's immutable admitted packet and
+shared-instruction bytes. It revalidates all current packet facts except tool
+guidance, which is supplied by the recovery wrapper; it does not admit a replacement
+instruction snapshot. Prepared restart resolves the predecessor's evidence-bound
+prompt rather than the mutable current task prompt. The read-only
+`factory-broker ticket inspect-capability-runtime` operation reports loaded-code
+identity independently of whether the ticket remains eligible for recovery.
+
 ### Disabled ticket-parent context integration
 
 The internal `ticket_parent_step` requires absolute, canonical `ticket_cli_root`
@@ -11,19 +19,235 @@ bounded context reader and command staging. These are behavioral instructions,
 not an OS-enforced read-only sandbox: the parent is a trusted operator interface.
 Controller admission still requires independently read native input and receipts.
 
+New controller pushes use the versioned V14 transport: a complete framed request
+is bounded at 1 MiB and its terminal receipt at 4 MiB. Admission accounts for UTF-8,
+nested JSON escaping, and Python ASCII escaping before any claim or child input.
+All safety evidence remains present. V11 history and V5 status readback apply these
+bounds only to V12/V13/V14 push execution/receipt envelopes; historical versions retain
+their existing limits and cannot gain new issuance authority from readback.
+Completed V12/V13/V14 envelopes are separately bounded at 12 MiB. Diagnosis/reassessment,
+CI claim, successor, ordinary-generation, and authorized empty-child import journals account for these
+copies only at fixed documented run/preimage paths; every other byte retains the
+2 MiB budget. Size projections use digest/length markers internally but never
+replace stored evidence or its hashes. Absolute encoded ceilings are 2 MiB plus
+four envelope copies for diagnosis rows, six for successor proofs, and two for
+preimage/claim/import/ordinary-generation objects, accounting for nested JSON escaping.
+Ordinary generation discounts only an authenticated completed push at
+`run_preimage.candidate_handoff`, never arbitrary journal content. The recorded
+binding bytes and SHA remain unchanged, including after a service upgrade.
+For ordinary generation only, the typed repair proof distinguishes the reviewed
+push candidate from a newer local source parent. Size qualification authenticates
+the former while preserving the latter; the full validator still independently
+matches the saved proof against consumed verifier and writer evidence.
+
+Historical generation authority is separate from the current push artifact.
+Finalized ordinary V2 and generated-only V3 journals may name only the current
+artifact or exact canonical helper/companion pairs in the versioned generation
+origin catalog. Each historical pair is authenticated by immutable release
+manifest bytes and artifact digests; same-byte unregistered paths remain invalid.
+Historical generation helpers are read, never executed, by this validation.
+One exact audited V12 preissuance rejection can use the existing schema-53
+retirement journal. The old envelope, requalification journal, rejection and
+reservation remain unchanged; the controller records one linked child nonce
+before a later owned tick may issue. Unknown outcomes and other rejected nonces
+do not gain retry authority.
+
+CI repair budgets count immutable claims and evidence successors, not the broader
+repair-round number shared with verifier repairs. Schema 54 permits positive round
+identities above ten while retaining the ten-total-attempt trigger and configured
+limits. Startup migration preserves existing rowids, receipt bytes, foreign keys,
+and immutability guards; a higher round identity does not grant another attempt.
+
+An operator may authorize one never-issued `PREPARED` push through
+`factory.prepared_push_requalifications`, keyed by a unique authorization key.
+The value pins `run_id`, `original_envelope_sha256`, `original_nonce`,
+`candidate_sha`, `spec_revision`, `contract_sha256`, `authorization_reference`,
+`maximum_implementation_iterations`, and `maximum_code_repair_rounds`.
+Only a normal owned scheduler tick can consume it, after fresh ordinary delivery
+checks and proof that the old nonce has no issuance artifacts. Schema 53 retains
+the original envelope and reservation disposition in an immutable one-use journal.
+That tick records `PUSH_REQUALIFIED` without issuing; a later tick may execute the
+fresh nonce. It never resets or spends implementation/CI counters. Consumed entries
+cannot mint another nonce and do not constrain genuinely later candidates. Removing
+an entry is not required for historical readback, but changing workflow bytes while
+the fresh push is pending can invalidate its ordinary current-policy fence.
+
 `mix factory.ticket` read actions open an existing current-schema SQLite ledger
 readonly and never create or migrate it. `stage` remains a separate writable
 proposal operation and grants no execution authority. Native read-command
 acceptance and the complete quality gate remain required before enabling this
 ticket-parent route.
 
+### Explicit repair of a blocked verifier result
+
+New ordinary native writer/verifier admissions with numbered `AC-<number>`
+criteria carry a versioned `review_protocol`. Their result must include complete,
+candidate-bound criterion coverage, boundary sweeps, and independent closure of
+every prior finding ID. Writers inspect the whole failure family within the
+contract; verifiers consolidate the full review before returning findings. These
+structured claims improve auditability but do not prove that no defect remains.
+For source writers, COMPLETE means the implementation is ready for controller
+formatting, generation, CI, and independent verification. Tests the writer cannot
+execute remain NOT_CHECKED with explicit source evidence; that alone does not
+require CONTINUE. Classified writer observations are retained but cannot close
+independent findings. Stopped report rejections are projected read-only from the
+exact current receipt, with a factory-owned recovery action rather than a generic
+waiting message. Consumption or changed task identity removes that projection.
+
+An explicitly configured `ticket_supervisor.source_completion_confirmations`
+entry may authorize one read-only confirmation at the exhausted implementation
+limit. It binds the exact run, candidate, contract, counters, and consumed
+CONTINUE receipt. The new request cannot mutate source or return CONTINUE; it
+must genuinely return no-edit COMPLETE or BLOCKED. Failure alone does not grant a
+replacement request. Normal controller generation, CI, and independent
+verification remain required. The global implementation and repair limits do
+not change; successful confirmation may advance the recorded iteration once
+beyond the unchanged limit. Removing the entry prevents new admission without
+invalidating immutable completed evidence.
+
+An exact optional `schema_rejection` authorization may permit one report-only
+successor after a provider rejects that confirmation's response schema before
+execution. It binds the failed request, turn, binding, complete evidence digest,
+native error digest, and operator authorization. Complete native history must
+contain only the original user input, with no output or tool activity; source
+must be unchanged and clean, ownership stopped, and the native queue empty.
+The existing failed-turn transfer journal preserves the failed row and all
+budgets. Preparation and start recheck the scope, history and queue; successor
+failure cannot grant another request. This is not an automatic retry policy.
+
+Provider response schemas are a separate wire representation. The controller
+retains its canonical admission/result schema; the wire adapter requires every
+declared property and represents an empty-array constraint as `maxItems: 0`.
+These restrictions narrow provider output without changing the controller's
+no-edit authorization or accepting a previously invalid result. Only the known
+positive-schema subset is adapted; schemas containing unsupported keywords are
+retained unchanged.
+
+The controller permits at most two automatic verification repairs after the
+initial review and stops earlier when a prior finding remains unresolved.
+Fresh instruction snapshots, CI repairs, ticks, and restarts do not reset that
+contract lineage's count. A factual `REPAIR` stays `REPAIR`: a separate policy
+decision and version-2 terminal receipt explain why automatic work stopped.
+Decision recording, result consumption, and ownership release are atomic.
+The dashboard shows the rule, recorded attempt count, requester responsibility,
+and exact-candidate CI status separately from factory scheduling health.
+
+Already admitted instruction snapshots and legacy result schemas are preserved.
+Historical `BLOCK` results that explicitly report the old two-non-PASS rule are
+labelled as legacy reviewer-reported stops, not new controller policy decisions.
+Policy stops are deliberate terminal records, not retry requests; the legacy
+authorization command below accepts only an exact preserved `BLOCK` and cannot
+silently override the new limit or turn a policy-stopped `REPAIR` into `BLOCK`.
+
+A valid stopped native verifier `BLOCK` (or over-budget `REPAIR`) is adopted
+atomically as terminal `FAILED`, retaining its raw verdict, consuming the result,
+and releasing REVIEW ownership. Normal ticks do not retry it or create a new run.
+
+An explicitly approved repair of an exact `BLOCK` can be staged with
+`mix factory.ticket authorize-verifier-repair RUN --workflow WORKFLOW.md
+--payload-base64 BASE64_JSON`. The strict payload contains `authorization_key`,
+`run_id`, `candidate_sha`, `spec_revision`, `contract_sha256`,
+`verifier_request_key`, `verifier_output_sha256`, `authorization_reference`,
+`authorization_body`, and `repair_instructions`. The operator reference/body are
+audited local approval, not a fabricated native parent message.
+
+Staging requires the same controller identity and ACTIVE, unleased control both
+before observation and at the authorization transaction. Completed normal ticks
+may advance only generation and update time during Jira observation. A completed
+pause/resume is also acceptable if control is again ACTIVE and idle with every
+other field unchanged: staging records approval, not SOURCE authority. A live
+lease, regressing generation or changed controller identity/conflict still refuses.
+Staging and normal owned application read Jira from the controller workspace, not
+the source repository or writer checkout.
+
+The service returns `VERIFIER_REPAIR_AUTHORIZED` without changing the run or
+dispatching. A normal owned tick requalifies the exact stopped/consumed verdict,
+released ownership, current Jira/checkout/capacity and existing budgets, then
+atomically records `VERIFIER_REPAIR_APPLIED` and enters `REPAIRING` with one repair
+round spent. Only a later normal tick may launch SOURCE; implementation counters
+advance through the usual worker path. Same approval replay cannot spend twice.
+Original finding IDs and `BLOCK` remain intact. Version-2 ordinary repair proof
+binds both events through generation, push and archived history; bare `BLOCK`
+does not grant repair authority and delivery still requires fresh verifier `PASS`.
+
+A single additional repair beyond the combined historical budget requires an
+explicit `ticket_supervisor.verifier_repair_budget_exceptions` entry keyed by the
+approval's `authorization_key`, as well as the normal operator approval command.
+The entry exactly binds `kind: ONE_VERIFIER_REPAIR`, run/candidate/contract,
+verifier request/output/round, approval reference, configured limit, and prior
+and next repair rounds. The next round must be precisely prior plus one. It
+waives neither capacity nor implementation limits, grants no automatic later
+repair, and never resets counters or changes the global limit. A version-2
+authorization retains both configured and effective limits in immutable events;
+after application, historical readback does not depend on retaining the config.
+Successor push/history codecs independently validate this exception and support
+both legacy prose-derived and admitted receipt/index-derived finding IDs. Older
+helper files and completed receipts remain unchanged.
+
 ### Ticket status and read-only diagnosis
+
+An operator may authorize one retry of an exactly failed `serverOverloaded`
+FILE_SOURCE writer with `mix factory recover-failed-writer REQUEST_KEY FAILED_TURN
+--workflow WORKFLOW.local.md`. This is not automatic backoff. It rejects a live
+tick lease, changed inputs/HEAD/files, pending human input, live source owner or
+unreconciled IO. Read-only native stored history must prove the same latest failed
+turn with no final result. The failed attempt remains intact; an atomic, separately
+recorded quiescence transfer admits one new request/generation in the same native
+thread and checkout. Quiescence is not a fabricated owned shutdown receipt.
+Recovery of the retry itself is intentionally refused; future bounded automatic
+recovery is tracked in the pilot hardening backlog. Deploy the controller changes
+at a proven idle boundary before applying this command.
 
 The dashboard separates the operator-facing ticket parent from diagnostic role
 workers and separates parent-summary synchronization from delivery state. A failed
 summary does not invalidate the recorded candidate or verifier result. Disabled
 factory and disabled ordinary-ticket routing are visible configuration states,
 not proof that existing workers have stopped.
+
+Current operation failures and uncertain handoffs take precedence over the
+source-stage label. The dashboard retains all current attention signals, including
+presentation-only warnings, rather than treating a healthy scheduler as healthy
+delivery. A timed-out refresh retains visibly stale last-good data; a failed
+initial read reports unknown counts. Runtime identity distinguishes control-server
+initialization from the BEAM process start. Neither a fingerprint nor a WebSocket
+connection establishes deployment or freshness.
+
+Workflow progress is not worker liveness: current execution is projected from the
+canonical task and latest exact worker evidence, even when task history is hidden.
+A consumed result is waiting, not running; a bound turn is explicitly unconfirmed
+live activity. Terminal generic controller failures remain recorded history,
+while unresolved handoffs and current delivery failures remain attention items.
+Implementation iterations and CI repair attempts are distinct budgets. Tick
+observation expires after the larger of three poll intervals or one lease, without
+changing the recorded last tick result. Ledger projection uses a deferred read
+snapshot; controller and disk-capacity observations are timestamped separately.
+
+MR handoff and CI polling verify the exact configured GitLab branch through the
+read-only MCP connector, bracketed around the MR reads on one owned or supplied
+session. The effective push/read origin must still match the completed push and
+the configured GitLab host/project. No Git network fallback is used. Owned
+sessions close before admission transactions, with no MCP/network observation
+under SQL. MR receipt validation and initial Jira finalization recheck captured
+delivery ledger facts; unchanged legacy/CI local checkout checks remain. Existing
+issued receipts remain historical evidence, not permission to replay a request.
+
+The explicit `TICKET_PUSH_CAS_RECOVERY` path recovers only the same immutable
+candidate from an audited uncertain push. It retains the original outcome as
+UNKNOWN, uses a new nonce and a genuinely recorded new child outcome, and requires
+exact remote-SHA convergence before advancing delivery. It does not manufacture
+the old helper's shutdown or retry the original intent. Retained uncertainty
+continues to fence branch deletion/reset, identity retargeting and candidate
+rollback. Versioned migration 39 adds those durable guards; historical run data
+must remain unchanged at activation. The maximum is three explicit recovery
+attempts, not automatic retry. The prospective ordinary-v2 descendant-push
+limitation and HTTP state-read timeout remain separately tracked in
+[`factory-pilot-hardening.md`](../docs/factory-pilot-hardening.md#unknown-push-recovery-and-truthful-dashboard--2026-10-13).
+
+Blocker-only activation uses a reviewed prebuilt artifact through explicit
+`MIX_BUILD_PATH` at a verified controller-idle boundary. The launcher denies a
+missing compiled application instead of silently compiling another checkout.
+This does not authorize restarting Desktop, changing source ownership, applying
+the local CI-default patches, or replaying an uncertain remote operation.
 
 From `elixir/`, inspect an existing ledger without replaying actions:
 
@@ -112,6 +336,10 @@ desktop task history after its first turn and can be reopened there. Symphony
 can also resume a recorded thread ID after restarting instead of creating a
 replacement conversation.
 
+Local app-server protocol responses are read only from stdout. Diagnostic stderr
+is inherited by the parent process, not merged into JSON frames or a bounded,
+redacted diagnostic capture. The SSH transport is unchanged.
+
 During app-server sessions, the selected tracker adapter may advertise provider-native tools. The
 Linear serves `linear_graphql`, GitHub Issues serves `github_api`, Jira Cloud serves
 `jira_rest`, Asana serves `asana_api`, and GitLab serves `gitlab_api`. Symphony executes those
@@ -141,6 +369,16 @@ explicit canonical `parent_output_root` before storage/controller children start
 unsupported runtime or cwd stops startup with a typed error. Per-effect claims and
 owned worker sessions retain their own checks. Listing, formatting and readback do
 not probe. This checkout has not enabled production or completed rollout acceptance.
+The exact accepted CLI versions include `0.163.0-alpha.10.2`,
+`0.163.0-alpha.11`, `0.163.0-alpha.11.1`, `0.163.0-alpha.11.2`, and
+`0.164.0-alpha.11.1`.
+Runtime rollout requires qualification against the exact installed binary;
+version acceptance alone does not establish successful qualification. Checks cover
+initialize-only admission, restricted FILE_SOURCE/REVIEW startup, a harmless
+synthetic turn, and persisted-thread resume. These do not prove model tool-use
+containment or same-ledger worker recovery. Version acceptance does not bypass canonical
+home, OS, effective policy, workspace, account, or connector-inventory checks and
+does not establish model tool-use containment.
 Disabled V1 runs are quarantined without stopping unrelated
 legacy work; unknown execution modes remain rejected.
 
@@ -176,9 +414,21 @@ claim. Production policy still rejects this route before readiness or connectors
 
 V1 preflight CI reads are catalog-qualified and model-free. WAIT/BLOCK retain
 `CI_WAITING`; an exact PASS atomically enters `VERIFYING` and increments its round
-once. The fresh blind verifier receives candidate-bound CI evidence, then PASS
-proceeds through normal exact push proof rollover. This is local integration, not
-live connector acceptance or Jira review-ready finalization.
+once. A passing retry also supersedes a recognized current CI-repair exhaustion
+error. Historical failures and consumed repair attempts remain unchanged, and
+unrelated errors are retained. The fresh blind verifier receives candidate-bound
+CI evidence, then PASS proceeds through normal exact push proof rollover. This is
+local integration, not live connector acceptance or Jira review-ready finalization.
+
+Schema 46 adds immutable MR observation qualifications for a completed controller
+`BLOCK` that reports only the prior CI-repair candidate SHA. The original request,
+result, and native turn stay unchanged. Normal adoption can qualify the same MR
+only after a fresh read proves the current pushed candidate and unchanged route,
+draft, reviewer, assignee, and source-removal policy. Current authorization, human
+input, and active tick lease are rechecked before the qualification and adoption
+are committed together. Retained-history and CI readers use that exact
+qualification after restart; a `BLOCK` alone remains unusable. This capability
+does not create a new MR request, trigger CI, or establish successful delivery.
 
 Schema 27 adds a two-effect V1 Jira journal. Initial implementation records the
 observed `In Dev` transition and factory-label delta; finalization records the
@@ -289,6 +539,18 @@ can inspect/edit its exact checkout. Writes require the full-file SHA-256 (or
 `ABSENT` for a new file in an existing directory), bounded UTF-8 contents, and
 the current request/thread/turn/reservation generation. Symlinks, hardlinks,
 control paths, connectors, shell tools and permission escalation are denied.
+Read paths prefixed with exact ASCII `.symphony-base/` resolve only the immutable contract-base SHA already bound to the
+current worker and persisted review base; callers cannot select a Git revision.
+This virtual namespace is available only through `repo_read` and `repo_read_binary`;
+all writes and listings continue to reject it. It never falls back to a physical
+directory, and preserves the exact original seven-tool catalog and policy hash
+for retained native threads. It reads regular Git blobs through a fixed, bounded, read-only helper, without
+fetching or changing the checkout. UTF-8 reads page by line; binary reads return
+canonical base64 pages. Both retain the 256 KiB file and 16 KiB response limits.
+Long or heavily escaped text pages fail closed; use binary pages for exact bytes.
+Historical hashes identify preimages, not the current file: restoring one still
+requires a current-file read and its exact write-CAS hash. Other dirty files are
+not touched. Stopped or superseded worker capabilities cannot call these tools.
 The controller alone runs approved checks and adopts a candidate; workers must
 report unrun checks, not claim them passed. Single-file deletion requires the
 exact current content hash, shares the durable mutation journal, and cannot
@@ -453,13 +715,18 @@ Admission requires completed direct client input, fresh projectless identity,
 exact body and question/contract/candidate bindings, and the successful staging
 receipt in that same native turn. Broker/delegated messages, quoted commands,
 edited native items and stale questions cannot authorize actions.
-The recorded invocation must be a standalone `mix factory.ticket stage RUN`
-(optionally under `mise exec --` or a supported shell wrapper), with literal
-base64 proposal and absolute workflow arguments matching the staged record.
+New recorded invocations use the exact `./scripts/factory-broker ticket stage RUN`
+launcher from the saved reader's cwd, with literal base64 proposal and absolute
+workflow arguments matching the staged record. The ticket launcher reads the
+canonical deployed LaunchAgent, refuses conflicting inherited build paths, and
+never falls back to the cwd's local build. Context projection verifies the
+canonical executable launcher bytes. Previously saved locators and successful
+legacy `mix factory.ticket` staging receipts remain valid historical evidence;
+their bytes are not rewritten.
 Use the execution tool's working-directory option; shell chains, expansions,
 echoed receipts and marker comments are not supported staging evidence.
 
-For explicit contract revisions and candidate rework, `mix factory.ticket
+For explicit contract revisions and candidate rework, `./scripts/factory-broker ticket
 prepare-stage RUN --workflow WORKFLOW.md` prepares the literal staging command
 from the bound parent's latest unclosed, single direct-human input. Persisted
 app-server history may label an owning-Desktop turn interrupted before completion;
@@ -624,6 +891,40 @@ refuses another unresolved request or moved HEAD/branch. The operator must
 independently verify the interrupted turn ID; the command does not attest
 Codex history by itself.
 
+Priority hardening (activated in the local pilot on October 13) retains genuine worker shutdown
+receipts on native errors and exceptions. Proven model-capacity failures can
+receive at most three exact-bound automatic retries after 5/15/30 minute
+cooldowns. The controller preserves the original thread, model, contract, plan,
+candidate and applied file receipts; changed evidence, active ownership, pending
+human input and ambiguous starts deny recovery. Historical quiescence recovery
+does not become a fabricated owned-exit receipt.
+
+For a service-owned writer interrupted by the exact recorded controller
+connection-loss error, use `mise exec -- mix factory recover-interrupted-writer
+REQUEST_KEY INTERRUPTED_TURN --workflow WORKFLOW.local.md` only after proving
+the latest terminal native turn. This separate manual path checks persisted
+history and an empty, version-stable native input queue outside ledger
+transactions, then atomically preserves the candidate, contract, plan, model
+and journaled partial bytes while transferring source ownership to one new
+attempt. Launch rechecks the proof. Active source-cwd holders, queued human
+input, uncertain completion, changed bytes and missing evidence deny recovery;
+no owned-stop receipt is invented and a second interruption is not silently
+rearmed. This does not authorize direct worker messages or a Desktop restart.
+The corrected interrupted path uses the existing sole-controller ownership
+contract, not a new global native queue-CAS requirement. It validates the
+persisted queue schema and revision, proves the native writer lock is free
+before transfer, and requires an exact same-owned-session preflight immediately
+before `turn/start`. Queue readback is not a cross-server atomic dispatch receipt;
+direct specialist input remains prohibited. A Desktop-held exclusive lock or
+unexplained source-cwd holder still denies recovery. Never delete native locks
+or fabricate shutdown receipts to bypass those guards.
+
+Every captured specialist error has a durable deduplicated parent notice. The
+notice requires independently read-back final text, not an acknowledgment-only
+result. An uncertain parent presentation remains a delivery obstruction and is
+never blindly resent. These changes do not authorize deployment or prove visible
+delivery in the live ticket chat.
+
 When a writer returns `BLOCKED` on a failing contract check with partial
 source edits, the controller does not discard them or silently reinterpret the
 contract. After proving the exact completed turn, one latest failed delivery
@@ -632,6 +933,68 @@ run `mise exec -- mix factory investigate-blocked-writer REQUEST_KEY
 BLOCKED_TURN --workflow WORKFLOW.local.md`. This permits one bounded
 investigation in the same task and dirty checkout. It does not commit the
 failed slice or override a genuine product decision.
+
+For a stopped `FILE_SOURCE` writer whose exact contract-base capability has
+since been restored, the owning service also supports
+`factory-broker ticket inspect-capability-recovery RUN --payload-base64 PAYLOAD
+--workflow WORKFLOW` and `authorize-capability-recovery` with the same binding
+plus `grant_id` and `grant_sha256`. Inspection is read-only. Authorization
+requires an independently reviewed, one-use local operator grant in the fixed
+service-owned `operator-grants` directory; the CLI cannot create grants. The
+grant pins the request, output, contract/base, exact raw journal rows and dirty
+bytes, approved base paths, and operator approval excerpt/reference. It records
+`LOCAL_OPERATOR_AUTHORIZATION`, not a native parent message or machine-proven
+cause. Grant and directory permissions are `0600` and `0700`, with canonical,
+owned, no-follow, single-link reads. Grants expire within fifteen minutes.
+
+Staging appends authority only, while current controller identity is `ACTIVE`
+with either no lease or a well-formed unexpired lease. It does not clear a
+blocker or launch work. External Jira, capacity, checkout, file and native
+observations precede a short locked ledger comparison. The normal owned tick
+must freshly qualify and consume a one-transition `CHECKED` proof before
+transferring the dirty reservation. Repeated APPLIED writes are checked in
+rowid chronology, including every physical receipt and final per-path bytes;
+unknown, partial and unsupported file histories are refused. Restart of an
+already reserved continuation requires fresh observations without another
+transfer, request or counter increment. The actual owned actor refreshes queue,
+result, owner and timestamp evidence again immediately before sending a turn.
+Native queue observations are not a SQLite compare-and-swap over the client.
+
+Old results and file receipts remain immutable. The seven-tool catalog and all
+budgets remain unchanged; source generation, commit, push, CI and independent
+verification stay controller-owned. This route relies on the current fixed
+check catalog and restricted worker profiles, not Unix permissions isolating
+arbitrary same-user code. Do not run unconfined candidate-authored code while a
+grant is live. An absent/expired grant, drift, new input, foreign owner or
+uncertain issuance stops recovery; do not manufacture parent input or retry
+with a second authorization to bypass those guards.
+
+New pushes whose retained lineage contains a validated capability transfer use
+the additive V26 issuer/V20 history codec. Other new pushes use V25/V20;
+archived programs and receipt bytes are never rewritten. Archived capability
+authority validates the service-created AUTHORIZED attestation, exact recorded
+file-receipt structure and ordered raw-row hashes, INITIAL CHECKED and APPLIED
+crosslinks, and one-generation transfer. It does not reread a retired spool,
+require the grant to remain live, or compare later source edits to old bytes.
+Grant timestamps retain their authenticated bytes; the capability codec accepts
+UTC `Z` and `+00:00` representations without widening historical timestamp rules.
+The two exact audited V15/V16 ordinary-verifier rejections may be retired by normal
+owned ticks only after stopped-helper, absent-issuance and remote-preimage checks.
+Each hash-linked event preserves its envelope and rejection, atomically releases
+MAINTENANCE and prepares a separate nonce without consuming a repair attempt or
+inventing a CI claim. The second audit pins the exact first event; live validation
+requires the complete two-event prefix. A separate V24 rejection audit may seal
+that fully validated prefix after the workflow advances to a different context;
+it permits one new retirement, not replay of either historical attempt. Unregistered
+retirements remain forbidden. This is not a general retry allowance.
+Historical generation and push artifacts require exact
+manifest-root and file-hash catalog entries across service replacement.
+Issuance requires a later fresh qualification. Event producers
+are append-only and consumers enforce cardinality and raw hashes; this journal
+does not add database-level immutability to the general events table.
+The older remote-CAS recovery executor refuses this new lineage; ordinary
+current-issuer readback remains available, while any further unknown-outcome
+intervention requires a separately reviewed supported recovery path.
 
 If a completed repair writer correctly refuses controller-owned push/MR work,
 pause dispatch and use `mise exec -- mix factory resume-controller-delivery
@@ -1049,6 +1412,15 @@ codex:
 
 ## Web dashboard
 
+Workflow titles fall back to the matching saved Jira snapshot when the ticket is
+absent from intake. Dark surfaces stay neutral; labeled indicators convey health.
+
+Schema v38 stores controller-owned intake rejection decisions separately from
+the observed Jira snapshot. A missing required manual-validation declaration
+shows `INTAKE_BLOCKED` with an actionable reason without starving other work;
+the next snapshot clears stale decisions. This hardening is local-only until an
+explicitly authorized deployment.
+
 The observability UI now runs on a minimal Phoenix stack:
 
 - LiveView for the dashboard at `/`
@@ -1198,4 +1570,274 @@ cycle, same-chat access, fresh external authorization, exact remote recoverabili
 and isolated cache reclamation. No filesystem removal fallback or extra attachment
 may be used to bypass the missing managed identity.
 
+## Native CI-repair policy
+
+`factory.ticket_supervisor.ci_repair` is absent by default. Missing, disabled, or
+unsupported policy does no repair-log collection, diagnosis persistence, or model
+dispatch. The local implementation recognizes `diagnosis_only_v1` (bounded,
+immutable diagnosis only) and `native_bounded_v1` (a separately admitted repair
+claim, at most seven total code-repair attempts, respecting a lower configured cap;
+the default remains five).
+Schema 47 preserves existing immutable receipt bytes and references while raising
+the claim-table bound from two to five; it does not reset rounds already consumed.
+This is not deployment or enablement
+evidence for any running factory.
+
+Every exactly bound failed pipeline is offered to the same repair specialist;
+there is no supported-failure-type list. Assertion, formatting, unfamiliar
+language, infrastructure and instruction-looking log text are all diagnostic
+data, not permission. Fresh MR/discussion, Jira, source-owner, native queue,
+controller, capacity and human-input proofs still gate admission. Editable paths
+come from the trusted committed candidate, never log filenames; agent, Git,
+CI/policy/configuration paths stay protected and BUILD stays controller-owned.
+Missing, malformed, oversized or inaccessible traces/artifacts are explicit
+evidence gaps, not an unsupported-failure verdict. The specialist may report a
+concrete inability to fix an authorization or environment problem. No-op output
+never fabricates progress, CI PASS, a commit, or a push.
+
+Diagnosis refresh and claim admission validate both complete CI snapshots against
+the same candidate and project. Their comparison ignores only a change between
+boolean values of a present job `runner.active` field: that is current runner
+availability, not completed-job evidence. Field presence and every other raw
+field remain exact, including ownership, review, pipeline and complete job data.
+The original snapshots, receipt hashes and transactional preimages are retained
+unchanged; this exception neither spends a retry nor relaxes freshness or safety
+gates.
+
+The collector retains all failed-job identities, fetching at most four complete
+trace streams and two artifact archives per assessment. Artifact metadata and
+downloads use the existing authenticated GitLab MCP session only, into private
+controller directories outside SOURCE. Metadata walks are bounded to16 exact-job
+requests, depth4,256 entries and256KiB metadata;
+directory-only listings are followed explicitly, never treated as file evidence.
+Unsafe paths, duplicate/colliding names and symlink/special entries become
+stage-specific evidence gaps. The collector version advances only future
+unclaimed assessments; an active claim retains its original evidence bytes.
+The pinned read-only decoder bounds ZIP
+central-directory allocation, members, decompression, output and time; it never
+extracts files or interprets their contents. Only CRC/EOF-verified UTF-8 text is
+eligible evidence. Credentials in text and filenames are redacted before durable
+or model use. Combined serialized diagnosis is limited to256KiB; reductions
+retain head/tail data, hashes and explicit partial/gap markers. Complete journal
+rows retain the 2 MiB non-push budget. Only authenticated completed V12 push
+copies use the separate fixed-path accounting described above; legacy helpers
+retain their old bounds. Authority preimages are never truncated. Private
+downloaded ZIPs remain sensitive local diagnostic evidence.
+
+New generic assessments append once beside historical blocked diagnoses.
+The legacy reassessment `collector_version` column now holds the canonical
+ordered-pair identity of the true collector and assessment versions, both also
+present in hashed diagnosis/preimage payloads. Effective selection uses only the
+current pair; old claims resolve their exact original row/hash independently.
+Exhaustion records the total cycles used, actual configured limit and current
+assessment in durable visible run diagnostics. The configured total includes earlier
+claims and evidence successors; increasing it never resets consumed attempts.
+Schema 49 preserves existing rows, rowids, foreign keys, and immutable receipts
+while widening the physical ceiling to seven. The global configuration may be
+temporarily raised to seven and restored to five without erasing history.
+
+Schema 50 adds an immutable human-empty-commit import journal. Explicit operator
+recovery can reconcile an exact one-parent, identical-tree child of a completed
+CI evidence-successor push while its old MR request is wholly unissued. Raw Git
+objects, checkout identity, remote branch, GitLab MR, stopped source ownership,
+contract, inputs and controller identity must agree across closing observations.
+The original push, checks, worker results and request payload remain unchanged;
+only that unissued request is terminally retired in the same transaction as the
+import. An imported-object envelope is not a factory push or verifier result.
+It clears current CI applicability and requires exact-current MR/CI readback.
+Subsequent repairs retain the normal total attempt budget and genuine native
+writer/controller checks. Versioned push executor v7 and history validator v4
+independently verify the import journal and original physical provenance before
+a later push; older helper bytes remain available for status-only readback.
+Caller-provided prepared maps cannot invoke the mutation path. A claim race,
+changed remote/MR, busy native owner or failed preimage comparison rejects the
+import without retiring the request. This path does not resume any monitor or
+change scheduler, broker, repair-budget or GitLab policy configuration.
+
+An explicit operator `factory.ci_repair_scope_extensions` entry may authorize two
+literal Go source paths for one exact run, contract, failed candidate and immutable
+repair claim. It is captured in a versioned policy receipt on a newly admitted
+request, never retroactively added to the stopped request or old claim. Current
+owned workflow and cached policy must still match at writes, generation and push;
+policy replacement revokes further use without invalidating archived receipts.
+The capability expires on a different repair claim. CI logs cannot grant it, and
+binary, generated, Git, agent and policy files remain outside writer authority.
+
+Schema 48 adds an immutable evidence-successor journal for an exactly stopped,
+no-edit BLOCKED CI writer when genuinely new, complete assertion-log content
+becomes available. A fresh admission retains the original result, claim, round,
+and blocked event, transfers SOURCE to one new request, and spends one of the
+same configured total attempts. Renamed or recombined old content does not qualify.
+Fresh policy, capacity, Jira, MR, input, owner, and lease checks remain mandatory;
+a restart reads the existing admission rather than dispatching it again.
+Successor preparation and delivery-rollover reads own one bounded GitLab read
+session when the scheduler supplies none, using only its authoritative controller
+workspace. Initial and closing CI reads share that session with review and
+artifact reads; it closes before admission or dispatch. A supplied session stays
+owned by its caller. Catalog, transaction, policy, capacity, and lease denials
+remain fail-closed and do not spend an attempt.
+
+Runs with this history use the versioned v5 push executor and v2 history validator.
+They authenticate every dedicated transfer and subsequent same-attempt CONTINUE
+slice through immutable instructions, owned stops, controller checks, and release
+receipts. Later CI claims retain that history; ordinary verified rework does not
+require CI repair to remain enabled. Historical helpers and already prepared push
+intents are not upgraded. Dashboard total-attempt usage is separate from the
+unchanged repair-round counter. These source capabilities do not establish live
+deployment or successful ticket delivery.
+
+After exact-candidate CI PASS and the next independent verifier PASS, a typed
+delivery-only rollover may prepare a new v5 push intent for that same candidate.
+It authenticates the original completed CI push, released checkout, current
+verifier instructions and receipt, fresh same-MR PASS observation, and the actual
+invoking tick lease. It spends no repair attempt and may finish with CI repair
+disabled, including a zero repair cap. The observation expires after 60 seconds;
+an expired intent is not refreshed or replayed. A completed rollover is reused
+without another nonce or push. Ordinary rework still needs its own writer and
+independent verifier.
+
+Descendant repairs create fresh push and typed MR-request identities while
+retaining the same draft MR and reviewers. Historical CAS proof is observed
+outside SQL and revalidated against exact ledger bindings inside issuance
+transactions. Old uncertain outcomes and their branch-retention hazards remain
+recorded. A new SHA needs fresh CI evidence before a verifier can run.
+New projectless MR requests separately pin the freshly observed native previous
+turn and the ledger controller anchor in their immutable preparation audit.
+Owner admission preserves both pins; result adoption advances only the captured
+ledger anchor. Later unrelated controller activity is not permission to rewrite
+an existing request or relax native queue, identity, or freshness checks.
+
+The v4 physical push helper resolves only the immutable reassessment pinned by
+the current repair claim; it does not select a later row or overwrite a blocked
+diagnosis. Schema45 journals one exact audited v3 preissuance rejection and its
+separate successor under a fresh ordinary tick. That narrowly qualified
+authority-closed proof is not a generic retry or owned-exit receipt. Read-only
+and paused reconciliation cannot prepare successors. Existing reconciliation
+may converge a genuinely stopped timed-out push when the exact destination SHA
+is observed, while preserving its real termination receipt rather than claiming
+exit zero or replaying its nonce.
+
+Applicable Go/BUILD controller generation uses an execution-pinned, independently qualified Gazelle
+and gofmt toolset. An unavailable or modified toolset fails closed with
+`ci_repair_generator_unavailable`; installing its resources does not enable the
+controller's cached CI-repair policy. The schema 41 append-only journal binds
+each owned execution and per-file byte-CAS replacement to the stopped FILE_SOURCE
+writer, held SOURCE reservation, current tick, repair round, and human-input
+snapshot. Unknown or partial effects hold SOURCE and forbid a new execution or
+automatic reapplication. Restart readback reads the original invocation only,
+including while policy or toolset availability is disabled. Non-Go repairs with
+no applicable actions do not load that toolset or create fake generation
+receipts, but retain the stopped-writer, exact source/round/input and commit
+fences. Formatting considers actual edits and committed repair descendants,
+not every unrelated Go file in the original candidate.
+
+The original worker output remains immutable. Separately receipted formatting
+and generated BUILD paths are united only for the controller's exact commit;
+real generated changes count as progress even when the writer reported no edits.
+Generation never grants arbitrary shell, Bazel, goimports, candidate-controlled
+executables, or local product compile/test authority. Compilation and tests remain
+CI-owned. Changes require a reviewed build and guarded deployment before a live
+controller can use them.
+
+## Shared role instruction admission
+
+Native planner, writer and verifier packets embed complete role-specific shared
+skills and applicable rules, including the verifier verdict contract and shared
+review criteria. The explicit restricted role and structured schema take
+precedence over broader actions described by a skill. Verification remains
+independent and source-read-only; only the controller commits, pushes or manages
+MRs. Code-verification PASS never replaces required exact-SHA manual validation.
+
+`TicketWorkerRunner.packet/4` admits instruction bytes once for the exact dynamic
+packet. Schema 43 adds append-only `worker_instruction_snapshots`; its binding
+includes run, role, stage, iterations/repair rounds, candidate/base/contract,
+plan and current CI/manual evidence. `read_packet/4` revalidates those facts and
+uses stored instruction bytes without reading host skills or writing storage.
+Task launch, preflight and failed-turn recovery use this read-only path. Shared
+file edits or deletion cannot change an admitted turn or start another pass.
+Missing/corrupt material fails closed. Pre-upgrade in-flight tasks without a
+snapshot cannot be silently re-admitted from today's files.
+
+An append-only `worker_instruction_task_bindings` data table links the exact
+task key and full prompt digest (including any rework/recovery wrapper) to its
+instruction snapshot. It is written in the existing task-prepare transaction,
+before a worker starts; a prepared replay with a missing link fails closed.
+No existing task row or historical receipt shape is changed. An explicitly
+authorized held contract amendment can inherit the captured predecessor's exact
+instruction bytes through its validated ancestry and task binding, never from
+today's host files. The ordinary rework, source-lease and candidate gates still
+own all permission to resume work; instruction metadata grants none.
+
+CI repair embeds bounded `fix-mr-pipeline` diagnosis guidance using only the
+controller's exact failure evidence. Neither `autopilot` nor `autopilot-mr` is a
+worker dependency; no connector, retry or MR-maintenance authority is added.
+Legacy/Desktop verification and manual-validation prompts embed the same review
+criteria in their persisted prompts while retaining their own output contracts.
+Those legacy references are complete release-pinned compilation inputs, tracked
+as external resources with content digests; polling never reopens host skill
+files. Updating them for a new legacy task requires a reviewed rebuild. Native
+new admissions may read newer shared files, but existing snapshots remain fixed.
+
+This integration is release-prepared, not deployment proof. Before rollout,
+inspect active tasks, worker receipts and reservations; do not interrupt an
+admitted old worker. After an authorized versioned rollout, read back the actual
+compiled identity and planner/verifier/CI-repair packets and their snapshot
+digests. Retain the unchanged shared `autopilot` compatibility copy until that
+runtime evidence proves there is no dependency. Source tests alone do not
+authorize its removal or establish deployed parity.
+
+### Controller push publication and recovery
+
+Ordinary publishing keeps its intent `PREPARED` throughout expensive history and
+checkout preparation. The controller then rereads Jira, completes both physical
+checkout observations, and observes the stopped source worker outside SQLite.
+The transaction rechecks that exact native evidence immediately before saving
+`PUSH_UNCERTAIN` with the helper PID and exact
+execution bytes. Only then may the helper receive input. Jira authorization
+remains limited to 60 seconds and native observations to 10 seconds; an expired
+observation before publication leaves preparation retryable, not issued.
+Rejected native guards log bounded evidence ages and identity-match flags, never
+native messages or tool payloads.
+
+Publication and recovery deferrals are durable, operation-scoped events. A
+successful scheduler tick does not prove that a ticket advanced. The dashboard
+distinguishes deferred preparation from an uncertain issued push and retains
+the recorded reason across restarts.
+
+Both ordinary and capability-recovery pushes allow Git five minutes to finish
+the remote exchange. The controller's 370-second execution transport window also
+allows bounded authorization/history preparation and receipt delivery; status
+reads retain their separate 35-second limit. Caller loss, termination and output
+overflow still stop and reap the owned process group. The scheduler rereads Jira
+before finalization as well as issuance; neither authorization TTL is extended.
+Callers without a refresh reader defer an expired finalization for a later
+freshly authorized reconciliation, never a second push.
+
+A stopped push with exact destination-branch readback is once-only branch
+publication evidence, even when its retained receipt records a timeout or
+nonzero exit. It is not proof of Git acknowledgement, MR synchronization, CI
+success or independent verification. MR adoption still requires the exact
+candidate SHA; stale MR references never authorize another push or acceptance
+of an older pipeline. Versioned programs and the previous publishing release's
+read-only receipt origin remain retained across rollout.
+
+The explicit `prepare-unattached-push-retirement` and
+`execute-unattached-push-retirement` controller commands apply only to the
+release-pinned legacy incident. They require an owned operator tick, fresh Jira
+authorization, unchanged protected ledger history, and verified shutdown of the
+original issuer with a qualified replacement service. They preserve the original
+envelope and proof in an audit event, then atomically rotate its nonce without
+changing its candidate, binding, reservation, or budgets. They do not push. Missing
+execution metadata or a missing receipt alone never authorizes retirement.
+
+The separate `prepare-preissuance-push-retirement` and
+`execute-preissuance-push-retirement` commands cover one compile-pinned rejected
+execution, not arbitrary uncertain pushes. They additionally authenticate the
+exact rejection and execution bytes, an absent helper, and the absence of any Git
+claim or receipt. After the same issuer shutdown and replacement checks, they
+archive both original records verbatim and rearm the unchanged reservation once.
+The recorded outcome is `GIT_NOT_ISSUED`: helper input arrived, but Git did not run.
+Neither command retries a helper or changes the earlier unattached operation.
+
 This project is licensed under the [Apache License 2.0](../LICENSE).
+

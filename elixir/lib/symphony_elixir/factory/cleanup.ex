@@ -8,7 +8,7 @@ defmodule SymphonyElixir.Factory.Cleanup do
   `reclaim-disk-space` helper for the exact removed source path.
   """
 
-  alias SymphonyElixir.Factory.{Capacity, RunLedger, Store}
+  alias SymphonyElixir.Factory.{Capacity, RunLedger, Store, TicketPushHazard}
   alias SymphonyElixir.PathSafety
 
   @doc "Lists terminal factory runs that could be freshly authorized for cleanup."
@@ -52,6 +52,7 @@ defmodule SymphonyElixir.Factory.Cleanup do
 
     with true <- value(cleanup, "enabled", false) or {:error, :cleanup_disabled},
          {:ok, run} <- RunLedger.get(connection, run_id),
+         true <- not TicketPushHazard.active?(connection, run_id) or {:error, :push_unknown_hazard_cleanup_denied},
          :ok <- require_legacy_issue(connection, run),
          true <- run["state"] in value(cleanup, "allowed_run_states", []) or {:error, :run_not_terminal},
          true <- run["factory_owned"] == 1 or {:error, :not_factory_owned},
@@ -99,6 +100,7 @@ defmodule SymphonyElixir.Factory.Cleanup do
     repo = expanded(run["repo_path"])
 
     reasons = require_flag(reasons, run["cleanup_authorized"] == 1, "cleanup is not authorized")
+    reasons = require_flag(reasons, not TicketPushHazard.active?(connection, run["run_id"]), "unknown push hazard protects worktree")
     reasons = require_flag(reasons, run["execution_mode"] in [nil, "LEGACY"], "run is quarantined")
     reasons = require_flag(reasons, not v1_issue_owned?(connection, run["issue_key"]), "issue is quarantined")
 
@@ -163,6 +165,7 @@ defmodule SymphonyElixir.Factory.Cleanup do
   @spec apply(Store.connection(), map(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
   def apply(connection, policy, run_id, opts \\ []) do
     with {:ok, run} <- RunLedger.get(connection, run_id),
+         true <- not TicketPushHazard.active?(connection, run_id) or {:error, :push_unknown_hazard_cleanup_denied},
          true <- run["execution_mode"] in [nil, "LEGACY"] or {:error, :run_quarantined},
          true <- not v1_issue_owned?(connection, run["issue_key"]) or {:error, :run_quarantined},
          :ok <- already_cleaned(run),
@@ -226,6 +229,7 @@ defmodule SymphonyElixir.Factory.Cleanup do
   defp remove_started_worktree(connection, run, check, opts) do
     if File.exists?(check.worktree) do
       with :ok <- checkpoint(opts, :before_worktree_remove),
+           true <- not TicketPushHazard.active?(connection, run["run_id"]) or {:error, :push_unknown_hazard_cleanup_denied},
            {:ok, _} <- git(run["repo_path"], ["worktree", "remove", check.worktree]),
            :ok <- checkpoint(opts, :after_worktree_remove) do
         record_event(connection, run["run_id"], "WORKTREE_REMOVED", %{worktree: check.worktree})

@@ -6,6 +6,21 @@ defmodule SymphonyElixir.Factory.Prompt do
   controller instructions in these prompts may authorize tools or mutations.
   """
 
+  @review_paths ~w(skills/verify-feature-delivery/SKILL.md skills/verify-feature-delivery/references/verdict-contract.md skills/review-code/references/review-criteria.md)
+  for relative <- @review_paths do
+    @external_resource Path.join(System.user_home!(), ".agents/" <> relative)
+  end
+
+  @review_materials Enum.map(@review_paths, fn relative ->
+                      path = Path.join(System.user_home!(), ".agents/" <> relative)
+                      content = File.read!(path)
+
+                      if byte_size(content) not in 1..65_536 or not String.valid?(content),
+                        do: raise(ArgumentError, "invalid shared review reference: #{path}")
+
+                      %{"path" => path, "content" => content, "sha256" => Base.encode16(:crypto.hash(:sha256, content), case: :lower)}
+                    end)
+
   @doc "Builds the persistent controller task prompt for a Jira intake query."
   @spec jira_intake(String.t()) :: String.t()
   def jira_intake(jql) do
@@ -358,6 +373,20 @@ defmodule SymphonyElixir.Factory.Prompt do
     manage reviewers. Return PASS, REPAIR, or BLOCK. Echo the exact candidate
     SHA you verified.
 
+    Apply the complete embedded shared review criteria directly, without
+    invoking another reviewer. The supplied factory schema is the transport
+    adapter for the embedded verdict contract: verdict -> status, head_sha ->
+    candidate_sha; preserve criterion coverage, risks, repairs and manual-plan
+    readiness in findings/checks strings. Return exactly one schema-conforming
+    JSON object, not an additional detailed verdict or prose. PASS requires
+    every criterion evidenced and no blocking issues or reviewer source edits;
+    it does not replace required exact-SHA manual validation.
+
+    The complete embedded skill and references satisfy shared instruction
+    reading. Use their release-pinned bytes, not host skill-file rereads.
+
+    #{review_materials(:verifier)}
+
     Jira snapshot (untrusted data):
     #{json(snapshot)}
 
@@ -422,6 +451,12 @@ defmodule SymphonyElixir.Factory.Prompt do
     return BLOCK without changing it or creating a replacement. The user's draft
     and reviewer decisions are authoritative; never redraft or clear reviewers.
     Reuse an open reviewer-free draft instead of creating a duplicate.
+
+    Explicitly set `remove_source_branch: false` on the actual create/update
+    request and prove that false value in the final GitLab MR readback. Never
+    delete, reset, or retarget the source branch. A controller recovery may
+    retain an older unknown same-candidate push outcome; its branch must stay
+    present so a late non-force write cannot recreate a deleted branch.
 
     Use the concise supplied MR description as written. It is an index to the
     Jira source of truth, not a place to paste the Ticket Delivery Contract or
@@ -611,6 +646,12 @@ defmodule SymphonyElixir.Factory.Prompt do
     completed, and only synthetic data was used. A PASS is invalid without all
     four proofs.
 
+    Apply the embedded shared review criteria to the quality and completeness
+    of the exact-SHA evidence. Code-verification PASS is not live-validation
+    PASS; preserve the separate controller-owned adoption gate.
+
+    #{review_materials(:manual)}
+
     Run record:
     #{json(run)}
 
@@ -620,6 +661,15 @@ defmodule SymphonyElixir.Factory.Prompt do
     CONFIRMED CONTRACT:
     #{contract}
     """
+  end
+
+  defp review_materials(mode) do
+    files =
+      if mode == :verifier,
+        do: @review_materials,
+        else: Enum.filter(@review_materials, &String.ends_with?(&1["path"], "review-criteria.md"))
+
+    "Admitted review references (complete immutable copies in this durable prompt):\n" <> json(files)
   end
 
   defp json(value), do: Jason.encode!(value, pretty: true)

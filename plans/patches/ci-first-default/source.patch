@@ -1,0 +1,687 @@
+--- a/elixir/lib/symphony_elixir/config/schema.ex
++++ b/elixir/lib/symphony_elixir/config/schema.ex
+@@ -314,6 +314,7 @@
+       field(:native_session_discovery_enabled, :boolean, default: false)
+       field(:native_source_attachment_enabled, :boolean, default: false)
+       field(:branch_prefix, :string, default: "ai")
++      field(:ci_preflight, :string, default: "draft_mr")
+       field(:lease_seconds, :integer, default: 240)
+       field(:controller_required_mcp_servers, {:array, :string}, default: [])
+       field(:controller_mcp_startup_timeout_ms, :integer, default: 60_000)
+@@ -353,6 +354,7 @@
+           :native_session_discovery_enabled,
+           :native_source_attachment_enabled,
+           :branch_prefix,
++          :ci_preflight,
+           :lease_seconds,
+           :controller_required_mcp_servers,
+           :controller_mcp_startup_timeout_ms,
+@@ -397,6 +399,7 @@
+       |> validate_number(:controller_writer_stale_minutes, greater_than: 0)
+       |> validate_number(:stale_task_minutes, greater_than: 0)
+       |> validate_inclusion(:task_transport, ["app_server", "desktop_broker"])
++      |> validate_inclusion(:ci_preflight, ["draft_mr", "verification_first"])
+       |> validate_factory_required_fields()
+     end
+ 
+@@ -591,7 +594,7 @@
+       settings.factory
+       | database: resolve_optional_path_value(settings.factory.database),
+         models: normalize_keys(settings.factory.models),
+-        repositories: normalize_keys(settings.factory.repositories),
++        repositories: settings.factory.repositories |> normalize_keys() |> Map.new(fn {key, route} -> {key, Map.put_new(route, "ci_preflight", settings.factory.ci_preflight)} end),
+         queue: normalize_keys(settings.factory.queue),
+         cleanup: normalize_keys(settings.factory.cleanup),
+         hibernation: normalize_keys(settings.factory.hibernation),
+--- a/elixir/lib/symphony_elixir/factory/policy.ex
++++ b/elixir/lib/symphony_elixir/factory/policy.ex
+@@ -3,7 +3,7 @@
+   Fail-closed startup validation for the complete factory control plane.
+   """
+ 
+-  alias SymphonyElixir.Factory.{ModelRouter, Queue}
++  alias SymphonyElixir.Factory.{CiPolicy, ModelRouter, Queue}
+ 
+   @explicit_roles ~w(
+     orchestrator orchestrator-intake specification-author specification-critic feature-planner
+@@ -77,9 +77,15 @@
+         not is_list(route_labels) or route_labels == [] or not Enum.all?(route_labels, &present?/1) ->
+           {:halt, {:error, {:repository_route_labels_required, to_string(repo_key)}}}
+ 
+-        value(route, "ci_preflight") not in [nil, "draft_mr"] ->
++        value(route, "ci_preflight", "draft_mr") not in ["verification_first", "draft_mr"] ->
+           {:halt, {:error, {:invalid_ci_preflight_route, to_string(repo_key)}}}
+ 
++        value(route, "ci_preflight", "draft_mr") == "draft_mr" and not CiPolicy.known_route?(to_string(repo_key), value(route, "gitlab_project")) ->
++          {:halt, {:error, {:ci_repository_policy_unknown, to_string(repo_key)}}}
++
++        value(route, "ci_preflight", "draft_mr") == "draft_mr" and to_string(repo_key) == "prepost" ->
++          {:halt, {:error, {:ci_selectors_unobservable_requires_verification_first, "prepost"}}}
++
+         not File.dir?(Path.expand(value(route, "path"))) ->
+           {:halt, {:error, {:repository_path_missing, to_string(repo_key), value(route, "path")}}}
+ 
+--- /dev/null
++++ b/elixir/lib/symphony_elixir/factory/ci_policy.ex
+@@ -0,0 +1,83 @@
++defmodule SymphonyElixir.Factory.CiPolicy do
++  @moduledoc "Repository-bound ordinary merge-request CI requirements."
++
++  @projects %{
++    "grail" => "grailbio/grail",
++    "polaris" => "grailbio/teams/polaris/polaris",
++    "augusta" => "grailbio/teams/cat/augusta",
++    "blackburn" => "grailbio/teams/cat/blackburn",
++    "prepost" => "grailbio/teams/prepost/prepost"
++  }
++  @client ~w(build_client_feature lint_client format_client unit_tests_client build_server lint_server format_server unit_tests_server_feature docker_test)
++  @project_ids %{"grail" => 33_747_681, "polaris" => 80_500_661, "augusta" => 47_773_868, "blackburn" => 47_773_823}
++  @anchors %{
++    "grail" => ["bazel"],
++    "polaris" => ["verify_pipeline"],
++    "augusta" => @client ++ ["typecheck_server"],
++    "blackburn" => @client ++ ~w(integration_tests_client build_verify_client lint_verify_client unit_tests_verify_client),
++    "prepost" =>
++      ~w(client-build client-lint client-codegen client-type-check client-unit-test-aggregator interaction-tests server-build server-lint server-type-check server-unit-tests container-build) ++
++        Enum.map(1..4, &"client-unit-tests #{&1}/4")
++  }
++
++  @spec known_route?(String.t(), String.t()) :: boolean()
++  def known_route?(key, project), do: Map.get(@projects, key) == project and Map.has_key?(@projects, key)
++
++  @spec admission(map(), String.t()) :: :ok | {:error, atom()}
++  def admission(route, key) do
++    case Map.get(route, "ci_preflight", "draft_mr") do
++      "verification_first" ->
++        :ok
++
++      "draft_mr" ->
++        cond do
++          not known_route?(key, route["gitlab_project"]) -> {:error, :ci_repository_policy_unknown}
++          key == "prepost" -> {:error, :ci_selectors_unobservable_requires_verification_first}
++          true -> :ok
++        end
++
++      _ ->
++        {:error, :invalid_ci_preflight_route}
++    end
++  end
++
++  @spec anchors(String.t()) :: {:ok, [String.t()]} | {:error, atom()}
++  def anchors(key) do
++    case Map.fetch(@anchors, key) do
++      {:ok, names} -> {:ok, names}
++      :error -> {:error, :ci_repository_policy_unknown}
++    end
++  end
++
++  @spec bind(map(), map()) :: {:ok, [String.t()]} | {:error, atom()}
++  def bind(run, mr) do
++    key = run["repo_key"]
++
++    with {:ok, names} <- anchors(key),
++         true <- key == "prepost" or mr["project_id"] == @project_ids[key] or {:error, :ci_repository_policy_mismatch},
++         true <- mr["web_url"] == "https://gitlab.com/#{@projects[key]}/-/merge_requests/#{mr["iid"]}" or {:error, :ci_repository_policy_mismatch} do
++      {:ok, names}
++    end
++  end
++
++  @spec passed?(map(), String.t()) :: boolean()
++  def passed?(evidence, key) do
++    with {:ok, names} <- anchors(key),
++         true <- evidence["ci_policy"] == key,
++         jobs when is_list(jobs) <- evidence["required_jobs"],
++         true <- Enum.all?(jobs, &is_map/1),
++         %{} = proof <- evidence["jobs_collection"] do
++      key != "prepost" and Enum.all?(names, fn name -> Enum.count(jobs, &(&1["name"] == name and &1["status"] == "success")) == 1 end) and
++        Enum.all?(
++          jobs,
++          &(&1["status"] == "success" and &1["allow_failure"] == false and get_in(&1, ["pipeline", "id"]) == evidence["pipeline_id"] and get_in(&1, ["pipeline", "sha"]) == evidence["pipeline_sha"])
++        ) and
++        proof["pipeline_id"] == evidence["pipeline_id"] and proof["pipeline_sha"] == evidence["pipeline_sha"] and
++        proof["pages"] == [1, 2] and proof["per_page"] == 100 and proof["include_retried"] == false and
++        proof["terminal_page_empty"] == true and is_integer(proof["observed_count"]) and
++        proof["observed_count"] >= length(jobs) and proof["observed_count"] <= 100
++    else
++      _ -> false
++    end
++  end
++end
+--- a/elixir/lib/symphony_elixir/factory/ci_collection.ex
++++ b/elixir/lib/symphony_elixir/factory/ci_collection.ex
+@@ -50,7 +50,21 @@
+          {:ok, last} <- read(connector, "get_merge_request", args, opts),
+          true <- Map.has_key?(last, "head_pipeline") or {:error, :ci_head_pipeline_not_observable},
+          true <- Map.take(first, @mr_fields) == Map.take(normalize_mr(last), @mr_fields) or {:error, :ci_mr_changed_during_collection} do
+-      {:ok, %{"mr" => first, "pipeline" => pipeline, "jobs" => jobs, "merge_commit" => commit}}
++      proof =
++        if pipeline,
++          do: %{
++            "project_id" => pin,
++            "pipeline_id" => pipeline["id"],
++            "pipeline_sha" => pipeline["sha"],
++            "per_page" => 100,
++            "include_retried" => false,
++            "pages" => [1, 2],
++            "terminal_page_empty" => true,
++            "observed_count" => length(jobs)
++          },
++          else: nil
++
++      {:ok, %{"mr" => first, "pipeline" => pipeline, "jobs" => jobs, "merge_commit" => commit, "jobs_collection" => proof}}
+     end
+   end
+ 
+--- a/elixir/lib/symphony_elixir/factory/controller_ci.ex
++++ b/elixir/lib/symphony_elixir/factory/controller_ci.ex
+@@ -4,24 +4,29 @@
+   @pending ~w(created waiting_for_resource preparing pending running scheduled)
+   @job_statuses @pending ++ ~w(success failed canceled canceling skipped manual waiting_for_callback)
+   @sha ~r/\A[0-9a-f]{40}\z/
++  alias SymphonyElixir.Factory.CiPolicy
+ 
+   @spec bind(map(), map(), pos_integer() | nil) :: {:ok, map()} | {:error, term()}
+   def bind(_run, _snapshots, pin) when not is_integer(pin) or pin <= 0, do: {:error, :ci_project_pin_required}
+ 
+   def bind(run, %{"mr" => mr, "pipeline" => pipeline, "jobs" => jobs, "merge_commit" => commit} = snapshots, project_id)
+       when is_map(mr) and is_list(jobs) and length(jobs) <= 100 do
+-    with true <- Enum.sort(Map.keys(snapshots)) == ~w(jobs merge_commit mr pipeline) or {:error, :invalid_ci_snapshots},
++    with true <- Enum.sort(Map.keys(snapshots)) == ~w(jobs jobs_collection merge_commit mr pipeline) or {:error, :invalid_ci_snapshots},
+          true <- containers?(mr, jobs) or {:error, :invalid_ci_snapshots},
+          :ok <- mr_binding(run, mr, project_id),
+          {:ok, source} <- pipeline_binding(run, mr, pipeline, commit),
+          :ok <- current_pipeline(mr, pipeline),
+          :ok <- jobs_binding(pipeline, jobs),
+-         {:ok, status, findings} <- verdict(pipeline, jobs) do
++         :ok <- collection_binding(pipeline, jobs, snapshots["jobs_collection"]),
++         {:ok, anchors} <- CiPolicy.bind(run, mr),
++         {:ok, status, findings} <- verdict(pipeline, jobs, anchors, run["repo_key"]) do
+       {:ok,
+        Map.merge(mr_fields(mr), pipeline_fields(pipeline))
+        |> Map.merge(%{
+          "status" => status,
+-         "required_jobs" => Enum.filter(jobs, &(&1["name"] == "bazel" and &1["allow_failure"] == false)) |> Enum.map(&Map.take(&1, ~w(id name status web_url))),
++         "required_jobs" => Enum.filter(jobs, &(&1["allow_failure"] == false and (&1["status"] != "skipped" or &1["name"] in anchors))),
++         "jobs_collection" => snapshots["jobs_collection"],
++         "ci_policy" => run["repo_key"],
+          "findings" => findings,
+          "source_binding" => source
+        })}
+@@ -138,35 +143,64 @@
+       get_in(job, ["pipeline", "sha"]) == pipeline["sha"]
+   end
+ 
+-  defp verdict(nil, []), do: {:ok, "WAIT", []}
+-  defp verdict(%{"status" => status}, _jobs) when status in @pending, do: {:ok, "WAIT", []}
++  defp collection_binding(nil, [], nil), do: :ok
+ 
+-  defp verdict(%{"status" => "success"}, jobs) do
+-    required = Enum.filter(jobs, &(&1["allow_failure"] == false))
++  defp collection_binding(pipeline, jobs, proof) when is_map(pipeline) do
++    expected = %{
++      "project_id" => pipeline["project_id"],
++      "pipeline_id" => pipeline["id"],
++      "pipeline_sha" => pipeline["sha"],
++      "per_page" => 100,
++      "include_retried" => false,
++      "pages" => [1, 2],
++      "terminal_page_empty" => true,
++      "observed_count" => length(jobs)
++    }
+ 
++    if proof == expected, do: :ok, else: {:error, :ci_jobs_collection_unproven}
++  end
++
++  defp collection_binding(_, _, _), do: {:error, :ci_jobs_collection_unproven}
++
++  defp verdict(nil, [], _anchors, _key), do: {:ok, "WAIT", []}
++
++  defp verdict(%{"status" => status}, jobs, _anchors, _key) when status in @pending do
++    hard = Enum.filter(jobs, &(&1["allow_failure"] == false))
++
++    cond do
++      Enum.any?(hard, &(&1["status"] in ~w(failed canceled canceling))) -> {:ok, "BLOCK", ["Required job failed or was canceled."]}
++      Enum.any?(hard, &(&1["status"] == "manual")) -> {:ok, "BLOCK", ["Required manual job needs explicit user authority; never auto-play."]}
++      true -> {:ok, "WAIT", []}
++    end
++  end
++
++  defp verdict(%{"status" => "success"}, jobs, anchors, key) do
++    required = Enum.filter(jobs, &(&1["allow_failure"] == false and (&1["status"] != "skipped" or &1["name"] in anchors)))
++
+     case required_job_states(required) do
+-      :ok -> bazel_verdict(required)
++      :ok -> anchors_verdict(required, anchors, key)
+       result -> result
+     end
+   end
+ 
+-  defp verdict(_pipeline, _jobs), do: {:ok, "BLOCK", ["Pipeline did not pass; controller diagnosis is required."]}
++  defp verdict(_pipeline, _jobs, _anchors, _key), do: {:ok, "BLOCK", ["Pipeline did not pass; controller diagnosis is required."]}
+ 
+   defp required_job_states(jobs) do
+     cond do
+       Enum.any?(jobs, &(&1["status"] in ~w(failed canceled canceling))) -> {:error, :ci_snapshot_inconsistent}
+       Enum.any?(jobs, &(&1["status"] in @pending)) -> {:ok, "WAIT", []}
++      Enum.any?(jobs, &(&1["status"] == "manual")) -> {:ok, "BLOCK", ["Required manual job needs explicit user authority; never auto-play."]}
+       Enum.any?(jobs, &(&1["status"] not in ~w(success skipped))) -> {:error, :ci_snapshot_inconsistent}
+       true -> :ok
+     end
+   end
+ 
+-  defp bazel_verdict(jobs) do
+-    case Enum.filter(jobs, &(&1["name"] == "bazel" and &1["allow_failure"] == false)) do
+-      [%{"status" => "success"}] -> {:ok, "PASS", []}
+-      [] -> {:ok, "BLOCK", ["Successful pipeline lacks a required non-allow-failure Bazel job."]}
+-      [_job] -> {:ok, "BLOCK", ["Required Bazel job did not pass."]}
+-      _ -> {:error, :ci_jobs_ambiguous}
++  defp anchors_verdict(jobs, anchors, key) do
++    cond do
++      Enum.any?(anchors, fn name -> Enum.count(jobs, &(&1["name"] == name)) > 1 end) -> {:error, :ci_jobs_ambiguous}
++      not Enum.all?(anchors, fn name -> Enum.any?(jobs, &(&1["name"] == name and &1["status"] == "success")) end) -> {:ok, "BLOCK", ["Required repository job is missing or did not pass."]}
++      key == "prepost" -> {:ok, "BLOCK", ["PrePost conditional selectors are not observable in the bounded collector; REQUIRE_CORE_E2E applicability is unproven."]}
++      true -> {:ok, "PASS", []}
+     end
+   end
+ 
+--- a/elixir/lib/symphony_elixir/factory/scheduler.ex
++++ b/elixir/lib/symphony_elixir/factory/scheduler.ex
+@@ -2815,7 +2815,8 @@
+   defp ticket_delivery_pending(_context, _run, _options), do: {:ok, %{status: "DELIVERY_JOIN_PENDING"}}
+ 
+   defp ticket_delivery_step(context, %{"state" => state} = run, options) when state in ~w(PUSHING CI_PUSHING) do
+-    with {:ok, authorization} <- ticket_authorization(context, run, options) do
++    with :ok <- SymphonyElixir.Factory.CiPolicy.admission(route_for_run(context, run), run["repo_key"]),
++         {:ok, authorization} <- ticket_authorization(context, run, options) do
+       TicketPush.step(context.store, run["run_id"], authorization, options)
+     end
+   end
+@@ -3782,6 +3783,8 @@
+     route = route_for_run(context, run)
+ 
+     with true <- ci_preflight?(route) or {:error, :ci_preflight_route_disabled},
++         :ok <- SymphonyElixir.Factory.CiPolicy.admission(route, run["repo_key"]),
++         true <- run["execution_mode"] == "TICKET_SUPERVISOR_V1" or {:error, :legacy_ci_collection_unavailable_requires_verification_first},
+          true <- context.worktree.reachable?(route, run["candidate_sha"]) or {:error, :candidate_unreachable},
+          {:ok, _push} <-
+            context.worktree.push_exact(route, run["worktree"], run["branch"], run["candidate_sha"]),
+@@ -4106,7 +4109,8 @@
+   defp consume_feature_writer(context, run, iteration, %{"status" => "COMPLETE", "commit_sha" => commit_sha}, acc) do
+     preflight? = ci_preflight?(route_for_run(context, run)) and not review_rework?(run) and not ready_rework_active?(context.store, run)
+ 
+-    with {:ok, head} <- context.worktree.candidate(run["worktree"], run["base_branch"]),
++    with true <- not preflight? or run["execution_mode"] == "TICKET_SUPERVISOR_V1" or {:error, :legacy_ci_collection_unavailable_requires_verification_first},
++         {:ok, head} <- context.worktree.candidate(run["worktree"], run["base_branch"]),
+          true <- commit_sha == head or {:error, :writer_sha_mismatch},
+          {:ok, _updated} <-
+            RunLedger.update(context.store, run["run_id"], %{
+@@ -4284,7 +4288,7 @@
+   end
+ 
+   defp consume_valid_ci_status(context, workspace, run, %{"status" => "PASS"} = output, acc) do
+-    if ci_bazel_passed?(output) do
++    if SymphonyElixir.Factory.CiPolicy.passed?(output, run["repo_key"]) do
+       RunLedger.update(context.store, run["run_id"], %{
+         state: "VERIFYING",
+         verifier_round: run["verifier_round"] + 1,
+@@ -4362,15 +4366,9 @@
+       (output["pipeline_ref"] == merge_ref or
+          (output["pipeline_ref"] == head_ref and pipeline_sha == run["candidate_sha"])) and
+       (output["status"] != "PASS" or output["pipeline_status"] == "success")
+-  end
+-
+-  defp ci_bazel_passed?(%{"required_jobs" => jobs}) when is_list(jobs) do
+-    Enum.any?(jobs, &(&1["name"] == "bazel" and &1["status"] == "success" and is_integer(&1["id"])))
+   end
+ 
+-  defp ci_bazel_passed?(_output), do: false
+-
+-  defp ci_preflight?(route), do: route["ci_preflight"] == "draft_mr"
++  defp ci_preflight?(route), do: Map.get(route, "ci_preflight", "draft_mr") == "draft_mr"
+ 
+   defp review_rework?(%{"review_base_sha" => sha, "review_feedback_json" => feedback})
+        when is_binary(sha) and is_binary(feedback),
+--- a/elixir/lib/symphony_elixir/factory/prompt.ex
++++ b/elixir/lib/symphony_elixir/factory/prompt.ex
+@@ -467,9 +467,15 @@
+     exact MR ref, `merge_request_event` source, and the MR read-back showing
+     source SHA `#{run["candidate_sha"]}`. For a pipeline on
+     `refs/merge-requests/#{run["mr_iid"]}/head`, require its SHA to equal the
+-    source SHA. Return WAIT while the exact-MR pipeline or required Bazel job
++    source SHA. Never trust an unproved merge source: require the exact merge
++    commit and its source parent to equal the candidate. Return WAIT while
++    the exact-MR pipeline or any applicable required repository job
+     has not finished. Return PASS only when the exact-MR pipeline has status success and a
+-    non-allow-failure `bazel` job has status success. Include that job's ID,
++    all emitted applicable non-allow-failure jobs and repository policy anchors
++    have status success. Use the controller's repository-bound CI policy, never
++    an empty-green fallback. Missing/skipped anchors deny PASS; hard manual jobs
++    need user authority and must never be auto-played. Conditional absence needs
++    trustworthy applicability proof. Include every required job's ID,
+     name, status, and URL. Return REPAIR only for a proven source-caused Bazel
+     failure, with concise actionable findings from its job log. Return BLOCK
+     for infrastructure failures, missing required jobs after pipeline completion,
+@@ -479,7 +485,9 @@
+     the expected values. Return `pipeline_id`, `pipeline_url`, `pipeline_sha`,
+     `pipeline_ref`, and `pipeline_source` as null only while no pipeline for
+     this exact MR exists.
+-    `required_jobs` lists observed Bazel
++    Only deterministic controller collection may attest complete page 1 and
++    empty page 2 with the 100-job bound; a model-reported PASS is not sufficient.
++    `required_jobs` lists all observed applicable required
+     jobs (empty while none exists). `findings` is empty unless REPAIR or BLOCK.
+ 
+     Repository route:
+--- a/elixir/test/symphony_elixir/factory_controller_ci_test.exs
++++ b/elixir/test/symphony_elixir/factory_controller_ci_test.exs
+@@ -5,6 +5,41 @@
+ 
+   setup :setup_fixture
+ 
++  test "repository anchors bind all configured routes and cannot be replaced by aggregate green", ctx do
++    {run, snapshots} = readbacks(ctx)
++
++    for {key, project} <- [
++          {"grail", "grailbio/grail"},
++          {"polaris", "grailbio/teams/polaris/polaris"},
++          {"augusta", "grailbio/teams/cat/augusta"},
++          {"blackburn", "grailbio/teams/cat/blackburn"},
++          {"prepost", "grailbio/teams/prepost/prepost"}
++        ] do
++      {:ok, names} = SymphonyElixir.Factory.CiPolicy.anchors(key)
++      url = "https://gitlab.com/#{project}/-/merge_requests/42"
++      project_id = %{"grail" => 33_747_681, "polaris" => 80_500_661, "augusta" => 47_773_868, "blackburn" => 47_773_823, "prepost" => 1}[key]
++      run = Map.merge(run, %{"repo_key" => key, "mr_url" => url})
++      [template] = snapshots["jobs"]
++      jobs = names |> Enum.with_index(100) |> Enum.map(fn {name, id} -> Map.merge(template, %{"name" => name, "id" => id}) end)
++      jobs = Enum.map(jobs, &put_in(&1, ["pipeline", "project_id"], project_id))
++
++      data =
++        snapshots
++        |> put_in(["mr", "web_url"], url)
++        |> put_in(["mr", "project_id"], project_id)
++        |> put_in(["pipeline", "project_id"], project_id)
++        |> Map.put("jobs", jobs)
++        |> put_in(["jobs_collection", "project_id"], project_id)
++        |> put_in(["jobs_collection", "observed_count"], length(jobs))
++
++      data = put_in(data, ["mr", "head_pipeline"], data["pipeline"])
++      assert {:ok, evidence} = SymphonyElixir.Factory.ControllerCi.bind(run, data, project_id)
++      assert evidence["status"] == if(key == "prepost", do: "BLOCK", else: "PASS")
++      missing = data |> Map.put("jobs", tl(jobs)) |> put_in(["jobs_collection", "observed_count"], length(jobs) - 1)
++      assert {:ok, %{"status" => "BLOCK"}} = SymphonyElixir.Factory.ControllerCi.bind(run, missing, project_id)
++    end
++  end
++
+   defp readbacks(ctx) do
+     url = "https://gitlab.com/grailbio/grail/-/merge_requests/42"
+     {:ok, _} = RunLedger.update(ctx.store, "run", %{state: "CI_WAITING", mr_iid: 42, mr_url: url, ci_preflight_sha: ctx.sha})
+@@ -46,6 +81,18 @@
+       "merge_commit" => nil
+     }
+ 
++    snapshots =
++      Map.put(snapshots, "jobs_collection", %{
++        "project_id" => 33_747_681,
++        "pipeline_id" => 99,
++        "pipeline_sha" => ctx.sha,
++        "per_page" => 100,
++        "include_retried" => false,
++        "pages" => [1, 2],
++        "terminal_page_empty" => true,
++        "observed_count" => 1
++      })
++
+     {run, put_in(snapshots, ["mr", "head_pipeline"], snapshots["pipeline"])}
+   end
+ 
+@@ -59,6 +106,24 @@
+     assert {:ok, ^run} = RunLedger.get(ctx.store, "run")
+   end
+ 
++  test "missing partial or inconsistent collector proof cannot pass", ctx do
++    {_run, snapshots} = readbacks(ctx)
++
++    for proof <- [nil, %{}, Map.put(snapshots["jobs_collection"], "terminal_page_empty", false), Map.put(snapshots["jobs_collection"], "observed_count", 0)] do
++      assert {:error, :ci_jobs_collection_unproven} = TicketWorkerRunner.ci_binding(ctx.store, "run", Map.put(snapshots, "jobs_collection", proof), 33_747_681)
++    end
++  end
++
++  test "manual hard jobs block while allow-failure manual jobs are informational", ctx do
++    {_run, snapshots} = readbacks(ctx)
++    [job] = snapshots["jobs"]
++    manual = Map.merge(job, %{"id" => 101, "name" => "manual_gate", "status" => "manual"})
++    data = snapshots |> Map.put("jobs", [job, manual]) |> put_in(["jobs_collection", "observed_count"], 2)
++    assert {:ok, %{"status" => "BLOCK"}} = TicketWorkerRunner.ci_binding(ctx.store, "run", data, 33_747_681)
++    data = Map.put(data, "jobs", [job, Map.put(manual, "allow_failure", true)])
++    assert {:ok, %{"status" => "PASS"}} = TicketWorkerRunner.ci_binding(ctx.store, "run", data, 33_747_681)
++  end
++
+   test "malformed GitLab container fields fail closed instead of crashing the controller", ctx do
+     {_run, snapshots} = readbacks(ctx)
+     malformed = put_in(snapshots, ["mr", "assignees"], ["not an assignee object"])
+@@ -98,6 +163,7 @@
+     skipped = Map.put(snapshots, "jobs", [Map.put(job, "status", "skipped")])
+     assert {:ok, %{"status" => "BLOCK"}} = TicketWorkerRunner.ci_binding(ctx.store, "run", skipped, 33_747_681)
+     competing = Map.put(snapshots, "jobs", [job, Map.put(job, "id", 101)])
++    competing = put_in(competing, ["jobs_collection", "observed_count"], 2)
+     assert {:error, :ci_jobs_ambiguous} = TicketWorkerRunner.ci_binding(ctx.store, "run", competing, 33_747_681)
+   end
+ 
+@@ -143,6 +209,7 @@
+     snapshots = put_in(snapshots, ["pipeline", "ref"], "refs/merge-requests/42/merge")
+     snapshots = put_in(snapshots, ["mr", "head_pipeline"], snapshots["pipeline"])
+     snapshots = Map.update!(snapshots, "jobs", fn [job] -> [put_in(job, ["pipeline", "sha"], merge_sha)] end)
++    snapshots = put_in(snapshots, ["jobs_collection", "pipeline_sha"], merge_sha)
+     assert {:error, :ci_merge_source_unproven} = TicketWorkerRunner.ci_binding(ctx.store, "run", snapshots, 33_747_681)
+     snapshots = Map.put(snapshots, "merge_commit", %{"id" => merge_sha, "parent_ids" => [target_sha, ctx.sha]})
+     assert {:ok, evidence} = TicketWorkerRunner.ci_binding(ctx.store, "run", snapshots, 33_747_681)
+@@ -156,6 +223,7 @@
+     {run, snapshots} = readbacks(ctx)
+     snapshots = Map.merge(snapshots, %{"pipeline" => nil, "jobs" => []})
+     snapshots = put_in(snapshots, ["mr", "head_pipeline"], nil)
++    snapshots = Map.put(snapshots, "jobs_collection", nil)
+     assert {:ok, %{"status" => "WAIT", "pipeline_id" => nil, "source_binding" => nil}} = TicketWorkerRunner.ci_binding(ctx.store, "run", snapshots, 33_747_681)
+     assert {:ok, ^run} = RunLedger.get(ctx.store, "run")
+   end
+@@ -206,6 +274,7 @@
+     [job] = snapshots["jobs"]
+     failed = Map.merge(job, %{"id" => 101, "name" => "lint", "status" => "failed"})
+     inconsistent = Map.put(snapshots, "jobs", [job, failed])
++    inconsistent = put_in(inconsistent, ["jobs_collection", "observed_count"], 2)
+     assert {:error, :ci_snapshot_inconsistent} = TicketWorkerRunner.ci_binding(ctx.store, "run", inconsistent, 33_747_681)
+     malformed = Map.put(snapshots, "jobs", [job, Map.put(failed, "status", nil)])
+     assert {:error, :ci_job_binding_mismatch} = TicketWorkerRunner.ci_binding(ctx.store, "run", malformed, 33_747_681)
+--- /dev/null
++++ b/elixir/test/symphony_elixir/factory_ci_policy_test.exs
+@@ -0,0 +1,34 @@
++defmodule SymphonyElixir.FactoryCiPolicyTest do
++  use ExUnit.Case, async: true
++  alias SymphonyElixir.Config.Schema
++  alias SymphonyElixir.Factory.CiPolicy
++
++  test "factory default is inherited and explicit verification-first is preserved" do
++    assert {:ok, settings} = Schema.parse(%{"factory" => %{"repositories" => %{"a" => %{}, "b" => %{"ci_preflight" => "verification_first"}}}})
++    assert settings.factory.ci_preflight == "draft_mr"
++    assert settings.factory.repositories["a"]["ci_preflight"] == "draft_mr"
++    assert settings.factory.repositories["b"]["ci_preflight"] == "verification_first"
++    assert {:error, _} = Schema.parse(%{"factory" => %{"ci_preflight" => "guess"}})
++  end
++
++  test "all configured repositories have distinct real MR anchors and structural shards" do
++    for {key, count} <- [{"grail", 1}, {"polaris", 1}, {"augusta", 10}, {"blackburn", 13}, {"prepost", 15}] do
++      assert {:ok, names} = CiPolicy.anchors(key)
++      assert length(names) == count
++      refute Enum.any?(names, &String.ends_with?(&1, "_main"))
++    end
++
++    assert {:ok, names} = CiPolicy.anchors("prepost")
++    refute "client-unit-tests" in names
++    assert "client-unit-tests 4/4" in names
++    assert {:error, :ci_repository_policy_unknown} = CiPolicy.anchors("unknown")
++    refute CiPolicy.known_route?("grail", "other/grail")
++  end
++
++  test "unsupported selectors and unknown policies deny before mutation unless explicitly opted out" do
++    assert {:error, :ci_selectors_unobservable_requires_verification_first} = CiPolicy.admission(%{"gitlab_project" => "grailbio/teams/prepost/prepost"}, "prepost")
++    assert {:error, :ci_repository_policy_unknown} = CiPolicy.admission(%{"gitlab_project" => "example/repo"}, "unknown")
++    assert :ok = CiPolicy.admission(%{"ci_preflight" => "verification_first"}, "unknown")
++    assert {:error, :invalid_ci_preflight_route} = CiPolicy.admission(%{"ci_preflight" => "guess"}, "grail")
++  end
++end
+--- a/elixir/test/symphony_elixir/factory_policy_test.exs
++++ b/elixir/test/symphony_elixir/factory_policy_test.exs
+@@ -19,6 +19,7 @@
+           "base_branch" => "master",
+           "codex_project_id" => "project-repo",
+           "gitlab_project" => "example/repo",
++          "ci_preflight" => "verification_first",
+           "route_labels" => []
+         }
+       },
+@@ -113,6 +114,7 @@
+ 
+       expected = [
+         FactorySupervisor.store_name(),
++        SymphonyElixir.Factory.ReadStore,
+         FactorySupervisor.control_name(),
+         FactorySupervisor.task_supervisor_name(),
+         SymphonyElixir.Factory.Controller
+@@ -243,6 +245,7 @@
+ 
+     %{
+       branch_prefix: "cgable",
++      task_transport: "app_server",
+       queue: %{
+         "assignee" => "currentUser()",
+         "statuses" => ["READY"],
+@@ -254,6 +257,7 @@
+           "base_branch" => "master",
+           "codex_project_id" => "project-repo",
+           "gitlab_project" => "example/repo",
++          "ci_preflight" => "verification_first",
+           "route_labels" => ["repo-example"]
+         }
+       },
+--- a/elixir/test/symphony_elixir/factory_config_test.exs
++++ b/elixir/test/symphony_elixir/factory_config_test.exs
+@@ -108,6 +108,7 @@
+                      "base_branch" => "master",
+                      "codex_project_id" => "project-grail",
+                      "gitlab_project" => "example/grail",
++                     "ci_preflight" => "verification_first",
+                      "route_labels" => ["repo-grail"]
+                    }
+                  }
+--- a/elixir/test/symphony_elixir/factory_scheduler_test.exs
++++ b/elixir/test/symphony_elixir/factory_scheduler_test.exs
+@@ -2905,7 +2905,7 @@
+     assert delivered["mr_url"] == mr_url
+   end
+ 
+-  test "Grail CI preflight creates one draft MR before verification and waits for exact-SHA CI", %{
++  test "legacy CI-first delivery denies before remote mutation without deterministic collection", %{
+     context: context,
+     store: store
+   } do
+@@ -2941,96 +2941,13 @@
+                verifier_round: 1
+              })
+ 
+-    mr_url = "https://gitlab.example/grailbio/grail/-/merge_requests/7"
+-
+-    Process.put(:factory_controller_responses, [
+-      intake_response(snapshot),
+-      %{
+-        "status" => "PASS",
+-        "mr_url" => mr_url,
+-        "iid" => 7,
+-        "source_branch" => "cgable/PPL-123-factory-work",
+-        "target_branch" => "master",
+-        "sha" => candidate,
+-        "draft" => true,
+-        "reviewers_count" => 0,
+-        "assignee_id" => 11_599_766,
+-        "state" => "opened"
+-      }
+-    ])
+-
+-    assert {:ok, _result} = tick(route)
+-    assert_received {:push_exact, "cgable/PPL-123-factory-work", ^candidate}
+-    assert {:ok, %{"state" => "CI_WAITING", "mr_url" => ^mr_url}} = RunLedger.get(store, run["run_id"])
+-    refute_received {:stage_launch, _, _, _, _}
+-    refute_received {:jira_write_options, _}
+-
+-    Process.put(:factory_controller_responses, [
+-      intake_response(snapshot),
+-      %{
+-        "status" => "PASS",
+-        "mr_url" => mr_url,
+-        "iid" => 7,
+-        "source_branch" => "cgable/PPL-123-factory-work",
+-        "target_branch" => "master",
+-        "draft" => true,
+-        "reviewers_count" => 0,
+-        "assignee_id" => 11_599_766,
+-        "mr_state" => "opened",
+-        "sha" => candidate,
+-        "pipeline_id" => 99,
+-        "pipeline_url" => "https://gitlab.example/grailbio/grail/-/pipelines/99",
+-        "pipeline_sha" => "caaa52a6a6c87771f00fae20505675f7b628436b",
+-        "pipeline_ref" => "refs/merge-requests/7/merge",
+-        "pipeline_source" => "merge_request_event",
+-        "pipeline_status" => "success",
+-        "required_jobs" => [%{"id" => 88, "name" => "bazel", "status" => "success", "web_url" => "https://gitlab.example/jobs/88"}],
+-        "findings" => []
+-      }
+-    ])
+-
+-    assert {:ok, _result} = tick(route)
+-    assert {:ok, %{"state" => "VERIFYING", "ci_pipeline_id" => 99}} = RunLedger.get(store, run["run_id"])
+-
+     Process.put(:factory_controller_response, intake_response(snapshot))
+-    assert {:ok, %{launches: [verifier]}} = tick(route)
+-    assert verifier.task_key == "preflight-run:change-verifier:2"
+-
+-    complete_task(store, verifier.task_key, %{
+-      "status" => "PASS",
+-      "candidate_sha" => candidate,
+-      "findings" => [],
+-      "checks" => ["independent review passed", "CI pipeline 99 bazel job 88 passed"]
+-    })
+-
+-    Process.exit(verifier.pid, :kill)
+-
+-    Process.put(:factory_controller_response, intake_response(snapshot))
+     assert {:ok, _result} = tick(route)
+-    assert {:ok, %{"state" => "MR_CREATING"}} = RunLedger.get(store, run["run_id"])
+     refute_received {:push_exact, _, _}
+-
+-    Process.put(:factory_controller_responses, [
+-      intake_response(snapshot),
+-      %{
+-        "status" => "PASS",
+-        "mr_url" => mr_url,
+-        "iid" => 7,
+-        "source_branch" => "cgable/PPL-123-factory-work",
+-        "target_branch" => "master",
+-        "sha" => candidate,
+-        "draft" => true,
+-        "reviewers_count" => 0,
+-        "assignee_id" => 11_599_766,
+-        "state" => "opened"
+-      },
+-      jira_write_response(["ai-review", "repo-grail"], mr_url)
+-    ])
+-
+-    assert {:ok, _result} = tick(route)
+-
+-    assert {:ok, %{"state" => "READY_FOR_REVIEW", "candidate_sha" => ^candidate}} =
+-             RunLedger.get(store, run["run_id"])
++    refute_received {:stage_launch, _, _, _, _}
++    assert {:ok, blocked} = RunLedger.get(store, run["run_id"])
++    assert blocked["state"] == "FAILED"
++    assert blocked["last_error"] =~ "legacy_ci_collection_unavailable_requires_verification_first"
+   end
+ 
+   test "runs Slack-coordinated exact-SHA manual validation before human review", %{

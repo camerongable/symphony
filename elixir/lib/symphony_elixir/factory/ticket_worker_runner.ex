@@ -3,12 +3,16 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
   Controller-owned role turns in one reserved checkout, separate from the Desktop parent.
   """
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.Factory.{CiCollection, Contract, ControllerCi, RunLedger}
-  alias SymphonyElixir.Factory.{StageRunner, StageSchemas, Store, TaskLedger}
+  alias SymphonyElixir.Factory.{CiCollection, Contract, ControllerCi, ReviewProtocol, RunLedger}
+  alias SymphonyElixir.Factory.{SpecialistErrorNotice, StageRunner, Store, TaskLedger}
 
   alias SymphonyElixir.Factory.{
+    TicketCapabilityRecovery,
     TicketChat,
     TicketChatCommands,
+    TicketCiGeneratedScope,
+    TicketCiRepair,
+    TicketCompletionConfirmation,
     TicketContractAmendment,
     TicketMrOperation,
     WorkerCheckIO,
@@ -16,7 +20,7 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
   }
 
   alias SymphonyElixir.Factory.TicketJiraJournal
-  alias SymphonyElixir.Factory.{WorkerFileTools, WorkspaceAccess}
+  alias SymphonyElixir.Factory.{WorkerFileTools, WorkerInstructions, WorkspaceAccess}
   alias SymphonyElixir.Factory.Worktree
   alias SymphonyElixir.Tracker.Issue
 
@@ -30,7 +34,7 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
     with {:ok, %{run: current}} <- writer_admission_facts(store, run, Keyword.delete(opts, :reservation)),
          :ok <- WorkspaceAccess.source_capacity(store, current, opts),
          :ok <- validate_authorization(current, authorization),
-         {:ok, %{run: admitted}} <- RunLedger.update(store, run["run_id"], %{state: "WRITING"}) do
+         {:ok, %{run: admitted}} <- RunLedger.update(store, run["run_id"], %{state: "WRITING", workspace_state: "MATERIALIZED"}) do
       {:ok, %{status: "WRITER_ADMITTED", run: admitted, model_invoked: false}}
     end
   end
@@ -59,10 +63,10 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
   @spec delivery_admission(Store.connection(), map(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def delivery_admission(store, run, authorization, opts) do
     with {:ok, delivery_opts} <- delivery_review_options(store, run, opts),
-         :ok <- validate_delivery_authorization(store, run, authorization, delivery_opts),
+         {:ok, history} <- observe_delivery_authorization(store, run, authorization, delivery_opts),
          {:ok, facts} <- delivery_facts(store, run, delivery_opts),
-         :ok <- validate_delivery_authorization(store, facts.run, authorization, delivery_opts) do
-      {:ok, facts}
+         :ok <- recheck_observed_authorization(store, facts.run, authorization, history) do
+      {:ok, Map.put(facts, :retained_mr_history, history)}
     end
   end
 
@@ -77,6 +81,19 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
 
       result ->
         result
+    end
+  end
+
+  @doc false
+  @spec refresh_delivery_authorization(map(), map(), DateTime.t(), map()) :: {:ok, map()} | {:error, term()}
+  def refresh_delivery_authorization(run, snapshot, observed_at, prior) do
+    fields = ~w(run_id issue_key spec_revision contract_sha256)
+    review? = prior["delivery_review"] == true
+    authorized_run = if review?, do: Map.put(run, "state", "REVIEW_WRITING"), else: run
+
+    with true <- Map.take(run, fields) == Map.take(prior, fields) or {:error, :ticket_authorization_changed},
+         {:ok, proof} <- authorization(authorized_run, snapshot, observed_at) do
+      {:ok, if(review?, do: Map.put(proof, "delivery_review", true), else: proof)}
     end
   end
 
@@ -115,10 +132,11 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
   end
 
   defp retained_mr_delivery_authorization(store, %{"state" => state, "mr_iid" => iid, "mr_url" => url} = run, snapshot, observed_at, opts)
-       when state in ~w(PUSHING MR_CREATING) and is_integer(iid) and is_binary(url) do
+       when state in ~w(PUSHING MR_CREATING CI_PUSHING CI_MR_CREATING CI_WAITING) and is_integer(iid) and is_binary(url) do
     review_run = Map.put(run, "state", "REVIEW_WRITING")
 
-    with {:ok, proof} <- authorization(review_run, snapshot, observed_at),
+    with :ok <- retained_ci_route(store, run, opts),
+         {:ok, proof} <- authorization(review_run, snapshot, observed_at),
          {:ok, _facts} <- delivery_facts(store, run, opts),
          {:ok, prior} <- retained_review_preimage(store, run),
          true <- {prior["mr_iid"], prior["mr_url"]} == {iid, url} or {:error, :ticket_delivery_mr_history_unproven},
@@ -132,9 +150,26 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
 
   defp retained_mr_delivery_authorization(_store, _run, _snapshot, _observed_at, _opts), do: {:error, :ticket_jira_not_dispatchable}
 
+  defp retained_ci_route(store, %{"state" => state} = run, opts) when state in ~w(CI_PUSHING CI_MR_CREATING CI_WAITING) do
+    with true <- opts[:ci_preflight_authorized] == true or {:error, :ticket_ci_preflight_not_authorized},
+         {:ok, _prior} <- SymphonyElixir.Factory.TicketCiRepair.retained_preimage(store, run) do
+      :ok
+    end
+  end
+
+  defp retained_ci_route(_store, _run, _opts), do: :ok
+
   @doc false
   @spec retained_review_preimage(Store.connection(), map()) :: {:ok, map()} | {:error, term()}
   def retained_review_preimage(store, run) do
+    case SymphonyElixir.Factory.TicketCiRepair.retained_preimage(store, run) do
+      {:ok, prior} -> {:ok, prior}
+      {:error, :ci_repair_history_absent} -> human_review_preimage(store, run)
+      {:error, _} = error -> error
+    end
+  end
+
+  defp human_review_preimage(store, run) do
     reworks =
       Store.query!(store, "SELECT command_key, payload_json, application_receipt_json FROM ticket_chat_commands WHERE run_id = ? AND status = 'APPLIED' ORDER BY created_at DESC", [run["run_id"]]).rows
       |> Enum.map(fn [command_key, payload_json, receipt_json] -> %{"command_key" => command_key, "payload_json" => payload_json, "application_receipt_json" => receipt_json} end)
@@ -232,34 +267,79 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
     end
   end
 
-  defp validate_delivery_authorization(store, run, %{"delivery_review" => true} = proof, _opts) do
+  defp observe_delivery_authorization(store, run, %{"delivery_review" => true} = proof, _opts) do
     with :ok <- validate_authorization(Map.put(run, "state", "REVIEW_WRITING"), Map.delete(proof, "delivery_review")),
          {:ok, prior} <- retained_review_preimage(store, run),
          true <- {prior["mr_iid"], prior["mr_url"]} == {run["mr_iid"], run["mr_url"]} or {:error, :ticket_delivery_mr_history_unproven} do
-      TicketMrOperation.validate_retained_mr_history(store, prior)
+      TicketMrOperation.observe_retained_mr_history(store, prior)
     end
   end
 
-  defp validate_delivery_authorization(_store, run, proof, _opts), do: validate_authorization(run, proof)
+  defp observe_delivery_authorization(_store, run, proof, _opts) do
+    with :ok <- validate_authorization(run, proof), do: {:ok, nil}
+  end
+
+  defp recheck_observed_authorization(store, run, %{"delivery_review" => true} = proof, history) when is_map(history) do
+    with :ok <- validate_authorization(Map.put(run, "state", "REVIEW_WRITING"), Map.delete(proof, "delivery_review")),
+         {:ok, prior} <- retained_review_preimage(store, run),
+         true <- {prior["mr_iid"], prior["mr_url"]} == {run["mr_iid"], run["mr_url"]} or {:error, :ticket_delivery_mr_history_unproven} do
+      TicketMrOperation.recheck_retained_mr_history(store, prior, history)
+    end
+  end
+
+  defp recheck_observed_authorization(_store, _run, %{"delivery_review" => true}, _history), do: {:error, :ticket_delivery_mr_history_unproven}
+  defp recheck_observed_authorization(_store, run, proof, nil), do: validate_authorization(run, proof)
+  defp recheck_observed_authorization(_store, _run, _proof, _history), do: {:error, :ticket_delivery_mr_history_unproven}
 
   @doc "Reads exact stopped delivery evidence without granting dispatch or external-write authority."
   @spec delivery_facts(Store.connection(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def delivery_facts(store, run, opts) do
-    with {:ok, current} <- RunLedger.get(store, run["run_id"]),
-         true <- current == run or {:error, :ticket_delivery_binding_changed},
-         true <- current["state"] in ~w(PUSHING MR_CREATING CI_PUSHING CI_MR_CREATING CI_WAITING) or {:error, :ticket_delivery_stage_not_admitted},
-         :ok <- TicketChat.ordinary_delivery_eligibility(current),
+    with {:ok, facts} <- delivery_ledger_facts(store, run, opts),
+         current = facts.run,
          {:ok, _} <- TicketChat.ready_for_run(store, current["run_id"]),
-         true <- is_binary(current["candidate_sha"]) or {:error, :ticket_delivery_candidate_missing},
-         :ok <- stopped_delivery_evidence(store, current),
-         {:ok, verifier} <- delivery_verifier(store, current, opts),
          {:ok, root} <- Keyword.fetch(opts, :workspace_root),
          {:ok, checkout} <- bound_checkout(store, current, current["candidate_sha"], root, opts),
          {:ok, after_check} <- RunLedger.get(store, current["run_id"]),
          true <- after_check == current or {:error, :ticket_delivery_binding_changed} do
-      {:ok, %{run: current, checkout: checkout, verifier: verifier}}
+      {:ok, Map.put(facts, :checkout, checkout)}
     else
       :error -> {:error, :ticket_delivery_workspace_root_required}
+      {:error, _} = error -> error
+    end
+  end
+
+  @doc "Rechecks captured delivery ledger facts without repeating physical checkout observation."
+  @spec recheck_delivery_facts(Store.connection(), map(), keyword(), map()) :: :ok | {:error, term()}
+  def recheck_delivery_facts(store, run, opts, captured) when is_map(captured) do
+    with {:ok, facts} <- delivery_ledger_facts(store, run, opts),
+         true <- facts == Map.take(captured, [:run, :verifier]) or {:error, :ticket_delivery_binding_changed} do
+      :ok
+    end
+  end
+
+  def recheck_delivery_facts(_store, _run, _opts, _captured), do: {:error, :ticket_delivery_binding_changed}
+
+  @doc false
+  @spec recheck_delivery_admission(Store.connection(), map(), map(), keyword(), map()) :: :ok | {:error, term()}
+  def recheck_delivery_admission(store, run, authorization, opts, admitted) do
+    with {:ok, delivery_opts} <- delivery_review_options(store, run, opts),
+         :ok <- recheck_observed_authorization(store, run, authorization, admitted[:retained_mr_history]),
+         {:ok, facts} <- delivery_ledger_facts(store, run, delivery_opts),
+         true <- facts == Map.take(admitted, [:run, :verifier]) or {:error, :ticket_delivery_binding_changed} do
+      :ok
+    end
+  end
+
+  defp delivery_ledger_facts(store, run, opts) do
+    with {:ok, current} <- RunLedger.get(store, run["run_id"]),
+         true <- current == run or {:error, :ticket_delivery_binding_changed},
+         true <- current["state"] in ~w(PUSHING MR_CREATING CI_PUSHING CI_MR_CREATING CI_WAITING) or {:error, :ticket_delivery_stage_not_admitted},
+         :ok <- TicketChat.ordinary_delivery_eligibility(current),
+         true <- is_binary(current["candidate_sha"]) or {:error, :ticket_delivery_candidate_missing},
+         :ok <- stopped_delivery_evidence(store, current),
+         {:ok, verifier} <- delivery_verifier(store, current, opts) do
+      {:ok, %{run: current, verifier: verifier}}
+    else
       {:error, _} = error -> error
     end
   end
@@ -322,6 +402,10 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
     end)
   end
 
+  @doc false
+  @spec delivery_candidate_check(Store.connection(), map()) :: :ok | {:error, term()}
+  def delivery_candidate_check(store, run), do: completed_candidate_check(store, run)
+
   defp completed_candidate_check(store, run) do
     rows =
       Store.query!(
@@ -342,7 +426,11 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
         end
       end)
 
-    if proven, do: :ok, else: {:error, :ticket_delivery_candidate_check_unproven}
+    cond do
+      proven -> :ok
+      match?({:ok, %{"kind" => "HUMAN_EMPTY_COMMIT_IMPORT_V1"}}, Jason.decode(run["candidate_handoff"] || "null")) -> SymphonyElixir.Factory.TicketHumanEmptyCommitImport.source_equivalence(store, run)
+      true -> {:error, :ticket_delivery_candidate_check_unproven}
+    end
   end
 
   defp delivery_verifier(_store, %{"state" => state} = run, opts) when state in ~w(CI_PUSHING CI_MR_CREATING CI_WAITING) do
@@ -463,7 +551,7 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
   @doc "Prepares exact stopped role evidence for controller adoption; writer checks keep source reserved."
   @spec adoption(Store.connection(), String.t()) :: {:ok, map()} | {:error, term()}
   def adoption(store, key) do
-    with {:ok, bound} <- Store.transaction!(store, &adoption_inputs(&1, key)),
+    with {:ok, bound} <- Store.transaction!(store, &adoption_inputs(&1, key), timeout: 60_000),
          {:ok, _} <- adoption_role(store, bound.run, bound.task, bound.evidence, bound.output),
          {:ok, current} <- RunLedger.get(store, bound.run["run_id"]) do
       {:ok, %{bound | run: current}}
@@ -480,7 +568,8 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
          true <- task["stage"] == run["state"] or {:error, :ticket_worker_stage_changed},
          {:ok, output} <- Jason.decode(evidence["output_json"] || "null"),
          :ok <- adoption_output_shape(evidence, output),
-         :ok <- StageSchemas.validate(output, adoption_schema(task["role"])),
+         {:ok, binding} <- Jason.decode(evidence["binding_json"]),
+         :ok <- ReviewProtocol.validate_result(store, task, binding, output),
          {:ok, task} <- WorkerEvidence.adopt_completed(store, key) do
       {:ok, %{run: run, task: task, evidence: evidence, output: output}}
     end
@@ -499,10 +588,6 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
   def admitted_stage(%{"state" => "VERIFYING"}, "change-verifier"), do: :ok
   def admitted_stage(_run, _role), do: {:error, :ticket_role_stage_not_admitted}
 
-  defp adoption_schema("feature-writer"), do: StageSchemas.for_stage(:native_feature_writer)
-  defp adoption_schema("feature-planner"), do: StageSchemas.for_stage(:feature_planner)
-  defp adoption_schema("change-verifier"), do: StageSchemas.for_stage(:change_verifier)
-
   defp adoption_role(store, run, %{"role" => "change-verifier"} = task, evidence, output) do
     with {:ok, verifier} <- WorkerEvidence.verifier_receipt(store, run, task),
          :ok <- verifier_controller_check(store, run, evidence, output) do
@@ -517,7 +602,9 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
          {:ok, _} <- TicketChat.ready_for_run(store, run["run_id"]),
          {:ok, current} <- RunLedger.get(store, run["run_id"]),
          true <- current == run or {:error, :ticket_writer_adoption_changed},
-         {:ok, candidate} <- writer_candidate(run, evidence, output),
+         {:ok, effective} <- SymphonyElixir.Factory.TicketCiGeneration.complete(store, evidence["request_key"], run, output),
+         :ok <- SymphonyElixir.Factory.TicketCiRepair.writer_result(store, run, output, effective["changed_paths"]),
+         {:ok, candidate} <- writer_candidate(run, evidence, effective),
          :ok <- persist_writer_candidate(store, run, evidence, candidate),
          {:ok, check} <- check(store, evidence["request_key"], "git-diff-check"),
          {:ok, %{"result" => "PASS", "candidate_sha" => ^candidate}} <- Jason.decode(check["receipt_json"]) do
@@ -572,7 +659,7 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
   defp writer_candidate(_run, _evidence, _output), do: {:error, :ticket_writer_blocked}
 
   defp persist_writer_candidate(store, run, evidence, candidate) do
-    Store.transaction!(store, fn tx ->
+    SymphonyElixir.Factory.TicketPushHazard.with_descendant(store, run["run_id"], candidate, fn tx ->
       {:ok, current} = RunLedger.get(tx, run["run_id"])
       parent = Jason.decode!(evidence["binding_json"])["expected_sha"]
       fields = ~w(state implementation_iteration spec_revision contract_sha256 worktree branch)
@@ -667,19 +754,44 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
     end
   end
 
+  @doc "Admits immutable instructions for the current exact packet; may append one snapshot, never launch a worker."
   @spec packet(Store.connection(), String.t(), String.t(), String.t()) :: {:ok, String.t()} | {:error, term()}
   def packet(store, run_id, role, base_sha) do
+    Store.transaction!(store, &instruction_packet(&1, run_id, role, base_sha, :admit))
+  end
+
+  @doc "Revalidates current packet facts using admitted instruction bytes only; never reads shared files or writes snapshots."
+  @spec read_packet(Store.connection(), String.t(), String.t(), String.t()) :: {:ok, String.t()} | {:error, term()}
+  def read_packet(store, run_id, role, base_sha) do
+    instruction_packet(store, run_id, role, base_sha, :read)
+  end
+
+  @doc "Revalidates facts and reuses predecessor-admitted bytes without admitting or authorizing a turn."
+  @spec retained_packet(Store.connection(), binary(), binary(), binary(), map()) :: {:ok, binary()} | {:error, term()}
+  def retained_packet(store, run_id, role, base_sha, predecessor) do
+    instruction_packet(store, run_id, role, base_sha, {:retained, predecessor})
+  end
+
+  defp instruction_packet(store, run_id, role, base_sha, mode) do
     with {:ok, run} <- RunLedger.get(store, run_id),
          true <- role in ~w(feature-writer feature-planner change-verifier manual-validator) or {:error, :ticket_worker_role_unsupported},
          :ok <- exact_contract(run),
          :ok <- validator_candidate(role, run["candidate_sha"]),
          :ok <- proven_base(store, run, base_sha) do
       packet = %{
+        "run_id" => run_id,
+        "stage" => instruction_stage(role, run["state"]),
+        "implementation_iteration" => run["implementation_iteration"],
+        "code_repair_round" => run["code_repair_round"],
+        "validation_repair_round" => run["validation_repair_round"],
+        "verifier_round" => run["verifier_round"],
+        "instruction_bundle_version" => 1,
         "role" => role,
         "issue_key" => run["issue_key"],
         "spec_revision" => run["spec_revision"],
         "contract_sha256" => run["contract_sha256"],
         "contract" => run["contract_markdown"],
+        "jira_snapshot" => run["snapshot_json"],
         "base_sha" => base_sha,
         "candidate_sha" => run["candidate_sha"],
         "tools" =>
@@ -699,15 +811,84 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
                 "blocked" => "For BLOCKED, report actual changed_paths and blockers; commit_message may be null. Never claim a completed slice."
               },
               "tools" =>
-                "Use repo_list and repo_read to inspect this checkout, repo_write with its exact file SHA-256 to edit the smallest authorized slice, repo_delete with its exact SHA-256 to remove a regular source file, and repo_mkdir to create one directory under an existing parent. Use repo_read_binary/repo_write_binary for bounded canonical-base64 fixtures. Your process is read-only: no native patch or shell, connectors, delegation, permission changes or Git writes. Controller alone runs approved checks, commits, pushes and manages MRs. Report all unrun checks honestly; file edits are not verification."
+                "Use repo_list and repo_read to inspect this checkout, repo_write with its exact file SHA-256 to edit the smallest authorized slice, repo_delete with its exact SHA-256 to remove a regular source file, and repo_mkdir to create one directory under an existing parent. Use repo_read_binary/repo_write_binary for bounded canonical-base64 fixtures. To read exact preimages from this task's pinned contract base, use repo_read or repo_read_binary with path .symphony-base/<relative-path>; this is a read-only virtual namespace, not a physical directory, and accepts no revision argument. Before restoring a preimage, read its ordinary current path and use that current SHA for write CAS, never the historical SHA. Never write to .symphony-base/. Your process is read-only: no native patch or shell, connectors, delegation, permission changes or Git writes. Controller alone runs approved checks, commits, pushes and manages MRs. Report all unrun checks honestly; file edits are not verification."
             }),
           else: packet
 
-      with {:ok, packet} <- validation_packet(packet, run, role) do
+      with {:ok, packet} <- ci_repair_packet(store, run, packet, role),
+           {:ok, packet} <- validation_packet(store, packet, run, role),
+           {:ok, packet} <- SymphonyElixir.Factory.RepairObligations.attach(store, packet),
+           packet = TicketCompletionConfirmation.attach(store, packet),
+           {:ok, packet} <- shared_instructions(store, packet, role, mode, run) do
         {:ok, Jason.encode!(packet)}
       end
     end
   end
+
+  defp ci_repair_packet(store, run, packet, "feature-writer") do
+    with {:ok, repair} <- SymphonyElixir.Factory.TicketCiRepair.writer_packet(store, run),
+         {:ok, packet} <- SymphonyElixir.Factory.TicketCiRepairSuccessor.supplemental_packet(store, run, if(is_nil(repair), do: packet, else: Map.put(packet, "ci_repair", repair))),
+         {:ok, scope} <- TicketCiRepair.writer_scope(store, run) do
+      TicketCiGeneratedScope.attach(packet, scope)
+    end
+  end
+
+  defp ci_repair_packet(_store, _run, packet, _role), do: {:ok, packet}
+
+  defp instruction_stage("feature-writer", "READY_FOR_REVIEW"), do: "REVIEW_WRITING"
+  defp instruction_stage(_role, state), do: state
+
+  defp shared_instructions(store, packet, role, mode, run) do
+    instruction_role = if role == "feature-writer" and is_map(packet["ci_repair"]), do: "ci-repair-writer", else: role
+
+    result =
+      case mode do
+        :admit -> admit_instructions(store, packet, instruction_role, run)
+        :read -> WorkerInstructions.read(store, packet, instruction_role)
+        {:retained, predecessor} -> retained_instructions(store, packet, instruction_role, predecessor)
+      end
+
+    with {:ok, instructions} <- result do
+      {:ok, Map.merge(packet, instructions)}
+    end
+  end
+
+  defp admit_instructions(store, packet, role, run) do
+    case WorkerInstructions.admit(store, packet, role, Path.join(System.user_home!(), ".agents")) do
+      {:error, :worker_instruction_snapshot_not_admitted} -> inherit_amendment_instructions(store, packet, role, run)
+      result -> result
+    end
+  end
+
+  defp retained_instructions(store, packet, role, predecessor) do
+    with true <- predecessor["run_id"] == packet["run_id"] and predecessor["role"] == packet["role"],
+         {:ok, mapping} <- WorkerInstructions.task_binding(store, predecessor),
+         row when is_map(row) <- Store.one!(store, "SELECT binding_json FROM worker_instruction_snapshots WHERE binding_sha256=?", [mapping["instruction_binding_sha256"]]),
+         true <- digest(row["binding_json"]) == mapping["instruction_binding_sha256"],
+         {:ok, retained} <- Jason.decode(row["binding_json"]),
+         true <- Map.drop(retained, ["tools"]) == Map.drop(packet, ["tools"]),
+         {:ok, bundle} <- WorkerInstructions.read(store, retained, role) do
+      {:ok, Map.merge(retained, bundle)}
+    else
+      _ -> {:error, :worker_instruction_retained_packet_unproven}
+    end
+  end
+
+  defp inherit_amendment_instructions(store, packet, "feature-writer", run) do
+    with {:ok, predecessor_proof} <- TicketContractAmendment.blocked_predecessor_for_installed_run(store, run),
+         %{receipt: receipt, amendment: amendment} = predecessor_proof,
+         :ok <- WorkspaceAccess.validate_blocked_amendment_predecessor(store, receipt),
+         {:ok, predecessor} <- Jason.decode(receipt["blocked_predecessor_json"]),
+         {:ok, task} <- Jason.decode(predecessor["task_json"]),
+         {:ok, prior} <- TicketContractAmendment.blocked_source_preimage(store, amendment["command_key"]) do
+      expected = Map.take(prior, ~w(run_id spec_revision contract_sha256 candidate_sha)) |> Map.merge(%{"role" => "feature-writer", "base_sha" => packet["base_sha"]})
+      WorkerInstructions.inherit(store, packet, "feature-writer", task, expected)
+    else
+      _ -> {:error, :worker_instruction_snapshot_not_admitted}
+    end
+  end
+
+  defp inherit_amendment_instructions(_store, _packet, _role, _run), do: {:error, :worker_instruction_snapshot_not_admitted}
 
   @doc false
   @spec blocked_resume_packet(String.t(), String.t(), map()) :: String.t()
@@ -719,7 +900,7 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
     })
   end
 
-  defp validation_packet(packet, run, "manual-validator") do
+  defp validation_packet(_store, packet, run, "manual-validator") do
     case Contract.manual_validation_definition(run["contract_markdown"]) do
       {:ok, nil} -> {:error, :manual_validation_not_required}
       {:ok, definition} -> {:ok, Map.merge(packet, %{"validation_definition" => definition, "validation_evidence" => "DECLARATIONS_ONLY"})}
@@ -727,16 +908,99 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
     end
   end
 
-  defp validation_packet(packet, %{"ci_evidence_json" => json} = run, "change-verifier") when is_binary(json) do
-    with {:ok, %{"status" => "PASS", "sha" => sha, "pipeline_id" => pipeline} = evidence} <- Jason.decode(json),
-         true <- is_integer(pipeline) and pipeline > 0 and sha == run["candidate_sha"] and sha == run["ci_preflight_sha"] and pipeline == run["ci_pipeline_id"] do
-      {:ok, Map.put(packet, "ci_evidence", evidence)}
+  defp validation_packet(store, packet, %{"ci_evidence_json" => json} = run, "change-verifier") when is_binary(json) do
+    candidate = run["candidate_sha"]
+    preflight = run["ci_preflight_sha"]
+    pipeline_id = run["ci_pipeline_id"]
+
+    case Jason.decode(json) do
+      {:ok, %{"status" => "PASS", "sha" => sha, "pipeline_id" => pipeline} = evidence}
+      when is_integer(pipeline) and pipeline > 0 and sha == candidate and sha == preflight and pipeline == pipeline_id ->
+        {:ok, Map.put(packet, "ci_evidence", evidence)}
+
+      {:ok, %{"status" => "PASS", "sha" => sha, "pipeline_id" => pipeline}}
+      when is_binary(sha) and sha == preflight and sha != candidate and is_integer(pipeline) and pipeline > 0 and pipeline == pipeline_id ->
+        with true <- Regex.match?(~r/\A[0-9a-f]{40}\z/, sha),
+             :ok <- ordinary_writer_candidate(store, run) do
+          {:ok, packet}
+        else
+          _ -> {:error, :ticket_verifier_ci_evidence_mismatch}
+        end
+
+      _ ->
+        {:error, :ticket_verifier_ci_evidence_mismatch}
+    end
+  end
+
+  defp validation_packet(_store, packet, _run, _role), do: {:ok, packet}
+
+  defp ordinary_writer_candidate(store, run) do
+    key = run["run_id"] <> ":feature-writer"
+
+    with {:ok, task} <- TaskLedger.get(store, key),
+         true <- task["run_id"] == run["run_id"] and task["role"] == "feature-writer" and task["status"] == "CONSUMED" and task["stage"] in ~w(WRITING REVIEW_WRITING),
+         worker when is_map(worker) <-
+           Store.one!(store, "SELECT * FROM worker_evidence WHERE task_key=? AND run_id=? AND thread_id=? AND turn_id=? AND output_json=? AND status='CONSUMED'", [
+             key,
+             run["run_id"],
+             task["thread_id"],
+             task["turn_id"],
+             task["output_json"]
+           ]),
+         {:ok, bound} <- retained_object(worker["binding_json"], worker["binding_sha256"]),
+         {:ok, %{"status" => "COMPLETE"}} <- retained_object(worker["output_json"], worker["output_sha256"]),
+         true <- Map.take(bound, ~w(run_id spec_revision contract_sha256)) == Map.take(run, ~w(run_id spec_revision contract_sha256)),
+         true <- Map.take(bound, ~w(task_key role stage model reasoning_effort prompt_sha256)) == Map.take(task, ~w(task_key role stage model reasoning_effort prompt_sha256)),
+         true <- bound["mode"] == "SOURCE" and bound["input_sha256"] == task["prompt_sha256"] and is_map(bound["policy"]) and bound["policy"]["cwd"] == run["worktree"],
+         true <- WorkerEvidence.owner_stopped?(store, worker),
+         {:ok, mapping} <- WorkerInstructions.task_binding(store, task),
+         snapshot when is_map(snapshot) <- Store.one!(store, "SELECT binding_json FROM worker_instruction_snapshots WHERE binding_sha256=?", [mapping["instruction_binding_sha256"]]),
+         {:ok, original} <- retained_object(snapshot["binding_json"], mapping["instruction_binding_sha256"]),
+         {:ok, _} <- WorkerInstructions.read(store, original, "feature-writer"),
+         true <- Map.take(original, ~w(run_id spec_revision contract_sha256 role stage)) == Map.take(bound, ~w(run_id spec_revision contract_sha256 role stage)),
+         true <- original["candidate_sha"] == bound["expected_sha"] and not Map.has_key?(original, "ci_repair"),
+         :ok <- ordinary_writer_check(store, run, worker, bound) do
+      :ok
     else
       _ -> {:error, :ticket_verifier_ci_evidence_mismatch}
     end
   end
 
-  defp validation_packet(packet, _run, _role), do: {:ok, packet}
+  defp ordinary_writer_check(store, run, worker, bound) do
+    with access when is_map(access) <- Store.one!(store, "SELECT * FROM workspace_access WHERE reservation_key=?", [worker["reservation_key"]]),
+         true <- bound["reservation_key"] == worker["reservation_key"] and bound["reservation_key"] == access["reservation_key"],
+         true <-
+           access["mode"] == "SOURCE" and access["run_id"] == run["run_id"] and access["task_key"] == worker["task_key"] and access["request_key"] == worker["request_key"] and
+             access["generation"] == bound["reservation_generation"] and access["canonical_path"] == run["worktree"] and is_binary(access["released_at"]),
+         {:ok, release} when is_map(release) <- Jason.decode(access["release_receipt_json"] || "null"),
+         true <- release == Map.take(worker, ~w(request_key binding_sha256 output_sha256 consumed_at owner_stopped_at)),
+         :ok <- WorkerEvidence.checks_stopped(store, access["reservation_key"]),
+         check when is_map(check) <-
+           Store.one!(store, "SELECT * FROM controller_checks WHERE worker_request_key=? AND reservation_key=? AND phase='COMPLETE' AND json_extract(binding_json,'$.action')='git-diff-check'", [
+             worker["request_key"],
+             access["reservation_key"]
+           ]),
+         {:ok, binding} <- retained_object(check["binding_json"], check["binding_sha256"]),
+         {:ok, receipt} <- retained_object(check["receipt_json"], check["receipt_sha256"]),
+         true <- Map.take(binding, ~w(run_id candidate_sha spec_revision contract_sha256)) == Map.take(run, ~w(run_id candidate_sha spec_revision contract_sha256)),
+         true <-
+           binding["worker_request_key"] == worker["request_key"] and binding["worker_binding_sha256"] == worker["binding_sha256"] and binding["worker_output_sha256"] == worker["output_sha256"] and
+             binding["worker_stop_sha256"] == digest(worker["owner_stop_json"]),
+         true <-
+           binding["reservation_key"] == access["reservation_key"] and binding["generation"] == access["generation"] and binding["workspace_binding_sha256"] == digest(access["binding_json"]) and
+             binding["cwd"] == run["worktree"],
+         true <- receipt["result"] == "PASS" and receipt["candidate_sha"] == run["candidate_sha"] do
+      :ok
+    else
+      _ -> {:error, :ticket_verifier_ci_evidence_mismatch}
+    end
+  end
+
+  defp retained_object(raw, sha) when is_binary(raw) and byte_size(raw) <= 2_097_152 do
+    with true <- digest(raw) == sha, {:ok, value} when is_map(value) <- Jason.decode(raw), do: {:ok, value}
+  end
+
+  defp retained_object(_, _), do: {:error, :retained_object_unproven}
 
   defp validator_candidate("manual-validator", nil), do: {:error, :manual_validation_candidate_missing}
 
@@ -789,11 +1053,13 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
          {:ok, run} <- RunLedger.get(store, task["run_id"]),
          {:ok, chat} <- TicketChat.for_run(store, run["run_id"]),
          :ok <- prerequisites(run, task, chat, issue, workspace, prompt, opts),
+         :ok <- ReviewProtocol.validate_admission(prompt, schema),
          {:ok, access} <- WorkspaceAccess.get(store, Keyword.fetch!(opts, :reservation_key)),
          {:ok, _} <- WorkspaceAccess.validate(store, access["reservation_key"], access["generation"]),
          true <- access["mode"] == if(task["role"] == "feature-writer", do: "SOURCE", else: "REVIEW") or {:error, :ticket_worker_access_mismatch},
          {:ok, resume} <- resume_writer(store, task, opts),
          policy = policy(access["mode"], access["canonical_path"]),
+         :ok <- SymphonyElixir.Factory.TicketCiRepairSuccessor.issuance_check(store, run, opts),
          {:ok, attempt} <-
            WorkerEvidence.reserve(store, %{
              "request_key" => key,
@@ -858,11 +1124,25 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
   defp role_input(_run, _task, _prompt, _opts), do: {:error, :ticket_worker_role_unsupported}
 
   defp packet_for_review(run, task, prompt, opts) do
+    if is_map(opts[:failed_turn_recovery]) do
+      with {:ok, base} <- read_packet(Keyword.fetch!(opts, :store), run["run_id"], task["role"], opts[:review_base_sha]),
+           {:ok, receipt} <- SymphonyElixir.Factory.FailedTurnRecovery.prepared(Keyword.fetch!(opts, :store), run["run_id"], base),
+           true <- receipt == opts[:failed_turn_recovery] and prompt == receipt["prompt"] do
+        :ok
+      else
+        _ -> {:error, :failed_retry_packet_changed}
+      end
+    else
+      packet_without_failed_recovery(run, task, prompt, opts)
+    end
+  end
+
+  defp packet_without_failed_recovery(run, task, prompt, opts) do
     case {opts[:ready_rework], opts[:blocked_resume_prompt], task["role"]} do
       {%{command_key: command_key}, nil, "feature-writer"} ->
         with {:ok, %{receipt: receipt, input: input}} <-
                TicketChatCommands.validate_ready_rework_replay(Keyword.fetch!(opts, :store), command_key),
-             {:ok, base_packet} <- packet(Keyword.fetch!(opts, :store), run["run_id"], task["role"], opts[:review_base_sha]),
+             {:ok, base_packet} <- read_packet(Keyword.fetch!(opts, :store), run["run_id"], task["role"], opts[:review_base_sha]),
              expected = ready_rework_packet(base_packet, command_key, input["body"]),
              true <-
                (receipt["request_key"] == opts[:request_key] and expected == prompt) or
@@ -874,7 +1154,7 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
         :ok
 
       {nil, nil, _} ->
-        if(packet(Keyword.fetch!(opts, :store), run["run_id"], task["role"], opts[:review_base_sha]) == {:ok, prompt}, do: :ok, else: {:error, :blind_packet_required})
+        if(read_packet(Keyword.fetch!(opts, :store), run["run_id"], task["role"], opts[:review_base_sha]) == {:ok, prompt}, do: :ok, else: {:error, :blind_packet_required})
 
       _ ->
         {:error, :blocked_resume_packet_mismatch}
@@ -884,6 +1164,19 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
   defp resume_writer(_store, %{"thread_id" => nil}, _opts), do: {:ok, nil}
 
   defp resume_writer(store, task, opts) do
+    if is_map(opts[:failed_turn_recovery]), do: resume_failed_writer(store, task, opts), else: resume_completed_writer(store, task, opts)
+  end
+
+  defp resume_failed_writer(store, task, opts) do
+    receipt = opts[:failed_turn_recovery]
+
+    with :ok <- SymphonyElixir.Factory.FailedTurnRecovery.start_preflight(store, receipt, opts),
+         true <- (receipt["new_request_key"] == opts[:request_key] and receipt["thread_id"] == task["thread_id"]) or {:error, :failed_retry_binding_changed} do
+      {:ok, task["thread_id"]}
+    end
+  end
+
+  defp resume_completed_writer(store, task, opts) do
     previous =
       Store.one!(
         store,
@@ -897,7 +1190,7 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
     valid =
       previous != nil and WorkerEvidence.owner_stopped?(store, previous) and digest(previous["binding_json"]) == previous["binding_sha256"] and
         digest(previous["output_json"]) == previous["output_sha256"] and resume_policy_matches?(previous, task) and
-        (previous["status"] == "CONSUMED" or blocked_transfer_matches?(store, previous, opts))
+        (previous["status"] == "CONSUMED" or blocked_transfer_matches?(store, previous, opts) or SymphonyElixir.Factory.TicketCiRepairSuccessor.resume_matches?(store, previous, opts))
 
     if valid,
       do: {:ok, previous["thread_id"]},
@@ -908,11 +1201,38 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
     resume = opts[:blocked_resume] || %{}
     access = Store.one!(store, "SELECT release_receipt_json FROM workspace_access WHERE reservation_key = ?", [previous["reservation_key"]])
 
-    with {:ok, transfer} <- Jason.decode((access || %{})["release_receipt_json"] || "null"),
-         {:ok, command} <- TicketChatCommands.get(store, resume["command_key"]),
+    with {:ok, transfer} <- Jason.decode((access || %{})["release_receipt_json"] || "null") do
+      transfer_matches?(transfer, previous, resume, opts) and blocked_application_matches?(store, previous, resume, opts)
+    else
+      _ -> false
+    end
+  end
+
+  defp blocked_application_matches?(store, previous, %{"operational_recovery_key" => "TCAP-" <> _ = key}, opts) do
+    case TicketCapabilityRecovery.applied(store, key) do
+      {:ok, application} ->
+        application["prior_request_key"] == previous["request_key"] and application["request_key"] == opts[:request_key] and application["output_sha256"] == previous["output_sha256"]
+
+      _ ->
+        false
+    end
+  end
+
+  defp blocked_application_matches?(store, previous, %{"operational_recovery_key" => key}, opts) when is_binary(key) do
+    case SymphonyElixir.Factory.TicketInfrastructureRecovery.applied(store, key) do
+      {:ok, application} ->
+        application["prior_request_key"] == previous["request_key"] and application["request_key"] == opts[:request_key] and application["output_sha256"] == previous["output_sha256"]
+
+      _ ->
+        false
+    end
+  end
+
+  defp blocked_application_matches?(store, previous, resume, opts) do
+    with {:ok, command} <- TicketChatCommands.get(store, resume["command_key"]),
+         true <- command["status"] == "APPLIED",
          {:ok, application} <- Jason.decode(command["application_receipt_json"] || "null") do
-      transfer_matches?(transfer, previous, resume, opts) and command["status"] == "APPLIED" and
-        application_matches?(application, previous, opts)
+      application_matches?(application, previous, opts)
     else
       _ -> false
     end
@@ -951,7 +1271,8 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
       %{event: :session_started, thread_id: thread, turn_id: turn} ->
         {:ok, _} = WorkerEvidence.bind_turn(store, key, thread, turn)
 
-      _ ->
+      message ->
+        SpecialistErrorNotice.observe(store, key, message)
         :ok
     end
 
@@ -981,6 +1302,18 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
     ]
 
     runner_opts =
+      if guarded_failed_recovery?(opts[:failed_turn_recovery]) do
+        Keyword.merge(runner_opts,
+          native_recovery: opts[:failed_turn_recovery],
+          recovery_preflight: fn session -> SymphonyElixir.Factory.FailedTurnRecovery.owned_session_preflight(store, opts[:failed_turn_recovery], session, opts) end
+        )
+      else
+        runner_opts
+      end
+
+    runner_opts = capability_runner_options(runner_opts, store, opts)
+
+    runner_opts =
       if policy["mode"] == "FILE_SOURCE" do
         {:ok, files} = WorkerFileTools.bind(store, key, attempt["owner_id"])
         Keyword.put(runner_opts, :worker_files, files)
@@ -991,6 +1324,10 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
     result = StageRunner.run(policy["cwd"], issue, prompt, schema, runner_opts)
 
     case result do
+      {:error, {:worker_failed, reason, observed}} ->
+        WorkerEvidence.reconcile_required(store, key, reason, observed)
+        {:error, reason}
+
       {:ok, observed} ->
         finish_result(store, attempt, observed)
 
@@ -1007,6 +1344,25 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
     exception ->
       WorkerEvidence.reconcile_required(store, attempt["request_key"], Exception.message(exception))
       {:error, :worker_observation_failed}
+  end
+
+  defp guarded_failed_recovery?(%{"kind" => "INTERRUPTED_TURN_QUIESCENCE"}), do: true
+  defp guarded_failed_recovery?(%{"schema_confirmation" => %{"kind" => "SOURCE_COMPLETION_SCHEMA_REJECTION_V1"}}), do: true
+  defp guarded_failed_recovery?(_), do: false
+
+  defp capability_runner_options(runner_opts, store, opts) do
+    case opts[:blocked_resume] do
+      %{"operational_recovery_key" => "TCAP-" <> _} = resume ->
+        preflight = &TicketCapabilityRecovery.owned_session_preflight(store, resume, &1, opts)
+
+        Keyword.merge(runner_opts,
+          native_recovery: resume,
+          recovery_preflight: preflight
+        )
+
+      _ ->
+        runner_opts
+    end
   end
 
   defp require_resumed_thread!(_observed, nil), do: :ok

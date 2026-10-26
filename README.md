@@ -96,6 +96,46 @@ help with the setup:
 
 ---
 
+## Bounded factory CI repair
+
+The native factory's CI-repair candidate is opt-in and disabled by default. It
+separates immutable, exact-pipeline diagnosis from a once-only repair claim,
+restricts the existing writer's file access before edits, and retains failed CI
+and uncertain push history across descendant candidates. Only the controller may
+commit, push, or reuse the recorded draft MR; a fresh successful pipeline for the
+new SHA still precedes independent verification.
+
+Controller-only Gazelle/gofmt generation passed its pinned-tool, runtime-confinement,
+journaled byte-CAS and recovery acceptance gates. The local schema41 artifact is
+deployed with native bounded repair enabled. A normal live tick has recorded the
+diagnosis and claimed repair round1; repaired output and delivery are not implied
+by admission. Product compilation and tests
+remain in CI. See the implementation README for the local policy boundary.
+
+## Shared factory instruction bundles
+
+New ordinary native review admissions add structured criterion coverage and
+prior-finding closure. The controller, not the reviewer, owns the normal limit of
+two automatic repairs after the initial review, with an earlier stop for an
+unresolved prior finding. Dashboard policy stops explain the rule independently
+of factory health. Legacy admitted instructions and verdicts remain unchanged.
+An explicitly approved, exact-verifier single-repair budget exception can resume
+one stopped legacy `BLOCK` without changing global limits or resetting history.
+The controller and successor physical publication codec both validate its scope.
+Source writers may report classified observations and honestly unrun checks;
+source-ready completion does not replace independent verifier acceptance. Rejected
+stopped reports surface a concrete factory action without discarding their edits.
+One exact, explicitly authorized read-only completion confirmation can finish an
+adopted continuation at its implementation limit without reopening source edits,
+granting another repair, or replacing CI and independent verification.
+
+The prepared schema43 integration embeds complete role skills and shared review
+criteria in restricted native packets, with immutable admission snapshots and
+exact task/prompt links. It preserves independent verification and controller-only
+Git/MR actions. Deployment and actual runtime packet readback remain separate
+gates; the old shared `autopilot` compatibility copy stays until those pass. See
+[the implementation contract](elixir/README.md#shared-role-instruction-admission).
+
 ## License
 
 This project is licensed under the [Apache License 2.0](LICENSE).

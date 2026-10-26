@@ -1,5 +1,5 @@
 defmodule SymphonyElixir.FactoryTickLeaseTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   alias SymphonyElixir.Factory.{Control, ControlServer, Store, TickLease}
 
@@ -7,6 +7,7 @@ defmodule SymphonyElixir.FactoryTickLeaseTest do
     suffix = "#{System.system_time(:nanosecond)}-#{System.unique_integer([:positive])}"
     database = Path.join(System.tmp_dir!(), "symphony-tick-#{suffix}.sqlite")
     store = start_supervised!({Store, database: database})
+    reader = start_supervised!(%{id: :reader, start: {Store, :start_read_only, [[database: database]]}})
     control_name = Module.concat(__MODULE__, "Control#{suffix}")
 
     factory = %{
@@ -16,7 +17,7 @@ defmodule SymphonyElixir.FactoryTickLeaseTest do
       lease_seconds: 240
     }
 
-    start_supervised!({ControlServer, store: store, factory: factory, name: control_name})
+    start_supervised!({ControlServer, store: store, read_store: reader, factory: factory, name: control_name})
     on_exit(fn -> File.rm(database) end)
     %{control_name: control_name, factory: factory, store: store}
   end
@@ -38,6 +39,61 @@ defmodule SymphonyElixir.FactoryTickLeaseTest do
 
     assert %{"tick_id" => nil, "status" => "ACTIVE"} =
              Control.status(context.store, context.factory.scope)
+  end
+
+  test "the monitored callback receives only its acquired identity and renewal preserves it", context do
+    assert {:ok, _} = ControlServer.activate("dispatcher-a", context.control_name)
+    parent = self()
+
+    assert {:ran, :owned} =
+             TickLease.run(
+               context.factory,
+               fn tick ->
+                 send(parent, {:owned_tick_child, self(), tick})
+                 assert {:ok, ^tick} = SymphonyElixir.Factory.TicketPushRecovery.tick_binding(context.store, operator_tick: tick)
+                 assert %{result: "LEASE_RENEWED"} = ControlServer.renew_tick("dispatcher-a", tick["tick_id"], context.control_name)
+                 assert {:ok, ^tick} = SymphonyElixir.Factory.TicketPushRecovery.tick_binding(context.store, operator_tick: tick)
+
+                 for changed <- [Map.put(tick, "generation", tick["generation"] + 1), Map.put(tick, "tick_id", "foreign"), Map.put(tick, "dispatcher_id", "foreign")] do
+                   assert {:error, :push_recovery_operator_tick_unproven} = SymphonyElixir.Factory.TicketPushRecovery.tick_binding(context.store, operator_tick: changed)
+                 end
+
+                 Store.query!(context.store, "UPDATE control SET lease_expires_at='2020-01-01T00:00:00Z' WHERE scope=?", [context.factory.scope])
+                 assert {:error, :push_recovery_operator_tick_unproven} = SymphonyElixir.Factory.TicketPushRecovery.tick_binding(context.store, operator_tick: tick)
+                 :owned
+               end,
+               control_server: context.control_name
+             )
+
+    assert_receive {:owned_tick_child, child, tick}
+    assert child != self()
+    assert Enum.sort(Map.keys(tick)) == ~w(dispatcher_id generation scope tick_id)
+    assert Control.status(context.store, context.factory.scope)["tick_id"] == nil
+    assert {:error, :push_recovery_operator_tick_unproven} = SymphonyElixir.Factory.TicketPushRecovery.tick_binding(context.store, operator_tick: tick)
+  end
+
+  test "disabled arity-one callbacks receive no ordinary lease authority", context do
+    assert {:ran, nil} = TickLease.run(%{context.factory | enabled: false}, fn tick -> tick end, control_server: context.control_name)
+    assert Control.status(context.store, context.factory.scope)["tick_id"] == nil
+  end
+
+  test "the real Controller passes its acquired tick to the normal Scheduler options", context do
+    alias SymphonyElixir.Factory.{Controller, Scheduler}
+    supervisor = start_supervised!({Task.Supervisor, name: nil})
+    settings = SymphonyElixir.Config.settings!()
+    factory = Map.merge(settings.factory, Map.merge(context.factory, %{queue: %{}, repositories: %{}}))
+    :erlang.trace_pattern({Scheduler, :tick, 2}, true, [])
+    :erlang.trace(supervisor, true, [:call, :set_on_spawn])
+    on_exit(fn -> :erlang.trace_pattern({Scheduler, :tick, 2}, false, []) end)
+    owner = start_supervised!({Controller, settings: %{settings | factory: factory}, store: context.store, control_server: context.control_name, task_supervisor: supervisor, name: nil})
+    assert {:ok, _} = ControlServer.activate(factory.dispatcher_id, context.control_name)
+    assert :ok = Controller.reconcile_now(owner)
+    assert_receive {:trace, child, :call, {Scheduler, :tick, [_scheduler_context, options]}}, 5_000
+    tick = options |> Keyword.fetch!(:ticket_options) |> Keyword.fetch!(:operator_tick)
+    assert Enum.sort(Map.keys(tick)) == ~w(dispatcher_id generation scope tick_id)
+    assert tick["scope"] == factory.scope and tick["dispatcher_id"] == factory.dispatcher_id
+    assert is_integer(tick["generation"]) and tick["generation"] > 0 and is_binary(tick["tick_id"])
+    assert child != owner and child != self()
   end
 
   defmodule NoQueueRead do
@@ -104,5 +160,276 @@ defmodule SymphonyElixir.FactoryTickLeaseTest do
 
     assert {:ran, :completed} = Task.await(task)
     assert ControlServer.status(context.control_name)["tick_id"] == nil
+  end
+
+  test "renewal survives a source transaction holding the shared connection beyond five seconds", context do
+    assert {:ok, _active} = ControlServer.activate("dispatcher-a", context.control_name)
+    parent = self()
+
+    task =
+      Task.async(fn ->
+        TickLease.run(
+          context.factory,
+          fn ->
+            Store.transaction!(
+              context.store,
+              fn tx ->
+                Store.query!(tx, "SELECT 1")
+                send(parent, :source_transaction_started)
+                Process.sleep(5_500)
+                :completed
+              end,
+              timeout: 10_000
+            )
+          end,
+          control_server: context.control_name,
+          renewal_interval_ms: 50
+        )
+      end)
+
+    assert_receive :source_transaction_started, 1_000
+    assert {:ran, :completed} = Task.await(task, 15_000)
+    assert %{"status" => "ACTIVE", "tick_id" => nil} = ControlServer.status(context.control_name)
+  end
+
+  @tag timeout: 80_000, renewal_envelope: true
+  test "renewal covers the existing sixty-second source transaction envelope", context do
+    assert {:ok, _active} = ControlServer.activate("dispatcher-a", context.control_name)
+    parent = self()
+
+    task =
+      Task.async(fn ->
+        TickLease.run(
+          context.factory,
+          fn ->
+            Store.transaction!(
+              context.store,
+              fn tx ->
+                Store.query!(tx, "SELECT 1")
+                send(parent, :long_transaction_started)
+                Process.sleep(60_000)
+                :completed
+              end,
+              timeout: 62_000
+            )
+          end,
+          control_server: context.control_name,
+          renewal_interval_ms: 50
+        )
+      end)
+
+    assert_receive :long_transaction_started, 1_000
+    assert_renewing(context.control_name)
+    assert ControlServer.status(context.control_name)["tick_id"] != nil
+    Process.sleep(6_100)
+    assert ControlServer.status(context.control_name)["tick_id"] != nil
+    assert Task.yield(task, 0) == nil
+    assert {:ran, :completed} = Task.await(task, 70_000)
+    assert ControlServer.status(context.control_name)["tick_id"] == nil
+  end
+
+  test "a bounded renewal timeout stops the source owner and cannot resurrect its lease", context do
+    assert {:ok, _active} = ControlServer.activate("dispatcher-a", context.control_name)
+    parent = self()
+    factory = %{context.factory | lease_seconds: 1}
+
+    task =
+      Task.async(fn ->
+        TickLease.run(
+          factory,
+          fn ->
+            Store.transaction!(
+              context.store,
+              fn tx ->
+                Store.query!(tx, "SELECT 1")
+                send(parent, {:bounded_source_started, self()})
+
+                receive do
+                  :finish -> send(parent, :incorrectly_completed)
+                end
+              end,
+              timeout: 5_000
+            )
+          end,
+          control_server: context.control_name,
+          renewal_interval_ms: 50
+        )
+      end)
+
+    assert_receive {:bounded_source_started, source}, 1_000
+    monitor = Process.monitor(source)
+    assert {:ran, {:error, {:tick_lease_lost, _reason}}} = Task.await(task, 5_000)
+    assert_receive {:DOWN, ^monitor, :process, ^source, :killed}, 1_000
+    assert %{"tick_id" => nil} = ControlServer.status(context.control_name)
+    send(source, :finish)
+    refute_received :incorrectly_completed
+    assert {:ran, :next_tick} = TickLease.run(context.factory, fn -> :next_tick end, control_server: context.control_name)
+    assert %{"tick_id" => nil} = ControlServer.status(context.control_name)
+  end
+
+  for {column, value, result} <- [{"status", "PAUSED", "PAUSED"}, {"dispatcher_id", "other", "LEASE_MISMATCH"}, {"tick_id", "replacement", "LEASE_MISMATCH"}] do
+    test "renewal still stops work when #{column} changes", context do
+      assert {:ok, _active} = ControlServer.activate("dispatcher-a", context.control_name)
+      parent = self()
+
+      task =
+        Task.async(fn ->
+          TickLease.run(
+            context.factory,
+            fn ->
+              send(parent, {:source_started, self()})
+
+              receive do
+                :finish -> :incorrectly_completed
+              end
+            end,
+            control_server: context.control_name,
+            renewal_interval_ms: 100
+          )
+        end)
+
+      assert_receive {:source_started, source}, 1_000
+      Store.query!(context.store, "UPDATE control SET #{unquote(column)} = ? WHERE scope = ?", [unquote(value), context.factory.scope])
+      assert {:ran, {:error, {:tick_lease_lost, %{result: unquote(result)}}}} = Task.await(task, 5_000)
+      refute Process.alive?(source)
+      if unquote(column) == "tick_id", do: assert(Control.status(context.store, context.factory.scope)["tick_id"] == "replacement")
+    end
+  end
+
+  test "an interval at lease expiry rejects the tick before source work starts", context do
+    assert {:ok, _active} = ControlServer.activate("dispatcher-a", context.control_name)
+
+    assert {:ran, {:error, :invalid_tick_renewal_interval}} =
+             TickLease.run(context.factory, fn -> flunk("source must not start") end, control_server: context.control_name, renewal_interval_ms: 240_000)
+
+    assert ControlServer.status(context.control_name)["tick_id"] == nil
+  end
+
+  test "an interval leaving no positive renewal budget does not start source work", context do
+    assert {:ok, _active} = ControlServer.activate("dispatcher-a", context.control_name)
+
+    assert {:ran, {:error, :invalid_tick_renewal_interval}} =
+             TickLease.run(%{context.factory | lease_seconds: 1}, fn -> flunk("source must not start") end, control_server: context.control_name, renewal_interval_ms: 999)
+
+    assert ControlServer.status(context.control_name)["tick_id"] == nil
+  end
+
+  test "an expired queued recovery renewal cannot extend the durable lease", context do
+    assert %{result: "ACQUIRED", tick_id: tick} = ControlServer.acquire_recovery_tick("dispatcher-a", context.control_name)
+    before = ControlServer.status(context.control_name)["lease_expires_at"]
+    :sys.suspend(context.control_name)
+
+    try do
+      caller =
+        Task.async(fn ->
+          try do
+            ControlServer.renew_recovery_tick("dispatcher-a", tick, context.control_name, 50)
+          catch
+            :exit, {:timeout, _} -> :timed_out
+          end
+        end)
+
+      assert :timed_out = Task.await(caller, 1_000)
+    after
+      :sys.resume(context.control_name)
+    end
+
+    assert ControlServer.status(context.control_name)["lease_expires_at"] == before
+    assert %{result: "RELEASED"} = ControlServer.release_tick("dispatcher-a", tick, context.control_name)
+  end
+
+  test "stopping control terminates its pending renewal helper", context do
+    assert {:ok, _active} = ControlServer.activate("dispatcher-a", context.control_name)
+    assert %{result: "ACQUIRED", tick_id: tick} = ControlServer.acquire_tick("dispatcher-a", context.control_name)
+    parent = self()
+
+    holder =
+      Task.async(fn ->
+        Store.transaction!(context.store, fn tx ->
+          Store.query!(tx, "SELECT 1")
+          send(parent, :connection_held)
+
+          receive do
+            :finish -> :ok
+          end
+        end)
+      end)
+
+    assert_receive :connection_held, 1_000
+
+    caller =
+      Task.async(fn ->
+        try do
+          ControlServer.renew_tick("dispatcher-a", tick, context.control_name, 1_000)
+        catch
+          :exit, _ -> :control_stopped
+        end
+      end)
+
+    assert_renewing(context.control_name)
+    helper = :sys.get_state(context.control_name).renewal.pid
+    ref = Process.monitor(helper)
+    GenServer.stop(context.control_name, :normal)
+    assert_receive {:DOWN, ^ref, :process, ^helper, :killed}, 1_000
+    assert :control_stopped = Task.await(caller)
+    send(holder.pid, :finish)
+    assert :ok = Task.await(holder)
+  end
+
+  test "abnormal control death cannot renew its old lease", context do
+    assert {:ok, _active} = ControlServer.activate("dispatcher-a", context.control_name)
+    assert %{result: "ACQUIRED", tick_id: tick} = ControlServer.acquire_tick("dispatcher-a", context.control_name)
+    before = ControlServer.status(context.control_name)["lease_expires_at"]
+    parent = self()
+
+    holder =
+      Task.async(fn ->
+        Store.transaction!(context.store, fn tx ->
+          Store.query!(tx, "SELECT 1")
+          send(parent, :connection_held)
+
+          receive do
+            :finish -> :ok
+          end
+        end)
+      end)
+
+    assert_receive :connection_held, 1_000
+
+    caller =
+      Task.async(fn ->
+        try do
+          ControlServer.renew_tick("dispatcher-a", tick, context.control_name, 1_000)
+        catch
+          :exit, _ -> :control_stopped
+        end
+      end)
+
+    assert_renewing(context.control_name)
+    helper = :sys.get_state(context.control_name).renewal.pid
+    helper_ref = Process.monitor(helper)
+    control = GenServer.whereis(context.control_name)
+    control_ref = Process.monitor(control)
+    Process.exit(control, :kill)
+    assert_receive {:DOWN, ^control_ref, :process, ^control, :killed}, 1_000
+    assert :control_stopped = Task.await(caller)
+    send(holder.pid, :finish)
+    assert :ok = Task.await(holder)
+    assert_receive {:DOWN, ^helper_ref, :process, ^helper, :normal}, 2_000
+    assert Control.status(context.store, context.factory.scope)["lease_expires_at"] == before
+  end
+
+  defp assert_renewing(server, attempts \\ 100)
+  defp assert_renewing(_server, 0), do: flunk("renewal helper did not start")
+
+  defp assert_renewing(server, attempts) do
+    case :sys.get_state(server) do
+      %{renewal: _} ->
+        :ok
+
+      _ ->
+        Process.sleep(10)
+        assert_renewing(server, attempts - 1)
+    end
   end
 end

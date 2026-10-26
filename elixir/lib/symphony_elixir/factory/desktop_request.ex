@@ -10,7 +10,15 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
   alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.Factory.DesktopToolArgs
   alias SymphonyElixir.Factory.NativeMaintenanceEvidence
-  alias SymphonyElixir.Factory.{NativeSourceBinding, NativeWorktreeProbe, RunLedger, StageSchemas}
+
+  alias SymphonyElixir.Factory.{
+    NativeSourceBinding,
+    NativeWorktreeProbe,
+    RunLedger,
+    SpecialistErrorNotice,
+    StageSchemas
+  }
+
   alias SymphonyElixir.Factory.{Store, TaskLauncher, TaskLedger, TicketChat, Worktree}
   alias SymphonyElixir.Factory.{TicketJiraJournal, TicketMrOperation, TicketParentGuard}
 
@@ -103,7 +111,56 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
 
   @doc "Qualifies and atomically claims an unissued MR followup; returns exact arguments after commit."
   @spec claim_mr_followup(Store.connection(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
-  def claim_mr_followup(connection, key, admission, opts) do
+  def claim_mr_followup(%DBConnection{}, _, _, _), do: {:error, :ticket_mr_observation_inside_transaction}
+
+  def claim_mr_followup(connection, key, %{factory: factory} = admission, opts) do
+    with_mr_claim_preadmission(connection, key, factory, opts, fn ->
+      claim_mr_followup_prepared(connection, key, admission, opts)
+    end)
+  end
+
+  def claim_mr_followup(_, _, _, _), do: {:error, :ticket_mr_claim_authority_required}
+
+  @doc false
+  @spec with_mr_claim_preadmission(Store.connection(), String.t(), map(), keyword(), (-> term())) :: term()
+  def with_mr_claim_preadmission(%DBConnection{}, _, _, _, _), do: {:error, :ticket_mr_observation_inside_transaction}
+
+  def with_mr_claim_preadmission(connection, key, factory, opts, operation) do
+    scope = {__MODULE__, :mr_claim_preadmission}
+
+    case Process.get(scope) do
+      %{store: ^connection, key: ^key, factory: ^factory} ->
+        operation.()
+
+      previous ->
+        with {:ok, prepared} <- TicketMrOperation.claim_preadmission(connection, key, factory, opts) do
+          Process.put(scope, %{store: connection, key: key, factory: factory, prepared: prepared, reference: make_ref()})
+
+          try do
+            operation.()
+          after
+            restore_mr_scope(scope, previous)
+          end
+        end
+    end
+  end
+
+  @doc false
+  @spec mr_claim_preadmission(Store.connection(), map(), map()) :: {:ok, map()} | {:error, term()}
+  def mr_claim_preadmission(store, request, factory) do
+    case Process.get({__MODULE__, :mr_claim_preadmission}) do
+      %{factory: ^factory, prepared: %{request: ^request} = prepared, reference: reference} = context
+      when is_reference(reference) ->
+        if store === context.store or (not is_nil(context[:transaction]) and store === context[:transaction]),
+          do: {:ok, prepared},
+          else: {:error, :ticket_mr_claim_preadmission_required}
+
+      _ ->
+        {:error, :ticket_mr_claim_preadmission_required}
+    end
+  end
+
+  defp claim_mr_followup_prepared(connection, key, admission, opts) do
     qualified_opts = Keyword.put(opts, :ticket_mr_admission, admission)
 
     with {:ok, request} <- get(connection, key),
@@ -112,6 +169,7 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
          {:ok, receipt} <- issuance_admission(connection, request, qualified_opts),
          %{factory: factory} <- admission,
          {:ok, run} <- RunLedger.get(connection, receipt["binding"]["run_id"]),
+         :ok <- SymphonyElixir.Factory.TicketMrCwdCorrection.check_native_actor(request, run, receipt["proof"]["native"]),
          :ok <- AppServer.check_ticket_runtime(receipt["binding"]["controller_cwd"]),
          {:ok, current_request, current_run, authorization} <-
            TicketMrOperation.read_claim_authorization(
@@ -124,13 +182,27 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
          true <- current_run == run or {:error, :ticket_mr_claim_run_changed} do
       fresh_opts = Keyword.put(opts, :ticket_mr_admission, Map.put(admission, :authorization, authorization))
 
-      case Exqlite.transaction(connection, &claim_mr_transaction(&1, request, run, fresh_opts)) do
+      case Exqlite.transaction(connection, &claim_mr_scoped_transaction(connection, &1, request, run, fresh_opts)) do
         {:ok, result} -> result
         {:error, reason} -> {:error, reason}
       end
     else
       {:error, _} = error -> error
-      _ -> {:error, :ticket_mr_claim_authority_required}
+    end
+  end
+
+  defp restore_mr_scope(scope, nil), do: Process.delete(scope)
+  defp restore_mr_scope(scope, previous), do: Process.put(scope, previous)
+
+  defp claim_mr_scoped_transaction(original, tx, request, run, opts) do
+    scope = {__MODULE__, :mr_claim_preadmission}
+    %{store: ^original} = previous = Process.get(scope)
+    Process.put(scope, Map.put(previous, :transaction, tx))
+
+    try do
+      claim_mr_transaction(tx, request, run, opts)
+    after
+      Process.put(scope, previous)
     end
   end
 
@@ -145,9 +217,25 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
     end
   end
 
+  @doc false
+  @spec claim_mr_prequalified(Store.connection(), SymphonyElixir.Factory.TicketMrOwnerAdmission.t(), map()) :: {:ok, map()} | {:error, term()}
+  def claim_mr_prequalified(%DBConnection{} = connection, %SymphonyElixir.Factory.TicketMrOwnerAdmission{} = context, proof) do
+    with true <- SymphonyElixir.Factory.BrokerRuntime.owner_admission_active?(context) or {:error, :mr_owner_service_authority_required},
+         true <- context.action == :claim or {:error, :mr_owner_admission_binding_mismatch},
+         {:ok, arguments} <- DesktopToolArgs.followup(context.prepared.request),
+         {:ok, claimed} <- claim_transaction(connection, context.key, [ticket_mr_admission: %{owner_admission: context, guard: proof}], context.prepared.request) do
+      {:ok, %{request_key: claimed["request_key"], status: claimed["status"], arguments: arguments}}
+    else
+      {:error, _} = error -> error
+    end
+  end
+
+  def claim_mr_prequalified(_connection, _context, _proof), do: {:error, :mr_owner_service_authority_required}
+
   defp claim_ticket_parent(connection, request, opts) do
     with :ok <- authorize_issuance(connection, request, opts),
          :ok <- require_status(request, "PENDING"),
+         :ok <- TicketChat.creation_root_current(request, Keyword.get(opts, :ticket_policy, %{})),
          {:ok, _receipt} <- parent_guard_receipt(request, opts),
          cwd = if(request["action"] == "CREATE", do: Path.dirname(request["cwd"]), else: request["cwd"]),
          :ok <- AppServer.check_ticket_runtime(cwd) do
@@ -801,23 +889,73 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
   end
 
   @doc false
+  @spec rebind_unissued_cwd(Store.connection(), map(), String.t(), String.t()) :: {:ok, map()} | {:error, atom()}
+  def rebind_unissued_cwd(store, request, cwd, prompt) do
+    unissued = ~w(claimed_at thread_id turn_id target_observation_json verified_cwd verified_project_id verified_head_sha output_json rejected_tool_call_id failure_code)
+
+    with {:ok, current} <- get(store, request["request_key"]),
+         true <- current == request and current["target_kind"] == "TICKET_CHAT" and current["action"] == "CREATE" and current["status"] == "PENDING",
+         true <- Enum.all?(unissued, &is_nil(current[&1])),
+         true <- payload_intact?(current) do
+      rebound = current |> Map.put("cwd", cwd) |> Map.put("prompt", prompt)
+      query = "UPDATE desktop_requests SET cwd = ?, prompt = ?, payload_sha256 = ?, updated_at = ? WHERE request_key = ? AND status = 'PENDING' AND payload_sha256 = ?"
+      Store.query!(store, query, [cwd, prompt, payload_digest(rebound), now(), current["request_key"], current["payload_sha256"]])
+      get(store, current["request_key"])
+    else
+      _ -> {:error, :ticket_chat_rebind_requires_unissued_request}
+    end
+  end
+
+  @doc false
+  @spec pin_unissued_mr_actor(Store.connection(), map(), String.t()) :: {:ok, map()} | {:error, atom()}
+  def pin_unissued_mr_actor(%DBConnection{} = store, request, actor_cwd) do
+    unissued = ~w(claimed_at thread_id turn_id target_observation_json verified_cwd verified_project_id verified_head_sha output_json rejected_tool_call_id failure_code superseded_by)
+
+    with {:ok, current} <- get(store, request["request_key"]),
+         true <- current == request and current["status"] == "PENDING" and TicketMrOperation.typed_request?(current),
+         true <- Enum.all?(unissued, &is_nil(current[&1])) and payload_intact?(current),
+         true <- Store.one!(store, "SELECT request_key FROM ticket_mr_claims WHERE request_key = ?", [current["request_key"]]) == nil,
+         {:ok, metadata} <- Jason.decode(current["metadata_json"]),
+         true <- not Map.has_key?(metadata["delivery_operation"], "controller_native_cwd") do
+      metadata = put_in(metadata, ["delivery_operation", "controller_native_cwd"], actor_cwd)
+      pinned = Map.put(current, "metadata_json", Jason.encode!(metadata))
+
+      Store.query!(store, "UPDATE desktop_requests SET metadata_json = ?, payload_sha256 = ?, updated_at = ? WHERE request_key = ? AND status = 'PENDING' AND payload_sha256 = ?", [
+        pinned["metadata_json"],
+        payload_digest(pinned),
+        now(),
+        current["request_key"],
+        current["payload_sha256"]
+      ])
+
+      get(store, current["request_key"])
+    else
+      _ -> {:error, :ticket_mr_actor_requires_unissued_request}
+    end
+  end
+
+  def pin_unissued_mr_actor(_store, _request, _actor_cwd), do: {:error, :mr_actor_audit_transaction_required}
+
+  @doc false
   @spec payload_intact?(map()) :: boolean()
   def payload_intact?(request) when is_map(request) do
-    payload =
-      request
-      |> Map.take(@required_strings ++ ~w(existing_thread_id branch base_branch))
-      |> Map.put("existing_thread_id", request["existing_thread_id"])
-      |> Map.put("branch", request["branch"])
-      |> Map.put("base_branch", request["base_branch"])
-      |> Map.put("schema_json", request["schema_json"])
-      |> Map.put("metadata_json", request["metadata_json"])
-
-    request["payload_sha256"] == digest(payload)
+    request["payload_sha256"] == payload_digest(request)
   rescue
     _error -> false
   end
 
   def payload_intact?(_request), do: false
+
+  defp payload_digest(request) do
+    request
+    |> Map.take(@required_strings ++ ~w(existing_thread_id branch base_branch))
+    |> Map.put("existing_thread_id", request["existing_thread_id"])
+    |> Map.put("branch", request["branch"])
+    |> Map.put("base_branch", request["base_branch"])
+    |> Map.put("schema_json", request["schema_json"])
+    |> Map.put("metadata_json", request["metadata_json"])
+    |> digest()
+  end
 
   @doc "Lists only requests safe to issue exactly once through the Desktop broker."
   @spec list_pending(Store.connection(), pos_integer(), keyword()) :: [map()]
@@ -1310,7 +1448,7 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
 
   defp complete_transaction(connection, request_key, attrs, output_json) do
     with {:ok, request} <- get(connection, request_key),
-         :ok <- require_completion(request, attrs, output_json),
+         :ok <- require_completion_with_claim(connection, request, attrs, output_json),
          :ok <- require_unseen_turn(connection, request, attrs),
          :ok <- validate_output(request, attrs),
          :ok <- NativeWorktreeProbe.validate_completion(connection, request, attrs),
@@ -1518,12 +1656,14 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
     end
   end
 
-  defp validate_output(request, %{"output" => %{"result" => result, "completed_tool_calls" => calls}})
+  defp validate_output(request, %{"output" => %{"result" => result, "completed_tool_calls" => calls} = output})
        when is_map(result) and is_list(calls) do
     with {:ok, schema} <- Jason.decode(request["schema_json"]),
          :ok <- StageSchemas.validate(result, schema),
          {:ok, metadata} <- Jason.decode(request["metadata_json"]),
-         :ok <- validate_required_calls(Map.get(metadata, "required_tool_calls", []), calls) do
+         :ok <- validate_required_calls(Map.get(metadata, "required_tool_calls", []), calls),
+         observation = Jason.decode!(request["target_observation_json"] || "{}"),
+         :ok <- SpecialistErrorNotice.validate_render(metadata, output, observation["native_readback_sha256"]) do
       :ok
     else
       {:error, _reason} = error -> error
@@ -1583,10 +1723,12 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
 
   defp maybe_complete(connection, request, attrs, output_json) do
     with :ok <- complete_native_stage(connection, request, attrs) do
+      thread_id = if TicketMrOperation.typed_request?(request), do: attrs["thread_id"], else: request["thread_id"]
+
       Store.query!(
         connection,
-        "UPDATE desktop_requests SET status = 'SUCCEEDED', turn_id = ?, output_json = ?, failure_code = NULL, updated_at = ? WHERE request_key = ?",
-        [Map.get(attrs, "turn_id"), output_json, now(), request["request_key"]]
+        "UPDATE desktop_requests SET status = 'SUCCEEDED', thread_id = ?, turn_id = ?, output_json = ?, failure_code = NULL, updated_at = ? WHERE request_key = ?",
+        [thread_id, Map.get(attrs, "turn_id"), output_json, now(), request["request_key"]]
       )
 
       get(connection, request["request_key"])
@@ -1855,9 +1997,20 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
         )
       end
 
+      record_specialist_failure(connection, request, reason)
+
       get(connection, request_key)
     end
   end
+
+  defp record_specialist_failure(connection, %{"target_kind" => "TASK"} = request, reason) do
+    case SpecialistErrorNotice.record_task(connection, request["target_key"], request["request_key"], reason) do
+      {:ok, _notice} -> :ok
+      {:error, error} -> Exqlite.rollback(connection, error)
+    end
+  end
+
+  defp record_specialist_failure(_connection, _request, _reason), do: :ok
 
   defp require_definitive_create_rejection(request, "CREATE_THREAD_INVALID_ARGUMENTS", opts) do
     call_id = Keyword.get(opts, :rejected_tool_call_id)
@@ -2208,6 +2361,16 @@ defmodule SymphonyElixir.Factory.DesktopRequest do
         other
     end
   end
+
+  defp require_completion_with_claim(connection, %{"status" => "FOLLOWUP_UNCERTAIN"} = request, attrs, _output_json) do
+    with true <- TicketMrOperation.typed_request?(request) or {:error, {:not_completable, request["status"]}},
+         :ok <- TicketMrOperation.authorize_readback(connection, request),
+         true <- (request["thread_id"] in [nil, request["existing_thread_id"]] and attrs["thread_id"] == request["existing_thread_id"]) or {:error, :thread_route_mismatch} do
+      require_fresh_turn(request, attrs)
+    end
+  end
+
+  defp require_completion_with_claim(_connection, request, attrs, output_json), do: require_completion(request, attrs, output_json)
 
   defp require_completion(%{"status" => status} = request, attrs, output_json) when status in ["SUCCEEDED", "FAILED"] do
     if request["thread_id"] == attrs["thread_id"] and

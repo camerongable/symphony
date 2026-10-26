@@ -55,6 +55,20 @@ defmodule SymphonyElixir.FactoryTaskLauncherTest do
     end
   end
 
+  defmodule FailingObservedStageRunner do
+    def run(_workspace, _issue, _prompt, _schema, opts) do
+      opts[:on_thread_started].("thread-failed")
+      opts[:on_message].(%{event: :session_started, thread_id: "thread-failed", turn_id: "turn-failed"})
+
+      opts[:on_message].(%{
+        event: :notification,
+        payload: %{"method" => "error", "params" => %{"threadId" => "thread-failed", "turnId" => "turn-failed", "error" => %{"codexErrorInfo" => "serverOverloaded"}}}
+      })
+
+      {:error, :worker_timeout}
+    end
+  end
+
   setup do
     token = "#{System.system_time(:nanosecond)}-#{System.unique_integer([:positive])}"
     database = Path.join(System.tmp_dir!(), "factory-launcher-#{token}.sqlite")
@@ -177,6 +191,43 @@ defmodule SymphonyElixir.FactoryTaskLauncherTest do
 
     assert {:ok, %{"status" => "WAITING_FOR_BROKER", "thread_id" => "thread-visible"}} =
              TaskLedger.get(context.store, task_key)
+
+    assert Store.one!(context.store, "SELECT COUNT(*) AS count FROM events WHERE event_type = 'SPECIALIST_ERROR_RECORDED'")["count"] == 0
+  end
+
+  test "generic specification roles capture exact native errors without a worker evidence row", context do
+    for role <- ["specification-author", "specification-critic"] do
+      policy = put_in(context.policy, ["roles", role], context.policy["roles"]["feature-planner"])
+      key = "run-1:" <> role
+
+      assert {:ok, _} =
+               TaskLauncher.launch(context.store, context.supervisor, context.run, %Issue{id: "100", identifier: "PPL-123", title: "Specify"}, "/tmp/workspace", "specify it", %{"type" => "object"},
+                 task_key: key,
+                 stage: "PLANNING",
+                 role: role,
+                 model_policy: policy,
+                 recipient: self(),
+                 project_id: "project-grail",
+                 project_root: "/tmp/grail",
+                 thread_name: "PPL-123 specification",
+                 stage_runner: FailingObservedStageRunner
+               )
+
+      assert_receive {:factory_task_finished, ^key, {:error, :worker_timeout}}
+      {:ok, task} = TaskLedger.get(context.store, key)
+      assert task["status"] == "FAILED"
+      assert task["turn_id"] == "turn-failed"
+      notices = Store.query!(context.store, "SELECT payload_json FROM events WHERE event_type = 'SPECIALIST_ERROR_RECORDED' AND json_extract(payload_json, '$.task_key') = ?", [key]).rows
+      assert length(notices) == 2
+
+      for [json] <- notices do
+        notice = Jason.decode!(json)
+        assert notice["role"] == role
+        assert notice["thread_id"] == "thread-failed"
+        assert notice["turn_id"] == "turn-failed"
+        assert notice["request_key"] =~ "desktop:"
+      end
+    end
   end
 
   test "re-resolves and records the route before each persistent follow-up", context do

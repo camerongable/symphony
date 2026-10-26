@@ -1,0 +1,46 @@
+{
+  "authorization_reference": "codex://threads/01a1312f-ebaf-7203-838e-94bb6c52b114; active human-review goal authorizes canonical retirement of this proven no-Git rejection and one fresh preparation, never replay of the rejected invocation",
+  "candidate_sha": "4e5c48fc2150515c4cb5ce0771f4c204b10c532c",
+  "closed_prior_retirements": [
+    {
+      "attempt": 1,
+      "event_id": 4067,
+      "event_sha256": "2b91e3e734f8b110d5be6586960906d58f7daaadb59466d0e3211c94a644ec72",
+      "original_sha256": "807f489d6e8cb7f7a20f4eac6dbb92949081e6311c1b5cf1eed82df3f196f1a6",
+      "retirement_key": "ordinary-push-rejection:15815a05299611b023c612f900cfbbf9696ce8daab5608b54946aa106290e273"
+    },
+    {
+      "attempt": 1,
+      "event_id": 4102,
+      "event_sha256": "02b490d44dbff370eee8013e1dc113fa2f9cf152177c6f0b63425c0244eef253",
+      "original_sha256": "514a9cb02824a872e3b3335e682de2658c1a66d6ecc8caba8bff2f25ebca9f75",
+      "retirement_key": "ordinary-push-rejection:e8003fcd70ffdb20eb1ca5cdffdc97b50addc083a37842ed10c61fdf2124244f"
+    }
+  ],
+  "code_repair_round": 12,
+  "companion_path": "/Users/cgable/Library/Application Support/ai-factory/releases/symphony-generation-handoff-cnRVdUfY-r18/dev/lib/symphony_elixir/priv/worker_file_companion.py",
+  "companion_sha256": "87f3dd595ddc70205ed881b42ab5a9401b0705c13cdc8fda2c2b8b5bac4b0b3b",
+  "contract_sha256": "dffee9637fd2da9dbd9b101c028d82210cbaf3c8380e5fbff55916ae88f74c02",
+  "current_context": {
+    "candidate_sha": "4e5c48fc2150515c4cb5ce0771f4c204b10c532c",
+    "code_repair_round": 12,
+    "contract_sha256": "dffee9637fd2da9dbd9b101c028d82210cbaf3c8380e5fbff55916ae88f74c02",
+    "spec_revision": 3,
+    "state": "CI_PUSHING",
+    "verifier_round": 4
+  },
+  "execution_sha256": "d61f30c08a56eed5791c0e42772eeb84dc091f9d8fb93b8b6776895aca512cc2",
+  "expected_remote_sha": "7e74035373e7051ddbd29a7d50eb2e6902fd2ec5",
+  "helper_path": "/Users/cgable/Library/Application Support/ai-factory/releases/symphony-generation-handoff-cnRVdUfY-r18/dev/lib/symphony_elixir/priv/ticket_push_executor_v24.py",
+  "helper_pid": 70863,
+  "helper_sha256": "ebc842bc1dce0180f73c68428e14df3e540f5c25af2dcaa3b6db5fdaf86875a1",
+  "kind": "AUDITED_V24_ORDINARY_PREISSUANCE_AUTHORITY_CLOSED",
+  "ordinary_verifier_repair_sha256": "26c1d3fdb2fe416a8af3e8c9219d8ea0a384bf6a879f374339ae15cfb3384f72",
+  "original_nonce": "7629c76f04af9679fb15ae05760c391413058c7fca844271a2b798933c201e9a",
+  "original_sha256": "58c8b05efdea0192a2d7fed19b64915954ef345bdae8883d95801dd268fd2865",
+  "prior_retirement_ref": null,
+  "reason": "worker_history_changed",
+  "rejection_sha256": "fea18079465623a7180243293fe915038f5b6ef7591ac193737d0cdc4a286cda",
+  "run_id": "ab5ab1fe-32cc-48c1-985e-3c3800adcfa2",
+  "version": 3
+}

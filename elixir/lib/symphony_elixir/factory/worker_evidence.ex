@@ -1,6 +1,17 @@
 defmodule SymphonyElixir.Factory.WorkerEvidence do
   @moduledoc "Immutable attempt bindings and exact worker receipts; model completion is not adoption."
-  alias SymphonyElixir.Factory.{RunLedger, StageSchemas, Store, TaskLedger, WorkerCheckIO, WorkspaceAccess}
+  alias SymphonyElixir.Factory.{
+    ReviewProtocol,
+    RunLedger,
+    StageSchemas,
+    Store,
+    TaskLedger,
+    WorkerCheckIO,
+    WorkspaceAccess
+  }
+
+  alias SymphonyElixir.Factory.SpecialistErrorNotice
+  alias SymphonyElixir.Factory.TicketCapabilityRecovery
 
   @fields ~w(request_key task_key reservation_key input_sha256 owner_id schema policy)
 
@@ -32,6 +43,80 @@ defmodule SymphonyElixir.Factory.WorkerEvidence do
       end
     end)
   end
+
+  @doc "Reserves only a dedicated CI successor whose physical SOURCE was observed before its current transaction."
+  @spec reserve_ci_successor(Store.connection(), map(), String.t()) :: {:ok, map()} | {:error, term()}
+  def reserve_ci_successor(%DBConnection{} = tx, attrs, key) do
+    with :ok <- valid_attrs(attrs),
+         {:ok, entry} <- SymphonyElixir.Factory.TicketCiRepairSuccessor.journal(tx, key),
+         true <- {attrs["request_key"], attrs["reservation_key"]} == {entry.row["new_request_key"], entry.row["new_reservation_key"]},
+         {:ok, task} <- TaskLedger.get(tx, attrs["task_key"]),
+         true <-
+           task["task_key"] == entry.proof["prior_task"]["task_key"] and task["run_id"] == entry.row["run_id"] and task["status"] == "STARTING" and task["stage"] == "REPAIRING" and
+             task["prompt_sha256"] == attrs["input_sha256"],
+         {:ok, run} <- RunLedger.get(tx, task["run_id"]),
+         true <- run == entry.proof["run"],
+         {:ok, access} <- WorkspaceAccess.get(tx, attrs["reservation_key"]),
+         true <- access["mode"] == "SOURCE" and is_nil(access["released_at"]) and access["request_key"] == attrs["request_key"] and access["task_key"] == task["task_key"],
+         {:ok, old_access} <- WorkspaceAccess.get(tx, entry.proof["prior_access"]["reservation_key"]),
+         {:ok, transfer} <- Jason.decode(old_access["release_receipt_json"] || "null"),
+         true <-
+           transfer["kind"] == "CI_EVIDENCE_SUCCESSOR_TRANSFER_V1" and transfer["ci_evidence_successor_key"] == key and transfer["new_request_key"] == attrs["request_key"] and
+             transfer["new_reservation_key"] == access["reservation_key"] and transfer["new_generation"] == access["generation"],
+         true <- Map.take(access, ~w(run_id task_key canonical_path git_dir common_dir)) == Map.take(entry.proof["prior_access"], ~w(run_id task_key canonical_path git_dir common_dir)),
+         {:ok, original} <- decode_binding(entry.proof["prior_evidence"]["binding_json"]),
+         true <- attrs["policy"] == original["policy"] and attrs["schema"] == original["schema"] do
+      binding =
+        Map.take(task, ~w(task_key run_id role stage model reasoning_effort prompt_sha256))
+        |> Map.merge(Map.take(run, ~w(spec_revision contract_sha256)))
+        |> Map.merge(Map.take(attrs, ~w(input_sha256 schema policy)))
+        |> Map.merge(%{
+          "reservation_key" => access["reservation_key"],
+          "reservation_generation" => access["generation"],
+          "expected_sha" => run["candidate_sha"],
+          "mode" => "SOURCE",
+          "base_sha" => original["base_sha"]
+        })
+
+      reserve_binding(tx, attrs, binding)
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :ci_successor_reservation_unproven}
+    end
+  end
+
+  def reserve_ci_successor(_, _, _), do: {:error, :ci_successor_transaction_required}
+
+  @doc "Reserves only the exact TCAP transfer already admitted by a fresh owned-tick observation."
+  @spec reserve_capability(Store.connection(), map(), map()) :: {:ok, map()} | {:error, term()}
+  def reserve_capability(%DBConnection{} = tx, attrs, resume) do
+    with :ok <- valid_attrs(attrs),
+         {:ok, verified} <- TicketCapabilityRecovery.reservation_facts(tx, resume),
+         target = verified.checked["destination"],
+         true <-
+           {attrs["request_key"], attrs["reservation_key"], attrs["task_key"], attrs["input_sha256"]} ==
+             {target["request_key"], target["reservation_key"], verified.task["task_key"], target["prompt_sha256"]},
+         true <- attrs["schema"] == verified.binding["schema"] and attrs["policy"] == verified.binding["policy"] do
+      binding =
+        Map.take(verified.task, ~w(task_key run_id role stage model reasoning_effort prompt_sha256))
+        |> Map.merge(Map.take(verified.run, ~w(spec_revision contract_sha256)))
+        |> Map.merge(Map.take(attrs, ~w(input_sha256 schema policy)))
+        |> Map.merge(%{
+          "reservation_key" => verified.access["reservation_key"],
+          "reservation_generation" => verified.access["generation"],
+          "expected_sha" => verified.run["candidate_sha"],
+          "base_sha" => verified.binding["base_sha"],
+          "mode" => "SOURCE"
+        })
+
+      reserve_binding(tx, attrs, binding)
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :capability_recovery_reservation_unproven}
+    end
+  end
+
+  def reserve_capability(_, _, _), do: {:error, :capability_recovery_transaction_required}
 
   defp valid_attrs(attrs) when is_map(attrs) do
     if Map.keys(attrs) -- @fields == [] and Enum.all?(~w(request_key task_key reservation_key input_sha256 owner_id), &(is_binary(attrs[&1]) and attrs[&1] != "")) and is_map(attrs["schema"]) and
@@ -71,6 +156,14 @@ defmodule SymphonyElixir.Factory.WorkerEvidence do
   @doc false
   @spec superseded_blocked_attempt?(Store.connection(), map()) :: boolean()
   def superseded_blocked_attempt?(store, evidence) do
+    SymphonyElixir.Factory.FailedTurnRecovery.superseded?(store, evidence) or
+      SymphonyElixir.Factory.TicketInfrastructureRecovery.superseded?(store, evidence) or
+      TicketCapabilityRecovery.superseded?(store, evidence) or
+      superseded_human_rework?(store, evidence) or
+      SymphonyElixir.Factory.TicketCiRepairSuccessor.superseded?(store, evidence)
+  end
+
+  defp superseded_human_rework?(store, evidence) do
     access =
       Store.one!(
         store,
@@ -252,7 +345,7 @@ defmodule SymphonyElixir.Factory.WorkerEvidence do
     if current == expected and is_binary(pin["base_sha"]) and ready and task_ready do
       pinned_result(binding, output)
       |> then(fn
-        :ok -> StageSchemas.validate(output, StageSchemas.for_stage(:change_verifier))
+        :ok -> ReviewProtocol.validate_result(store, task, binding, output)
         error -> error
       end)
     else
@@ -409,14 +502,91 @@ defmodule SymphonyElixir.Factory.WorkerEvidence do
     end
   end
 
-  @spec reconcile_required(Store.connection(), String.t(), term()) :: {:ok, map()} | {:error, term()}
-  def reconcile_required(store, key, reason) do
-    transaction(store, fn tx ->
-      with {:ok, evidence} <- get(tx, key),
-           true <- evidence["status"] != "CONSUMED" or {:error, :worker_already_consumed} do
-        update(tx, key, "status = 'RECONCILE_REQUIRED', failure_code = ?", [inspect(reason)])
+  @spec reconcile_required(Store.connection(), String.t(), term(), map() | nil) :: {:ok, map()} | {:error, term()}
+  def reconcile_required(store, key, reason, observed \\ nil) do
+    transaction(store, &reconcile_failed_attempt(&1, key, reason, observed))
+  end
+
+  defp reconcile_failed_attempt(tx, key, reason, observed) do
+    with {:ok, evidence} <- get(tx, key),
+         true <- evidence["status"] != "CONSUMED" or {:error, :worker_already_consumed} do
+      {:ok, failed} = update(tx, key, "status = 'RECONCILE_REQUIRED', failure_code = ?", [inspect(reason)])
+
+      if failed_stop_matches?(tx, failed, observed) and is_nil(failed["owner_stopped_at"]),
+        do: update(tx, key, "owner_stopped_at = ?, owner_stop_json = ?", [now(), Jason.encode!(observed.owner_stop)])
+
+      SpecialistErrorNotice.record(tx, key, reason)
+      get(tx, failed["request_key"])
+    end
+  end
+
+  @doc "Retains a genuine bound-session or exact-turn shutdown without inventing a turn or result."
+  @spec record_failed_stop(Store.connection(), String.t(), map()) :: {:ok, map()} | {:error, term()}
+  def record_failed_stop(store, key, observed) do
+    transaction(store, &retain_failed_stop(&1, key, observed))
+  end
+
+  defp retain_failed_stop(tx, key, observed) do
+    with {:ok, evidence} <- get(tx, key),
+         true <- failed_stop_matches?(tx, evidence, observed) do
+      if evidence["owner_stopped_at"], do: {:ok, evidence}, else: update(tx, key, "owner_stopped_at = ?, owner_stop_json = ?", [now(), Jason.encode!(observed.owner_stop)])
+    else
+      _ -> {:error, :worker_failed_stop_unproven}
+    end
+  end
+
+  defp failed_stop_matches?(store, evidence, observed) when is_map(observed) do
+    evidence["status"] == "RECONCILE_REQUIRED" and
+      {observed[:thread_id], observed[:turn_id], Jason.encode!(observed[:policy])} == {evidence["thread_id"], evidence["turn_id"], evidence["policy_json"]} and
+      failed_identity_bound?(evidence) and is_nil(evidence["output_json"]) and valid_stop(store, evidence, observed[:owner_stop]) and
+      (is_nil(evidence["owner_stop_json"]) or evidence["owner_stop_json"] == Jason.encode!(observed[:owner_stop]))
+  end
+
+  defp failed_stop_matches?(_store, _evidence, _observed), do: false
+
+  defp failed_identity_bound?(%{"turn_id" => nil} = evidence),
+    do: is_binary(evidence["thread_id"]) and evidence["thread_id"] != "" and is_nil(evidence["item_id"]) and is_nil(evidence["output_sha256"])
+
+  defp failed_identity_bound?(evidence), do: is_binary(evidence["turn_id"])
+
+  @doc "Rearms only an exact pre-session resume rejection; ambiguous starts remain protected."
+  @spec rearm_rejected_resume(Store.connection(), String.t()) :: {:ok, map()} | {:error, term()}
+  def rearm_rejected_resume(store, key) do
+    transition(store, key, fn tx, evidence, binding ->
+      {:ok, task} = TaskLedger.get(tx, evidence["task_key"])
+      {:ok, run} = RunLedger.get(tx, evidence["run_id"])
+      reason = inspect({:response_error, %{"code" => -32_600, "message" => "thread #{task["thread_id"]} already has an active writer"}})
+
+      with true <- evidence["status"] == "RECONCILE_REQUIRED" and task["status"] == "STALE",
+           true <- is_binary(task["thread_id"]) and task["thread_id"] != "",
+           true <- {evidence["failure_code"], task["failure_code"]} == {reason, reason},
+           true <- {run["execution_mode"], run["state"], binding["role"], binding["mode"]} == {"TICKET_SUPERVISOR_V1", "WRITING", "feature-writer", "SOURCE"},
+           true <- Enum.all?(~w(thread_id turn_id item_id output_json output_sha256 policy_json owner_process_json owner_stopped_at owner_stop_json), &is_nil(evidence[&1])),
+           [current] <- pending(tx, evidence["run_id"]),
+           true <- current["request_key"] == key,
+           %{"n" => 0} <- Store.one!(tx, "SELECT COUNT(*) AS n FROM worker_file_operations WHERE request_key = ?", [key]),
+           {:ok, _} <- WorkspaceAccess.validate(tx, evidence["reservation_key"], binding["reservation_generation"]),
+           :ok <- resume_retry_due(task),
+           {:ok, _} <- TaskLedger.update(tx, task["task_key"], %{status: "STARTING", failure_code: nil}) do
+        Store.query!(tx, "INSERT INTO events(occurred_at, event_type, run_id, payload_json) VALUES (?, 'TICKET_WORKER_RESUME_REARMED', ?, ?)", [
+          now(),
+          evidence["run_id"],
+          Jason.encode!(%{request_key: key, task_key: task["task_key"], thread_id: task["thread_id"], prior_turn_id: task["turn_id"], failure_code: reason, binding_sha256: evidence["binding_sha256"]})
+        ])
+
+        update(tx, key, "status = 'RESERVED', failure_code = NULL", [])
+      else
+        {:error, _} = error -> error
+        _ -> {:error, :worker_resume_rejection_unproven}
       end
     end)
+  end
+
+  defp resume_retry_due(task) do
+    case DateTime.from_iso8601(task["updated_at"] || "") do
+      {:ok, at, _} -> if DateTime.diff(DateTime.utc_now(), at) >= 180, do: :ok, else: {:error, :worker_resume_retry_not_due}
+      _ -> {:error, :worker_resume_retry_time_unproven}
+    end
   end
 
   defp unseen_turn(store, key, thread, turn) do
@@ -717,7 +887,7 @@ defmodule SymphonyElixir.Factory.WorkerEvidence do
   defp now, do: DateTime.utc_now() |> DateTime.to_iso8601()
 
   defp transaction(store, fun) do
-    case Exqlite.transaction(store, fn tx -> rollback_error(tx, fun.(tx)) end) do
+    case Exqlite.transaction(store, fn tx -> rollback_error(tx, fun.(tx)) end, timeout: 60_000) do
       {:ok, result} -> result
       {:error, reason} -> {:error, reason}
     end

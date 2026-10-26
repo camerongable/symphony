@@ -11,6 +11,9 @@ the existing safety boundaries, and execute its gates in order.
 | [001](001-ticket-supervisor-workers.md) | Introduce one ticket chat with bounded role workers | P1 | L | Historical foundation | REJECTED as active ownership design; retain accepted foundations, do not rerun |
 | [002](002-correlate-worker-turn-events.md) | Preserve and correlate exact worker-turn events | P1 | M | Historical committed foundation | IN PROGRESS — foundation exists; current runtime acceptance belongs to 006 |
 | [006](006-complete-desktop-ticket-chat.md) | Complete ordinary Desktop ticket-chat integration; gate required manual validation separately | P1 | L | Current dirty Slices 1–3 and capability gates | IN PROGRESS — ordinary `Required: no` path authorized; Required: yes remains gated |
+| [007](007-complete-verifier-repair-cycle.md) | Complete retained-history verifier repair and current-status reporting | P0 | L | Copied deployed-source baseline and 80 passing focused checks | DONE — scoped local deployment00:50UTC20Oct; three packaged cases and independent preservation accepted; full quality limits remain |
+| [008](008-complete-mr-receipts-and-ten-attempts.md) | Complete typed MR receipts, ten total attempts and ordinary generated-build handoff | P0 | L | Deployed007 scoped fix | DONE — scoped local deployment20Oct07:35UTC; preserved7spent, normal8thSOURCEgen39/native activity independently verified; ticket repair/CI/delivery not yet proven; existing full-quality limits remain |
+| [009](009-bound-push-receipt-readback.md) | Recover bounded push receipts without repeating issuance | P0 | M | Deployed008 | IN PROGRESS — actual push remote-confirmed;262236byte receipt exceeds old262144 reader cap; new bounded readonly recovery candidate required |
 
 Plan 006 was added on 2026-10-04 at HEAD `52a978818875c59ccf2758ed1b728bb23e33f631`.
 Its checksum manifest also pins selected dirty/untracked source: HEAD alone is insufficient.

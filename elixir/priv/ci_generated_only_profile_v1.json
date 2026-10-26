@@ -1,0 +1,1 @@
+{"version":1,"kind":"CI_GENERATED_ONLY_V1","language":"go","diagnostic":"strict_dependencies","maximum_go_files":16,"build_names":["BUILD","BUILD.bazel"],"require_existing_tracked_regular":true,"operation":"GAZELLE_DIFF","require_no_edit_complete":true}

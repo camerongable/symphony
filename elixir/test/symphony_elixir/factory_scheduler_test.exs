@@ -2387,7 +2387,8 @@ defmodule SymphonyElixir.FactorySchedulerTest do
           Contract.bind("PPL-123", 1, "## Manual Validation\n- Required: maybe")
         ] do
       Process.put(:factory_controller_response, intake_response(authorized_snapshot(contract, ["ai-ready", "repo-grail"])))
-      assert {:error, {:delivery_registration_failed, _reason}} = tick(context)
+      assert {:ok, rejected} = tick(context)
+      assert Enum.any?(rejected.events, &(&1.issue_key == "PPL-123" and &1.event == "INTAKE_BLOCKED" and &1.detail == :manual_validation_contract_missing))
       assert RunLedger.list(ctx.store) == []
       assert_no_ticket_admission_effects(ctx.store)
     end
@@ -2495,6 +2496,41 @@ defmodule SymphonyElixir.FactorySchedulerTest do
       assert Store.query!(ctx.store, "SELECT * FROM ticket_chats").rows == []
       assert Store.query!(ctx.store, "SELECT * FROM desktop_requests").rows == []
     end
+  end
+
+  test "missing manual-validation declaration rejects only that intake rather than the whole tick", ctx do
+    context = ticket_registration_context(ctx)
+    bad = Contract.bind("PPL-123", 1, "An authorized scope missing its Manual Validation declaration.")
+    Process.put(:factory_controller_response, intake_response(authorized_snapshot(bad, ["ai-ready", "repo-grail"])))
+    assert {:ok, result} = tick(context)
+    assert Enum.any?(result.events, &(&1.issue_key == "PPL-123" and &1.event == "INTAKE_BLOCKED"))
+    assert RunLedger.list(ctx.store) == []
+    assert_no_ticket_admission_effects(ctx.store)
+    control = start_supervised!({SymphonyElixir.Factory.ControlServer, store: ctx.store, factory: Map.put(context.factory, :lease_seconds, 240), name: nil})
+    saved = SymphonyElixir.Factory.Observability.snapshot(settings: %{factory: context.factory}, store: ctx.store, control_server: control)
+    assert saved.available
+    assert [%{issue_key: "PPL-123", local_state: "INTAKE_BLOCKED", admission_error: %{code: "manual_validation_contract_missing"}}] = saved.intake.issues
+    assert saved.overview.by_issue["PPL-123"] == "NEEDS_ATTENTION"
+    good = Contract.bind("PPL-123", 2, "## Manual Validation\n- Required: no")
+    Process.put(:factory_controller_response, intake_response(authorized_snapshot(good, ["ai-ready", "repo-grail"])))
+    assert {:ok, _} = tick(context)
+    assert [%{"state" => "ADMITTING_WRITER", "spec_revision" => 2}] = RunLedger.list(ctx.store)
+    assert {:ok, %{decisions: %{}}} = IntakeLedger.get(ctx.store, context.factory.scope)
+  end
+
+  test "missing validation in one queued ticket cannot starve another authorized ticket", ctx do
+    context = ticket_registration_context(ctx)
+    context = put_in(context.factory.ticket_supervisor["pilot_issue_keys"], ["PPL-123", "PPL-124"])
+    bad = authorized_snapshot(Contract.bind("PPL-123", 1, "Missing validation declaration."), ["ai-ready", "repo-grail"])
+    good = authorized_snapshot(Contract.bind("PPL-124", 1, "## Manual Validation\n- Required: no"), ["ai-ready", "repo-grail"]) |> Map.merge(%{"key" => "PPL-124", "id" => "101"})
+    Process.put(:factory_controller_response, %{intake_response(bad) | "snapshot_json" => Jason.encode!([bad, good])})
+    assert {:ok, result} = tick(context)
+    assert Enum.any?(result.events, &(&1.issue_key == "PPL-123" and &1.event == "INTAKE_BLOCKED"))
+    assert [%{"issue_key" => "PPL-124", "state" => "ADMITTING_WRITER"}] = RunLedger.list(ctx.store)
+    assert Enum.any?(result.events, &(&1.issue_key == "PPL-124" and &1.event == "TICKET_PARENT_PENDING"))
+    assert Store.one!(ctx.store, "SELECT COUNT(*) AS n FROM ticket_chats")["n"] == 1
+    assert Store.query!(ctx.store, "SELECT * FROM workspace_access").rows == []
+    refute_received {:jira_write_options, _}
   end
 
   defp ticket_registration_context(ctx) do

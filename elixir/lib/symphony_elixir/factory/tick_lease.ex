@@ -11,13 +11,13 @@ defmodule SymphonyElixir.Factory.TickLease do
   Runs a function when factory control is disabled or when the exact dispatcher
   acquires the lease. The acquired tick is always released in an `after` path.
   """
-  @spec run(struct() | map(), (-> result), keyword()) :: {:ran, result} | {:skipped, String.t()}
+  @spec run(struct() | map(), (-> result) | (map() | nil -> result), keyword()) :: {:ran, result} | {:skipped, String.t()}
         when result: var
-  def run(factory, fun, opts \\ []) when is_function(fun, 0) do
+  def run(factory, fun, opts \\ []) when is_function(fun, 0) or is_function(fun, 1) do
     if Map.get(factory, :enabled, false) do
       run_controlled(factory, fun, Keyword.delete(opts, :recovery_only))
     else
-      {:ran, fun.()}
+      {:ran, invoke(fun, nil)}
     end
   end
 
@@ -35,9 +35,11 @@ defmodule SymphonyElixir.Factory.TickLease do
     acquire = if opts[:recovery_only], do: &ControlServer.acquire_recovery_tick/2, else: &ControlServer.acquire_tick/2
 
     case call_control(fn -> acquire.(dispatcher_id, control_server) end) do
-      %{result: "ACQUIRED", tick_id: tick_id} ->
+      %{result: "ACQUIRED", tick_id: tick_id, generation: generation} ->
+        binding = if opts[:recovery_only], do: nil, else: %{"scope" => factory.scope, "dispatcher_id" => dispatcher_id, "generation" => generation, "tick_id" => tick_id}
+
         try do
-          run_with_renewal(factory, fun, control_server, dispatcher_id, tick_id, opts)
+          run_with_renewal(factory, fn -> invoke(fun, binding) end, control_server, dispatcher_id, tick_id, opts)
         after
           release_tick(control_server, dispatcher_id, tick_id)
         end
@@ -55,7 +57,23 @@ defmodule SymphonyElixir.Factory.TickLease do
     end
   end
 
+  defp invoke(fun, binding) when is_function(fun, 1), do: fun.(binding)
+  defp invoke(fun, _binding), do: fun.()
+
   defp run_with_renewal(factory, fun, control_server, dispatcher_id, tick_id, opts) do
+    lease_ms = Map.get(factory, :lease_seconds, 240) * 1_000
+    renewal_interval_ms = Keyword.get(opts, :renewal_interval_ms, max(div(lease_ms, 3), 100))
+
+    if is_integer(renewal_interval_ms) and renewal_interval_ms > 0 and renewal_interval_ms < lease_ms - 1 do
+      # Adoption can hold the shared connection for 60s; both waits must fit before lease expiry.
+      renewal_timeout_ms = min(65_000, min(div(lease_ms, 3), lease_ms - renewal_interval_ms - 1))
+      run_tick(fun, control_server, dispatcher_id, tick_id, opts[:recovery_only] == true, renewal_interval_ms, renewal_timeout_ms)
+    else
+      {:ran, {:error, :invalid_tick_renewal_interval}}
+    end
+  end
+
+  defp run_tick(fun, control_server, dispatcher_id, tick_id, recovery, renewal_interval_ms, renewal_timeout_ms) do
     caller = self()
     result_ref = make_ref()
 
@@ -71,12 +89,7 @@ defmodule SymphonyElixir.Factory.TickLease do
         send(caller, {result_ref, outcome})
       end)
 
-    lease_seconds = Map.get(factory, :lease_seconds, 240)
-
-    renewal_interval_ms =
-      Keyword.get(opts, :renewal_interval_ms, max(div(lease_seconds * 1_000, 3), 100))
-
-    renewer = fn -> renew_tick(control_server, dispatcher_id, tick_id, opts[:recovery_only] == true) end
+    renewer = fn -> renew_tick(control_server, dispatcher_id, tick_id, recovery, renewal_timeout_ms) end
 
     await_result(
       pid,
@@ -125,9 +138,9 @@ defmodule SymphonyElixir.Factory.TickLease do
     end
   end
 
-  defp renew_tick(control_server, dispatcher_id, tick_id, recovery) do
-    renew = if recovery, do: &ControlServer.renew_recovery_tick/3, else: &ControlServer.renew_tick/3
-    call_control(fn -> renew.(dispatcher_id, tick_id, control_server) end)
+  defp renew_tick(control_server, dispatcher_id, tick_id, recovery, timeout) do
+    renew = if recovery, do: &ControlServer.renew_recovery_tick/4, else: &ControlServer.renew_tick/4
+    call_control(fn -> renew.(dispatcher_id, tick_id, control_server, timeout) end)
   end
 
   defp await_down(monitor_ref, pid) do

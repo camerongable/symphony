@@ -10,18 +10,20 @@ defmodule SymphonyElixir.Factory.ControllerCi do
 
   def bind(run, %{"mr" => mr, "pipeline" => pipeline, "jobs" => jobs, "merge_commit" => commit} = snapshots, project_id)
       when is_map(mr) and is_list(jobs) and length(jobs) <= 100 do
-    with true <- Enum.sort(Map.keys(snapshots)) == ~w(jobs merge_commit mr pipeline) or {:error, :invalid_ci_snapshots},
+    with true <- Enum.sort(Map.keys(snapshots)) in [~w(jobs merge_commit mr pipeline), ~w(jobs merge_commit mr pipeline pipeline_selector)] or {:error, :invalid_ci_snapshots},
          true <- containers?(mr, jobs) or {:error, :invalid_ci_snapshots},
          :ok <- mr_binding(run, mr, project_id),
          {:ok, source} <- pipeline_binding(run, mr, pipeline, commit),
-         :ok <- current_pipeline(mr, pipeline),
+         :ok <- current_pipeline(run, mr, pipeline, snapshots, project_id),
          :ok <- jobs_binding(pipeline, jobs),
          {:ok, status, findings} <- verdict(pipeline, jobs) do
       {:ok,
        Map.merge(mr_fields(mr), pipeline_fields(pipeline))
+       |> Map.merge(if(Map.has_key?(snapshots, "pipeline_selector"), do: Map.take(snapshots, ["pipeline_selector"]), else: %{}))
        |> Map.merge(%{
          "status" => status,
          "required_jobs" => Enum.filter(jobs, &(&1["name"] == "bazel" and &1["allow_failure"] == false)) |> Enum.map(&Map.take(&1, ~w(id name status web_url))),
+         "failed_jobs" => Enum.filter(jobs, &(&1["allow_failure"] == false and &1["status"] in ~w(failed canceled canceling))) |> Enum.map(&Map.take(&1, ~w(id name status web_url))),
          "findings" => findings,
          "source_binding" => source
        })}
@@ -29,6 +31,87 @@ defmodule SymphonyElixir.Factory.ControllerCi do
   end
 
   def bind(_run, _snapshots, _pin), do: {:error, :invalid_ci_snapshots}
+
+  @doc "Selects the unique newest record from a complete bounded MR pipeline listing, never by status or candidate."
+  @spec pipeline_list_selector(map(), pos_integer(), [map()]) :: {:ok, map()} | {:error, term()}
+  def pipeline_list_selector(run, project_id, pipelines) when is_list(pipelines) and length(pipelines) <= 100 do
+    fields = ~w(id sha ref status created_at project_id source)
+
+    with true <- is_integer(project_id) and project_id > 0 and is_integer(run["mr_iid"]) and run["mr_iid"] > 0,
+         true <- Enum.all?(pipelines, &(is_map(&1) and Map.keys(&1) -- fields == [] and listing_record?(&1, project_id))),
+         ids = Enum.map(pipelines, & &1["id"]),
+         true <- Enum.uniq(ids) == ids,
+         {:ok, selected} <- newest_pipeline(pipelines) do
+      ordered = Enum.sort_by(pipelines, & &1["id"])
+      selected_row = Enum.find(ordered, &(&1["id"] == selected))
+
+      {:ok,
+       %{
+         "kind" => "MR_PIPELINE_LIST_V1",
+         "project_id" => project_id,
+         "mr_iid" => run["mr_iid"],
+         "complete_pages" => [1, 2],
+         "before" => ordered,
+         "after" => ordered,
+         "selected_pipeline_id" => selected,
+         "selected_created_at" => if(selected_row, do: selected_row["created_at"], else: nil)
+       }}
+    else
+      _ -> {:error, :ci_mr_pipeline_selector_unproven}
+    end
+  end
+
+  def pipeline_list_selector(_run, _project_id, _pipelines), do: {:error, :ci_mr_pipeline_selector_unproven}
+
+  defp listing_record?(row, project_id) do
+    is_integer(row["id"]) and row["id"] > 0 and sha?(row["sha"]) and present?(row["ref"]) and present?(row["status"]) and
+      listing_time(row["created_at"]) != nil and (not Map.has_key?(row, "project_id") or row["project_id"] == project_id) and
+      (not Map.has_key?(row, "source") or present?(row["source"]))
+  end
+
+  defp listing_time(value) when is_binary(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, timestamp, _} -> DateTime.to_unix(timestamp, :microsecond)
+      _ -> nil
+    end
+  end
+
+  defp listing_time(_value), do: nil
+  defp newest_pipeline([]), do: {:ok, nil}
+
+  defp newest_pipeline(pipelines) do
+    newest = pipelines |> Enum.map(&listing_time(&1["created_at"])) |> Enum.max()
+
+    case Enum.filter(pipelines, &(listing_time(&1["created_at"]) == newest)) do
+      [pipeline] -> {:ok, pipeline["id"]}
+      _ -> {:error, :ci_mr_pipeline_selector_unproven}
+    end
+  end
+
+  defp current_pipeline(run, mr, pipeline, %{"pipeline_selector" => selector}, project_id) when is_map(selector) do
+    with false <- Map.has_key?(mr, "head_pipeline"),
+         {:ok, expected} <- pipeline_list_selector(run, project_id, selector["before"]),
+         true <- selector == expected,
+         :ok <- selected_pipeline(selector, pipeline) do
+      :ok
+    else
+      _ -> {:error, :ci_mr_pipeline_selector_unproven}
+    end
+  end
+
+  defp current_pipeline(_run, _mr, _pipeline, %{"pipeline_selector" => _}, _project_id), do: {:error, :ci_mr_pipeline_selector_unproven}
+  defp current_pipeline(_run, mr, pipeline, _snapshots, _project_id), do: current_pipeline(mr, pipeline)
+  defp selected_pipeline(%{"selected_pipeline_id" => nil, "before" => [], "after" => []}, nil), do: :ok
+
+  defp selected_pipeline(selector, pipeline) when is_map(pipeline) do
+    row = Enum.find(selector["before"], &(&1["id"] == selector["selected_pipeline_id"]))
+
+    if is_map(row) and Map.take(pipeline, Map.keys(row)) == row,
+      do: :ok,
+      else: {:error, :ci_mr_pipeline_selector_unproven}
+  end
+
+  defp selected_pipeline(_selector, _pipeline), do: {:error, :ci_mr_pipeline_selector_unproven}
 
   defp containers?(mr, jobs) do
     object_list?(mr["assignees"]) and object_list?(mr["reviewers"]) and

@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "kind": "AUDITED_V7_PREISSUANCE_AUTHORITY_CLOSED",
+  "run_id": "ab5ab1fe-32cc-48c1-985e-3c3800adcfa2",
+  "candidate_sha": "e0b6d51a006db299525ae1c6fdd062f6f9d7b71a",
+  "contract_sha256": "dffee9637fd2da9dbd9b101c028d82210cbaf3c8380e5fbff55916ae88f74c02",
+  "code_repair_round": 5,
+  "original_nonce": "aaced70849a1a63e5845bbe43f1d2e0c5d875721e9ffe88569e95b8aa81559c7",
+  "original_sha256": "5cbd19e39d38f5497b8e9ad740e86e4c45674aad5bf047565f860e4e61a0d2c1",
+  "execution_sha256": "824dda5eca3e4360595c8c1300b4eaf94c6fd356fefcb7f5f5efc157638aec02",
+  "helper_pid": 66657,
+  "helper_path": "/Users/cgable/Library/Application Support/ai-factory/releases/symphony-empty-child-v1-adb105bb13/dev/lib/symphony_elixir/priv/ticket_push_executor_v7.py",
+  "helper_sha256": "0a508832da9ae8dac08f4a7eabcf7699f9ce395a9355af2b67f8f10da514db2d",
+  "companion_path": "/Users/cgable/Library/Application Support/ai-factory/releases/symphony-empty-child-v1-adb105bb13/dev/lib/symphony_elixir/priv/worker_file_companion.py",
+  "companion_sha256": "87f3dd595ddc70205ed881b42ab5a9401b0705c13cdc8fda2c2b8b5bac4b0b3b",
+  "rejection_sha256": "44a1907a497d3028170c58043c483e6a3e4165c9b4c689592bb36b6e5a399a82",
+  "reason": "ci_evidence_successor_changed",
+  "expected_remote_sha": "fa8a340b5fe2bd3b9ba984ea9960ac810beac910"
+}

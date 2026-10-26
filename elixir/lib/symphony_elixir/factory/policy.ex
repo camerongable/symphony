@@ -3,7 +3,7 @@ defmodule SymphonyElixir.Factory.Policy do
   Fail-closed startup validation for the complete factory control plane.
   """
 
-  alias SymphonyElixir.Factory.{ModelRouter, Queue}
+  alias SymphonyElixir.Factory.{ModelRouter, Queue, TicketCompletionConfirmation}
 
   @explicit_roles ~w(
     orchestrator orchestrator-intake specification-author specification-critic feature-planner
@@ -35,11 +35,15 @@ defmodule SymphonyElixir.Factory.Policy do
       not is_boolean(enabled) -> {:error, :invalid_ticket_supervisor_policy}
       not is_boolean(value(policy, "all_eligible_tickets", false)) -> {:error, :invalid_ticket_supervisor_policy}
       not valid_string_list?(pilot_issue_keys) -> {:error, :invalid_ticket_supervisor_policy}
+      not valid_completion_confirmations?(policy) -> {:error, :invalid_source_completion_confirmations}
       true -> :ok
     end
   end
 
   defp validate_ticket_supervisor(_policy), do: {:error, :invalid_ticket_supervisor_policy}
+
+  defp valid_completion_confirmations?(policy),
+    do: TicketCompletionConfirmation.valid_policy?(value(policy, "source_completion_confirmations", %{}))
 
   @doc "Selects the ticket route without widening queue or contract eligibility."
   @spec ticket_selected?(map(), String.t()) :: boolean()

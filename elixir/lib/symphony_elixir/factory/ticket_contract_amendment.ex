@@ -4,6 +4,7 @@ defmodule SymphonyElixir.Factory.TicketContractAmendment do
   alias Exqlite
   alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.Factory.{Contract, ModelRouter, Prompt, RunLedger, StageSchemas, Store, TaskLedger}
+  alias SymphonyElixir.Factory.SpecialistErrorNotice
   alias SymphonyElixir.Factory.{TicketAmendmentJiraOperation, TicketChatCommands, TicketMrOperation}
   alias SymphonyElixir.Factory.{WorkerEvidence, WorkspaceAccess}
   alias SymphonyElixir.PathSafety
@@ -353,8 +354,10 @@ defmodule SymphonyElixir.Factory.TicketContractAmendment do
   def reconcile_critic(store, command_key, controller_context, reason, observation \\ %{}) do
     transaction(store, fn tx ->
       with {:ok, _validated, _amendment, attempt} <- current_critic_attempt(tx, command_key, controller_context),
-           true <- is_map(observation) or {:error, :critic_observation_invalid} do
-        persist_critic_reconciliation(tx, attempt, reason, observation)
+           true <- is_map(observation) or {:error, :critic_observation_invalid},
+           {:ok, reconciled} <- persist_critic_reconciliation(tx, attempt, reason, observation),
+           {:ok, _notice} <- SpecialistErrorNotice.record_critic(tx, command_key, reason) do
+        {:ok, reconciled}
       end
     end)
   end

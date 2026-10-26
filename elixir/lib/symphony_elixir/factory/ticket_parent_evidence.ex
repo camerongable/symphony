@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.Factory.TicketParentEvidence do
   @moduledoc "Exact completed delegation provenance; persisted history never attests live idle ownership."
 
-  alias SymphonyElixir.Factory.DesktopRequest
+  alias SymphonyElixir.Factory.{DesktopRequest, SpecialistErrorNotice}
 
   @spec observe(map(), String.t(), map()) :: {:ok, map()} | {:error, term()}
   def observe(request, broker, native) when is_map(native) and is_binary(broker) do
@@ -12,7 +12,8 @@ defmodule SymphonyElixir.Factory.TicketParentEvidence do
          :ok <- validate_parent(request, native),
          {:ok, tool} <- expected_tool(request),
          {:ok, turn, item} <- exact_invocation(native["turns"], tool, wrapper_variants(broker, request["prompt"])),
-         :ok <- validate_timestamps(request, turn) do
+         :ok <- validate_timestamps(request, turn),
+         {:ok, rendered_notice} <- rendered_notice(metadata, turn, digest(native)) do
       {:ok,
        %{
          "request_key" => request["request_key"],
@@ -28,6 +29,7 @@ defmodule SymphonyElixir.Factory.TicketParentEvidence do
          "completed_at" => turn["completedAt"],
          "readback_sha256" => digest(native),
          "invocation_sha256" => digest(item),
+         "rendered_specialist_notice" => rendered_notice,
          "status" => "OBSERVED_COMPLETED",
          "history_complete" => full_history?(native),
          "live_idle_attested" => false
@@ -39,6 +41,39 @@ defmodule SymphonyElixir.Factory.TicketParentEvidence do
   end
 
   def observe(_request, _broker, _native), do: {:error, :parent_native_readback_invalid}
+
+  @doc "Exposes the target's recorded empty inventory as historical evidence, never current attachment state."
+  @spec attachment_observation(map(), map()) :: {:ok, map()} | {:error, atom()}
+  def attachment_observation(native, receipt) do
+    with true <- receipt["readback_sha256"] == digest(native) and full_history?(native),
+         calls <- for(turn <- native["turns"], item <- turn["items"], item["type"] == "mcpToolCall" and item["server"] == "codex_app" and item["tool"] == "list_artifacts", do: {turn, item}),
+         [{turn, item}] <- calls,
+         true <- turn["status"] == "completed" and is_number(turn["completedAt"]),
+         false <- Enum.any?(native["turns"], &attachment_mutation?/1),
+         [_] <- empty_artifact_call([item]) do
+      {:ok,
+       %{
+         "historical" => true,
+         "turn_id" => turn["id"],
+         "item_id" => item["id"],
+         "completed_at" => turn["completedAt"],
+         "native_readback_sha256" => receipt["readback_sha256"],
+         "observation" => Map.take(item, ~w(server tool arguments result))
+       }}
+    else
+      _ -> {:error, :parent_attachment_history_unproven}
+    end
+  end
+
+  defp attachment_mutation?(turn) do
+    Enum.any?(turn["items"], fn item ->
+      type = item["type"] || ""
+      tool = String.downcase(item["tool"] || item["name"] || "")
+
+      String.contains?(tool, "worktree") or tool in ~w(handoff_thread move_thread_to_project) or
+        String.starts_with?(type, "collabAgent") or String.contains?(String.downcase(type), "worktree")
+    end)
+  end
 
   @doc "Extracts a bounded final result from the already attested completed native turn."
   @spec completion(map(), map()) :: {:ok, map()} | {:error, atom()}
@@ -66,6 +101,7 @@ defmodule SymphonyElixir.Factory.TicketParentEvidence do
         end
 
       output = %{"result" => result, "completed_tool_calls" => calls}
+      output = add_rendered_notice(output, receipt["rendered_specialist_notice"])
       output = if include_bootstrap_evidence?, do: Map.merge(output, %{"bootstrap_evidence" => bootstrap_evidence, "native_readback_sha256" => receipt["readback_sha256"]}), else: output
 
       completion = %{
@@ -80,8 +116,24 @@ defmodule SymphonyElixir.Factory.TicketParentEvidence do
     end
   end
 
+  defp add_rendered_notice(output, nil), do: output
+  defp add_rendered_notice(output, proof), do: Map.put(output, "rendered_specialist_notice", proof)
+
   defp valid_acknowledgment_result?(acknowledged, result),
     do: is_boolean(acknowledged) and Map.keys(result) == ["acknowledged"]
+
+  defp rendered_notice(%{"specialist_notice_text" => text, "specialist_notice_ids" => ids} = metadata, turn, readback_sha) do
+    with [final] <- Enum.filter(turn["items"], &(&1["type"] == "agentMessage" and &1["phase"] == "final_answer")),
+         true <- final["text"] == text <> "\n{\"acknowledged\":true}" do
+      text_sha = :crypto.hash(:sha256, text) |> Base.encode16(case: :lower)
+      proof = %{"notice_ids" => ids, "text_sha256" => text_sha, "native_readback_sha256" => readback_sha}
+      with :ok <- SpecialistErrorNotice.validate_render(metadata, %{"rendered_specialist_notice" => proof}, readback_sha), do: {:ok, proof}
+    else
+      _ -> {:error, :specialist_notice_render_unproven}
+    end
+  end
+
+  defp rendered_notice(_metadata, _turn, _readback), do: {:ok, nil}
 
   defp empty_artifact_call(items) do
     case Enum.find(items, fn
@@ -238,6 +290,13 @@ defmodule SymphonyElixir.Factory.TicketParentEvidence do
   defp wrapper_variants(broker, prompt) do
     [wrapper(broker, prompt), wrapper(broker, escape_xml_text(prompt))] |> Enum.uniq()
   end
+
+  @doc false
+  @spec delegation_item?(map(), String.t(), String.t()) :: boolean()
+  def delegation_item?(%{"type" => "functionCallOutput", "namespace" => "codex_app", "name" => "send_message_to_thread", "output" => output}, broker, prompt),
+    do: output in wrapper_variants(broker, prompt)
+
+  def delegation_item?(_, _, _), do: false
 
   defp escape_xml_text(text) do
     text

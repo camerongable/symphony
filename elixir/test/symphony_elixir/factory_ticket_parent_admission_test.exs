@@ -69,14 +69,18 @@ defmodule SymphonyElixir.FactoryTicketParentAdmissionTest do
     assert reader["cwd"] == ctx.opts[:ticket_cli_root]
     assert reader["workflow"] == ctx.opts[:ticket_workflow]
     assert reader["arguments"] == ["context", "new-run", "--workflow", ctx.opts[:ticket_workflow]]
-    assert reader["command"] =~ "mix run --no-compile --no-start"
+    assert reader["command"] =~ "./scripts/factory-broker ticket context"
+    refute reader["command"] =~ "mix run"
     assert request["prompt"] =~ chat["context_reader_json"]
     assert request["prompt"] =~ "You may stage only an explicit command from that direct human message"
     assert {:ok, ^before} = RunLedger.get(ctx.store, "new-run")
     assert Store.query!(ctx.store, "SELECT * FROM factory_tasks").rows == tasks
     assert Store.query!(ctx.store, "SELECT * FROM worker_evidence").rows == []
     assert Store.query!(ctx.store, "SELECT * FROM workspace_access").rows == []
-    assert length(File.read!(ctx.runtime_trace) |> String.split("\n", trim: true)) == 1
+    methods = ctx.runtime_trace |> File.read!() |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!(&1)["method"])
+    assert Enum.count(methods, &(&1 == "initialize")) == 1
+    assert Enum.count(methods, &(&1 == "initialized")) <= 1
+    assert Enum.all?(methods, &(&1 in ~w(initialize initialized)))
     assert {:ok, reopened} = Store.start_link(database: ctx.database)
 
     try do
@@ -280,6 +284,26 @@ defmodule SymphonyElixir.FactoryTicketParentAdmissionTest do
     assert chat["broker_thread_id"] == nil
   end
 
+  test "dated deployment explicitly rehomes only the unissued reservation and retains issued cwd", ctx do
+    {:ok, original} = Scheduler.ticket_parent_step(ctx.context, "new-run", ctx.opts)
+    {:ok, run} = RunLedger.get(ctx.store, "new-run")
+    dated = Path.join(ctx.root, "desktop/{date}")
+    opts = Keyword.put(ctx.opts, :parent_output_root, dated)
+    assert {:ok, rebound} = Scheduler.ticket_parent_step(ctx.context, "new-run", opts)
+    assert rebound.request_key == original.request_key
+    assert {:ok, request} = DesktopRequest.get(ctx.store, rebound.request_key)
+    assert Path.dirname(request["cwd"]) == TicketChat.output_root(dated)
+    assert request["prompt"] =~ "./scripts/factory-broker ticket context"
+    refute File.exists?(request["cwd"])
+    assert {:ok, ^run} = RunLedger.get(ctx.store, "new-run")
+    Store.query!(ctx.store, "UPDATE desktop_requests SET status = 'CREATE_UNCERTAIN', claimed_at = ? WHERE request_key = ?", [DateTime.to_iso8601(DateTime.utc_now()), rebound.request_key])
+    other_day = Path.join(ctx.root, "another-day/{date}")
+    assert {:ok, _} = Scheduler.ticket_parent_step(ctx.context, "new-run", Keyword.put(opts, :parent_output_root, other_day))
+    assert {:ok, issued} = DesktopRequest.get(ctx.store, rebound.request_key)
+    assert issued["cwd"] == request["cwd"]
+    assert issued["payload_sha256"] == request["payload_sha256"]
+  end
+
   test "reader binds the current ledger and rejects changed or malformed command locators", ctx do
     assert {:ok, locator} = TicketContextReader.bind(ctx.store, "new-run", ctx.opts)
     assert :ok = TicketContextReader.validate(ctx.store, "new-run", locator)
@@ -303,9 +327,8 @@ defmodule SymphonyElixir.FactoryTicketParentAdmissionTest do
     command = locator["command"]
     refute command =~ ">"
     assert command == String.replace(command, ">", "&gt;")
-    expression = command |> String.split(" -e '", parts: 2) |> List.last() |> String.trim_trailing("'")
-    assert {:ok, _} = Code.string_to_quoted(expression)
-    [_, encoded] = Regex.run(~r/Base.decode64!\("([A-Za-z0-9+\/=]+)"\)/, command)
+    assert OptionParser.split(command) == ["./scripts/factory-broker", "ticket" | locator["arguments"]]
+    encoded = locator["arguments"] |> Jason.encode!() |> Base.encode64()
     legacy_command = "mise exec -- mix run --no-compile --no-start -e 'Mix.Tasks.Factory.Ticket.run(Base.decode64!(\"#{encoded}\") |> Jason.decode!())'"
     legacy = locator |> Map.put("command", legacy_command) |> Jason.encode!()
     assert :ok = TicketContextReader.validate(ctx.store, "new-run", legacy)
@@ -317,7 +340,7 @@ defmodule SymphonyElixir.FactoryTicketParentAdmissionTest do
   test "bound legacy locator bytes survive rebinding without changing chat identity", ctx do
     assert {:ok, json} = TicketContextReader.bind(ctx.store, "run", ctx.opts)
     locator = Jason.decode!(json)
-    [_, encoded] = Regex.run(~r/Base.decode64!\("([A-Za-z0-9+\/=]+)"\)/, locator["command"])
+    encoded = locator["arguments"] |> Jason.encode!() |> Base.encode64()
     legacy_command = "mise exec -- mix run --no-compile --no-start -e 'Mix.Tasks.Factory.Ticket.run(Base.decode64!(\"#{encoded}\") |> Jason.decode!())'"
     legacy = locator |> Map.put("command", legacy_command) |> Jason.encode!()
     Store.query!(ctx.store, "UPDATE ticket_chats SET context_reader_json = ? WHERE chat_key = ?", [legacy, ctx.chat["chat_key"]])
@@ -329,12 +352,11 @@ defmodule SymphonyElixir.FactoryTicketParentAdmissionTest do
     assert Store.one!(ctx.store, "SELECT context_reader_json FROM ticket_chats WHERE chat_key = ?", [ctx.chat["chat_key"]])["context_reader_json"] == legacy
   end
 
-  test "reader encodes arguments instead of interpolating executable shell or Elixir text", ctx do
+  test "reader quotes literal arguments instead of interpolating executable shell or Elixir text", ctx do
     assert {:ok, json} = TicketContextReader.bind(ctx.store, "run'$(false)", ctx.opts)
     reader = Jason.decode!(json)
-    refute reader["command"] =~ "$(false)"
-    [_, encoded] = Regex.run(~r/Base.decode64!\("([A-Za-z0-9+\/=]+)"\)/, reader["command"])
-    assert encoded |> Base.decode64!() |> Jason.decode!() == reader["arguments"]
+    assert OptionParser.split(reader["command"]) == ["./scripts/factory-broker", "ticket" | reader["arguments"]]
+    assert reader["command"] =~ "'run'\"'\"'$(false)'"
     assert Enum.at(reader["arguments"], 1) == "run'$(false)"
     assert TicketContextReader.instructions(nil) =~ "do not present the incoming snapshot as fresh"
   end
@@ -349,9 +371,9 @@ defmodule SymphonyElixir.FactoryTicketParentAdmissionTest do
     assert instructions =~ "a refresh from an earlier turn is not sufficient"
     assert instructions =~ "direct human message"
     assert instructions =~ "explicit command from that direct human message"
-    assert instructions =~ "mix factory.ticket details RUN ARTIFACT_REF --offset 0 --limit 4096 --workflow WORKFLOW.md"
+    assert instructions =~ "./scripts/factory-broker ticket details RUN ARTIFACT_REF --offset 0 --limit 4096 --workflow WORKFLOW.md"
     assert instructions =~ "Follow a returned next_offset only with the same reference"
-    assert instructions =~ "mix factory.ticket stage RUN --payload-base64 BASE64_JSON --workflow WORKFLOW.md"
+    assert instructions =~ "./scripts/factory-broker ticket stage RUN --payload-base64 BASE64_JSON --workflow WORKFLOW.md"
     assert instructions =~ "cwd set to this locator's cwd"
     assert instructions =~ "Encoding and staging are separate commands"
     assert instructions =~ "Never stage through mix run -e, Mix.Tasks.Factory.Ticket.run"
@@ -373,7 +395,7 @@ defmodule SymphonyElixir.FactoryTicketParentAdmissionTest do
     assert instructions =~ "PENDING"
     assert instructions =~ "do not apply"
     assert instructions =~ "do not stage this controller presentation"
-    assert instructions =~ "Do not invoke broker, scheduler, source, Jira, GitLab, or delivery actions"
+    assert instructions =~ "Do not invoke other broker actions, scheduler, source, Jira, GitLab, or delivery actions"
     assert TicketContextReader.instructions(nil) =~ "or stage any proposal"
   end
 end

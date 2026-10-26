@@ -97,11 +97,9 @@ defmodule SymphonyElixir.Factory.Contract do
   @doc "Extracts the unique automatic-authorization critic proof for this exact contract."
   @spec automatic_authorization_proof(map(), bound_contract()) :: {:ok, map()} | :none | {:error, atom()}
   def automatic_authorization_proof(snapshot, contract) do
-    prefix =
-      "AI FACTORY AUTHORIZED issue-hex=#{issue_hex(contract.issue_key)} revision=#{contract.revision} " <>
-        "sha256=#{contract.sha256} mode=automatic critic-task-key="
+    prefix = authorization_prefix_pattern(contract) <> "mode=automatic critic-task-key="
 
-    pattern = ~r/\A#{Regex.escape(prefix)}([A-Za-z0-9:._-]+) critic-output-sha256=([0-9a-f]{64})\z/
+    pattern = ~r/\A#{prefix}([A-Za-z0-9:._-]+) critic-output-sha256=([0-9a-f]{64})\z/
 
     proofs =
       snapshot
@@ -211,16 +209,14 @@ defmodule SymphonyElixir.Factory.Contract do
   @doc "Checks that Jira still contains and authorizes the latest exact contract."
   @spec authorized?(map(), bound_contract()) :: boolean()
   def authorized?(snapshot, contract) do
-    prefix =
-      "AI FACTORY AUTHORIZED issue-hex=#{issue_hex(contract.issue_key)} revision=#{contract.revision} " <>
-        "sha256=#{contract.sha256} "
+    prefix = authorization_prefix_pattern(contract)
 
-    human_marker = ~r/\A#{Regex.escape(prefix)}confirmation[-_]comment[-_]id=[A-Za-z0-9-]+\z/
+    human_marker = ~r/\A#{prefix}confirmation[-_]comment[-_]id=[A-Za-z0-9-]+\z/
 
     automatic_marker =
-      ~r/\A#{Regex.escape(prefix)}mode=automatic critic-task-key=[A-Za-z0-9:._-]+ critic-output-sha256=[0-9a-f]{64}\z/
+      ~r/\A#{prefix}mode=automatic critic-task-key=[A-Za-z0-9:._-]+ critic-output-sha256=[0-9a-f]{64}\z/
 
-    specification_skill_marker = ~r/\A#{Regex.escape(prefix)}mode=specify-work\z/
+    specification_skill_marker = ~r/\A#{prefix}mode=specify-work\z/
 
     draft_read_back?(snapshot, contract) and next_revision(snapshot) == contract.revision + 1 and
       unique_revision_digest?(snapshot, contract) and
@@ -545,7 +541,7 @@ defmodule SymphonyElixir.Factory.Contract do
   end
 
   defp marker_revisions(text) do
-    Regex.scan(~r/#{@begin_marker} (?:issue-hex=[0-9A-F]+|issue=\S+) revision=(\d+) sha256=[0-9a-f]{64}/, text)
+    Regex.scan(~r/#{@begin_marker} (?:issue-hex=[0-9a-fA-F]+|issue=\S+) revision=(\d+) sha256=[0-9a-f]{64}/, text)
     |> Enum.flat_map(fn
       [_match, revision] ->
         case Integer.parse(revision) do
@@ -578,7 +574,7 @@ defmodule SymphonyElixir.Factory.Contract do
     hex = issue_hex(contract.issue_key)
 
     markers = [
-      ~r/#{@begin_marker} issue-hex=#{hex} revision=#{contract.revision} sha256=([0-9a-f]{64})/,
+      ~r/#{@begin_marker} issue-hex=(?i:#{hex}) revision=#{contract.revision} sha256=([0-9a-f]{64})/,
       ~r/#{@begin_marker} issue=#{issue} revision=#{contract.revision} sha256=([0-9a-f]{64})/
     ]
 
@@ -596,7 +592,7 @@ defmodule SymphonyElixir.Factory.Contract do
     hex = issue_hex(issue_key)
 
     regex =
-      ~r/\A#{@begin_marker} issue-hex=#{hex} revision=(\d+) sha256=([0-9a-f]{64})\n(?:[ \t]*\n)*```\n(.*?)\n```\n(?:[ \t]*\n)*#{@end_marker} issue-hex=#{hex} revision=\1 sha256=\2\z/ms
+      ~r/\A#{@begin_marker} issue-hex=(?i:#{hex}) revision=(\d+) sha256=([0-9a-f]{64})\n(?:[ \t]*\n)*```\n(.*?)\n```\n(?:[ \t]*\n)*#{@end_marker} issue-hex=(?i:#{hex}) revision=\1 sha256=\2\z/ms
 
     case Regex.run(regex, text) do
       [_match, revision_text, sha256, literal] ->
@@ -704,6 +700,11 @@ defmodule SymphonyElixir.Factory.Contract do
   end
 
   defp comment_text(_comment), do: ""
+
+  defp authorization_prefix_pattern(contract) do
+    "AI FACTORY AUTHORIZED issue-hex=(?i:#{issue_hex(contract.issue_key)}) " <>
+      "revision=#{contract.revision} sha256=#{contract.sha256} "
+  end
 
   defp issue_hex(issue_key), do: Base.encode16(issue_key, case: :upper)
 end

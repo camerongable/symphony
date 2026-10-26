@@ -96,6 +96,13 @@ defmodule SymphonyElixir.FactoryTicketChatCommandsTest do
     wrapped = "/bin/bash -lc 'mise exec -- mix factory.ticket stage run --payload-base64 #{payload} --workflow #{workflow}'"
 
     assert {:ok, "run", ^attrs} = TicketChatCommands.staging_invocation(wrapped)
+    compiled = String.replace(wrapped, "mise exec -- mix", ~s(mise exec -- elixir -pa "_build/dev/lib/*/ebin" -S mix))
+    assert {:ok, "run", ^attrs} = TicketChatCommands.staging_invocation(compiled)
+
+    for bad <- [String.replace(compiled, "_build/dev/lib/*/ebin", "/tmp/other-code"), String.replace(compiled, "-S mix", "-e unsafe"), compiled <> "; true"] do
+      assert :none = TicketChatCommands.staging_invocation(bad)
+    end
+
     multiline = "/bin/zsh -lc 'echo first\nmise exec -- mix factory.ticket stage run --payload-base64 #{payload} --workflow #{workflow}'"
     assert :none = TicketChatCommands.staging_invocation(multiline)
 
@@ -104,6 +111,36 @@ defmodule SymphonyElixir.FactoryTicketChatCommandsTest do
 
     python_literal = "/bin/bash -lc 'python3 -c \"import base64; print(base64.b64encode(b'{}').decode())\"'"
     assert :none = TicketChatCommands.staging_invocation(python_literal)
+  end
+
+  @tag :ticket_deployed_cli
+  test "deployment-aware stage receipts admit only the exact launcher and argument grammar", ctx do
+    body = "Rework the current candidate.\n"
+    {:ok, staged} = stage(ctx, "deployed-wrapper", body, [%{"operation" => "request_rework"}])
+    attrs = Map.merge(Jason.decode!(staged["binding_json"]), %{"proposal_id" => staged["proposal_id"], "body" => body, "operations" => [%{"operation" => "request_rework"}]})
+    payload = Jason.encode!(attrs) |> Base.encode64()
+    suffix = "stage run --payload-base64 #{payload} --workflow #{ctx.root}/WORKFLOW.md"
+    command = "./scripts/factory-broker ticket " <> suffix
+    assert {:ok, "run", ^attrs} = TicketChatCommands.staging_invocation(command)
+    assert {:ok, "run", ^attrs} = TicketChatCommands.staging_invocation("/bin/zsh -lc '#{command}'")
+
+    for bad <- [
+          "scripts/factory-broker ticket " <> suffix,
+          "/tmp/factory-broker ticket " <> suffix,
+          "./scripts/../scripts/factory-broker ticket " <> suffix,
+          "./scripts/factory-broker desktop " <> suffix,
+          "env MIX_BUILD_PATH=/tmp/foreign " <> command,
+          "MIX_BUILD_PATH=/tmp/foreign " <> command,
+          "mise exec -- " <> command,
+          ~s(elixir -pa "_build/dev/lib/*/ebin" -S ) <> command,
+          command <> " --workflow /tmp/foreign",
+          command <> " --payload-base64 #{payload}",
+          command <> "; true",
+          "cd #{ctx.root} && " <> command,
+          String.replace(command, "--payload-base64 #{payload} --workflow #{ctx.root}/WORKFLOW.md", "--workflow #{ctx.root}/WORKFLOW.md --payload-base64 #{payload}")
+        ] do
+      assert :none = TicketChatCommands.staging_invocation(bad)
+    end
   end
 
   test "accepted inputs cannot be replayed or transferred before application", ctx do

@@ -6,6 +6,9 @@ defmodule SymphonyElixir.Factory.WorkerFileIO do
   @helper Path.expand("../../../priv/worker_file_io.py", __DIR__)
   @external_resource @helper
   @helper_sha :crypto.hash(:sha256, File.read!(@helper))
+  @revision_helper Path.expand("../../../priv/worker_revision_reader_v1.py", __DIR__)
+  @external_resource @revision_helper
+  @revision_helper_sha :crypto.hash(:sha256, File.read!(@revision_helper))
   @companion Path.expand("../../../priv/worker_file_companion.py", __DIR__)
   @external_resource @companion
   @companion_sha :crypto.hash(:sha256, File.read!(@companion))
@@ -13,6 +16,7 @@ defmodule SymphonyElixir.Factory.WorkerFileIO do
   @limit 2_097_152
   @profile "(version 1)(deny default)(allow process-exec)(allow file-read*)(allow file-write* (subpath (param \"SOURCE_ROOT\")))(allow sysctl-read)(allow mach-lookup)"
   @read_profile "(version 1)(deny default)(allow process-exec)(allow file-read*)(allow sysctl-read)(allow mach-lookup)"
+  @revision_profile "(version 1)(deny default)(allow process-exec)(allow process-fork)(allow signal (target children))(allow file-read*)(allow file-write* (literal \"/dev/null\"))(allow sysctl-read)(allow mach-lookup)"
   @type result :: {:ok, map(), map()} | {:error, term(), map()} | {:error, term()}
 
   @spec request(Path.t(), map(), String.t(), map(), map() | nil) :: result()
@@ -30,6 +34,24 @@ defmodule SymphonyElixir.Factory.WorkerFileIO do
       else
         {:error, :file_io_frame_rejected}
       end
+    end
+  end
+
+  @spec request_revision(Path.t(), map(), map(), map() | nil) :: result()
+  def request_revision(root, binding, arguments, transport \\ nil) do
+    with :ok <- platform(),
+         {:ok, helper} <- PathSafety.canonicalize(Application.app_dir(:symphony_elixir, "priv/worker_revision_reader_v1.py")),
+         :ok <- outside_source(helper, root, :file_io_helper_in_source),
+         {:ok, bytes} <- File.read(helper),
+         true <- :crypto.hash(:sha256, bytes) == @revision_helper_sha or {:error, :file_io_helper_changed},
+         true <- valid_root?(binding) or {:error, :file_io_root_unproven},
+         {:ok, program, argv} <- reader_command(helper, "request", root, [], transport) do
+      nonce = Base.encode16(:crypto.strong_rand_bytes(32), case: :lower)
+      input = Jason.encode!(%{version: 1, nonce: nonce, root: root, device: binding["root_device"], inode: binding["root_inode"], operation: "revision", arguments: arguments})
+
+      if byte_size(input) <= @limit,
+        do: exchange(root, program, "revision", arguments, input, nonce, argv, @revision_helper_sha),
+        else: {:error, :file_io_frame_rejected}
     end
   end
 
@@ -640,8 +662,14 @@ defmodule SymphonyElixir.Factory.WorkerFileIO do
          do: {:ok, path}
   end
 
-  defp exchange(root, helper, operation, arguments, input, nonce, argv) do
-    profile = if operation == "replace", do: @profile, else: @read_profile
+  defp exchange(root, helper, operation, arguments, input, nonce, argv, helper_sha \\ @helper_sha) do
+    profile =
+      case operation do
+        "replace" -> @profile
+        "revision" -> @revision_profile
+        _ -> @read_profile
+      end
+
     args = ["-D", "SOURCE_ROOT=" <> root, "-p", profile, "/usr/bin/python3", "-I", "-S", "-B", helper | argv]
     environment = Enum.map(System.get_env(), fn {key, _} -> {String.to_charlist(key), false} end)
     port = Port.open({:spawn_executable, ~c"/usr/bin/sandbox-exec"}, [:binary, :exit_status, :stderr_to_stdout, args: Enum.map(args, &String.to_charlist/1), env: environment])
@@ -651,7 +679,7 @@ defmodule SymphonyElixir.Factory.WorkerFileIO do
       "transport" => "owned_file_helper",
       "pid" => pid,
       "nonce" => nonce,
-      "helper_sha256" => Base.encode16(@helper_sha, case: :lower),
+      "helper_sha256" => Base.encode16(helper_sha, case: :lower),
       "input_sha256" => Base.encode16(:crypto.hash(:sha256, input), case: :lower),
       "arguments_sha256" => Base.encode16(:crypto.hash(:sha256, Jason.encode!(arguments)), case: :lower)
     }

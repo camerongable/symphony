@@ -45,4 +45,32 @@
       this.el.removeEventListener("toggle", this.rememberState);
     }
   };
+
+  window.SymphonyHooks.CopySuggestedPrompt = {
+    mounted: function () {
+      this.copySuggestedPrompt = async function (event) {
+        var button = event.target.closest("button[data-copy-suggested-prompt]");
+        if (!button || !this.el.contains(button) || this.copying) return;
+        event.preventDefault();
+        var status = this.el.querySelector(".copy-note");
+        this.copying = true;
+        button.disabled = true;
+        try {
+          var bytes = Uint8Array.from(atob(button.dataset.promptBase64), function (character) { return character.charCodeAt(0); });
+          var prompt = new TextDecoder("utf-8", {fatal: true, ignoreBOM: true}).decode(bytes);
+          await navigator.clipboard.writeText(prompt);
+          status.textContent = "Copied. Open chat to paste and review; nothing has been sent.";
+        } catch (_error) {
+          status.textContent = "Copy unavailable. Nothing has been sent.";
+        } finally {
+          this.copying = false;
+          button.disabled = false;
+        }
+      }.bind(this);
+      this.el.addEventListener("click", this.copySuggestedPrompt);
+    },
+    destroyed: function () {
+      this.el.removeEventListener("click", this.copySuggestedPrompt);
+    }
+  };
 })();

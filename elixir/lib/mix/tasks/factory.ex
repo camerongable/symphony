@@ -33,6 +33,8 @@ defmodule Mix.Tasks.Factory do
       mix factory recover-native-bootstrap REQUEST_KEY COMPLETED_BOOTSTRAP_TURN --workflow /path/to/WORKFLOW.md
       mix factory authorize-controller-repair REQUEST_KEY MALFORMED_TURN --workflow /path/to/WORKFLOW.md
       mix factory claim-controller-repair REQUEST_KEY --workflow /path/to/WORKFLOW.md
+      mix factory recover-failed-writer REQUEST_KEY FAILED_TURN --workflow /path/to/WORKFLOW.md
+      mix factory recover-interrupted-writer REQUEST_KEY INTERRUPTED_TURN --workflow /path/to/WORKFLOW.md
 
   `--dispatcher-id` is optional and defaults to the identity configured in the
   workflow. Status is read-only. Activate, pause, and retry-spec fail while a
@@ -56,9 +58,26 @@ defmodule Mix.Tasks.Factory do
 
       true ->
         workflow_path = Path.expand(opts[:workflow] || "WORKFLOW.md")
-        factory = load_factory!(workflow_path)
-        result = run_action!(actions, factory, opts[:dispatcher_id])
-        Mix.shell().info(Jason.encode!(result, pretty: true))
+
+        with_workflow(workflow_path, fn ->
+          factory = load_factory!(workflow_path)
+          result = run_action!(actions, factory, opts[:dispatcher_id])
+          Mix.shell().info(Jason.encode!(result, pretty: true))
+        end)
+    end
+  end
+
+  defp with_workflow(path, operation) do
+    previous = Application.fetch_env(:symphony_elixir, :workflow_file_path)
+
+    try do
+      Workflow.set_workflow_file_path(path)
+      operation.()
+    after
+      case previous do
+        {:ok, original} -> Workflow.set_workflow_file_path(original)
+        :error -> Workflow.clear_workflow_file_path()
+      end
     end
   end
 
@@ -125,8 +144,34 @@ defmodule Mix.Tasks.Factory do
 
   defp valid_action?(["claim-controller-repair", request_key]), do: String.trim(request_key) != ""
 
+  defp valid_action?(["recover-failed-writer", request_key, turn]), do: String.trim(request_key) != "" and String.trim(turn) != ""
+  defp valid_action?(["recover-interrupted-writer", request_key, turn]), do: String.trim(request_key) != "" and String.trim(turn) != ""
+
+  defp valid_action?([action, run, nonce]) when action in ~w(prepare-push-cas execute-push-cas reconcile-push-cas), do: String.trim(run) != "" and Regex.match?(~r/\A[0-9a-f]{64}\z/, nonce)
+
+  defp valid_action?(["prepare-push-input-retirement", run, nonce, envelope, receipt, receipt_sha, guard]),
+    do: input_retirement_args?(run, [nonce, envelope, receipt_sha], [receipt, guard])
+
+  defp valid_action?(["execute-push-input-retirement", run, nonce, envelope, receipt, receipt_sha, guard, plan]),
+    do: input_retirement_args?(run, [nonce, envelope, receipt_sha, plan], [receipt, guard])
+
+  defp valid_action?(["prepare-unattached-push-retirement", run, nonce, envelope, receipt, receipt_sha]),
+    do: input_retirement_args?(run, [nonce, envelope, receipt_sha], [receipt])
+
+  defp valid_action?(["execute-unattached-push-retirement", run, nonce, envelope, receipt, receipt_sha, plan]),
+    do: input_retirement_args?(run, [nonce, envelope, receipt_sha, plan], [receipt])
+
+  defp valid_action?(["prepare-preissuance-push-retirement", run, nonce, envelope, receipt, receipt_sha]),
+    do: input_retirement_args?(run, [nonce, envelope, receipt_sha], [receipt])
+
+  defp valid_action?(["execute-preissuance-push-retirement", run, nonce, envelope, receipt, receipt_sha, plan]),
+    do: input_retirement_args?(run, [nonce, envelope, receipt_sha, plan], [receipt])
+
   defp valid_action?(["replace-controller" | identities]), do: length(identities) == 4 and Enum.all?(identities, &(String.trim(&1) != ""))
   defp valid_action?(_actions), do: false
+
+  defp input_retirement_args?(run, hashes, paths),
+    do: String.trim(run) != "" and Enum.all?(hashes, &Regex.match?(~r/\A[0-9a-f]{64}\z/, &1)) and Enum.all?(paths, &(Path.type(&1) == :absolute and Path.expand(&1) == &1))
 
   defp run_action!(["status"], factory, _dispatcher_id), do: unwrap!(Admin.overview(factory))
   defp run_action!(["activate"], factory, dispatcher_id), do: unwrap!(Admin.activate(factory, dispatcher_id))
@@ -188,6 +233,34 @@ defmodule Mix.Tasks.Factory do
 
   defp run_action!(["claim-controller-repair", request_key], factory, _dispatcher_id),
     do: unwrap!(Admin.claim_controller_format_repair(factory, request_key))
+
+  defp run_action!(["recover-failed-writer", request_key, turn], factory, _dispatcher_id),
+    do: unwrap!(Admin.recover_failed_writer(factory, request_key, turn))
+
+  defp run_action!(["recover-interrupted-writer", request_key, turn], factory, _dispatcher_id),
+    do: unwrap!(Admin.recover_interrupted_writer(factory, request_key, turn))
+
+  defp run_action!(["prepare-push-cas", run, nonce], factory, _dispatcher_id), do: unwrap!(Admin.recover_push_cas(factory, run, nonce, :prepare))
+  defp run_action!(["execute-push-cas", run, nonce], factory, _dispatcher_id), do: unwrap!(Admin.recover_push_cas(factory, run, nonce, :execute))
+  defp run_action!(["reconcile-push-cas", run, nonce], factory, _dispatcher_id), do: unwrap!(Admin.recover_push_cas(factory, run, nonce, :reconcile))
+
+  defp run_action!(["prepare-push-input-retirement", run, nonce, envelope, receipt, receipt_sha, guard], factory, _dispatcher_id),
+    do: unwrap!(Admin.retire_push_input(factory, run, nonce, envelope, receipt, receipt_sha, guard, nil))
+
+  defp run_action!(["execute-push-input-retirement", run, nonce, envelope, receipt, receipt_sha, guard, plan], factory, _dispatcher_id),
+    do: unwrap!(Admin.retire_push_input(factory, run, nonce, envelope, receipt, receipt_sha, guard, plan))
+
+  defp run_action!(["prepare-unattached-push-retirement", run, nonce, envelope, receipt, receipt_sha], factory, _dispatcher_id),
+    do: unwrap!(Admin.retire_unattached_push(factory, run, nonce, envelope, receipt, receipt_sha, nil))
+
+  defp run_action!(["execute-unattached-push-retirement", run, nonce, envelope, receipt, receipt_sha, plan], factory, _dispatcher_id),
+    do: unwrap!(Admin.retire_unattached_push(factory, run, nonce, envelope, receipt, receipt_sha, plan))
+
+  defp run_action!(["prepare-preissuance-push-retirement", run, nonce, envelope, receipt, receipt_sha], factory, _dispatcher_id),
+    do: unwrap!(Admin.retire_preissuance_push(factory, run, nonce, envelope, receipt, receipt_sha, nil))
+
+  defp run_action!(["execute-preissuance-push-retirement", run, nonce, envelope, receipt, receipt_sha, plan], factory, _dispatcher_id),
+    do: unwrap!(Admin.retire_preissuance_push(factory, run, nonce, envelope, receipt, receipt_sha, plan))
 
   defp run_action!(["replace-controller", old_thread, new_thread, new_turn, request_key], factory, _dispatcher_id),
     do: unwrap!(Admin.replace_controller(factory, old_thread, new_thread, new_turn, request_key))

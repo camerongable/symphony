@@ -16,8 +16,17 @@ fi
 
 cd "${elixir_dir}"
 
+mix_prebuilt_args=()
+if [[ -n "${MIX_BUILD_PATH:-}" ]]; then
+  if [[ ! -f "${MIX_BUILD_PATH}/lib/symphony_elixir/ebin/symphony_elixir.app" || ! -f "${MIX_BUILD_PATH}/lib/symphony_elixir/ebin/Elixir.SymphonyElixir.Factory.Controller.beam" ]]; then
+    print -u2 "Explicit MIX_BUILD_PATH requires a compiled factory application"
+    exit 78
+  fi
+  mix_prebuilt_args=(--no-compile --no-deps-check)
+fi
+
 exec /opt/homebrew/bin/mise exec -- \
-  mix run --no-start -e 'SymphonyElixir.CLI.main(System.argv())' -- \
+  mix run "${mix_prebuilt_args[@]}" --no-start -e 'SymphonyElixir.CLI.main(System.argv())' -- \
   --i-understand-that-this-will-be-running-without-the-usual-guardrails \
   --logs-root "${logs_root}" \
   "${workflow_path}"

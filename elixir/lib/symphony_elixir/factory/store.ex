@@ -10,6 +10,40 @@ defmodule SymphonyElixir.Factory.Store do
   alias Exqlite.Result
   alias SymphonyElixir.Factory.WorkerFileIO
 
+  @mr_presend_table """
+  CREATE TABLE IF NOT EXISTS ticket_mr_presend_consumptions (
+    request_key TEXT PRIMARY KEY REFERENCES ticket_mr_claims(request_key),
+    claim_sha256 TEXT NOT NULL,
+    payload_sha256 TEXT NOT NULL,
+    broker_thread_id TEXT NOT NULL,
+    native_call_id TEXT NOT NULL,
+    proof_json TEXT NOT NULL,
+    proof_sha256 TEXT NOT NULL,
+    consumed_at TEXT NOT NULL,
+    UNIQUE(broker_thread_id, native_call_id)
+  )
+  """
+
+  @push_prepared_requalification_table """
+  CREATE TABLE IF NOT EXISTS ticket_push_prepared_requalifications (
+    authorization_key TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(run_id),
+    original_nonce TEXT NOT NULL,
+    original_envelope TEXT NOT NULL,
+    original_sha256 TEXT NOT NULL,
+    authorization_json TEXT NOT NULL,
+    authorization_sha256 TEXT NOT NULL,
+    proof_json TEXT NOT NULL,
+    proof_sha256 TEXT NOT NULL,
+    successor_nonce TEXT NOT NULL UNIQUE,
+    successor_binding_json TEXT NOT NULL,
+    successor_binding_sha256 TEXT NOT NULL,
+    successor_reservation_key TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    UNIQUE(run_id, original_nonce)
+  )
+  """
+
   @schema_statements [
     """
     CREATE TABLE IF NOT EXISTS ticket_jira_effects (
@@ -261,22 +295,6 @@ defmodule SymphonyElixir.Factory.Store do
     )
     """,
     """
-    DROP INDEX IF EXISTS one_active_run_per_issue_kind
-    """,
-    """
-    CREATE UNIQUE INDEX one_active_run_per_issue_kind
-    ON runs(issue_key, kind)
-    WHERE state NOT IN ('READY_FOR_REVIEW', 'DELIVERED', 'AWAITING_VALIDATION', 'CANCELLED', 'FAILED')
-    """,
-    """
-    DROP INDEX IF EXISTS one_active_factory_run_per_issue
-    """,
-    """
-    CREATE UNIQUE INDEX one_active_factory_run_per_issue
-    ON runs(issue_key)
-    WHERE state NOT IN ('READY_FOR_REVIEW', 'DELIVERED', 'AWAITING_VALIDATION', 'CANCELLED', 'FAILED')
-    """,
-    """
     CREATE TABLE IF NOT EXISTS events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       occurred_at TEXT NOT NULL,
@@ -341,7 +359,8 @@ defmodule SymphonyElixir.Factory.Store do
     CREATE TABLE IF NOT EXISTS intake_snapshots (
       scope TEXT PRIMARY KEY,
       observed_at TEXT NOT NULL,
-      snapshot_json TEXT NOT NULL
+      snapshot_json TEXT NOT NULL,
+      decisions_json TEXT NOT NULL DEFAULT '{}'
     )
     """,
     """
@@ -848,10 +867,14 @@ defmodule SymphonyElixir.Factory.Store do
   def start_read_only(opts) do
     database = Keyword.fetch!(opts, :database)
 
+    connection_opts =
+      [database: database, mode: :readonly, default_transaction_mode: :deferred, busy_timeout: Keyword.get(opts, :busy_timeout, 30_000)]
+      |> Keyword.merge(Keyword.take(opts, [:name]))
+
     with true <- is_binary(database) and Path.type(database) == :absolute,
          {:ok, %File.Stat{type: :regular}} <- File.lstat(database),
          {:ok, %File.Stat{type: :directory}} <- File.stat(Path.dirname(database)),
-         {:ok, connection} <- Exqlite.start_link(database: database, mode: :readonly, default_transaction_mode: :deferred, busy_timeout: Keyword.get(opts, :busy_timeout, 30_000)) do
+         {:ok, connection} <- Exqlite.start_link(connection_opts) do
       validate_reader(connection)
     else
       _ -> {:error, :existing_factory_ledger_required}
@@ -895,20 +918,117 @@ defmodule SymphonyElixir.Factory.Store do
       end)
       |> MapSet.new()
 
-    if versions == Enum.map(1..37, &[&1]) and MapSet.subset?(expected, tables) and reader_columns_present?(connection) and
-         reader_indexes_present?(connection),
+    expected =
+      MapSet.union(
+        expected,
+        MapSet.new(
+          ~w(ticket_ci_repair_diagnoses ticket_ci_repair_claims ticket_ci_generation_intents ticket_ci_generation_events ticket_push_input_retirements worker_instruction_snapshots worker_instruction_task_bindings ticket_ci_repair_reassessments ticket_mr_qualifications ticket_ci_repair_evidence_successors)
+        )
+      )
+
+    if mr_presend_current?(connection, versions) and
+         MapSet.subset?(MapSet.new(~w(ticket_human_empty_commit_imports ticket_push_rejection_retirements ticket_ordinary_generation_intents ticket_ordinary_generation_events)), tables) and
+         MapSet.subset?(expected, tables) and reader_structure_present?(connection) and
+         reader_indexes_present?(connection) and recovery_triggers_present?(connection),
        do: :ok,
        else: {:error, :factory_ledger_schema_not_current}
   rescue
     Exqlite.Error -> {:error, :factory_ledger_schema_not_current}
   end
 
+  defp reader_structure_present?(connection) do
+    successor_sql = one!(connection, "SELECT sql FROM sqlite_master WHERE name='ticket_ci_repair_evidence_successors'")["sql"]
+
+    reader_columns_present?(connection) and ci_claim_definition?(one!(connection, "SELECT sql FROM sqlite_master WHERE name='ticket_ci_repair_claims'")["sql"], :identity) and
+      is_binary(successor_sql) and String.contains?(successor_sql, "attempt_index BETWEEN 2 AND 10") and String.contains?(successor_sql, "configured_limit BETWEEN 1 AND 10")
+  end
+
   defp reader_indexes_present?(connection) do
-    one!(connection, "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'one_active_contract_amendment_per_run'") != nil
+    Enum.all?(~w(one_active_contract_amendment_per_run one_specialist_error_notice), fn name ->
+      one!(connection, "SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?", [name]) != nil
+    end) and retirement_indexes_present?(connection) and rejection_indexes_present?(connection) and
+      mr_qualification_indexes_present?(connection) and ci_successor_indexes_present?(connection)
+  end
+
+  defp ci_successor_indexes_present?(connection) do
+    actual =
+      query!(connection, "SELECT name FROM pragma_index_list('ticket_ci_repair_evidence_successors') WHERE \"unique\"=1").rows
+      |> Enum.map(fn [name] -> query!(connection, "SELECT name FROM pragma_index_info(?) ORDER BY seqno", [name]).rows |> List.flatten() end)
+      |> MapSet.new()
+
+    expected = [~w(successor_key), ~w(prior_request_key), ~w(new_request_key), ~w(new_reservation_key), ~w(run_id attempt_index), ~w(claim_key evidence_content_sha256)]
+    MapSet.equal?(MapSet.new(expected), actual)
+  end
+
+  defp mr_qualification_indexes_present?(connection) do
+    actual =
+      query!(connection, "SELECT name FROM pragma_index_list('ticket_mr_qualifications') WHERE \"unique\"=1").rows
+      |> Enum.map(fn [name] -> query!(connection, "SELECT name FROM pragma_index_info(?) ORDER BY seqno", [name]).rows |> List.flatten() end)
+      |> MapSet.new()
+
+    MapSet.equal?(MapSet.new([~w(qualification_key), ~w(request_key)]), actual)
+  end
+
+  defp rejection_indexes_present?(connection) do
+    actual =
+      query!(connection, "SELECT name FROM pragma_index_list('ticket_push_rejection_retirements') WHERE \"unique\"=1").rows
+      |> Enum.map(fn [name] -> query!(connection, "SELECT name FROM pragma_index_info(?) ORDER BY seqno", [name]).rows |> List.flatten() end)
+      |> MapSet.new()
+
+    MapSet.equal?(MapSet.new([~w(retirement_key), ~w(successor_nonce), ~w(successor_reservation_key), ~w(run_id candidate_sha code_repair_round claim_key), ~w(run_id original_nonce)]), actual)
+  end
+
+  defp retirement_indexes_present?(connection) do
+    actual =
+      query!(connection, "SELECT name FROM pragma_index_list('ticket_push_input_retirements') WHERE \"unique\" = 1").rows
+      |> Enum.map(fn [name] -> query!(connection, "SELECT name FROM pragma_index_info(?) ORDER BY seqno", [name]).rows |> List.flatten() end)
+      |> MapSet.new()
+
+    MapSet.equal?(
+      MapSet.new([
+        ["retirement_key"],
+        ["successor_nonce"],
+        ["successor_reservation_key"],
+        ["run_id", "code_repair_round"],
+        ["run_id", "original_nonce"]
+      ]),
+      actual
+    )
+  end
+
+  defp recovery_triggers_present?(connection) do
+    reassessment =
+      ~w(ci_reassessment_update ci_reassessment_delete ci_reassessment_schema_rollback push_rejection_update push_rejection_delete push_rejection_schema_rollback mr_qualification_update mr_qualification_delete mr_qualification_schema_rollback)
+
+    Enum.all?(
+      ~w(ci_repair_five_rounds_schema_rollback ci_successor_update ci_successor_delete ci_successor_schema_rollback ci_successor_total_budget ci_claim_total_budget ci_ten_attempt_schema_rollback ci_round_identity_schema_rollback ticket_ordinary_generation_intents_update ticket_ordinary_generation_intents_delete ticket_ordinary_generation_events_update ticket_ordinary_generation_events_delete ordinary_generation_source_hold ordinary_generation_source_delete) ++
+        ~w(mr_presend_update mr_presend_delete mr_presend_schema_rollback) ++
+        reassessment ++
+        ~w(human_empty_import_update human_empty_import_delete human_empty_import_schema_rollback) ++
+        ~w(push_unknown_run_identity push_unknown_run_delete push_unknown_event_delete push_unknown_event_update push_unknown_schema_rollback mr_actor_audit_update mr_actor_audit_delete mr_actor_schema_rollback ci_repair_diagnosis_update ci_repair_diagnosis_delete ci_repair_claim_update ci_repair_claim_delete ci_repair_schema_rollback ci_generation_intent_update ci_generation_intent_delete ci_generation_event_update ci_generation_event_delete ci_generation_schema_rollback ci_generation_source_hold ci_generation_source_delete push_input_retirement_update push_input_retirement_delete push_input_retirement_schema_rollback worker_instruction_snapshot_update worker_instruction_snapshot_delete worker_instruction_task_binding_update worker_instruction_task_binding_delete worker_instruction_snapshot_schema_rollback),
+      fn name ->
+        one!(connection, "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name = ?", [name]) != nil
+      end
+    )
   end
 
   defp reader_columns_present?(connection) do
     required = %{
+      "ticket_ordinary_generation_intents" => ~w(intent_key run_id verifier_request_key request_key operation binding_json binding_sha256 created_at),
+      "ticket_ordinary_generation_events" => ~w(event_key intent_key event_type path predecessor_key receipt_json receipt_sha256 created_at),
+      "ticket_human_empty_commit_imports" => ~w(import_key run_id request_key candidate_sha proof_json proof_sha256 created_at),
+      "ticket_ci_repair_evidence_successors" =>
+        ~w(successor_key run_id claim_key prior_request_key prior_successor_key attempt_index configured_limit evidence_content_sha256 evidence_json evidence_sha256 proof_json proof_sha256 new_request_key new_reservation_key created_at),
+      "ticket_mr_qualifications" =>
+        ~w(qualification_key request_key run_id candidate_sha contract_sha256 spec_revision stage completed_push_sha256 request_sha256 output_sha256 binding_sha256 preimage_json preimage_sha256 observation_json observation_sha256 observed_at kind),
+      "ticket_push_rejection_retirements" =>
+        ~w(retirement_key run_id candidate_sha code_repair_round claim_key original_nonce original_envelope original_sha256 proof_json proof_sha256 successor_nonce successor_binding_sha256 successor_reservation_key created_at),
+      "ticket_ci_repair_reassessments" =>
+        ~w(reassessment_key diagnosis_key collector_version original_sha256 run_id candidate_sha pipeline_id preimage_json preimage_sha256 diagnosis_json diagnosis_sha256 verdict created_at kind),
+      "worker_instruction_snapshots" => ~w(binding_sha256 run_id role binding_json bundle_json bundle_sha256 created_at),
+      "worker_instruction_task_bindings" => ~w(task_key prompt_sha256 instruction_binding_sha256 run_id role created_at),
+      "ticket_push_input_retirements" =>
+        ~w(retirement_key run_id code_repair_round original_nonce original_envelope original_sha256 proof_json proof_sha256 successor_nonce successor_binding_sha256 successor_reservation_key created_at),
       "runs" =>
         ~w(run_id issue_key repo_key repo_path kind state contract_markdown snapshot_json plan_markdown candidate_sha ci_evidence_json repair_findings_json review_feedback_json updated_at) ++
           Map.keys(@model_run_columns),
@@ -934,7 +1054,10 @@ defmodule SymphonyElixir.Factory.Store do
       "ticket_review_bases" => ~w(run_id base_sha),
       "ticket_checkout_intents" => ~w(run_id canonical_path repo_path branch binding_json binding_sha256 phase owner_nonce helper_pid execution_json receipt_json last_error),
       "ticket_mr_claims" => ~w(request_key receipt_json receipt_sha256 claimed_at),
-      "events" => ~w(id run_id event_type payload_json occurred_at)
+      "ticket_mr_presend_consumptions" => ~w(request_key claim_sha256 payload_sha256 broker_thread_id native_call_id proof_json proof_sha256 consumed_at),
+      "ticket_mr_actor_bindings" => ~w(request_key operation original_request_json original_request_sha256 original_payload_sha256 pinned_payload_sha256 proof_json proof_sha256 created_at),
+      "events" => ~w(id run_id event_type payload_json occurred_at),
+      "intake_snapshots" => ~w(scope observed_at snapshot_json decisions_json)
     }
 
     Enum.all?(required, fn {table, columns} ->
@@ -965,10 +1088,13 @@ defmodule SymphonyElixir.Factory.Store do
   @spec initialize(connection()) :: :ok
   def initialize(connection) do
     Enum.each(@schema_statements, &query!(connection, &1))
+    ensure_active_run_indexes(connection)
     ensure_columns(connection, "runs", @model_run_columns)
     ensure_columns(connection, "control", @control_columns)
     ensure_columns(connection, "factory_tasks", @task_columns)
     ensure_columns(connection, "desktop_requests", @desktop_request_columns)
+    ensure_columns(connection, "intake_snapshots", %{"decisions_json" => "TEXT NOT NULL DEFAULT '{}'"})
+    query!(connection, "CREATE UNIQUE INDEX IF NOT EXISTS one_specialist_error_notice ON events(run_id, json_extract(payload_json, '$.notice_id')) WHERE event_type = 'SPECIALIST_ERROR_RECORDED'")
 
     ensure_columns(connection, "ticket_chats", %{
       "broker_thread_id" => "TEXT",
@@ -1020,9 +1146,862 @@ defmodule SymphonyElixir.Factory.Store do
     query!(connection, "INSERT OR IGNORE INTO factory_schema_migrations(version, applied_at) VALUES (35, ?)", [iso_now()])
     query!(connection, "INSERT OR IGNORE INTO factory_schema_migrations(version, applied_at) VALUES (36, ?)", [iso_now()])
     query!(connection, "INSERT OR IGNORE INTO factory_schema_migrations(version, applied_at) VALUES (37, ?)", [iso_now()])
+    query!(connection, "INSERT OR IGNORE INTO factory_schema_migrations(version, applied_at) VALUES (38, ?)", [iso_now()])
+    migrate_push_unknown_guards(connection)
+    query!(connection, "INSERT OR IGNORE INTO factory_schema_migrations(version, applied_at) VALUES (39, ?)", [iso_now()])
+    migrate_mr_actor_bindings(connection)
+    query!(connection, "INSERT OR IGNORE INTO factory_schema_migrations(version, applied_at) VALUES (40, ?)", [iso_now()])
+    migrate_ci_repair_receipts(connection)
+    query!(connection, "INSERT OR IGNORE INTO factory_schema_migrations(version, applied_at) VALUES (41, ?)", [iso_now()])
+    migrate_push_input_retirements(connection)
+    query!(connection, "INSERT OR IGNORE INTO factory_schema_migrations(version, applied_at) VALUES (42, ?)", [iso_now()])
+    migrate_worker_instruction_snapshots(connection)
+    query!(connection, "INSERT OR IGNORE INTO factory_schema_migrations(version, applied_at) VALUES (43, ?)", [iso_now()])
+    migrate_ci_reassessments(connection)
+    query!(connection, "INSERT OR IGNORE INTO factory_schema_migrations(version, applied_at) VALUES (44, ?)", [iso_now()])
+    migrate_push_rejections(connection)
+    query!(connection, "INSERT OR IGNORE INTO factory_schema_migrations(version, applied_at) VALUES (45, ?)", [iso_now()])
+    migrate_mr_qualifications(connection)
+    query!(connection, "INSERT OR IGNORE INTO factory_schema_migrations(version, applied_at) VALUES (46, ?)", [iso_now()])
+    migrate_ci_claim_rounds(connection)
+    migrate_ci_evidence_successors(connection)
+    migrate_ci_seven_attempts(connection)
+    migrate_human_empty_commit_imports(connection)
+    migrate_ten_attempts_and_ordinary_generation(connection)
+    migrate_mr_presend_consumptions(connection)
+    migrate_push_prepared_requalifications(connection)
+    migrate_ci_round_identity(connection)
 
     :ok
   end
+
+  defp migrate_mr_presend_consumptions(connection) do
+    unless one!(connection, "SELECT version FROM factory_schema_migrations WHERE version=52") do
+      transaction!(connection, fn tx ->
+        query!(tx, @mr_presend_table)
+
+        install_mr_presend_triggers(tx)
+
+        query!(tx, "INSERT OR IGNORE INTO factory_schema_migrations(version,applied_at) VALUES(52,?)", [iso_now()])
+      end)
+    end
+
+    if not mr_presend_structure?(connection), do: raise("MR pre-send consumption schema invalid")
+  end
+
+  defp install_mr_presend_triggers(tx) do
+    for operation <- ~w(UPDATE DELETE) do
+      query!(
+        tx,
+        "CREATE TRIGGER IF NOT EXISTS mr_presend_#{String.downcase(operation)} BEFORE #{operation} ON ticket_mr_presend_consumptions BEGIN SELECT RAISE(ABORT,'mr_presend_immutable'); END"
+      )
+    end
+
+    query!(
+      tx,
+      "CREATE TRIGGER IF NOT EXISTS mr_presend_schema_rollback BEFORE DELETE ON factory_schema_migrations WHEN OLD.version=52 AND EXISTS(SELECT 1 FROM ticket_mr_presend_consumptions) BEGIN SELECT RAISE(ABORT,'mr_presend_schema_required'); END"
+    )
+  end
+
+  defp mr_presend_structure?(connection) do
+    actual = one!(connection, "SELECT sql FROM sqlite_master WHERE type='table' AND name='ticket_mr_presend_consumptions'")
+    is_map(actual) and normalize_presend_sql(actual["sql"]) == normalize_presend_sql(@mr_presend_table)
+  end
+
+  defp mr_presend_current?(connection, versions) do
+    versions == Enum.map(1..54, &[&1]) and mr_presend_structure?(connection) and push_prepared_requalification_structure?(connection)
+  end
+
+  defp migrate_ci_round_identity(connection) do
+    unless one!(connection, "SELECT version FROM factory_schema_migrations WHERE version=54") do
+      migrate_ci_round_identity_checked(connection)
+    end
+
+    unless ci_claim_definition?(one!(connection, "SELECT sql FROM sqlite_master WHERE name='ticket_ci_repair_claims'")["sql"], :identity),
+      do: raise("CI repair round identity schema invalid")
+  end
+
+  defp migrate_ci_round_identity_checked(%DBConnection{conn_mode: :transaction}),
+    do: raise("CI round identity migration requires an outer connection checkout")
+
+  defp migrate_ci_round_identity_checked(connection) do
+    DBConnection.run(connection, fn leased ->
+      original = Map.new(~w(foreign_keys legacy_alter_table), &{&1, one!(leased, "PRAGMA #{&1}")[&1]})
+
+      try do
+        query!(leased, "PRAGMA foreign_keys=OFF")
+        query!(leased, "PRAGMA legacy_alter_table=ON")
+        if one!(leased, "PRAGMA foreign_keys")["foreign_keys"] != 0, do: raise("CI round identity migration failed to disable foreign keys")
+
+        transaction!(
+          leased,
+          fn tx ->
+            unless one!(tx, "SELECT version FROM factory_schema_migrations WHERE version=54") do
+              unless ci_claim_definition?(one!(tx, "SELECT sql FROM sqlite_master WHERE name='ticket_ci_repair_claims'")["sql"], 10),
+                do: raise("CI round identity migration requires the exact prior schema")
+
+              widen_ci_attempt_table(tx, "ticket_ci_repair_claims", [{"round BETWEEN 1 AND 10", "round >= 1"}])
+              unless query!(tx, "PRAGMA foreign_key_check").rows == [], do: raise("CI round identity migration failed foreign-key validation")
+              query!(tx, "INSERT INTO factory_schema_migrations(version,applied_at) VALUES(54,?)", [iso_now()])
+
+              query!(tx, """
+              CREATE TRIGGER ci_round_identity_schema_rollback BEFORE DELETE ON factory_schema_migrations
+              WHEN OLD.version=54
+              BEGIN SELECT RAISE(ABORT,'CI round identity schema required'); END
+              """)
+            end
+          end,
+          mode: :immediate
+        )
+      after
+        restore_ci_claim_pragmas(connection, leased, original)
+      end
+    end)
+  end
+
+  defp migrate_push_prepared_requalifications(connection) do
+    transaction!(connection, fn tx ->
+      unless one!(tx, "SELECT version FROM factory_schema_migrations WHERE version=53") do
+        query!(tx, @push_prepared_requalification_table)
+        Enum.each(push_prepared_requalification_triggers(), &query!(tx, &1))
+        query!(tx, "INSERT INTO factory_schema_migrations(version,applied_at) VALUES(53,?)", [iso_now()])
+      end
+    end)
+
+    unless push_prepared_requalification_structure?(connection), do: raise("Prepared push requalification schema invalid")
+  end
+
+  defp push_prepared_requalification_structure?(connection) do
+    actual = one!(connection, "SELECT sql FROM sqlite_master WHERE type='table' AND name='ticket_push_prepared_requalifications'")
+
+    triggers =
+      query!(
+        connection,
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name IN ('push_prepared_requalification_update','push_prepared_requalification_delete','push_prepared_requalification_schema_rollback')"
+      ).rows
+      |> Enum.map(fn [sql] -> normalize_presend_sql(sql) end)
+      |> Enum.sort()
+
+    expected = push_prepared_requalification_triggers() |> Enum.map(&normalize_presend_sql/1) |> Enum.sort()
+
+    is_map(actual) and
+      normalize_presend_sql(actual["sql"]) == normalize_presend_sql(@push_prepared_requalification_table) and
+      triggers == expected
+  end
+
+  defp push_prepared_requalification_triggers do
+    Enum.map(~w(UPDATE DELETE), fn operation ->
+      "CREATE TRIGGER push_prepared_requalification_#{String.downcase(operation)} BEFORE #{operation} ON ticket_push_prepared_requalifications BEGIN SELECT RAISE(ABORT,'push_prepared_requalification_immutable'); END"
+    end) ++
+      [
+        "CREATE TRIGGER push_prepared_requalification_schema_rollback BEFORE DELETE ON factory_schema_migrations WHEN OLD.version=53 AND EXISTS(SELECT 1 FROM ticket_push_prepared_requalifications) BEGIN SELECT RAISE(ABORT,'push_prepared_requalification_schema_required'); END"
+      ]
+  end
+
+  defp normalize_presend_sql(sql) do
+    sql |> String.replace(~r/IF\s+NOT\s+EXISTS\s+/i, "") |> String.replace(~r/\s+/, "") |> String.trim_trailing(";")
+  end
+
+  defp migrate_ten_attempts_and_ordinary_generation(connection) do
+    unless one!(connection, "SELECT version FROM factory_schema_migrations WHERE version=51") do
+      migrate_ten_attempts_checked(connection)
+    end
+  end
+
+  defp migrate_ten_attempts_checked(%DBConnection{conn_mode: :transaction}),
+    do: raise("CI attempt migration requires an outer connection checkout")
+
+  defp migrate_ten_attempts_checked(connection) do
+    DBConnection.run(connection, fn leased ->
+      original = Map.new(~w(foreign_keys legacy_alter_table), &{&1, one!(leased, "PRAGMA #{&1}")[&1]})
+
+      try do
+        query!(leased, "PRAGMA foreign_keys=OFF")
+        query!(leased, "PRAGMA legacy_alter_table=ON")
+        if one!(leased, "PRAGMA foreign_keys")["foreign_keys"] != 0, do: raise("CI attempt migration failed to disable foreign keys")
+
+        transaction!(
+          leased,
+          fn tx ->
+            if is_nil(one!(tx, "SELECT version FROM factory_schema_migrations WHERE version=51")) do
+              widen_ci_attempt_table(tx, "ticket_ci_repair_claims", [{"round BETWEEN 1 AND 7", "round BETWEEN 1 AND 10"}])
+
+              widen_ci_attempt_table(tx, "ticket_ci_repair_evidence_successors", [
+                {"attempt_index BETWEEN 2 AND 7", "attempt_index BETWEEN 2 AND 10"},
+                {"configured_limit BETWEEN 1 AND 7", "configured_limit BETWEEN 1 AND 10"}
+              ])
+
+              query!(tx, "DROP TRIGGER ci_claim_total_budget")
+
+              query!(tx, """
+              CREATE TRIGGER ci_claim_total_budget BEFORE INSERT ON ticket_ci_repair_claims
+              WHEN (SELECT COUNT(*) FROM ticket_ci_repair_claims WHERE run_id=NEW.run_id) +
+                   (SELECT COUNT(*) FROM ticket_ci_repair_evidence_successors WHERE run_id=NEW.run_id) >= 10
+              BEGIN SELECT RAISE(ABORT,'CI repair attempt budget exhausted'); END
+              """)
+
+              create_ordinary_generation_journal(tx)
+              unless query!(tx, "PRAGMA foreign_key_check").rows == [], do: raise("CI attempt migration failed foreign-key validation")
+              query!(tx, "INSERT INTO factory_schema_migrations(version,applied_at) VALUES(51,?)", [iso_now()])
+
+              query!(tx, """
+              CREATE TRIGGER ci_ten_attempt_schema_rollback BEFORE DELETE ON factory_schema_migrations
+              WHEN OLD.version=51
+              BEGIN SELECT RAISE(ABORT,'CI ten-attempt schema required'); END
+              """)
+            end
+          end,
+          mode: :immediate
+        )
+      after
+        restore_ci_claim_pragmas(connection, leased, original)
+      end
+    end)
+  end
+
+  defp create_ordinary_generation_journal(connection) do
+    query!(connection, """
+    CREATE TABLE ticket_ordinary_generation_intents (
+      intent_key TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES runs(run_id),
+      verifier_request_key TEXT NOT NULL REFERENCES worker_evidence(request_key),
+      request_key TEXT NOT NULL REFERENCES worker_evidence(request_key),
+      operation TEXT NOT NULL CHECK(operation IN ('GAZELLE_DIFF', 'GOFMT_DIFF')),
+      binding_json TEXT NOT NULL, binding_sha256 TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(request_key, operation)
+    )
+    """)
+
+    query!(connection, """
+    CREATE TABLE ticket_ordinary_generation_events (
+      event_key TEXT PRIMARY KEY,
+      intent_key TEXT NOT NULL REFERENCES ticket_ordinary_generation_intents(intent_key),
+      event_type TEXT NOT NULL CHECK(event_type IN ('EXECUTION_PREPARED','EXECUTION_STARTED','EXECUTION_RECEIPT','APPLY_PREPARED','APPLY_STARTED','APPLY_CREATED','APPLIED','BLOCKED','UNCERTAIN','FINALIZED')),
+      path TEXT NOT NULL,
+      predecessor_key TEXT REFERENCES ticket_ordinary_generation_events(event_key),
+      receipt_json TEXT NOT NULL, receipt_sha256 TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(intent_key, event_type, path)
+    )
+    """)
+
+    for table <- ~w(ticket_ordinary_generation_intents ticket_ordinary_generation_events), action <- ~w(UPDATE DELETE) do
+      query!(connection, "CREATE TRIGGER #{table}_#{String.downcase(action)} BEFORE #{action} ON #{table} BEGIN SELECT RAISE(ABORT,'ordinary_generation_receipt_immutable'); END")
+    end
+
+    query!(connection, """
+    CREATE TRIGGER ordinary_generation_source_hold BEFORE UPDATE ON workspace_access
+    WHEN OLD.mode='SOURCE' AND OLD.released_at IS NULL AND EXISTS (
+      SELECT 1 FROM ticket_ordinary_generation_intents i WHERE i.request_key=OLD.request_key AND NOT EXISTS (
+        SELECT 1 FROM ticket_ordinary_generation_events e WHERE e.intent_key=i.intent_key AND e.event_type='FINALIZED' AND e.path=''
+      )
+    )
+    BEGIN SELECT RAISE(ABORT,'ordinary_generation_source_required'); END
+    """)
+
+    query!(connection, """
+    CREATE TRIGGER ordinary_generation_source_delete BEFORE DELETE ON workspace_access
+    WHEN OLD.mode='SOURCE' AND EXISTS (SELECT 1 FROM ticket_ordinary_generation_intents i WHERE i.request_key=OLD.request_key)
+    BEGIN SELECT RAISE(ABORT,'ordinary_generation_source_required'); END
+    """)
+  end
+
+  defp migrate_human_empty_commit_imports(connection) do
+    transaction!(connection, fn tx ->
+      query!(tx, """
+      CREATE TABLE IF NOT EXISTS ticket_human_empty_commit_imports (
+        import_key TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES runs(run_id),
+        request_key TEXT NOT NULL UNIQUE REFERENCES desktop_requests(request_key),
+        candidate_sha TEXT NOT NULL,
+        proof_json TEXT NOT NULL,
+        proof_sha256 TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(run_id, candidate_sha)
+      )
+      """)
+
+      for operation <- ~w(UPDATE DELETE) do
+        query!(
+          tx,
+          "CREATE TRIGGER IF NOT EXISTS human_empty_import_#{String.downcase(operation)} BEFORE #{operation} ON ticket_human_empty_commit_imports BEGIN SELECT RAISE(ABORT,'human_empty_import_immutable'); END"
+        )
+      end
+
+      query!(tx, "INSERT OR IGNORE INTO factory_schema_migrations(version,applied_at) VALUES(50,?)", [iso_now()])
+
+      query!(tx, """
+      CREATE TRIGGER IF NOT EXISTS human_empty_import_schema_rollback BEFORE DELETE ON factory_schema_migrations
+      WHEN OLD.version=50 AND EXISTS(SELECT 1 FROM ticket_human_empty_commit_imports)
+      BEGIN SELECT RAISE(ABORT,'human_empty_import_history_present'); END
+      """)
+    end)
+  end
+
+  defp migrate_ci_evidence_successors(connection) do
+    transaction!(connection, &create_ci_evidence_successors/1, mode: :immediate)
+  end
+
+  defp create_ci_evidence_successors(connection) do
+    query!(connection, """
+    CREATE TABLE IF NOT EXISTS ticket_ci_repair_evidence_successors (
+      successor_key TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES runs(run_id),
+      claim_key TEXT NOT NULL REFERENCES ticket_ci_repair_claims(claim_key),
+      prior_request_key TEXT NOT NULL UNIQUE REFERENCES worker_evidence(request_key),
+      prior_successor_key TEXT REFERENCES ticket_ci_repair_evidence_successors(successor_key),
+      attempt_index INTEGER NOT NULL CHECK(attempt_index BETWEEN 2 AND 5),
+      configured_limit INTEGER NOT NULL CHECK(configured_limit BETWEEN 1 AND 5),
+      evidence_content_sha256 TEXT NOT NULL,
+      evidence_json TEXT NOT NULL, evidence_sha256 TEXT NOT NULL,
+      proof_json TEXT NOT NULL, proof_sha256 TEXT NOT NULL,
+      new_request_key TEXT NOT NULL UNIQUE,
+      new_reservation_key TEXT NOT NULL UNIQUE,
+      created_at TEXT NOT NULL,
+      UNIQUE(run_id, attempt_index), UNIQUE(claim_key, evidence_content_sha256)
+    )
+    """)
+
+    for {name, operation} <- [{"ci_successor_update", "UPDATE"}, {"ci_successor_delete", "DELETE"}] do
+      query!(connection, "CREATE TRIGGER IF NOT EXISTS #{name} BEFORE #{operation} ON ticket_ci_repair_evidence_successors BEGIN SELECT RAISE(ABORT,'CI evidence successor immutable'); END")
+    end
+
+    query!(connection, """
+    CREATE TRIGGER IF NOT EXISTS ci_successor_total_budget BEFORE INSERT ON ticket_ci_repair_evidence_successors
+    WHEN NEW.attempt_index != (SELECT COUNT(*)+1 FROM ticket_ci_repair_claims WHERE run_id=NEW.run_id) +
+                              (SELECT COUNT(*) FROM ticket_ci_repair_evidence_successors WHERE run_id=NEW.run_id)
+      OR NEW.attempt_index > NEW.configured_limit
+      OR NOT EXISTS(SELECT 1 FROM ticket_ci_repair_claims WHERE claim_key=NEW.claim_key AND run_id=NEW.run_id)
+    BEGIN SELECT RAISE(ABORT,'CI repair attempt budget changed'); END
+    """)
+
+    query!(connection, """
+    CREATE TRIGGER IF NOT EXISTS ci_claim_total_budget BEFORE INSERT ON ticket_ci_repair_claims
+    WHEN (SELECT COUNT(*) FROM ticket_ci_repair_claims WHERE run_id=NEW.run_id) +
+         (SELECT COUNT(*) FROM ticket_ci_repair_evidence_successors WHERE run_id=NEW.run_id) >= 5
+    BEGIN SELECT RAISE(ABORT,'CI repair attempt budget exhausted'); END
+    """)
+
+    query!(connection, """
+    CREATE TRIGGER IF NOT EXISTS ci_successor_schema_rollback BEFORE DELETE ON factory_schema_migrations
+    WHEN OLD.version=48 AND EXISTS(SELECT 1 FROM ticket_ci_repair_evidence_successors)
+    BEGIN SELECT RAISE(ABORT,'CI evidence successor schema required'); END
+    """)
+
+    query!(connection, "INSERT OR IGNORE INTO factory_schema_migrations(version,applied_at) VALUES(48,?)", [iso_now()])
+  end
+
+  defp migrate_ci_claim_rounds(connection) do
+    sql = one!(connection, "SELECT sql FROM sqlite_master WHERE name='ticket_ci_repair_claims'")["sql"]
+
+    unless (ci_claim_definition?(sql, 5) or ci_claim_definition?(sql, 7) or ci_claim_definition?(sql, 10) or
+              (ci_claim_definition?(sql, :identity) and not is_nil(one!(connection, "SELECT version FROM factory_schema_migrations WHERE version=54")))) and
+             one!(connection, "SELECT version FROM factory_schema_migrations WHERE version=47") do
+      migrate_ci_claim_rounds_checked(connection)
+    end
+  end
+
+  defp migrate_ci_seven_attempts(connection) do
+    unless one!(connection, "SELECT version FROM factory_schema_migrations WHERE version=49") do
+      migrate_ci_seven_attempts_checked(connection)
+    end
+  end
+
+  defp migrate_ci_seven_attempts_checked(%DBConnection{conn_mode: :transaction}),
+    do: raise("CI attempt migration requires an outer connection checkout")
+
+  defp migrate_ci_seven_attempts_checked(connection) do
+    DBConnection.run(connection, fn leased ->
+      original = Map.new(~w(foreign_keys legacy_alter_table), &{&1, one!(leased, "PRAGMA #{&1}")[&1]})
+
+      try do
+        query!(leased, "PRAGMA foreign_keys=OFF")
+        query!(leased, "PRAGMA legacy_alter_table=ON")
+        if one!(leased, "PRAGMA foreign_keys")["foreign_keys"] != 0, do: raise("CI attempt migration failed to disable foreign keys")
+
+        transaction!(
+          leased,
+          fn tx ->
+            if is_nil(one!(tx, "SELECT version FROM factory_schema_migrations WHERE version=49")) do
+              widen_ci_attempt_table(tx, "ticket_ci_repair_claims", [{"round BETWEEN 1 AND 5", "round BETWEEN 1 AND 7"}])
+
+              widen_ci_attempt_table(tx, "ticket_ci_repair_evidence_successors", [
+                {"attempt_index BETWEEN 2 AND 5", "attempt_index BETWEEN 2 AND 7"},
+                {"configured_limit BETWEEN 1 AND 5", "configured_limit BETWEEN 1 AND 7"}
+              ])
+
+              query!(tx, "DROP TRIGGER ci_claim_total_budget")
+
+              query!(tx, """
+              CREATE TRIGGER ci_claim_total_budget BEFORE INSERT ON ticket_ci_repair_claims
+              WHEN (SELECT COUNT(*) FROM ticket_ci_repair_claims WHERE run_id=NEW.run_id) +
+                   (SELECT COUNT(*) FROM ticket_ci_repair_evidence_successors WHERE run_id=NEW.run_id) >= 7
+              BEGIN SELECT RAISE(ABORT,'CI repair attempt budget exhausted'); END
+              """)
+
+              unless query!(tx, "PRAGMA foreign_key_check").rows == [], do: raise("CI attempt migration failed foreign-key validation")
+              query!(tx, "INSERT INTO factory_schema_migrations(version,applied_at) VALUES(49,?)", [iso_now()])
+
+              query!(tx, """
+              CREATE TRIGGER ci_seven_attempt_schema_rollback BEFORE DELETE ON factory_schema_migrations
+              WHEN OLD.version=49
+              BEGIN SELECT RAISE(ABORT,'CI seven-attempt schema required'); END
+              """)
+            end
+          end,
+          mode: :immediate
+        )
+      after
+        restore_ci_claim_pragmas(connection, leased, original)
+      end
+    end)
+  end
+
+  defp widen_ci_attempt_table(tx, table, replacements) do
+    sql = one!(tx, "SELECT sql FROM sqlite_master WHERE name=?", [table])["sql"]
+    before = query!(tx, "SELECT rowid,* FROM #{table} ORDER BY rowid").rows
+    objects = query!(tx, "SELECT sql FROM sqlite_master WHERE tbl_name=? AND type IN ('index','trigger') AND sql IS NOT NULL ORDER BY name", [table]).rows
+
+    widened =
+      Enum.reduce(replacements, sql, fn {old, new}, current ->
+        unless length(String.split(current, old)) == 2, do: raise("CI attempt migration requires the exact prior bounds")
+        String.replace(current, old, new, global: false)
+      end)
+
+    create = Regex.replace(~r/\ACREATE TABLE (?:"#{table}"|#{table})/, widened, "CREATE TABLE #{table}_upgrade49")
+    if create == widened, do: raise("CI attempt migration requires the exact prior table")
+    query!(tx, create)
+    query!(tx, "INSERT INTO #{table}_upgrade49(rowid,#{Enum.map_join(query!(tx, "PRAGMA table_info(#{table})").rows, ",", &Enum.at(&1, 1))}) SELECT rowid,* FROM #{table}")
+    query!(tx, "DROP TABLE #{table}")
+    query!(tx, "ALTER TABLE #{table}_upgrade49 RENAME TO #{table}")
+    for [statement] <- objects, do: query!(tx, statement)
+    unless query!(tx, "SELECT rowid,* FROM #{table} ORDER BY rowid").rows == before, do: raise("CI attempt migration changed receipt bytes")
+  end
+
+  defp migrate_ci_claim_rounds_checked(%DBConnection{conn_mode: :transaction}),
+    do: raise("CI claim migration requires an outer connection checkout")
+
+  defp migrate_ci_claim_rounds_checked(connection) do
+    DBConnection.run(connection, fn leased ->
+      original = Map.new(~w(foreign_keys legacy_alter_table), &{&1, one!(leased, "PRAGMA #{&1}")[&1]})
+
+      try do
+        query!(leased, "PRAGMA foreign_keys=OFF")
+        query!(leased, "PRAGMA legacy_alter_table=ON")
+        if one!(leased, "PRAGMA foreign_keys")["foreign_keys"] != 0, do: raise("CI claim migration failed to disable foreign keys")
+        transaction!(leased, &rebuild_ci_claim_rounds/1, mode: :immediate)
+      after
+        restore_ci_claim_pragmas(connection, leased, original)
+      end
+    end)
+  end
+
+  defp restore_ci_claim_pragmas(connection, leased, original) do
+    for {name, value} <- original, do: query!(leased, "PRAGMA #{name}=#{value}")
+
+    for {name, value} <- original do
+      if one!(leased, "PRAGMA #{name}")[name] != value, do: raise("CI claim migration failed to restore connection settings")
+    end
+  rescue
+    error ->
+      DBConnection.disconnect_all(connection, 0)
+      reraise error, __STACKTRACE__
+  end
+
+  defp rebuild_ci_claim_rounds(tx) do
+    sql = one!(tx, "SELECT sql FROM sqlite_master WHERE name='ticket_ci_repair_claims'")["sql"]
+
+    unless ci_claim_definition?(sql, 5) do
+      unless ci_claim_definition?(sql, 2), do: raise("CI claim migration requires the exact prior schema")
+      before = query!(tx, "SELECT rowid,* FROM ticket_ci_repair_claims ORDER BY rowid").rows
+      objects = query!(tx, "SELECT sql FROM sqlite_master WHERE tbl_name='ticket_ci_repair_claims' AND type IN ('index','trigger') AND sql IS NOT NULL ORDER BY name").rows
+      create = ci_claim_sql(5) |> String.replace("CREATE TABLE ticket_ci_repair_claims", "CREATE TABLE ticket_ci_repair_claims_upgrade", global: false)
+      query!(tx, create)
+      query!(tx, "INSERT INTO ticket_ci_repair_claims_upgrade(rowid,claim_key,diagnosis_key,run_id,round,claim_json,claim_sha256,created_at) SELECT rowid,* FROM ticket_ci_repair_claims")
+      query!(tx, "DROP TABLE ticket_ci_repair_claims")
+      query!(tx, "ALTER TABLE ticket_ci_repair_claims_upgrade RENAME TO ticket_ci_repair_claims")
+      for [statement] <- objects, do: query!(tx, statement)
+      unless query!(tx, "SELECT rowid,* FROM ticket_ci_repair_claims ORDER BY rowid").rows == before, do: raise("CI claim migration changed receipt bytes")
+    end
+
+    unless query!(tx, "PRAGMA foreign_key_check").rows == [], do: raise("CI claim migration failed foreign-key validation")
+
+    query!(tx, """
+    CREATE TRIGGER IF NOT EXISTS ci_repair_five_rounds_schema_rollback BEFORE DELETE ON factory_schema_migrations
+    WHEN OLD.version=47 AND EXISTS(SELECT 1 FROM ticket_ci_repair_claims)
+    BEGIN SELECT RAISE(ABORT,'ci_repair_five_rounds_schema_required'); END
+    """)
+
+    query!(tx, "INSERT OR IGNORE INTO factory_schema_migrations(version,applied_at) VALUES(47,?)", [iso_now()])
+    :ok
+  end
+
+  defp ci_claim_definition?(sql, rounds) when is_binary(sql) do
+    expected = ci_claim_sql(rounds) |> String.trim()
+    String.trim(sql) in [expected, String.replace(expected, "CREATE TABLE ticket_ci_repair_claims", ~s(CREATE TABLE "ticket_ci_repair_claims"), global: false)]
+  end
+
+  defp ci_claim_definition?(_, _), do: false
+
+  defp ci_claim_sql(:identity), do: String.replace(ci_claim_sql(10), "round BETWEEN 1 AND 10", "round >= 1", global: false)
+
+  defp ci_claim_sql(rounds) do
+    """
+    CREATE TABLE ticket_ci_repair_claims (
+      claim_key TEXT PRIMARY KEY,
+      diagnosis_key TEXT NOT NULL UNIQUE REFERENCES ticket_ci_repair_diagnoses(diagnosis_key),
+      run_id TEXT NOT NULL REFERENCES runs(run_id),
+      round INTEGER NOT NULL CHECK(round BETWEEN 1 AND #{rounds}),
+      claim_json TEXT NOT NULL, claim_sha256 TEXT NOT NULL, created_at TEXT NOT NULL,
+      UNIQUE(run_id, round)
+    )
+    """
+  end
+
+  defp migrate_mr_qualifications(connection) do
+    query!(connection, """
+    CREATE TABLE IF NOT EXISTS ticket_mr_qualifications (
+      qualification_key TEXT PRIMARY KEY, request_key TEXT NOT NULL UNIQUE REFERENCES desktop_requests(request_key),
+      run_id TEXT NOT NULL REFERENCES runs(run_id), candidate_sha TEXT NOT NULL,
+      contract_sha256 TEXT NOT NULL, spec_revision INTEGER NOT NULL, stage TEXT NOT NULL,
+      completed_push_sha256 TEXT NOT NULL, request_sha256 TEXT NOT NULL, output_sha256 TEXT NOT NULL,
+      binding_sha256 TEXT NOT NULL, preimage_json TEXT NOT NULL, preimage_sha256 TEXT NOT NULL,
+      observation_json TEXT NOT NULL, observation_sha256 TEXT NOT NULL, observed_at TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK(kind='MR_OBSERVATION_V1')
+    )
+    """)
+
+    for operation <- ~w(UPDATE DELETE) do
+      query!(
+        connection,
+        "CREATE TRIGGER IF NOT EXISTS mr_qualification_#{String.downcase(operation)} BEFORE #{operation} ON ticket_mr_qualifications BEGIN SELECT RAISE(ABORT,'mr_qualification_immutable'); END"
+      )
+    end
+
+    query!(connection, """
+    CREATE TRIGGER IF NOT EXISTS mr_qualification_schema_rollback BEFORE DELETE ON factory_schema_migrations
+    WHEN OLD.version=46 AND EXISTS(SELECT 1 FROM ticket_mr_qualifications)
+    BEGIN SELECT RAISE(ABORT,'mr_qualification_schema_required'); END
+    """)
+  end
+
+  defp migrate_push_rejections(connection) do
+    query!(connection, """
+    CREATE TABLE IF NOT EXISTS ticket_push_rejection_retirements (
+      retirement_key TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES runs(run_id), candidate_sha TEXT NOT NULL,
+      code_repair_round INTEGER NOT NULL, claim_key TEXT NOT NULL REFERENCES ticket_ci_repair_claims(claim_key),
+      original_nonce TEXT NOT NULL, original_envelope TEXT NOT NULL, original_sha256 TEXT NOT NULL,
+      proof_json TEXT NOT NULL, proof_sha256 TEXT NOT NULL,
+      successor_nonce TEXT NOT NULL UNIQUE, successor_binding_sha256 TEXT NOT NULL,
+      successor_reservation_key TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL,
+      UNIQUE(run_id,candidate_sha,code_repair_round,claim_key), UNIQUE(run_id,original_nonce)
+    )
+    """)
+
+    for operation <- ~w(UPDATE DELETE) do
+      query!(
+        connection,
+        "CREATE TRIGGER IF NOT EXISTS push_rejection_#{String.downcase(operation)} BEFORE #{operation} ON ticket_push_rejection_retirements BEGIN SELECT RAISE(ABORT,'push_rejection_immutable'); END"
+      )
+    end
+
+    query!(connection, """
+    CREATE TRIGGER IF NOT EXISTS push_rejection_schema_rollback BEFORE DELETE ON factory_schema_migrations
+    WHEN OLD.version=45 AND EXISTS(SELECT 1 FROM ticket_push_rejection_retirements)
+    BEGIN SELECT RAISE(ABORT,'push_rejection_schema_required'); END
+    """)
+  end
+
+  defp migrate_ci_reassessments(connection) do
+    query!(connection, """
+    CREATE TABLE IF NOT EXISTS ticket_ci_repair_reassessments (
+      reassessment_key TEXT PRIMARY KEY,
+      diagnosis_key TEXT NOT NULL REFERENCES ticket_ci_repair_diagnoses(diagnosis_key),
+      collector_version TEXT NOT NULL, original_sha256 TEXT NOT NULL,
+      run_id TEXT NOT NULL REFERENCES runs(run_id), candidate_sha TEXT NOT NULL,
+      pipeline_id INTEGER NOT NULL, preimage_json TEXT NOT NULL, preimage_sha256 TEXT NOT NULL,
+      diagnosis_json TEXT NOT NULL, diagnosis_sha256 TEXT NOT NULL,
+      verdict TEXT NOT NULL CHECK(verdict IN ('REPAIRABLE','BLOCKED')),
+      created_at TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind='COLLECTOR_REASSESSMENT_V1'),
+      UNIQUE(diagnosis_key, collector_version)
+    )
+    """)
+
+    for operation <- ~w(UPDATE DELETE) do
+      query!(
+        connection,
+        "CREATE TRIGGER IF NOT EXISTS ci_reassessment_#{String.downcase(operation)} BEFORE #{operation} ON ticket_ci_repair_reassessments BEGIN SELECT RAISE(ABORT,'ci_reassessment_immutable'); END"
+      )
+    end
+
+    query!(connection, """
+    CREATE TRIGGER IF NOT EXISTS ci_reassessment_schema_rollback
+    BEFORE DELETE ON factory_schema_migrations
+    WHEN OLD.version=44 AND EXISTS(SELECT 1 FROM ticket_ci_repair_reassessments)
+    BEGIN SELECT RAISE(ABORT,'ci_reassessment_schema_rollback_forbidden'); END
+    """)
+  end
+
+  defp migrate_worker_instruction_snapshots(connection) do
+    query!(connection, """
+    CREATE TABLE IF NOT EXISTS worker_instruction_snapshots (
+      binding_sha256 TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES runs(run_id),
+      role TEXT NOT NULL,
+      binding_json TEXT NOT NULL,
+      bundle_json TEXT NOT NULL,
+      bundle_sha256 TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )
+    """)
+
+    query!(connection, """
+    CREATE TABLE IF NOT EXISTS worker_instruction_task_bindings (
+      task_key TEXT NOT NULL REFERENCES factory_tasks(task_key),
+      prompt_sha256 TEXT NOT NULL,
+      instruction_binding_sha256 TEXT NOT NULL REFERENCES worker_instruction_snapshots(binding_sha256),
+      run_id TEXT NOT NULL REFERENCES runs(run_id),
+      role TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY(task_key, prompt_sha256)
+    )
+    """)
+
+    for {suffix, action} <- [{"update", "UPDATE"}, {"delete", "DELETE"}] do
+      query!(
+        connection,
+        "CREATE TRIGGER IF NOT EXISTS worker_instruction_snapshot_#{suffix} BEFORE #{action} ON worker_instruction_snapshots BEGIN SELECT RAISE(ABORT, 'worker_instruction_snapshot_immutable'); END"
+      )
+
+      query!(
+        connection,
+        "CREATE TRIGGER IF NOT EXISTS worker_instruction_task_binding_#{suffix} BEFORE #{action} ON worker_instruction_task_bindings BEGIN SELECT RAISE(ABORT, 'worker_instruction_task_binding_immutable'); END"
+      )
+    end
+
+    query!(connection, """
+    CREATE TRIGGER IF NOT EXISTS worker_instruction_snapshot_schema_rollback BEFORE DELETE ON factory_schema_migrations
+    WHEN OLD.version = 43 AND EXISTS (SELECT 1 FROM worker_instruction_snapshots)
+    BEGIN SELECT RAISE(ABORT, 'worker_instruction_snapshot_schema_required'); END
+    """)
+  end
+
+  defp migrate_push_input_retirements(connection) do
+    query!(connection, """
+    CREATE TABLE IF NOT EXISTS ticket_push_input_retirements (
+      retirement_key TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES runs(run_id),
+      code_repair_round INTEGER NOT NULL CHECK(code_repair_round >= 1),
+      original_nonce TEXT NOT NULL,
+      original_envelope TEXT NOT NULL,
+      original_sha256 TEXT NOT NULL,
+      proof_json TEXT NOT NULL,
+      proof_sha256 TEXT NOT NULL,
+      successor_nonce TEXT NOT NULL UNIQUE,
+      successor_binding_sha256 TEXT NOT NULL,
+      successor_reservation_key TEXT NOT NULL UNIQUE,
+      created_at TEXT NOT NULL,
+      UNIQUE(run_id, code_repair_round),
+      UNIQUE(run_id, original_nonce)
+    )
+    """)
+
+    for {name, operation} <- [{"push_input_retirement_update", "UPDATE"}, {"push_input_retirement_delete", "DELETE"}] do
+      query!(connection, """
+      CREATE TRIGGER IF NOT EXISTS #{name} BEFORE #{operation} ON ticket_push_input_retirements
+      BEGIN SELECT RAISE(ABORT, 'push_input_retirement_immutable'); END
+      """)
+    end
+
+    query!(connection, """
+    CREATE TRIGGER IF NOT EXISTS push_input_retirement_schema_rollback BEFORE DELETE ON factory_schema_migrations
+    WHEN OLD.version = 42 AND EXISTS (SELECT 1 FROM ticket_push_input_retirements)
+    BEGIN SELECT RAISE(ABORT, 'push_input_retirement_schema_required'); END
+    """)
+  end
+
+  defp migrate_ci_repair_receipts(connection) do
+    query!(connection, """
+    CREATE TABLE IF NOT EXISTS ticket_ci_repair_diagnoses (
+      diagnosis_key TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES runs(run_id),
+      candidate_sha TEXT NOT NULL,
+      pipeline_id INTEGER NOT NULL,
+      preimage_json TEXT NOT NULL, preimage_sha256 TEXT NOT NULL,
+      diagnosis_json TEXT NOT NULL, diagnosis_sha256 TEXT NOT NULL,
+      verdict TEXT NOT NULL CHECK(verdict IN ('REPAIRABLE', 'BLOCKED')),
+      created_at TEXT NOT NULL,
+      UNIQUE(run_id, candidate_sha, pipeline_id)
+    )
+    """)
+
+    query!(connection, """
+    CREATE TABLE IF NOT EXISTS ticket_ci_repair_claims (
+      claim_key TEXT PRIMARY KEY,
+      diagnosis_key TEXT NOT NULL UNIQUE REFERENCES ticket_ci_repair_diagnoses(diagnosis_key),
+      run_id TEXT NOT NULL REFERENCES runs(run_id),
+      round INTEGER NOT NULL CHECK(round BETWEEN 1 AND 2),
+      claim_json TEXT NOT NULL, claim_sha256 TEXT NOT NULL, created_at TEXT NOT NULL,
+      UNIQUE(run_id, round)
+    )
+    """)
+
+    for {label, table} <- [{"diagnosis", "ticket_ci_repair_diagnoses"}, {"claim", "ticket_ci_repair_claims"}],
+        {action, suffix} <- [{"UPDATE", "update"}, {"DELETE", "delete"}] do
+      query!(connection, "CREATE TRIGGER IF NOT EXISTS ci_repair_#{label}_#{suffix} BEFORE #{action} ON #{table} BEGIN SELECT RAISE(ABORT, 'ci_repair_receipt_immutable'); END")
+    end
+
+    query!(connection, """
+    CREATE TRIGGER IF NOT EXISTS ci_repair_schema_rollback BEFORE DELETE ON factory_schema_migrations
+    WHEN OLD.version = 41 AND EXISTS (SELECT 1 FROM ticket_ci_repair_diagnoses)
+    BEGIN SELECT RAISE(ABORT, 'ci_repair_schema_required'); END
+    """)
+
+    migrate_ci_generation_journal(connection)
+  end
+
+  defp migrate_ci_generation_journal(connection) do
+    query!(connection, """
+    CREATE TABLE IF NOT EXISTS ticket_ci_generation_intents (
+      intent_key TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES runs(run_id),
+      claim_key TEXT NOT NULL REFERENCES ticket_ci_repair_claims(claim_key),
+      request_key TEXT NOT NULL REFERENCES worker_evidence(request_key),
+      operation TEXT NOT NULL CHECK(operation IN ('GAZELLE_DIFF', 'GOFMT_DIFF')),
+      binding_json TEXT NOT NULL, binding_sha256 TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(request_key, operation)
+    )
+    """)
+
+    query!(connection, """
+    CREATE TABLE IF NOT EXISTS ticket_ci_generation_events (
+      event_key TEXT PRIMARY KEY,
+      intent_key TEXT NOT NULL REFERENCES ticket_ci_generation_intents(intent_key),
+      event_type TEXT NOT NULL CHECK(event_type IN ('EXECUTION_PREPARED','EXECUTION_STARTED','EXECUTION_RECEIPT','APPLY_PREPARED','APPLY_STARTED','APPLY_CREATED','APPLIED','BLOCKED','UNCERTAIN','FINALIZED')),
+      path TEXT NOT NULL,
+      predecessor_key TEXT REFERENCES ticket_ci_generation_events(event_key),
+      receipt_json TEXT NOT NULL, receipt_sha256 TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(intent_key, event_type, path)
+    )
+    """)
+
+    for {label, table} <- [{"intent", "ticket_ci_generation_intents"}, {"event", "ticket_ci_generation_events"}],
+        {action, suffix} <- [{"UPDATE", "update"}, {"DELETE", "delete"}] do
+      query!(connection, "CREATE TRIGGER IF NOT EXISTS ci_generation_#{label}_#{suffix} BEFORE #{action} ON #{table} BEGIN SELECT RAISE(ABORT, 'ci_generation_receipt_immutable'); END")
+    end
+
+    query!(connection, """
+    CREATE TRIGGER IF NOT EXISTS ci_generation_schema_rollback BEFORE DELETE ON factory_schema_migrations
+    WHEN OLD.version = 41 AND EXISTS (SELECT 1 FROM ticket_ci_generation_intents)
+    BEGIN SELECT RAISE(ABORT, 'ci_generation_schema_required'); END
+    """)
+
+    query!(connection, """
+    CREATE TRIGGER IF NOT EXISTS ci_generation_source_hold BEFORE UPDATE ON workspace_access
+    WHEN OLD.mode = 'SOURCE' AND OLD.released_at IS NULL AND EXISTS (
+      SELECT 1 FROM ticket_ci_generation_intents i
+      WHERE i.request_key = OLD.request_key AND NOT EXISTS (
+        SELECT 1 FROM ticket_ci_generation_events e
+        WHERE e.intent_key = i.intent_key AND e.event_type = 'FINALIZED' AND e.path = ''
+      )
+    )
+    BEGIN SELECT RAISE(ABORT, 'ci_generation_source_required'); END
+    """)
+
+    query!(connection, """
+    CREATE TRIGGER IF NOT EXISTS ci_generation_source_delete BEFORE DELETE ON workspace_access
+    WHEN OLD.mode = 'SOURCE' AND EXISTS (
+      SELECT 1 FROM ticket_ci_generation_intents i WHERE i.request_key = OLD.request_key
+    )
+    BEGIN SELECT RAISE(ABORT, 'ci_generation_source_required'); END
+    """)
+  end
+
+  defp migrate_mr_actor_bindings(connection) do
+    query!(connection, """
+    CREATE TABLE IF NOT EXISTS ticket_mr_actor_bindings (
+      request_key TEXT PRIMARY KEY REFERENCES desktop_requests(request_key),
+      operation TEXT NOT NULL CHECK(operation IN ('PREPARED','CORRECTED')),
+      original_request_json TEXT NOT NULL, original_request_sha256 TEXT NOT NULL,
+      original_payload_sha256 TEXT NOT NULL, pinned_payload_sha256 TEXT NOT NULL,
+      proof_json TEXT NOT NULL, proof_sha256 TEXT NOT NULL, created_at TEXT NOT NULL
+    )
+    """)
+
+    for {name, action} <- [{"mr_actor_audit_update", "UPDATE"}, {"mr_actor_audit_delete", "DELETE"}] do
+      query!(connection, "CREATE TRIGGER IF NOT EXISTS #{name} BEFORE #{action} ON ticket_mr_actor_bindings BEGIN SELECT RAISE(ABORT, 'mr_actor_audit_immutable'); END")
+    end
+
+    query!(connection, """
+    CREATE TRIGGER IF NOT EXISTS mr_actor_schema_rollback BEFORE DELETE ON factory_schema_migrations
+    WHEN OLD.version = 40 AND EXISTS (SELECT 1 FROM ticket_mr_actor_bindings)
+    BEGIN SELECT RAISE(ABORT, 'mr_actor_audit_schema_required'); END
+    """)
+  end
+
+  defp migrate_push_unknown_guards(connection) do
+    query!(connection, """
+    CREATE TRIGGER IF NOT EXISTS push_unknown_run_identity BEFORE UPDATE ON runs
+    WHEN EXISTS (SELECT 1 FROM events WHERE run_id = OLD.run_id AND event_type = 'TICKET_PUSH_UNKNOWN_HAZARD')
+      AND (NEW.run_id IS NOT OLD.run_id OR NEW.repo_key IS NOT OLD.repo_key OR NEW.repo_path IS NOT OLD.repo_path OR NEW.worktree IS NOT OLD.worktree
+        OR NEW.branch IS NOT OLD.branch OR NEW.base_branch IS NOT OLD.base_branch
+        OR (NEW.candidate_sha IS NOT OLD.candidate_sha AND NOT EXISTS (
+          SELECT 1 FROM events lineage JOIN events hazard ON hazard.run_id = lineage.run_id
+          WHERE lineage.run_id = OLD.run_id AND lineage.event_type = 'TICKET_PUSH_DESCENDANT_PROVEN'
+            AND hazard.event_type = 'TICKET_PUSH_UNKNOWN_HAZARD'
+            AND json_extract(lineage.payload_json, '$.hazard_sha256') = json_extract(hazard.payload_json, '$.sha256')
+            AND json_extract(lineage.payload_json, '$.from_sha') IS OLD.candidate_sha
+            AND json_extract(lineage.payload_json, '$.to_sha') IS NEW.candidate_sha
+            AND json_extract(lineage.payload_json, '$.branch') IS OLD.branch
+            AND json_extract(lineage.payload_json, '$.worktree') IS OLD.worktree
+            AND json_extract(lineage.payload_json, '$.contract_sha256') IS OLD.contract_sha256
+            AND json_extract(lineage.payload_json, '$.spec_revision') IS OLD.spec_revision
+            AND json_extract(lineage.payload_json, '$.handoff') IS OLD.candidate_handoff)))
+    BEGIN SELECT RAISE(ABORT, 'push_unknown_hazard_mutation_unproven'); END
+    """)
+
+    query!(connection, """
+    CREATE TRIGGER IF NOT EXISTS push_unknown_run_delete BEFORE DELETE ON runs
+    WHEN EXISTS (SELECT 1 FROM events WHERE run_id = OLD.run_id AND event_type = 'TICKET_PUSH_UNKNOWN_HAZARD')
+    BEGIN SELECT RAISE(ABORT, 'push_unknown_hazard_delete_unproven'); END
+    """)
+
+    for {name, operation} <- [{"push_unknown_event_delete", "DELETE"}, {"push_unknown_event_update", "UPDATE"}] do
+      query!(connection, """
+      CREATE TRIGGER IF NOT EXISTS #{name} BEFORE #{operation} ON events
+      WHEN OLD.event_type IN ('TICKET_PUSH_UNKNOWN_HAZARD', 'TICKET_PUSH_DESCENDANT_PROVEN')
+      BEGIN SELECT RAISE(ABORT, 'push_unknown_history_immutable'); END
+      """)
+    end
+
+    query!(connection, """
+    CREATE TRIGGER IF NOT EXISTS push_unknown_schema_rollback BEFORE DELETE ON factory_schema_migrations
+    WHEN OLD.version = 39 AND EXISTS (SELECT 1 FROM events WHERE event_type = 'TICKET_PUSH_UNKNOWN_HAZARD')
+    BEGIN SELECT RAISE(ABORT, 'push_unknown_hazard_schema_required'); END
+    """)
+  end
+
+  defp ensure_active_run_indexes(connection) do
+    transaction!(connection, fn tx ->
+      for {name, columns} <- [{"one_active_run_per_issue_kind", "issue_key, kind"}, {"one_active_factory_run_per_issue", "issue_key"}] do
+        sql = "CREATE UNIQUE INDEX #{name} ON runs(#{columns}) WHERE state NOT IN ('READY_FOR_REVIEW', 'DELIVERED', 'AWAITING_VALIDATION', 'CANCELLED', 'FAILED')"
+        existing = one!(tx, "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?", [name])
+
+        unless existing && normalize_schema_sql(existing["sql"]) == normalize_schema_sql(sql) do
+          query!(tx, "DROP INDEX IF EXISTS #{name}")
+          query!(tx, sql)
+        end
+      end
+    end)
+
+    :ok
+  end
+
+  defp normalize_schema_sql(sql), do: sql |> String.replace(~r/\s+/, " ") |> String.trim()
 
   defp migrate_nullable_amendment_candidates(connection) do
     tables = ~w(ticket_contract_amendments ticket_contract_critic_attempts ticket_amendment_jira_effects ticket_amendment_authorization_effects)
@@ -1085,8 +2064,11 @@ defmodule SymphonyElixir.Factory.Store do
   Runs a function inside an immediate SQLite transaction.
   """
   @spec transaction!(connection(), (DBConnection.t() -> result)) :: result when result: var
-  def transaction!(connection, fun) do
-    case Exqlite.transaction(connection, fun) do
+  def transaction!(connection, fun), do: transaction!(connection, fun, [])
+
+  @spec transaction!(connection(), (DBConnection.t() -> result), keyword()) :: result when result: var
+  def transaction!(connection, fun, opts) do
+    case Exqlite.transaction(connection, fun, opts) do
       {:ok, result} -> result
       {:error, reason} -> raise "factory SQLite transaction failed: #{inspect(reason)}"
     end

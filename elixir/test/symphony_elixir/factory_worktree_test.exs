@@ -320,6 +320,32 @@ defmodule SymphonyElixir.FactoryWorktreeTest do
     assert String.trim(cmd!(path, ["branch", "--show-current"])) == branch
   end
 
+  @tag :ci_generation_inputs
+  test "controller generation observes exact dirty paths and refuses hidden ignored inputs without changing HEAD", %{route: route, repo: repo} do
+    File.write!(Path.join(repo, ".gitignore"), "hidden-config\n")
+    cmd!(repo, ["add", ".gitignore"])
+    cmd!(repo, ["commit", "--no-verify", "-m", "fixture ignore rule"])
+    parent = String.trim(cmd!(repo, ["rev-parse", "HEAD"]))
+    path = Path.join(Path.dirname(repo), "native-generation")
+    branch = "factory/native-generation"
+    cmd!(repo, ["worktree", "add", "--detach", path, parent])
+    assert {:ok, _} = Worktree.attach_native_branch(route, path, branch, parent)
+    File.write!(Path.join(path, "job.go"), "package p\n")
+    assert {:ok, facts} = Worktree.generation_inputs(route, path, branch, parent, ["job.go"])
+    assert facts.sha == parent and facts.dirty_paths == ["job.go"]
+    assert {:error, :native_slice_paths_mismatch} = Worktree.generation_inputs(route, path, branch, parent, [])
+    assert {:ok, %{sha: candidate}} = Worktree.commit_native_slice(route, path, branch, parent, ["job.go"], "feat(PPL-123): generation fixture")
+    File.write!(Path.join(path, "job.go"), "package p\nvar changed = 1\n")
+    assert {:ok, ["job.go"]} = Worktree.generation_candidate_paths(route, path, branch, parent, candidate, ["job.go"])
+    assert {:error, :worktree_dirty} = Worktree.committed_candidate_paths(route, path, branch, parent, candidate)
+    assert {:error, :native_slice_paths_mismatch} = Worktree.generation_candidate_paths(route, path, branch, parent, candidate, [])
+    assert {:error, :controller_generation_head_changed} = Worktree.generation_candidate_paths(route, path, branch, parent, parent, ["job.go"])
+    File.write!(Path.join(path, "hidden-config"), "untracked ignored input\n")
+    assert {:error, :controller_generation_ignored_input} = Worktree.generation_inputs(route, path, branch, candidate, ["job.go"])
+    assert {:error, :controller_generation_ignored_input} = Worktree.generation_candidate_paths(route, path, branch, parent, candidate, ["job.go"])
+    assert String.trim(cmd!(path, ["rev-parse", "HEAD"])) == candidate
+  end
+
   test "controller commits only the writer-declared native files and adopts the same commit after a retry", %{
     route: route,
     repo: repo

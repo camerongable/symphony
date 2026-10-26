@@ -14,10 +14,12 @@ defmodule SymphonyElixir.Factory.TicketContext do
     "findings" => {"runs", "run_id", "repair_findings_json"},
     "feedback" => {"runs", "run_id", "review_feedback_json"},
     "task" => {"factory_tasks", "task_key", "output_json"},
+    "task_failure" => {"factory_tasks", "task_key", "failure_code"},
     "receipt" => {"desktop_requests", "request_key", "output_json"},
     "event" => {"events", "id", "payload_json"},
     "question" => {"ticket_chat_questions", "question_key", "body"},
     "command" => {"ticket_chat_commands", "command_key", "payload_json"},
+    "command_receipt" => {"ticket_chat_commands", "command_key", "receipt_json"},
     "answers" => {"ticket_chat_questions", "question_key", "answers_json"},
     "worker" => {"worker_evidence", "request_key", "output_json"}
   }
@@ -189,6 +191,10 @@ defmodule SymphonyElixir.Factory.TicketContext do
 
     %{
       identity: Map.take(chat, ~w(chat_key scope_key issue_id issue_key repo_key generation thread_id context_sequence)),
+      ticket_cli: %{
+        prefix: SymphonyElixir.Factory.TicketContextReader.cli_prefix(),
+        instruction: "Use this deployment-aware prefix from the saved reader cwd for ticket prepare-stage, stage and details commands; do not retry bare Mix with elevated permissions."
+      },
       run: Map.take(run, @run_fields),
       run_details: artifact("run", run["run_id"], run_details(run)),
       contract: %{binding: contract_binding(run), artifact: artifact("contract", run["run_id"], run["contract_markdown"])},
@@ -198,8 +204,9 @@ defmodule SymphonyElixir.Factory.TicketContext do
         rows(store, "SELECT command_key, status, receipt_json, updated_at FROM ticket_chat_commands WHERE chat_key = ? AND run_id = ? AND status != 'PENDING' ORDER BY updated_at DESC LIMIT 4", [
           chat["chat_key"],
           run["run_id"]
-        ]),
-      tasks: Enum.map(tasks, &Map.put(Map.take(&1, @task_fields), "evidence", artifact("task", &1["task_key"], &1["output_json"]))),
+        ])
+        |> Enum.map(&decision_projection/1),
+      tasks: Enum.map(tasks, &task_projection/1),
       latest_verifier: verifier(store, run),
       historical_verifier: historical_verifier(store, run),
       manual_validation: manual_validation(store, run),
@@ -219,6 +226,24 @@ defmodule SymphonyElixir.Factory.TicketContext do
       summary: summary(run, writer_disposition)
     }
   end
+
+  defp decision_projection(row) do
+    row
+    |> Map.drop(["receipt_json"])
+    |> Map.put("receipt", artifact("command_receipt", row["command_key"], row["receipt_json"]))
+  end
+
+  defp task_projection(row) do
+    row
+    |> Map.take(@task_fields)
+    |> Map.put("failure_code", bounded_failure(row["failure_code"]))
+    |> Map.put("failure", artifact("task_failure", row["task_key"], row["failure_code"]))
+    |> Map.put("evidence", artifact("task", row["task_key"], row["output_json"]))
+  end
+
+  defp bounded_failure(nil), do: nil
+  defp bounded_failure(raw) when byte_size(raw) <= 512, do: raw
+  defp bounded_failure(raw), do: valid_prefix(raw, 509) <> "…"
 
   defp current_writer_disposition(store, run) do
     event =
@@ -451,7 +476,7 @@ defmodule SymphonyElixir.Factory.TicketContext do
   defp artifact(kind, id, raw) do
     token = %{"kind" => kind, "id" => id, "sha256" => digest(raw)}
     ref = token |> Jason.encode!() |> Base.url_encode64(padding: false)
-    availability = if kind in ~w(contract plan question) or match?({:ok, _}, Jason.decode(raw)), do: "RECORDED", else: "INVALID_JSON"
+    availability = if kind in ~w(contract plan question task_failure) or match?({:ok, _}, Jason.decode(raw)), do: "RECORDED", else: "INVALID_JSON"
     %{artifact_ref: ref, kind: kind, sha256: token["sha256"], bytes: byte_size(raw), availability: availability}
   end
 

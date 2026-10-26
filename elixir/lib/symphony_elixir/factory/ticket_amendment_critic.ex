@@ -2,6 +2,7 @@ defmodule SymphonyElixir.Factory.TicketAmendmentCritic do
   @moduledoc "Runs and durably records one isolated critic turn for a published ticket amendment."
 
   alias SymphonyElixir.Codex.AppServer
+  alias SymphonyElixir.Factory.SpecialistErrorNotice
   alias SymphonyElixir.Factory.{StageRunner, TicketAmendmentJiraOperation, TicketContractAmendment, TicketMrOperation}
   alias SymphonyElixir.Tracker.Issue
 
@@ -93,14 +94,17 @@ defmodule SymphonyElixir.Factory.TicketAmendmentCritic do
         %{event: :session_started} ->
           raise "critic parent thread rejected"
 
-        _event ->
-          :ok
+        message ->
+          SpecialistErrorNotice.observe_task(store, attempt["task_key"], command_key, attempt["prompt_sha256"], message)
       end
     ]
 
     case runner.run(workspace, issue, attempt["prompt"], schema, run_opts) do
       {:ok, evidence} ->
         persist_result(store, command_key, context, attempt, evidence)
+
+      {:error, {:worker_failed, reason, observed}} when is_map(observed) ->
+        reconcile(store, command_key, context, reason, stringify(observed))
 
       {:error, reason} ->
         reconcile(store, command_key, context, reason, %{})

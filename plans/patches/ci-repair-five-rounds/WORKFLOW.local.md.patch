@@ -1,0 +1,5 @@
+--- a/WORKFLOW.local.md
++++ b/WORKFLOW.local.md
+@@ -64 +64 @@
+-  maximum_code_repair_rounds: 2
++  maximum_code_repair_rounds: 5

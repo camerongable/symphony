@@ -1,7 +1,174 @@
 defmodule SymphonyElixir.FactoryGitLabMcpConnectorTest do
   use ExUnit.Case, async: true
-
   alias SymphonyElixir.Factory.GitLabMcpConnector
+  alias SymphonyElixir.FactoryGitLabMcpConnectorTest.FakeAppServer
+
+  test "branch heads require the exact readonly catalog and caller-owned session" do
+    opts = [workspace: "/tmp/controller", app_server: FakeAppServer, mcp_session: %{thread_id: "controller"}]
+
+    schema = %{
+      "name" => "get_branch",
+      "annotations" => %{"readOnlyHint" => true},
+      "inputSchema" => %{"type" => "object", "required" => ~w(project_id branch_name), "properties" => Map.new(~w(project_id branch_name), &{&1, %{"type" => "string"}})}
+    }
+
+    sha = String.duplicate("a", 40)
+    Process.put(:gitlab_mcp_catalog, {:ok, %{"get_branch" => schema}})
+
+    Process.put(
+      :gitlab_mcp_response,
+      {:ok,
+       %{
+         "structuredContent" => %{
+           "name" => "feature/exact",
+           "web_url" => "https://gitlab.com/grailbio/grail/-/tree/feature/exact",
+           "commit" => %{"id" => sha, "web_url" => "https://gitlab.com/grailbio/grail/-/commit/#{sha}"}
+         }
+       }}
+    )
+
+    assert {:ok, ^sha} = GitLabMcpConnector.branch_head(33_747_681, "grailbio/grail", "feature/exact", opts)
+    assert_received {:mcp_session_call, _, "GitLab", "get_branch", %{"project_id" => "33747681", "branch_name" => "feature/exact"}}
+    assert {:error, :gitlab_branch_scope_required} = GitLabMcpConnector.branch_head(33_747_681, "grailbio/grail", "feature/exact", Keyword.delete(opts, :mcp_session))
+    refute_received {:mcp_session_call, _, _, _, _}
+
+    for bad <- [
+          put_in(schema, ["annotations", "readOnlyHint"], false),
+          put_in(schema, ["inputSchema", "properties", "branch_name", "type"], "number"),
+          put_in(schema, ["inputSchema", "required"], ~w(project_id branch)),
+          Map.put(schema, "name", "get_commit")
+        ] do
+      Process.put(:gitlab_mcp_catalog, {:ok, %{"get_branch" => bad}})
+      assert {:error, :gitlab_branch_schema_unavailable} = GitLabMcpConnector.branch_head(33_747_681, "grailbio/grail", "feature/exact", opts)
+      refute_received {:mcp_session_call, _, _, _, _}
+    end
+
+    Process.put(:gitlab_mcp_catalog, {:ok, %{"get_branch" => schema}})
+
+    result = %{
+      "name" => "feature/exact",
+      "web_url" => "https://gitlab.com/grailbio/grail/-/tree/feature/exact",
+      "commit" => %{"id" => sha, "web_url" => "https://gitlab.com/grailbio/grail/-/commit/#{sha}"}
+    }
+
+    for bad <- [
+          Map.put(result, "name", "feature/foreign"),
+          Map.put(result, "project_id", 7),
+          Map.put(result, "project_id", %{}),
+          Map.put(result, "web_url", "https://gitlab.com/foreign/project/-/tree/feature/exact"),
+          put_in(result, ["commit", "id"], String.duplicate("b", 39)),
+          put_in(result, ["commit", "web_url"], "https://gitlab.com/foreign/project/-/commit/#{sha}"),
+          Map.put(result, "commit", nil)
+        ] do
+      Process.put(:gitlab_mcp_response, {:ok, %{"structuredContent" => bad}})
+      assert {:error, :gitlab_branch_result_invalid} = GitLabMcpConnector.branch_head(33_747_681, "grailbio/grail", "feature/exact", opts)
+      assert_received {:mcp_session_call, _, "GitLab", "get_branch", _}
+    end
+
+    Process.put(:gitlab_mcp_response, {:ok, %{"isError" => true, "content" => []}})
+    assert {:error, :gitlab_branch_result_invalid} = GitLabMcpConnector.branch_head(33_747_681, "grailbio/grail", "feature/exact", opts)
+    assert_received {:mcp_session_call, _, "GitLab", "get_branch", _}
+    Process.put(:gitlab_mcp_response, {:error, :mcp_tool_read_timeout})
+    assert {:error, :mcp_tool_read_timeout} = GitLabMcpConnector.branch_head(33_747_681, "grailbio/grail", "feature/exact", opts)
+    assert_received {:mcp_session_call, _, "GitLab", "get_branch", _}
+  end
+
+  test "artifact directory reads retain exact job session and readonly capability guards" do
+    opts = [workspace: "/tmp/controller", app_server: FakeAppServer, mcp_session: %{thread_id: "controller"}]
+    args = %{"project_id" => "33747681", "job_id" => "17239341490", "path" => "build-artifacts/tests", "recursive" => true}
+    properties = Map.new(~w(project_id job_id path), &{&1, %{"type" => "string"}}) |> Map.put("recursive", %{"type" => "boolean"})
+    schema = %{"name" => "list_job_artifacts", "annotations" => %{"readOnlyHint" => true}, "inputSchema" => %{"type" => "object", "required" => ~w(project_id job_id), "properties" => properties}}
+    Process.put(:gitlab_mcp_catalog, {:ok, %{"list_job_artifacts" => schema}})
+    Process.put(:gitlab_mcp_response, {:ok, %{"content" => [%{"type" => "text", "text" => "[]"}]}})
+    assert {:ok, []} = GitLabMcpConnector.job_artifacts("list_job_artifacts", args, opts)
+    assert_received {:mcp_session_call, _, "GitLab", "list_job_artifacts", ^args}
+
+    for path <- ["/absolute", "../outside", "a/../b", "a//b", "C:/drive", "a\\b", "a\nsecret", "a/b/c/d/e", "trailing/"] do
+      assert {:error, :ci_artifact_scope_required} = GitLabMcpConnector.job_artifacts("list_job_artifacts", Map.put(args, "path", path), opts)
+    end
+
+    assert {:error, :ci_artifact_scope_required} = GitLabMcpConnector.job_artifacts("list_job_artifacts", Map.put(args, "job_id", "../7"), opts)
+    assert {:error, :ci_artifact_scope_required} = GitLabMcpConnector.job_artifacts("list_job_artifacts", args, Keyword.delete(opts, :mcp_session))
+    Process.put(:gitlab_mcp_catalog, {:ok, %{"list_job_artifacts" => put_in(schema, ["annotations", "readOnlyHint"], false)}})
+    assert {:error, :ci_artifact_schema_unavailable} = GitLabMcpConnector.job_artifacts("list_job_artifacts", args, opts)
+    refute_received {:mcp_session_call, _, _, _, _}
+  end
+
+  test "discussion pages require exact unfiltered owner session scope and fresh readonly capability" do
+    opts = [workspace: "/tmp/controller", app_server: FakeAppServer, mcp_session: %{thread_id: "controller"}]
+    args = %{"project_id" => "33747681", "merge_request_iid" => "47818", "page" => 1, "per_page" => 100}
+    properties = Map.new(~w(project_id merge_request_iid), &{&1, %{"type" => "string"}}) |> Map.merge(Map.new(~w(page per_page), &{&1, %{"type" => "number"}}))
+
+    schema = %{
+      "name" => "mr_discussions",
+      "annotations" => %{"readOnlyHint" => true},
+      "inputSchema" => %{"type" => "object", "required" => ~w(project_id merge_request_iid), "properties" => properties}
+    }
+
+    Process.put(:gitlab_mcp_catalog, {:ok, %{"mr_discussions" => schema}})
+    response = %{"items" => [], "pagination" => %{"x_next_page" => nil}}
+    Process.put(:gitlab_mcp_response, {:ok, %{"structuredContent" => response}})
+    assert {:ok, ^response} = GitLabMcpConnector.discussion_page(args, opts)
+    assert_received {:mcp_session_call, _, "GitLab", "mr_discussions", ^args}
+
+    for changed <- [Map.put(args, "jmespath", "items"), Map.put(args, "page", 4), Map.put(args, "per_page", 20), Map.put(args, "project_id", "foreign/path")] do
+      assert {:error, :ci_discussion_scope_required} = GitLabMcpConnector.discussion_page(changed, opts)
+    end
+
+    Process.put(:gitlab_mcp_catalog, {:ok, %{"mr_discussions" => put_in(schema, ["annotations", "readOnlyHint"], false)}})
+    assert {:error, :ci_discussion_schema_unavailable} = GitLabMcpConnector.discussion_page(args, opts)
+    assert {:error, :ci_discussion_scope_required} = GitLabMcpConnector.discussion_page(args, Keyword.delete(opts, :mcp_session))
+    refute_received {:mcp_session_call, _, _, _, _}
+  end
+
+  test "CI traces require exact bounded arguments a fresh read-only schema and a single text result" do
+    opts = [workspace: "/tmp/controller", app_server: FakeAppServer, mcp_session: %{thread_id: "controller"}]
+    args = %{"project_id" => "33747681", "job_id" => "77", "limit" => 1000, "offset" => 0}
+    fields = Map.new(~w(project_id job_id), &{&1, %{"type" => "string"}}) |> Map.merge(Map.new(~w(limit offset), &{&1, %{"type" => "number"}}))
+    schema = %{"name" => "get_pipeline_job_output", "annotations" => %{"readOnlyHint" => true}, "inputSchema" => %{"type" => "object", "required" => ~w(project_id job_id), "properties" => fields}}
+    Process.put(:gitlab_mcp_catalog, {:ok, %{"get_pipeline_job_output" => schema}})
+    Process.put(:gitlab_mcp_response, {:ok, %{"content" => [%{"type" => "text", "text" => "trace"}]}})
+    assert {:ok, "trace"} = GitLabMcpConnector.job_output(args, opts)
+    assert_received {:mcp_session_call, _, "GitLab", "get_pipeline_job_output", ^args}
+
+    for offset <- [1000, 2000, 3000, 4000] do
+      page = Map.put(args, "offset", offset)
+      assert {:ok, "trace"} = GitLabMcpConnector.job_output(page, opts)
+      assert_received {:mcp_session_call, _, "GitLab", "get_pipeline_job_output", ^page}
+    end
+
+    for changed <- [Map.put(args, "jmespath", "@"), Map.put(args, "offset", 5000), Map.put(args, "limit", 2000), Map.put(args, "job_id", "../77")] do
+      assert {:error, :ci_trace_scope_required} = GitLabMcpConnector.job_output(changed, opts)
+    end
+
+    Process.put(:gitlab_mcp_catalog, {:ok, %{"get_pipeline_job_output" => put_in(schema, ["annotations", "readOnlyHint"], false)}})
+    assert {:error, :ci_trace_schema_unavailable} = GitLabMcpConnector.job_output(args, opts)
+    assert {:error, :ci_trace_scope_required} = GitLabMcpConnector.job_output(args, Keyword.delete(opts, :mcp_session))
+    refute_received {:mcp_session_call, _, _, _, _}
+  end
+
+  test "MR pipeline lists require an exact unfiltered bounded scope and the existing session" do
+    opts = [workspace: "/tmp/controller", app_server: SymphonyElixir.FactoryGitLabMcpConnectorTest.FakeAppServer, mcp_session: %{thread_id: "controller"}]
+    arguments = %{"project_id" => "33747681", "merge_request_iid" => "47818", "page" => 1, "per_page" => 100}
+    Process.put(:gitlab_mcp_response, {:ok, %{"structuredContent" => []}})
+    assert {:ok, []} = GitLabMcpConnector.call_list("list_merge_request_pipelines", arguments, opts)
+    assert_received {:mcp_session_call, _, "GitLab", "list_merge_request_pipelines", ^arguments}
+
+    for changed <- [
+          Map.put(arguments, "status", "success"),
+          Map.put(arguments, "jmespath", "[?status=='success']"),
+          Map.put(arguments, "page", 3),
+          Map.put(arguments, "per_page", 20),
+          Map.put(arguments, "project_id", "foreign/path")
+        ] do
+      assert {:error, :gitlab_mr_pipeline_scope_required} = GitLabMcpConnector.call_list("list_merge_request_pipelines", changed, opts)
+    end
+
+    assert {:error, :gitlab_mr_pipeline_scope_required} = GitLabMcpConnector.call_list("list_merge_request_pipelines", arguments, Keyword.delete(opts, :mcp_session))
+    refute_received {:mcp_call, _, _, _, _}
+    refute_received {:mcp_session_call, _, _, _, _}
+    assert {:error, :gitlab_tool_not_allowed} = GitLabMcpConnector.call("list_merge_request_pipelines", arguments, opts)
+  end
 
   defmodule FakeAppServer do
     @spec mcp_tool_catalog_in_session(map(), String.t()) :: {:ok, map()} | {:error, term()}

@@ -1,15 +1,21 @@
 defmodule Mix.Tasks.Factory.Ticket do
   use Mix.Task
 
+  alias SymphonyElixir.Config
   alias SymphonyElixir.Config.Schema
+  alias SymphonyElixir.Config.Schema.Factory
 
   alias SymphonyElixir.Factory.{
+    BrokerRuntime,
+    Policy,
     Store,
+    TicketCapabilityRecovery,
     TicketChat,
     TicketChatCommands,
     TicketChatOutbox,
     TicketContext,
-    TicketStagePayload
+    TicketStagePayload,
+    TicketVerifierRepair
   }
 
   alias SymphonyElixir.Workflow
@@ -25,6 +31,10 @@ defmodule Mix.Tasks.Factory.Ticket do
       mix factory.ticket prepare-stage RUN --workflow WORKFLOW.md
       mix factory.ticket command RUN COMMAND_KEY --workflow WORKFLOW.md
       mix factory.ticket synchronization RUN --workflow WORKFLOW.md
+      mix factory.ticket authorize-verifier-repair RUN --payload-base64 BASE64_JSON --workflow WORKFLOW.md
+      mix factory.ticket inspect-capability-recovery RUN --payload-base64 BASE64_JSON --workflow WORKFLOW.md
+      mix factory.ticket inspect-capability-runtime RUN --payload-base64 BASE64_JSON --workflow WORKFLOW.md
+      mix factory.ticket authorize-capability-recovery RUN --payload-base64 BASE64_JSON --workflow WORKFLOW.md
 
   Stage accepts only proposal_id, body, operations and the current generation,
   spec_revision, contract_sha256 and candidate_sha. It returns PENDING, never
@@ -74,16 +84,39 @@ defmodule Mix.Tasks.Factory.Ticket do
 
   defp execute(["prepare-stage", run], store, opts) do
     path = Path.expand(opts[:workflow] || "WORKFLOW.md")
-    previous = Application.fetch_env(:symphony_elixir, :workflow_file_path)
 
-    try do
-      Workflow.set_workflow_file_path(path)
-      TicketStagePayload.prepare(store, run, path)
-    after
-      case previous do
-        {:ok, original} -> Workflow.set_workflow_file_path(original)
-        :error -> Workflow.clear_workflow_file_path()
-      end
+    with {:ok, _chat} <- TicketChat.ready_for_run(store, run) do
+      BrokerRuntime.call(["prepare-ticket-stage", run, "--workflow", path])
+    end
+  end
+
+  defp execute(["authorize-verifier-repair", run], _store, opts) do
+    with payload when is_binary(payload) <- opts[:payload_base64],
+         true <- byte_size(payload) <= 43_692,
+         true <- Enum.all?(Keyword.keys(opts), &(&1 in [:workflow, :payload_base64])) do
+      BrokerRuntime.call(["authorize-ticket-verifier-repair", run, "--workflow", Path.expand(opts[:workflow] || "WORKFLOW.md"), "--payload-base64", payload])
+    else
+      _ -> {:error, :verifier_repair_authorization_invalid}
+    end
+  end
+
+  defp execute([action, run], _store, opts) when action in ~w(inspect-capability-recovery inspect-capability-runtime authorize-capability-recovery) do
+    with payload when is_binary(payload) <- opts[:payload_base64],
+         true <- byte_size(payload) <= 43_692,
+         true <- Enum.all?(Keyword.keys(opts), &(&1 in [:workflow, :payload_base64])) do
+      operation =
+        Map.fetch!(
+          %{
+            "inspect-capability-recovery" => "inspect-ticket-capability-recovery",
+            "inspect-capability-runtime" => "inspect-ticket-capability-runtime",
+            "authorize-capability-recovery" => "authorize-ticket-capability-recovery"
+          },
+          action
+        )
+
+      BrokerRuntime.call([operation, run, "--workflow", Path.expand(opts[:workflow] || "WORKFLOW.md"), "--payload-base64", payload])
+    else
+      _ -> {:error, :capability_recovery_authorization_invalid}
     end
   end
 
@@ -119,4 +152,75 @@ defmodule Mix.Tasks.Factory.Ticket do
   end
 
   defp execute(_action, _store, _opts), do: {:error, :invalid_ticket_action}
+
+  @doc "Prepares bytes in the service process; never stages or grants source authority."
+  @spec runtime_prepare([String.t()], Store.connection(), Schema.Factory.t()) :: {:ok, map()} | {:error, term()}
+  def runtime_prepare(["prepare-ticket-stage", run, "--workflow", path], store, factory) do
+    with true <- path == factory.ticket_supervisor["ticket_workflow"],
+         true <- factory.ticket_supervisor["enabled"] == true,
+         {:ok, _chat} <- TicketChat.ready_for_run(store, run) do
+      prepare_in_service(store, run, path)
+    else
+      _ -> {:error, :ticket_runtime_preparation_forbidden}
+    end
+  end
+
+  def runtime_prepare(_args, _store, _factory), do: {:error, :ticket_runtime_preparation_forbidden}
+
+  @doc "Stages explicit local-operator approval in the owning service; never dispatches source work."
+  @spec runtime_authorize_verifier_repair([String.t()], Store.connection(), Schema.Factory.t()) ::
+          {:ok, map()} | {:error, term()}
+  def runtime_authorize_verifier_repair(["authorize-ticket-verifier-repair", run, "--workflow", path, "--payload-base64", payload], store, factory) do
+    with true <- path == factory.ticket_supervisor["ticket_workflow"] and factory.ticket_supervisor["enabled"] == true,
+         :ok <- Policy.validate(factory),
+         true <- byte_size(payload) <= 43_692,
+         {:ok, raw} <- Base.decode64(payload),
+         true <- byte_size(raw) <= 32_768,
+         {:ok, %{"run_id" => ^run} = input} <- Jason.decode(raw) do
+      workspace = Path.join([Config.local_workspace_root(), "factory-controller", String.replace(factory.scope, ~r/[^a-zA-Z0-9._-]/, "_")])
+      TicketVerifierRepair.stage(store, input, factory, workspace: workspace)
+    else
+      _ -> {:error, :verifier_repair_authorization_invalid}
+    end
+  end
+
+  def runtime_authorize_verifier_repair(_args, _store, _factory), do: {:error, :verifier_repair_authorization_invalid}
+
+  @doc "Observes or stages exact grant-backed operator authority in the existing owning service; never dispatches."
+  @spec runtime_capability_recovery([String.t()], Store.connection(), Factory.t()) :: {:ok, map()} | {:error, term()}
+  def runtime_capability_recovery([operation, run, "--workflow", path, "--payload-base64", payload], store, factory)
+      when operation in ~w(inspect-ticket-capability-recovery inspect-ticket-capability-runtime authorize-ticket-capability-recovery) do
+    with true <- path == factory.ticket_supervisor["ticket_workflow"] and factory.ticket_supervisor["enabled"] == true,
+         :ok <- Policy.validate(factory),
+         true <- byte_size(payload) <= 43_692,
+         {:ok, raw} <- Base.decode64(payload),
+         true <- byte_size(raw) <= 32_768,
+         {:ok, %{"run_id" => ^run} = input} <- Jason.decode(raw) do
+      workspace = Path.join([Config.local_workspace_root(), "factory-controller", String.replace(factory.scope, ~r/[^a-zA-Z0-9._-]/, "_")])
+
+      case operation do
+        "inspect-ticket-capability-runtime" -> {:ok, %{"runtime" => TicketCapabilityRecovery.runtime_attestation()}}
+        "inspect-ticket-capability-recovery" -> TicketCapabilityRecovery.describe(store, input, factory, workspace: workspace)
+        "authorize-ticket-capability-recovery" -> TicketCapabilityRecovery.stage(store, input, factory, workspace: workspace)
+      end
+    else
+      _ -> {:error, :capability_recovery_authorization_invalid}
+    end
+  end
+
+  def runtime_capability_recovery(_, _, _), do: {:error, :capability_recovery_authorization_invalid}
+
+  defp prepare_in_service(store, run, path) do
+    previous = Application.fetch_env(:symphony_elixir, :workflow_file_path)
+
+    try do
+      Workflow.set_workflow_file_path(path)
+      TicketStagePayload.prepare(store, run, path)
+    after
+      case previous do
+        {:ok, original} -> Workflow.set_workflow_file_path(original)
+        :error -> Workflow.clear_workflow_file_path()
+      end
+    end
+  end
 end

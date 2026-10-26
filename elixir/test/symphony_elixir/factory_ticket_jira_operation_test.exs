@@ -98,6 +98,55 @@ defmodule SymphonyElixir.FactoryTicketJiraOperationTest do
     assert length(Process.get(:jira_calls)) == 2
   end
 
+  test "scheduler opens initial Jira effects in its controller workspace rather than the ticket parent", ctx do
+    context = %{store: ctx.store, workspace_root: ctx.options[:workspace_root], factory: %{scope: "scope"}}
+    expected = Path.join([context.workspace_root, "factory-controller", "scope"])
+    File.mkdir_p!(expected)
+
+    scope = fn workspace, _operation ->
+      send(self(), {:initial_jira_workspace, workspace})
+      {:error, :workspace_probe_finished}
+    end
+
+    assert {:error, :workspace_probe_finished} = Scheduler.ticket_step(context, "run", Keyword.put(ctx.options, :jira_session, scope))
+    assert_received {:initial_jira_workspace, ^expected}
+    assert Process.get(:jira_calls) == []
+    assert {:ok, %{"state" => "ADMITTING_WRITER"}} = RunLedger.get(ctx.store, "run")
+  end
+
+  test "Jira ownership uses a bounded monorepo budget on the actual outer transaction", ctx do
+    test_pid = self()
+    tracer = spawn_link(fn -> trace_jira_transactions(test_pid) end)
+    :erlang.trace_pattern({Exqlite, :transaction, 3}, true, [:local])
+    :erlang.trace(self(), true, [:call, {:tracer, tracer}])
+
+    try do
+      assert {:ok, %{status: "WRITER_ADMITTED"}} = step(ctx)
+      assert_receive {:jira_outer_transaction, store, opts}, 1000
+      assert store == ctx.store
+      assert Keyword.fetch!(opts, :timeout) == 60_000
+      assert Store.one!(ctx.store, "SELECT phase FROM ticket_jira_effects")["phase"] == "COMPLETE"
+    after
+      :erlang.trace(self(), false, [:call])
+      :erlang.trace_pattern({Exqlite, :transaction, 3}, false, [:local])
+      send(tracer, :stop)
+    end
+  end
+
+  defp trace_jira_transactions(test_pid) do
+    receive do
+      {:trace, _pid, :call, {Exqlite, :transaction, [store, fun, opts]}} when is_pid(store) ->
+        if :erlang.fun_info(fun, :module) == {:module, TicketJiraOperation}, do: send(test_pid, {:jira_outer_transaction, store, opts})
+        trace_jira_transactions(test_pid)
+
+      :stop ->
+        :ok
+
+      _ ->
+        trace_jira_transactions(test_pid)
+    end
+  end
+
   test "unqualified runtime prevents a pending Jira effect from becoming uncertain or admitting a writer", ctx do
     SymphonyElixir.TicketChatFixture.runtime_fixture(ctx.root, %{})
     assert {:error, :worker_runtime_identity_unproven} = step(ctx)
@@ -187,7 +236,8 @@ defmodule SymphonyElixir.FactoryTicketJiraOperationTest do
 
   test "lost acknowledgement after application and already observed state both avoid repeat mutations", ctx do
     Process.put(:jira_mode, :lost_after_apply)
-    assert {:ok, %{status: "WRITER_ADMITTED"}} = step(ctx)
+    assert {:ok, %{status: "WRITER_ADMITTED", run: admitted}} = step(ctx)
+    assert admitted["workspace_state"] == "MATERIALIZED"
     assert length(Process.get(:jira_calls)) == 2
   end
 
@@ -209,6 +259,26 @@ defmodule SymphonyElixir.FactoryTicketJiraOperationTest do
     Process.put(:jira_transitions, [])
     assert {:ok, %{status: "WRITER_ADMITTED"}} = step(ctx)
     assert Process.get(:jira_calls) == []
+  end
+
+  test "the installed Jira transition shape admits the observed In Dev action with a numeric ID", ctx do
+    Process.put(:jira_transitions, [%{"id" => 21, "name" => "To Do"}, %{"id" => 31, "name" => "In Dev"}])
+    assert {:ok, %{status: "WRITER_ADMITTED"}} = step(ctx)
+    assert [{"jira_transition_issue", %{"issue_key" => "PPL-123", "transition_id" => "31"}}, {"jira_update_factory_labels", _}] = Process.get(:jira_calls)
+    assert Process.get(:jira_snapshot)["status"] == "In Dev"
+  end
+
+  test "explicit transition destinations override names and ambiguous or invalid IDs remain unissued", ctx do
+    for transitions <- [
+          [%{"id" => 31, "name" => "In Dev", "to_status" => "Done"}],
+          [%{"id" => 31, "name" => "In Dev"}, %{"id" => 32, "name" => "In Dev"}],
+          [%{"id" => 0, "name" => "In Dev"}],
+          [%{"id" => "31/invalid", "name" => "In Dev"}]
+        ] do
+      Process.put(:jira_transitions, transitions)
+      assert {:error, :ticket_jira_in_dev_transition_unproven} = step(ctx)
+      assert Process.get(:jira_calls) == []
+    end
   end
 
   test "an ignored first-effect observation retains maintenance ownership until exact retry", ctx do
@@ -405,7 +475,16 @@ defmodule SymphonyElixir.FactoryTicketJiraOperationTest do
       factory: %{scope: "scope", ticket_supervisor: %{"enabled" => false}}
     }
 
-    options = [jira_reader: Reader, jira_connector: Connector, ticket_options: ctx.options]
+    expected = Path.join([context.workspace_root, "factory-controller", "scope"])
+
+    File.mkdir_p!(expected)
+
+    scope = fn workspace, operation ->
+      assert workspace == expected
+      ctx.options[:jira_session].(workspace, operation)
+    end
+
+    options = [jira_reader: Reader, jira_connector: Connector, ticket_options: Keyword.put(ctx.options, :jira_session, scope)]
     Scheduler.reconcile_ticket_jira(context, options)
   end
 end

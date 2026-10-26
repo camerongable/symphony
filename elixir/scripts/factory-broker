@@ -1,0 +1,64 @@
+#!/bin/zsh
+set -euo pipefail
+
+script_dir="${0:A:h}"
+elixir_dir="${script_dir:h}"
+cd "${elixir_dir}"
+
+if [[ "${1:-}" == "ticket" ]]; then
+  launch_agent="/Users/cgable/Library/LaunchAgents/com.cgable.symphony-factory.plist"
+  if [[ ! -f "${launch_agent}" || -L "${launch_agent}" || "${launch_agent:A}" != "${launch_agent}" ]]; then
+    print -u2 "Ticket CLI requires the canonical deployed LaunchAgent."
+    exit 1
+  fi
+  build_path="$(/usr/bin/plutil -extract EnvironmentVariables.MIX_BUILD_PATH raw -o - "${launch_agent}" 2>/dev/null || true)"
+  if [[ "${build_path}" != /* || "${build_path:A}" != "${build_path}" || ( ${+MIX_BUILD_PATH} == 1 && "${MIX_BUILD_PATH:-}" != "${build_path}" ) ]]; then
+    print -u2 "Ticket CLI requires its exact deployed build; inherited build overrides are not supported."
+    exit 1
+  fi
+  for required in Elixir.Mix.Tasks.Factory.Ticket.beam Elixir.Mix.Tasks.Factory.Desktop.beam symphony_elixir.app; do
+    artifact="${build_path}/lib/symphony_elixir/ebin/${required}"
+    if [[ ! -f "${artifact}" || -L "${artifact}" || "${artifact:A}" != "${artifact}" ]]; then
+      print -u2 "Ticket CLI requires canonical deployed ticket artifacts."
+      exit 1
+    fi
+  done
+else
+  build_path="${MIX_BUILD_PATH:-}"
+  if [[ -z "${build_path}" ]]; then
+    launch_agent="${HOME}/Library/LaunchAgents/com.cgable.symphony-factory.plist"
+    if [[ -f "${launch_agent}" ]]; then
+      build_path="$(/usr/bin/plutil -extract EnvironmentVariables.MIX_BUILD_PATH raw -o - "${launch_agent}" 2>/dev/null || true)"
+    fi
+  fi
+  build_path="${build_path:-${elixir_dir}/_build/dev}"
+fi
+
+if [[ "${build_path}" != /* || ! -f "${build_path}/lib/symphony_elixir/ebin/Elixir.Mix.Tasks.Factory.Desktop.beam" || ! -f "${build_path}/lib/symphony_elixir/ebin/symphony_elixir.app" ]]; then
+  print -u2 "Factory broker requires the deployed compiled application; compile it outside the broker."
+  exit 1
+fi
+
+# Broker exchanges use deployed code, not Mix's socket-based build coordination.
+exec /opt/homebrew/bin/mise exec -- elixir \
+  -pa "${build_path}/lib/*/ebin" \
+  -e 'Mix.start(); case System.argv() do
+    ["mr-driver"] ->
+      case SymphonyElixir.Factory.TicketMrBrokerDriver.export() do
+        {:ok, value} -> IO.puts(Jason.encode!(value))
+        {:error, reason} -> IO.puts(:stderr, "Factory driver unavailable: #{inspect(reason)}"); System.halt(1)
+      end
+    ["status" | args] -> Mix.Tasks.Factory.run(["status" | args])
+    ["desktop" | args] ->
+      if SymphonyElixir.Factory.BrokerRuntime.bridged?(args) do
+        Application.ensure_all_started(:exqlite)
+        case SymphonyElixir.Factory.BrokerRuntime.call(args) do
+          {:ok, value} -> IO.puts(Jason.encode!(value, pretty: true))
+          {:error, reason} -> IO.puts(:stderr, "Factory runtime exchange failed: #{inspect(reason)}"); System.halt(1)
+        end
+      else
+        Mix.Tasks.Factory.Desktop.run(args)
+      end
+    ["ticket" | args] -> Mix.Tasks.Factory.Ticket.run(args)
+    _ -> IO.puts(:stderr, "Use factory-broker status|desktop|ticket ..."); System.halt(1)
+  end' -- "$@"

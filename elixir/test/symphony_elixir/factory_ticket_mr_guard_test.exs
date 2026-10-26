@@ -54,6 +54,25 @@ defmodule SymphonyElixir.FactoryTicketMrGuardTest do
     assert {:ok, _} = TicketMrGuard.receipt(ctx.request, put_in(ctx.proof, ["owner", "response", "thread", "status"], %{"type" => "notLoaded"}), @broker, ctx.now)
   end
 
+  test "explicit native null project matches only the ledger projectless sentinel without altering proof", ctx do
+    request = Map.put(ctx.request, "codex_project_id", "projectless")
+    proof = put_in(ctx.proof, ["native", "projectId"], nil)
+    assert {:ok, receipt} = TicketMrGuard.receipt(request, proof, @broker, ctx.now)
+    assert receipt["native_sha256"] == digest(proof["native"])
+    assert proof["native"]["projectId"] == nil and Map.has_key?(proof["native"], "projectId")
+    assert :ok = TicketMrGuard.native_receipt(request, proof["native"], ctx.now)
+
+    for native <- [Map.delete(proof["native"], "projectId"), Map.put(proof["native"], "projectId", "foreign"), Map.put(proof["native"], "projectId", false), Map.put(proof["native"], "projectId", "")] do
+      assert {:error, _} = TicketMrGuard.receipt(request, Map.put(proof, "native", native), @broker, ctx.now)
+      assert {:error, _} = TicketMrGuard.native_receipt(request, native, ctx.now)
+    end
+
+    assert {:error, :mr_guard_identity_mismatch} = TicketMrGuard.receipt(ctx.request, proof, @broker, ctx.now)
+    assert {:error, :mr_guard_identity_mismatch} = TicketMrGuard.native_receipt(ctx.request, proof["native"], ctx.now)
+    assert {:ok, _} = TicketMrGuard.receipt(request, put_in(proof, ["native", "projectId"], "projectless"), @broker, ctx.now)
+    assert {:ok, _} = TicketMrGuard.receipt(ctx.request, ctx.proof, @broker, ctx.now)
+  end
+
   test "foreign, busy, incomplete, malformed and stale observations do not authorize claim", ctx do
     old = ctx.now |> DateTime.add(-11, :second) |> DateTime.to_iso8601()
     future = ctx.now |> DateTime.add(1, :second) |> DateTime.to_iso8601()
@@ -86,6 +105,31 @@ defmodule SymphonyElixir.FactoryTicketMrGuardTest do
         ] do
       assert {:error, _} = TicketMrGuard.receipt(ctx.request, proof, @broker, ctx.now)
     end
+  end
+
+  test "evidence expiring after capture still refuses and logs ages without native content", ctx do
+    import ExUnit.CaptureLog
+    raw = put_in(ctx.proof["native"]["latest_turn_observation"]["raw_response"], ["data", Access.at(0), "items"], [%{"text" => "private native payload"}])
+
+    native =
+      ctx.proof["native"]
+      |> put_in(["latest_turn_observation", "raw_response"], raw)
+      |> put_in(["latest_turn_observation", "sha256"], digest(raw))
+      |> put_in(["latest_turn_observation", "confirmation", "raw_response"], raw)
+      |> put_in(["latest_turn_observation", "confirmation", "sha256"], digest(raw))
+
+    assert :ok = TicketMrGuard.native_receipt(ctx.request, native, ctx.now)
+
+    log =
+      capture_log(fn ->
+        assert {:error, :mr_guard_native_turn_mismatch} = TicketMrGuard.native_receipt(ctx.request, native, DateTime.add(ctx.now, 11, :second))
+      end)
+
+    assert log =~ "latest_age_ms\":11000"
+    assert log =~ "confirmation_age_ms\":11000"
+    assert log =~ "latest_turn_matches\":true"
+    refute log =~ "private native payload"
+    assert :ok = TicketMrGuard.native_receipt(ctx.request, native, ctx.now)
   end
 
   defp digest(raw), do: Base.encode16(:crypto.hash(:sha256, Jason.encode!(raw)), case: :lower)

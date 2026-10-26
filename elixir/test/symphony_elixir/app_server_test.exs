@@ -3,6 +3,7 @@ defmodule SymphonyElixir.AppServerTest do
   alias SymphonyElixir.Factory.TicketChatCommands
   alias SymphonyElixir.TicketChatFixture
 
+  @tag :provider_schema
   test "internal review workers use named scoped profiles, explicit turns and no controller connectors" do
     for {mode, profile} <- [{"REVIEW", "symphony_ticket_review_v1"}] do
       handler = """
@@ -20,44 +21,67 @@ defmodule SymphonyElixir.AppServerTest do
       esac
       """
 
-      with_thread_listing_server("worker-#{mode}", handler, fn workspace, trace ->
-        assert {:ok, session} = AppServer.start_session(workspace, worker_access: mode, model: "gpt-6-luna", reasoning_effort: "medium")
-        assert session.approval_policy == "never" and session.worker_policy["mode"] == mode
-        issue = %Issue{identifier: "PPL-123", title: "Fixture"}
-        assert {:ok, %{turn_id: "turn"}} = AppServer.run_turn(session, "Local role work", issue, event_scope: :exact_turn)
-        AppServer.stop_session(session)
-        args = File.read!(trace <> ".args")
-        assert args =~ "default_permissions=\"#{profile}\""
-        assert args =~ "mcp_servers.Jira.enabled=false"
-        assert args =~ "mcp_servers.AI Toolkit Skills.enabled=false"
-        assert args =~ "mcp_servers.openai-api-key-local-confirmation.enabled=false"
-        assert args =~ "mcp_servers.openai-api-key-local-confirmation.command=\"/usr/bin/false\""
-        assert args =~ "plugins.test-plugin@provider.enabled=false"
-        refute args =~ "mcp_servers.\"Jira\""
-        assert args =~ "network.enabled=false"
-        environment = session.worker_policy["shell_environment"]
-        assert environment["inherit"] == "core"
-        assert environment["set"]["GIT_CONFIG_GLOBAL"] == "/dev/null"
-        assert environment["set"]["GIT_CONFIG_SYSTEM"] == "/dev/null"
-        assert environment["set"]["GIT_OPTIONAL_LOCKS"] == "0"
-        assert environment["set"]["PATH"] |> String.starts_with?("/Library/Developer/CommandLineTools/usr/bin:")
-        assert args =~ "shell_environment_policy={inherit=\"core\",set={"
-        assert args =~ "\"GIT_CONFIG_GLOBAL\"=\"/dev/null\""
-        assert args =~ "\"GIT_CONFIG_SYSTEM\"=\"/dev/null\""
-        messages = File.read!(trace) |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!(String.trim_leading(&1, "JSON:")))
-        start = Enum.find(messages, &(&1["method"] == "thread/start"))["params"]
-        turn = Enum.find(messages, &(&1["method"] == "turn/start"))["params"]
-        assert start["dynamicTools"] == [] and start["permissions"] == profile
-        assert start["runtimeWorkspaceRoots"] == [session.workspace]
-        assert start["allowProviderModelFallback"] == false
-        assert turn["permissions"] == profile and turn["model"] == "gpt-6-luna" and turn["effort"] == "medium"
-        refute Map.has_key?(turn, "sandboxPolicy")
-      end)
+      with_thread_listing_server(
+        "worker-#{mode}",
+        handler,
+        fn workspace, trace ->
+          assert {:ok, session} = AppServer.start_session(workspace, worker_access: mode, model: "gpt-6-luna", reasoning_effort: "medium")
+          assert session.approval_policy == "never" and session.worker_policy["mode"] == mode
+          issue = %Issue{identifier: "PPL-123", title: "Fixture"}
+
+          schema = %{
+            "type" => "object",
+            "required" => [],
+            "additionalProperties" => false,
+            "properties" => %{"changed_paths" => %{"type" => "array", "items" => %{"type" => "string"}, "enum" => [[]]}}
+          }
+
+          options = [event_scope: :exact_turn, output_schema: schema]
+          assert {:ok, %{turn_id: "turn"}} = AppServer.run_turn(session, "Local role work", issue, options)
+          AppServer.stop_session(session)
+          args = File.read!(trace <> ".args")
+          assert args =~ "default_permissions=\"#{profile}\""
+          assert args =~ "mcp_servers.Jira.enabled=false"
+          assert args =~ "mcp_servers.AI Toolkit Skills.enabled=false"
+          assert args =~ "mcp_servers.openai-api-key-local-confirmation.enabled=false"
+          assert args =~ "mcp_servers.openai-api-key-local-confirmation.command=\"/usr/bin/false\""
+          assert args =~ "plugins.test-plugin@provider.enabled=false"
+          refute args =~ "mcp_servers.\"Jira\""
+          assert args =~ "network.enabled=false"
+          environment = session.worker_policy["shell_environment"]
+          assert environment["inherit"] == "core"
+          assert environment["set"]["GIT_CONFIG_GLOBAL"] == "/dev/null"
+          assert environment["set"]["GIT_CONFIG_SYSTEM"] == "/dev/null"
+          assert environment["set"]["GIT_OPTIONAL_LOCKS"] == "0"
+          assert environment["set"]["PATH"] |> String.starts_with?("/Library/Developer/CommandLineTools/usr/bin:")
+          assert args =~ "shell_environment_policy={inherit=\"core\",set={"
+          assert args =~ "\"GIT_CONFIG_GLOBAL\"=\"/dev/null\""
+          assert args =~ "\"GIT_CONFIG_SYSTEM\"=\"/dev/null\""
+          messages = File.read!(trace) |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!(String.trim_leading(&1, "JSON:")))
+          start = Enum.find(messages, &(&1["method"] == "thread/start"))["params"]
+          turn = Enum.find(messages, &(&1["method"] == "turn/start"))["params"]
+          assert start["dynamicTools"] == [] and start["permissions"] == profile
+          assert start["runtimeWorkspaceRoots"] == [session.workspace]
+          assert start["allowProviderModelFallback"] == false
+          assert turn["permissions"] == profile and turn["model"] == "gpt-6-luna" and turn["effort"] == "medium"
+          assert turn["outputSchema"]["required"] == ["changed_paths"]
+          assert turn["outputSchema"]["properties"]["changed_paths"]["maxItems"] == 0
+          refute Map.has_key?(turn["outputSchema"]["properties"]["changed_paths"], "enum")
+          assert schema["properties"]["changed_paths"]["enum"] == [[]]
+          refute Map.has_key?(turn, "sandboxPolicy")
+        end,
+        Map.put(fixture_runtime(), "userAgent", "symphony-orchestrator/0.163.0-alpha.10.2 (fixture)")
+      )
     end
   end
 
+  @tag installed_runtime_112: true
   test "V1 workers reject unqualified runtime identity before thread creation", _ctx do
-    supported = fixture_runtime()
+    supported = Map.put(fixture_runtime(), "userAgent", "symphony-orchestrator/0.163.0-alpha.10.2 (fixture)")
+    agent164 = "symphony-orchestrator/0.164.0-alpha.11.1"
+    suffix164 = Map.put(supported, "userAgent", agent164 <> "suffix (fixture)")
+    lookalike164 = Map.put(supported, "userAgent", agent164 <> "0 (fixture)")
+    next164 = Map.put(supported, "userAgent", "symphony-orchestrator/0.164.0-alpha.11.2 (fixture)")
 
     for {name, response, reason} <- [
           {"missing", %{}, :worker_runtime_identity_unproven},
@@ -66,6 +90,20 @@ defmodule SymphonyElixir.AppServerTest do
           {"version", Map.put(supported, "userAgent", "symphony-orchestrator/0.161.0 (fixture)"), :worker_runtime_unsupported},
           {"candidate-version-lookalike", Map.put(supported, "userAgent", "symphony-orchestrator/0.162.0-alpha.20 (fixture)"), :worker_runtime_unsupported},
           {"updated-version-lookalike", Map.put(supported, "userAgent", "symphony-orchestrator/0.162.0-alpha.17.20 (fixture)"), :worker_runtime_unsupported},
+          {"current-version-lookalike", Map.put(supported, "userAgent", "symphony-orchestrator/0.163.0-alpha.10.20 (fixture)"), :worker_runtime_unsupported},
+          {"current-version-suffix", Map.put(supported, "userAgent", "symphony-orchestrator/0.163.0-alpha.10.2suffix (fixture)"), :worker_runtime_unsupported},
+          {"unqualified-new-version", Map.put(supported, "userAgent", "symphony-orchestrator/0.163.0-alpha.10.3 (fixture)"), :worker_runtime_unsupported},
+          {"latest-version-lookalike", Map.put(supported, "userAgent", "symphony-orchestrator/0.163.0-alpha.110 (fixture)"), :worker_runtime_unsupported},
+          {"latest-version-suffix", Map.put(supported, "userAgent", "symphony-orchestrator/0.163.0-alpha.11suffix (fixture)"), :worker_runtime_unsupported},
+          {"patch-version-suffix", Map.put(supported, "userAgent", "symphony-orchestrator/0.163.0-alpha.11.1suffix (fixture)"), :worker_runtime_unsupported},
+          {"patch-version-lookalike", Map.put(supported, "userAgent", "symphony-orchestrator/0.163.0-alpha.11.10 (fixture)"), :worker_runtime_unsupported},
+          {"qualified-patch-suffix", Map.put(supported, "userAgent", "symphony-orchestrator/0.163.0-alpha.11.2suffix (fixture)"), :worker_runtime_unsupported},
+          {"qualified-patch-lookalike", Map.put(supported, "userAgent", "symphony-orchestrator/0.163.0-alpha.11.20 (fixture)"), :worker_runtime_unsupported},
+          {"unqualified-next-patch", Map.put(supported, "userAgent", "symphony-orchestrator/0.163.0-alpha.11.3 (fixture)"), :worker_runtime_unsupported},
+          {"unqualified-next-version", Map.put(supported, "userAgent", "symphony-orchestrator/0.163.0-alpha.12 (fixture)"), :worker_runtime_unsupported},
+          {"updated-runtime-suffix", suffix164, :worker_runtime_unsupported},
+          {"updated-runtime-lookalike", lookalike164, :worker_runtime_unsupported},
+          {"updated-runtime-unqualified-patch", next164, :worker_runtime_unsupported},
           {"agent", Map.put(supported, "userAgent", "other/0.160.0 (fixture)"), :worker_runtime_unsupported},
           {"platform", Map.put(supported, "platformOs", "linux"), :worker_runtime_unsupported},
           {"home", Map.put(supported, "codexHome", System.tmp_dir!()), :worker_runtime_home_mismatch}
@@ -97,15 +135,31 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
-  test "ticket runtime probes initialize only and observe process exit on success and rejection" do
+  @tag installed_runtime_112: true
+  test "ticket runtime probes finish only qualified handshakes and observe process exit" do
     candidate_runtime = Map.put(fixture_runtime(), "userAgent", "symphony-orchestrator/0.162.0-alpha.2 (fixture)")
     updated_runtime = Map.put(fixture_runtime(), "userAgent", "symphony-orchestrator/0.162.0-alpha.17.2 (fixture)")
+    current_runtime = Map.put(fixture_runtime(), "userAgent", "symphony-orchestrator/0.163.0-alpha.10.2 (fixture)")
+    latest_runtime = Map.put(fixture_runtime(), "userAgent", "symphony-orchestrator/0.163.0-alpha.11 (fixture)")
+    patch_runtime = Map.put(fixture_runtime(), "userAgent", "symphony-orchestrator/0.163.0-alpha.11.1 (fixture)")
+    next_patch_runtime = Map.put(fixture_runtime(), "userAgent", "symphony-orchestrator/0.163.0-alpha.11.2 (fixture)")
+    agent164 = "symphony-orchestrator/0.164.0-alpha.11.1 (fixture)"
+    updated_minor_runtime = Map.put(fixture_runtime(), "userAgent", agent164)
+    unqualified_runtime = Map.put(fixture_runtime(), "userAgent", "symphony-orchestrator/0.163.0-alpha.10.3 (fixture)")
 
     for {name, response, expected} <- [
           {"supported", fixture_runtime(), :ok},
           {"installed-candidate-version", candidate_runtime, :ok},
           {"updated-installed-version", updated_runtime, :ok},
-          {"unsupported", %{}, {:error, :worker_runtime_identity_unproven}}
+          {"updated-minor-installed-version", updated_minor_runtime, :ok},
+          {"current-installed-version", current_runtime, :ok},
+          {"latest-installed-version", latest_runtime, :ok},
+          {"patch-installed-version", patch_runtime, :ok},
+          {"next-patch-installed-version", next_patch_runtime, :ok},
+          {"missing-identity", %{}, {:error, :worker_runtime_identity_unproven}},
+          {"unsupported-version", unqualified_runtime, {:error, :worker_runtime_unsupported}},
+          {"unsupported-platform", Map.put(current_runtime, "platformOs", "linux"), {:error, :worker_runtime_unsupported}},
+          {"foreign-home", Map.put(current_runtime, "codexHome", System.tmp_dir!()), {:error, :worker_runtime_home_mismatch}}
         ] do
       with_thread_listing_server(
         "probe-#{name}",
@@ -120,7 +174,12 @@ defmodule SymphonyElixir.AppServerTest do
           assert {_output, status} = System.cmd("/bin/kill", ["-0", pid], stderr_to_stdout: true)
           assert status != 0
           requests = File.read!(trace) |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!(String.trim_leading(&1, "JSON:")))
-          assert Enum.map(requests, & &1["method"]) == ["initialize"]
+          expected_methods = if expected == :ok, do: ["initialize", "initialized"], else: ["initialize"]
+          assert Enum.map(requests, & &1["method"]) == expected_methods
+
+          if expected == :ok do
+            assert List.last(requests) == %{"method" => "initialized", "params" => %{}}
+          end
         end,
         response
       )
@@ -262,6 +321,49 @@ defmodule SymphonyElixir.AppServerTest do
           assert Enum.count(messages, &(&1["method"] == "mcpServer/tool/call")) == if(outcome == :ok, do: 2, else: 0)
         end
       )
+    end
+  end
+
+  test "factory Jira provider overrides are session-local and preserve connector authentication" do
+    previous = System.get_env("SYMP_FACTORY_TEST_TOKEN")
+    System.put_env("SYMP_FACTORY_TEST_TOKEN", "synthetic-auth-sentinel")
+    on_exit(fn -> restore_env("SYMP_FACTORY_TEST_TOKEN", previous) end)
+
+    for {server, scope} <- [{"Jira", &AppServer.with_jira_controller_session/2}, {"GitLab", &AppServer.with_gitlab_read_session/2}] do
+      handler = """
+      case "$line" in
+        *'"method":"initialize"'*) printf '%s\\n' "$*" > "$trace_file.args"; printf '%s' "${SYMP_FACTORY_TEST_TOKEN:-missing}" > "$trace_file.auth" ;;
+        *'"method":"thread/start"'*) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"connector"}}}'; printf '%s\\n' '{"method":"mcpServer/startupStatus/updated","params":{"name":"#{server}","status":"ready"}}' ;;
+        *'"method":"mcpServerStatus/list"'*) printf '%s\\n' '{"id":18,"result":{"data":[{"name":"#{server}","tools":{"fixture":{"name":"fixture","inputSchema":{"type":"object"}}},"toolsError":null,"resources":[],"resourceTemplates":[]}],"nextCursor":null}}' ;;
+        *'"method":"thread/unsubscribe"'*) printf '%s\\n' '{"id":6,"result":{}}' ;;
+      esac
+      """
+
+      with_thread_listing_server("jira-provider-#{server}", handler, fn workspace, trace ->
+        adapter = Path.join(workspace, "adapter.py")
+        File.write!(adapter, "pass\n")
+        provider = Jason.encode!(%{"command" => "/usr/bin/python3", "args" => [adapter]})
+        workflow = File.read!(Workflow.workflow_file_path()) |> String.replace("\n---\n", "\nfactory:\n  jira_connector: #{provider}\n---\n", global: false)
+        File.write!(Workflow.workflow_file_path(), workflow)
+        WorkflowStore.force_reload()
+
+        assert {:ok, _} = scope.(workspace, fn session -> AppServer.mcp_tool_catalog_in_session(session, server) end)
+        args = File.read!(trace <> ".args")
+
+        if server == "Jira" do
+          assert args =~ "mcp_servers.Jira.command=\"/usr/bin/python3\""
+          assert args =~ "mcp_servers.Jira.args="
+          assert args =~ adapter
+          assert length(Regex.scan(~r/--config /, args)) == 2
+        else
+          refute args =~ "mcp_servers.Jira.command="
+        end
+
+        assert File.read!(trace <> ".auth") == "synthetic-auth-sentinel"
+        messages = File.read!(trace) |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!(String.trim_leading(&1, "JSON:")))
+        refute Enum.any?(messages, &(&1["method"] == "turn/start"))
+        assert Enum.any?(messages, &(&1["method"] == "thread/unsubscribe"))
+      end)
     end
   end
 
@@ -428,6 +530,90 @@ defmodule SymphonyElixir.AppServerTest do
     )
   end
 
+  @tag mr_completion_transport: true
+  test "anchored native receipt reads every newer full item across pages and stops at the exact anchor" do
+    with_thread_listing_server(
+      "anchored-native-read",
+      """
+      case "$line" in
+        *'"method":"thread/read"'*) printf '%s\\n' '{"id":9,"result":{"thread":{"id":"parent","projectId":null,"cwd":"/parent","updatedAt":42}}}' ;;
+        *'"method":"thread/turns/list"'*)
+          case "$line" in
+            *'"cursor":"older"'*) printf '%s\\n' '{"id":19,"result":{"data":[{"id":"anchor","items":[]},{"id":"unneeded","items":[]}],"nextCursor":"never-read"}}' ;;
+            *) printf '%s\\n' '{"id":19,"result":{"data":[{"id":"newest","items":[]},{"id":"middle","items":[]}],"nextCursor":"older"}}' ;;
+          esac ;;
+      esac
+      """,
+      fn workspace, trace ->
+        assert {:ok, thread} =
+                 AppServer.read_native_thread("parent",
+                   workspace: workspace,
+                   include_turns: false,
+                   history_after_turn: "anchor"
+                 )
+
+        assert Enum.map(thread["turns"], & &1["id"]) == ~w(anchor middle newest)
+
+        assert thread["history_observation"] == %{
+                 "mode" => "PAGED_AFTER_ANCHOR",
+                 "anchor_turn_id" => "anchor",
+                 "turn_count" => 3,
+                 "updated_at" => 42
+               }
+
+        requests =
+          File.read!(trace)
+          |> String.split("\n", trim: true)
+          |> Enum.map(&Jason.decode!(String.trim_leading(&1, "JSON:")))
+
+        pages = Enum.filter(requests, &(&1["method"] == "thread/turns/list"))
+        assert length(pages) == 2
+        assert Enum.all?(pages, &(&1["params"]["itemsView"] == "full" and &1["params"]["sortDirection"] == "desc"))
+        refute Enum.any?(requests, &(&1["method"] in ~w(turn/start thread/resume)))
+      end
+    )
+  end
+
+  @tag mr_completion_transport: true
+  test "anchored native receipt refuses absent anchors cycles cross-page duplicates and native version drift" do
+    for {name, first, second, changing, expected} <- [
+          {"absent", %{"data" => [%{"id" => "new", "items" => []}], "nextCursor" => nil}, nil, false, :native_history_anchor_missing},
+          {"cycle", %{"data" => [], "nextCursor" => "older"}, %{"data" => [], "nextCursor" => "older"}, false, :native_history_cursor_invalid},
+          {"duplicate", %{"data" => [%{"id" => "new", "items" => []}], "nextCursor" => "older"},
+           %{"data" => [%{"id" => "new", "items" => []}, %{"id" => "anchor", "items" => []}], "nextCursor" => nil}, false, :native_history_turn_conflict},
+          {"drift", %{"data" => [%{"id" => "anchor", "items" => []}], "nextCursor" => nil}, nil, true, :native_history_changed_during_read}
+        ] do
+      first = Jason.encode!(%{"id" => 19, "result" => first})
+      second = Jason.encode!(%{"id" => 19, "result" => second})
+
+      with_thread_listing_server(
+        "anchor-" <> name,
+        """
+        case "$line" in
+          *'"method":"thread/read"'*)
+            count=$(( ${count:-0} + 1 ))
+            version=42
+            if [ '#{changing}' = true ] && [ "$count" -gt 1 ]; then version=43; fi
+            printf '{"id":9,"result":{"thread":{"id":"parent","updatedAt":%s}}}\\n' "$version" ;;
+          *'"method":"thread/turns/list"'*)
+            case "$line" in
+              *'"cursor":"older"'*) printf '%s\\n' '#{second}' ;;
+              *) printf '%s\\n' '#{first}' ;;
+            esac ;;
+        esac
+        """,
+        fn workspace, _trace ->
+          assert {:error, ^expected} =
+                   AppServer.read_native_thread("parent",
+                     workspace: workspace,
+                     include_turns: false,
+                     history_after_turn: "anchor"
+                   )
+        end
+      )
+    end
+  end
+
   test "incomplete, repeated-cursor or duplicate native pages retain readback uncertainty" do
     for {name, page, error} <- [
           {"missing-items", %{"data" => [%{"id" => "first"}], "nextCursor" => nil}, :native_history_items_missing},
@@ -533,6 +719,61 @@ defmodule SymphonyElixir.AppServerTest do
     )
   end
 
+  test "recovery marker requires its guard before sending any turn request" do
+    with_thread_listing_server(
+      "missing-recovery-guard",
+      """
+      case "$line" in
+        *'"method":"thread/start"'*) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"owned"}}}' ;;
+        *'"method":"thread/unsubscribe"'*) printf '%s\\n' '{"id":6,"result":{}}' ;;
+      esac
+      """,
+      fn workspace, trace ->
+        {:ok, session} = AppServer.start_session(workspace, native_recovery: %{"kind" => "INTERRUPTED_TURN_QUIESCENCE"})
+
+        try do
+          assert {:error, :native_recovery_guard_missing} = AppServer.run_turn(session, "not sent", %Issue{})
+          refute File.read!(trace) =~ ~s("method":"turn/start")
+        after
+          AppServer.stop_session(session)
+        end
+      end
+    )
+  end
+
+  test "owned native recovery read stays on its actor and denies a foreign process" do
+    latest = Jason.encode!(%{"data" => [%{"id" => "interrupted", "status" => "interrupted", "error" => nil, "items" => []}], "nextCursor" => nil})
+
+    with_thread_listing_server(
+      "owned-recovery-read",
+      """
+      case "$line" in
+        *'"method":"thread/start"'*) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"owned"}}}' ;;
+        *'"method":"thread/read"'*) printf '%s\\n' '{"id":9,"result":{"thread":{"id":"owned","updatedAt":1,"status":{"type":"idle"}}}}' ;;
+        *'"method":"thread/turns/list"'*) printf '%s\\n' '{"id":19,"result":#{latest}}' ;;
+        *'"method":"thread/queue/list"'*) printf '%s\\n' '{"id":20,"result":{"data":[],"nextCursor":null}}' ;;
+        *'"method":"thread/unsubscribe"'*) printf '%s\\n' '{"id":6,"result":{}}' ;;
+      esac
+      """,
+      fn workspace, trace ->
+        {:ok, session} = AppServer.start_session(workspace)
+
+        try do
+          task = Task.async(fn -> AppServer.read_owned_native_thread(session) end)
+          assert {:error, :file_worker_session_not_owned} = Task.await(task)
+          assert {:ok, observed} = AppServer.read_owned_native_thread(session)
+          assert observed["queue_observation"]["empty_complete"]
+          assert is_list(:erlang.port_info(session.port))
+          messages = File.read!(trace)
+          refute messages =~ ~s("method":"turn/start")
+          refute messages =~ ~s("method":"thread/resume")
+        after
+          AppServer.stop_session(session)
+        end
+      end
+    )
+  end
+
   test "same-owner catalog reads cannot consume notifications from an active turn" do
     catalog =
       Jason.encode!(%{"data" => [%{"name" => "GitLab", "toolsError" => nil, "tools" => %{"get_pipeline" => %{"name" => "get_pipeline", "inputSchema" => %{"type" => "object"}}}}], "nextCursor" => nil})
@@ -596,13 +837,18 @@ defmodule SymphonyElixir.AppServerTest do
       esac
       """
 
-      with_thread_listing_server("reject-#{name}", handler, fn workspace, trace ->
-        assert {:error, ^expected} = AppServer.start_session(workspace, worker_access: "REVIEW", model: "gpt-6-luna")
-        refute File.read!(trace) =~ ~s("method":"turn/start")
-        restricted = [worker_access: "REVIEW", project_id: "project"]
-        assert {:error, :worker_capability_configuration_rejected} = AppServer.start_session(workspace, restricted)
-        assert {:error, :worker_access_profile_unsupported} = AppServer.start_session(workspace, worker_access: "UNKNOWN")
-      end)
+      with_thread_listing_server(
+        "reject-#{name}",
+        handler,
+        fn workspace, trace ->
+          assert {:error, ^expected} = AppServer.start_session(workspace, worker_access: "REVIEW", model: "gpt-6-luna")
+          refute File.read!(trace) =~ ~s("method":"turn/start")
+          restricted = [worker_access: "REVIEW", project_id: "project"]
+          assert {:error, :worker_capability_configuration_rejected} = AppServer.start_session(workspace, restricted)
+          assert {:error, :worker_access_profile_unsupported} = AppServer.start_session(workspace, worker_access: "UNKNOWN")
+        end,
+        Map.put(fixture_runtime(), "userAgent", "symphony-orchestrator/0.163.0-alpha.10.2 (fixture)")
+      )
     end
   end
 
@@ -648,12 +894,60 @@ defmodule SymphonyElixir.AppServerTest do
       esac
       """
 
-      with_thread_listing_server("effective-#{name}", handler, fn workspace, trace ->
-        options = [worker_access: "REVIEW", model: "gpt-6-luna", reasoning_effort: "medium"]
-        assert {:error, :worker_effective_policy_mismatch} = AppServer.start_session(workspace, options)
-        refute File.read!(trace) =~ ~s("method":"turn/start")
-      end)
+      with_thread_listing_server(
+        "effective-#{name}",
+        handler,
+        fn workspace, trace ->
+          options = [worker_access: "REVIEW", model: "gpt-6-luna", reasoning_effort: "medium"]
+          assert {:error, :worker_effective_policy_mismatch} = AppServer.start_session(workspace, options)
+          refute File.read!(trace) =~ ~s("method":"turn/start")
+        end,
+        Map.put(fixture_runtime(), "userAgent", "symphony-orchestrator/0.163.0-alpha.10.2 (fixture)")
+      )
     end
+  end
+
+  test "a failed native turn retains the actual owned process shutdown through StageRunner", _ctx do
+    handler = """
+    case "$line" in
+      *'"method":"config/read"'*) printf '%s\\n' '{"id":15,"result":{"config":{}}}' ;;
+      *'"method":"account/read"'*) printf '%s\\n' '{"id":17,"result":{"account":{"type":"chatgpt"}}}' ;;
+      *'"method":"thread/start"'*) printf '{"id":2,"result":{"thread":{"id":"worker","cwd":"%s"},"cwd":"%s","runtimeWorkspaceRoots":["%s"],"reasoningEffort":null,"activePermissionProfile":{"id":"symphony_ticket_review_v1"},"approvalPolicy":"never","model":"gpt-6-luna"}}\\n' "$(pwd -P)" "$(pwd -P)" "$(pwd -P)" ;;
+      *'"method":"mcpServerStatus/list"'*) printf '%s\\n' '{"id":16,"result":{"data":[],"nextCursor":null}}' ;;
+      *'"method":"turn/start"'*)
+        request_id=$(printf '%s\\n' "$line" | sed -n 's/.*"id":"\\([^\"]*\\)".*/\\1/p')
+        printf '{"id":"%s","result":{"turn":{"id":"failed-turn"}}}\\n' "$request_id"
+        printf '%s\\n' '{"method":"error","params":{"threadId":"worker","turnId":"failed-turn","willRetry":false,"error":{"message":"Selected model is at capacity","codexErrorInfo":"serverOverloaded"}}}' ;;
+      *'"method":"thread/unsubscribe"'*) printf '%s\\n' '{"id":6,"result":{"status":"unsubscribed"}}' ;;
+    esac
+    """
+
+    with_thread_listing_server("failed-turn-shutdown", handler, fn workspace, trace ->
+      assert {:error, {:worker_failed, {:worker_turn_error, failure}, observed}} =
+               SymphonyElixir.Factory.StageRunner.run(workspace, %Issue{identifier: "PPL-123", title: "Fixture"}, "One failed turn", %{"type" => "object"},
+                 worker_access: "REVIEW",
+                 model: "gpt-6-luna",
+                 include_evidence: true,
+                 event_scope: :exact_turn,
+                 on_session_ready: fn session -> send(self(), {:owned_failed_session, session}) end
+               )
+
+      assert_received {:owned_failed_session, session}
+      assert failure["codexErrorInfo"] == "serverOverloaded"
+      assert observed.thread_id == session.thread_id and observed.turn_id == "failed-turn"
+      assert observed.policy == session.worker_policy
+      stop = observed.owner_stop
+      actual_pid = File.read!(trace <> ".pid") |> String.trim()
+      assert stop["transport"] == "owned_app_server"
+      assert stop["pid"] == session.metadata.codex_app_server_pid
+      assert stop["pid"] == actual_pid
+      assert stop["invocation_nonce"] == session.worker_invocation
+      assert stop["thread_id"] == session.thread_id and stop["cwd"] == session.worker_policy["cwd"]
+      assert is_integer(stop["exit_status"])
+      assert Port.info(session.port) == nil
+      refute Map.has_key?(observed, :output)
+      refute Map.has_key?(observed, :item_id)
+    end)
   end
 
   test "a startup observer exception closes the actual owned port before returning", _ctx do
@@ -3452,7 +3746,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
-  test "app server captures codex side output and logs it through Logger" do
+  test "app server keeps inherited stderr out of protocol events and Logger" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -3503,8 +3797,8 @@ defmodule SymphonyElixir.AppServerTest do
       issue = %Issue{
         id: "issue-stderr",
         identifier: "MT-92",
-        title: "Capture stderr",
-        description: "Ensure codex stderr is captured and logged",
+        title: "Separate stderr",
+        description: "Ensure codex stderr does not contaminate the protocol stream",
         state: "In Progress",
         url: "https://example.org/issues/MT-92",
         labels: ["backend"]
@@ -3516,12 +3810,12 @@ defmodule SymphonyElixir.AppServerTest do
       log =
         capture_log(fn ->
           assert {:ok, _result} =
-                   AppServer.run(workspace, "Capture stderr log", issue, on_message: on_message)
+                   AppServer.run(workspace, "Separate stderr from protocol", issue, on_message: on_message)
         end)
 
       assert_received {:app_server_message, %{event: :turn_completed}}
       refute_received {:app_server_message, %{event: :malformed}}
-      assert log =~ "Codex turn stream output: warning: this is stderr noise"
+      refute log =~ "warning: this is stderr noise"
     after
       File.rm_rf(test_root)
     end

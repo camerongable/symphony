@@ -7,20 +7,150 @@ defmodule SymphonyElixir.Factory.WorkspaceAccess do
     RunLedger,
     Store,
     TaskLedger,
+    TicketCapabilityRecovery,
     TicketChatCommands,
     TicketContractAmendment,
     Worktree
   }
 
   alias SymphonyElixir.Factory.{TicketChat, TicketJiraJournal, TicketPushIO, WorkerEvidence, WorkerFileIO}
+  alias SymphonyElixir.Factory.TicketPushOrdinaryRejection
+  alias SymphonyElixir.Factory.TicketPushPreissuanceRejection
+  alias SymphonyElixir.Factory.TicketPushRequalification
   alias SymphonyElixir.PathSafety
 
   @fields ~w(reservation_key run_id task_key request_key mode allowed_root expected_sha)
   @active ~w(STARTING RUNNING WAITING_FOR_WRITER WAITING_FOR_BROKER)
+  @typep access_result :: {:ok, map()} | {:error, term()}
 
   @spec acquire(Store.connection(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def acquire(store, attrs, opts \\ []) do
     transaction(store, fn tx -> acquire_transaction(tx, attrs, opts) end)
+  end
+
+  @doc "Observes the checkout before atomically claiming it and committing SQL-only caller state."
+  @spec acquire_with(Store.connection(), map(), keyword(), (Store.connection(), map() -> term())) :: term()
+  def acquire_with(%DBConnection{}, _attrs, _opts, _commit), do: {:error, :workspace_observation_inside_transaction}
+
+  def acquire_with(store, attrs, opts, commit) do
+    acquire_with_observation(store, attrs, opts, fn -> {:ok, nil} end, fn tx, access, _ -> commit.(tx, access) end)
+  end
+
+  @doc "Captures short-lived caller evidence after physical admission, outside SQLite, for the final SQL-only commit."
+  @spec acquire_with_observation(Store.connection(), map(), keyword(), (-> {:ok, term()} | {:error, term()}), (Store.connection(), map(), term() -> term())) :: term()
+  def acquire_with_observation(%DBConnection{}, _attrs, _opts, _observe, _commit), do: {:error, :workspace_observation_inside_transaction}
+
+  def acquire_with_observation(store, attrs, opts, capture, commit) do
+    with :ok <- valid_attrs(attrs),
+         {:ok, run} <- RunLedger.get(store, attrs["run_id"]),
+         {:ok, task} <- task_binding(store, attrs),
+         :ok <- before_acquisition_observation(opts),
+         {:ok, observed} <- observe(run, true, attrs["expected_sha"]),
+         :ok <- within_root(observed.path, attrs["allowed_root"]),
+         :ok <- WorkerFileIO.workspace_allowed?(store, observed.path),
+         :ok <- acquisition_checkpoint(opts, :after_acquisition_observation),
+         :ok <- acquisition_root_current(observed),
+         {:ok, fresh} <- observe(run, true, attrs["expected_sha"]),
+         true <- fresh == observed or {:error, :workspace_identity_changed},
+         {:ok, physical} <- acquisition_physical_identity(observed),
+         {:ok, captured} <- capture_observation(capture) do
+      transaction(store, fn tx ->
+        with {:ok, current} <- RunLedger.get(tx, attrs["run_id"]),
+             true <- current == run or {:error, :workspace_acquisition_input_changed},
+             {:ok, current_task} <- task_binding(tx, attrs),
+             true <- current_task == task or {:error, :workspace_acquisition_task_changed},
+             :ok <- acquisition_root_current(observed),
+             :ok <- within_root(observed.path, attrs["allowed_root"]),
+             {:ok, current_physical} <- acquisition_physical_identity(observed),
+             true <- current_physical == physical or {:error, :workspace_identity_changed},
+             {:ok, access} <- acquire_observed(tx, attrs, opts, run, task, observed) do
+          commit.(tx, access, captured)
+        end
+      end)
+    end
+  end
+
+  defp capture_observation(capture) do
+    case capture.() do
+      {:ok, _} = result -> result
+      {:error, _} = error -> error
+      _ -> {:error, :workspace_observation_invalid}
+    end
+  end
+
+  if Mix.env() == :test do
+    defp acquisition_checkpoint(opts, key) do
+      case opts[key] do
+        fun when is_function(fun, 0) -> fun.()
+        _ -> :ok
+      end
+    end
+  else
+    defp acquisition_checkpoint(_opts, _key), do: :ok
+  end
+
+  defp before_acquisition_observation(opts), do: acquisition_checkpoint(opts, :before_acquisition_observation)
+
+  @doc "Carries actual stopped push readback into an atomic claim callback without reading a helper inside SQLite."
+  @spec acquire_with_push_receipt(Store.connection(), map(), keyword(), map(), function()) :: term()
+  def acquire_with_push_receipt(%DBConnection{}, _attrs, _opts, _intent, _commit), do: {:error, :workspace_observation_inside_transaction}
+
+  def acquire_with_push_receipt(store, attrs, opts, intent, commit) do
+    with {:ok, run} <- RunLedger.get(store, attrs["run_id"]),
+         {:ok, current_intent} <- Jason.decode(run["candidate_handoff"] || "null"),
+         true <- (current_intent == intent and intent["phase"] == "PUSH_UNCERTAIN" and intent["reservation_key"] == attrs["reservation_key"]) or {:error, :controller_push_completion_unproven},
+         {:ok, raw} <- TicketPushIO.readback(intent),
+         true <- TicketPushIO.receipt_valid?(raw, intent) or {:error, :controller_push_receipt_unproven} do
+      acquire_with(store, attrs, opts, fn tx, access ->
+        with {:ok, current} <- RunLedger.get(tx, attrs["run_id"]),
+             true <- (current == run and access["generation"] == intent["reservation_generation"]) or {:error, :controller_push_completion_unproven} do
+          release = fn -> release_push_observed(tx, attrs["run_id"], attrs["reservation_key"], access["generation"], access, raw) end
+          commit.(tx, access, raw, release)
+        end
+      end)
+    end
+  end
+
+  defp acquisition_root_current(observed) do
+    with {:ok, path} <- PathSafety.canonicalize(observed.path),
+         {:ok, %File.Stat{type: :directory} = stat} <- File.lstat(path),
+         true <- path == observed.path and {stat.major_device, stat.inode} == {observed.root_device, observed.root_inode} do
+      :ok
+    else
+      _ -> {:error, :workspace_root_identity_changed}
+    end
+  end
+
+  defp acquisition_physical_identity(observed) do
+    Enum.reduce_while([observed.path, observed.git_dir, observed.common_dir], {:ok, []}, fn path, {:ok, identities} ->
+      with {:ok, ^path} <- PathSafety.canonicalize(path),
+           {:ok, %File.Stat{type: :directory} = stat} <- File.lstat(path) do
+        {:cont, {:ok, [{path, stat.major_device, stat.inode} | identities]}}
+      else
+        _ -> {:halt, {:error, :workspace_identity_changed}}
+      end
+    end)
+  end
+
+  defp acquire_observed(store, attrs, opts, run, task, observed) do
+    case get_row(store, attrs["reservation_key"]) do
+      nil ->
+        insert_observed(store, attrs, opts, run, task, observed)
+
+      row ->
+        with {:ok, _} <- replay(row, attrs),
+             true <- {row["canonical_path"], row["git_dir"], row["common_dir"]} == {observed.path, observed.git_dir, observed.common_dir} or {:error, :workspace_identity_changed},
+             {:ok, binding} <- Jason.decode(row["binding_json"]),
+             true <- same_root?(observed, binding) or {:error, :workspace_root_identity_changed},
+             true <- Map.take(run, ~w(spec_revision contract_sha256 branch)) == Map.take(binding, ~w(spec_revision contract_sha256 branch)) or {:error, :workspace_input_changed},
+             :ok <- admitted_sha(store, run, task, attrs),
+             :ok <- checkout_intent_available(store, observed, run["branch"], nil),
+             :ok <- NativeWorkspaceMaintenance.checkout_available(store, attrs["run_id"]),
+             :ok <- current_task(store, row, binding),
+             :ok <- current_initial_base(store, row, binding, run) do
+          {:ok, row}
+        end
+    end
   end
 
   defp acquire_transaction(store, attrs, opts) do
@@ -45,11 +175,21 @@ defmodule SymphonyElixir.Factory.WorkspaceAccess do
   defp acquire_new(store, attrs, opts) do
     with :ok <- valid_attrs(attrs),
          {:ok, run} <- RunLedger.get(store, attrs["run_id"]),
+         :ok <- before_acquisition_observation(opts),
          {:ok, observed} <- observe(run, true, attrs["expected_sha"]),
          :ok <- checkout_intent_available(store, observed, run["branch"], nil),
          :ok <- within_root(observed.path, attrs["allowed_root"]),
          :ok <- WorkerFileIO.workspace_allowed?(store, observed.path),
          {:ok, task} <- task_binding(store, attrs),
+         :ok <- admitted_sha(store, run, task, attrs) do
+      insert_observed(store, attrs, opts, run, task, observed)
+    else
+      {:error, _} = error -> error
+    end
+  end
+
+  defp insert_observed(store, attrs, opts, run, task, observed) do
+    with :ok <- checkout_intent_available(store, observed, run["branch"], nil),
          :ok <- admitted_sha(store, run, task, attrs) do
       binding = Map.merge(attrs, Map.merge(observed, Map.take(run, ~w(spec_revision contract_sha256 candidate_sha branch))))
       binding = Map.put(binding, "prompt_sha256", (task || %{})["prompt_sha256"])
@@ -82,8 +222,6 @@ defmodule SymphonyElixir.Factory.WorkspaceAccess do
 
         {:ok, get_row(store, attrs["reservation_key"])}
       end
-    else
-      {:error, _} = error -> error
     end
   end
 
@@ -305,6 +443,32 @@ defmodule SymphonyElixir.Factory.WorkspaceAccess do
     end)
   end
 
+  @doc "Transfers only a TCAP source whose checkout and native admission were observed before this transaction."
+  @spec transfer_capability_source(Store.connection(), String.t(), pos_integer(), map(), map()) :: access_result()
+  def transfer_capability_source(%DBConnection{} = tx, old_key, generation, attrs, %{"operational_recovery_key" => "TCAP-" <> _} = proof) do
+    with :ok <- valid_attrs(attrs),
+         {:ok, verified} <- TicketCapabilityRecovery.checked(tx, proof),
+         old = verified.facts.access,
+         true <- old["reservation_key"] == old_key and old["generation"] == generation and is_nil(old["released_at"]),
+         destination = verified.checked["destination"],
+         true <- {attrs["request_key"], attrs["reservation_key"], proof["new_prompt_sha256"]} == {destination["request_key"], destination["reservation_key"], destination["prompt_sha256"]},
+         {:ok, old_binding} <- Jason.decode(old["binding_json"]),
+         true <- attrs["allowed_root"] == old_binding["allowed_root"] and attrs["expected_sha"] == verified.facts.run["candidate_sha"],
+         :ok <- blocked_resume_proof(tx, old, verified.facts.evidence, verified.facts.task, verified.facts.run, attrs, proof),
+         {:ok, observed} <- TicketCapabilityRecovery.checkout(tx, proof),
+         %{"generation" => maximum} <- Store.one!(tx, "SELECT MAX(generation) AS generation FROM workspace_access WHERE canonical_path=? OR git_dir=?", [old["canonical_path"], old["git_dir"]]),
+         true <- maximum == generation and destination["generation"] == generation + 1,
+         :ok <- retire_blocked_source(tx, old, attrs, proof),
+         {:ok, inserted} <- insert_transferred_source(tx, old, attrs, observed, verified.facts.task, verified.facts.run, proof) do
+      {:ok, inserted}
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :capability_recovery_transfer_unproven}
+    end
+  end
+
+  def transfer_capability_source(_, _, _, _, _), do: {:error, :capability_recovery_transaction_required}
+
   defp validate_blocked_resume_source(store, key, generation, %{"amendment_command_key" => command_key}) when is_binary(command_key) do
     with {:ok, receipt} <- TicketContractAmendment.blocked_predecessor_for_request(store, Store.one!(store, "SELECT request_key FROM workspace_access WHERE reservation_key = ?", [key])["request_key"]),
          true <- receipt["command_key"] == command_key or {:error, :blocked_amendment_receipt_changed},
@@ -330,7 +494,7 @@ defmodule SymphonyElixir.Factory.WorkspaceAccess do
          :ok <- accepted_rework_proof(store, proof, attrs, old, evidence, output),
          :ok <- blocked_result_scope(store, evidence, output, proof, old, task),
          :ok <- blocked_task_scope(task, binding, evidence, old),
-         :ok <- blocked_run_scope(run, binding, old, proof),
+         :ok <- blocked_run_scope(store, run, binding, old, attrs, proof),
          true <- attrs_match_old?(old, proof) or {:error, :blocked_resume_reservation_mismatch} do
       :ok
     else
@@ -369,9 +533,10 @@ defmodule SymphonyElixir.Factory.WorkspaceAccess do
     if actual == expected, do: :ok, else: {:error, :blocked_resume_task_changed}
   end
 
-  defp blocked_run_scope(run, binding, old, proof) do
+  defp blocked_run_scope(store, run, binding, old, attrs, proof) do
     cond do
-      run["candidate_sha"] != binding["expected_sha"] and not nil_candidate_resume?(run, proof) ->
+      run["candidate_sha"] != binding["expected_sha"] and
+          not (nil_candidate_resume?(run, proof) or initial_blocked_source?(store, run, binding, old, attrs)) ->
         {:error, :blocked_resume_candidate_changed}
 
       Path.expand(run["worktree"] || "") != Path.expand(old["canonical_path"] || "") ->
@@ -382,9 +547,51 @@ defmodule SymphonyElixir.Factory.WorkspaceAccess do
     end
   end
 
+  defp initial_blocked_source?(store, %{"state" => "WRITING", "candidate_sha" => nil, "implementation_iteration" => 0} = run, binding, old, attrs) do
+    sha = binding["expected_sha"]
+    base = Store.one!(store, "SELECT base_ref, base_sha FROM ticket_review_bases WHERE run_id = ?", [run["run_id"]])
+
+    with {:ok, owned} when is_map(owned) <- Jason.decode(old["binding_json"] || "null"),
+         :ok <- TicketChat.ordinary_delivery_eligibility(run),
+         true <- is_binary(sha) and Regex.match?(~r/\A[0-9a-f]{40}\z/, sha),
+         true <- is_binary(run["base_branch"]),
+         true <- base == %{"base_ref" => "refs/remotes/origin/" <> run["base_branch"], "base_sha" => sha},
+         true <- binding["base_sha"] == sha and owned["expected_sha"] == sha and attrs["expected_sha"] == sha,
+         true <- is_nil(owned["candidate_sha"]),
+         :ok <- competing_activity(store, old["canonical_path"], old["task_key"]),
+         {:ok, observed} <- observe(run, false, sha) do
+      {observed.path, observed.git_dir, observed.common_dir} == {old["canonical_path"], old["git_dir"], old["common_dir"]}
+    else
+      _ -> false
+    end
+  end
+
+  defp initial_blocked_source?(_store, _run, _binding, _old, _attrs), do: false
+
   defp nil_candidate_resume?(run, proof) do
     is_nil(run["candidate_sha"]) and is_binary(proof["amendment_command_key"]) and
       is_binary(proof["checkout_head_sha"]) and Regex.match?(~r/\A[0-9a-f]{40}\z/, proof["checkout_head_sha"])
+  end
+
+  defp accepted_rework_proof(store, %{"operational_recovery_key" => "TCAP-" <> _} = proof, attrs, old, evidence, output) do
+    with {:ok, checked} <- TicketCapabilityRecovery.checked(store, proof),
+         true <- checked.facts.evidence == evidence and checked.facts.access == old and output == checked.facts.output,
+         true <- attrs["request_key"] == checked.checked["destination"]["request_key"] and attrs["reservation_key"] == checked.checked["destination"]["reservation_key"],
+         do: :ok,
+         else: (_ -> {:error, :capability_recovery_transfer_unproven})
+  end
+
+  defp accepted_rework_proof(store, %{"operational_recovery_key" => key} = proof, attrs, old, evidence, output) when is_binary(key) do
+    with :ok <- SymphonyElixir.Factory.TicketInfrastructureRecovery.preflight(store, key),
+         {:ok, resume} <- SymphonyElixir.Factory.TicketInfrastructureRecovery.resume(store, evidence["request_key"]),
+         true <- resume["operational_recovery_key"] == key and resume["disposition_key"] == proof["disposition_key"],
+         true <- output["status"] == "BLOCKED",
+         true <- attrs["request_key"] != old["request_key"] and attrs["reservation_key"] != old["reservation_key"] do
+      :ok
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :blocked_resume_authority_unproven}
+    end
   end
 
   defp accepted_rework_proof(store, proof, attrs, old, evidence, output) do
@@ -436,7 +643,8 @@ defmodule SymphonyElixir.Factory.WorkspaceAccess do
 
   defp accepted_rework_input?(command, input, proof, chat) when is_map(command) and is_map(input) and is_map(chat) do
     rework_body_matches?(command, input, proof) and input_route_matches?(command, input, chat) and
-      matching_resume_staging_receipt?(command, input) and command_created_during_input?(command, input)
+      ((matching_resume_staging_receipt?(command, input) and command_created_during_input?(command, input)) or
+         SymphonyElixir.Factory.TicketReworkRecovery.valid?(command, input, chat))
   end
 
   defp accepted_rework_input?(_command, _input, _proof, _chat), do: false
@@ -517,6 +725,7 @@ defmodule SymphonyElixir.Factory.WorkspaceAccess do
         "new_request_key" => attrs["request_key"],
         "new_reservation_key" => attrs["reservation_key"],
         "command_key" => proof["command_key"],
+        "operational_recovery_key" => proof["operational_recovery_key"],
         "amendment_command_key" => proof["amendment_command_key"],
         "input_key" => proof["input_key"],
         "disposition_key" => proof["disposition_key"],
@@ -553,6 +762,93 @@ defmodule SymphonyElixir.Factory.WorkspaceAccess do
     )
 
     get(tx, attrs["reservation_key"])
+  end
+
+  @doc "Captures a stopped CI predecessor's clean checkout outside SQL; this observation grants no transfer authority."
+  @spec prepare_ci_successor_source(Store.connection(), map(), map(), Path.t()) :: {:ok, map()} | {:error, term()}
+  def prepare_ci_successor_source(%DBConnection{}, _run, _old, _root), do: {:error, :workspace_observation_inside_transaction}
+
+  def prepare_ci_successor_source(store, run, old, root) do
+    with true <- old["run_id"] == run["run_id"] and old["mode"] == "SOURCE" and is_nil(old["released_at"]),
+         {:ok, observed} <- observe(run, true, run["candidate_sha"]),
+         true <- {observed.path, observed.git_dir, observed.common_dir} == {old["canonical_path"], old["git_dir"], old["common_dir"]},
+         :ok <- within_root(observed.path, root),
+         :ok <- WorkerFileIO.workspace_allowed?(store, observed.path),
+         {:ok, fresh} <- observe(run, true, run["candidate_sha"]),
+         true <- fresh == observed,
+         {:ok, physical} <- acquisition_physical_identity(observed) do
+      {:ok, %{run: run, old: old, observed: observed, physical: physical, root: root}}
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :ci_successor_source_changed}
+    end
+  end
+
+  @doc "Transfers SOURCE only through a fully validated dedicated CI journal, with no Git or native calls under SQL."
+  @spec transfer_ci_successor_source(Store.connection(), map(), map(), String.t()) :: {:ok, map()} | {:error, term()}
+  def transfer_ci_successor_source(%DBConnection{} = tx, observed, attrs, key) do
+    with {:ok, entry} <- SymphonyElixir.Factory.TicketCiRepairSuccessor.journal(tx, key),
+         true <- entry.proof["prior_access"] == observed.old and entry.proof["run"] == observed.run,
+         true <-
+           attrs["request_key"] == entry.row["new_request_key"] and attrs["reservation_key"] == entry.row["new_reservation_key"] and attrs["run_id"] == entry.row["run_id"] and
+             attrs["task_key"] == observed.old["task_key"] and attrs["mode"] == "SOURCE" and attrs["expected_sha"] == observed.run["candidate_sha"],
+         {:ok, current} <- RunLedger.get(tx, attrs["run_id"]),
+         true <- current == observed.run,
+         {:ok, old} <- get(tx, observed.old["reservation_key"]),
+         true <- old == observed.old and is_nil(old["released_at"]),
+         :ok <- acquisition_root_current(observed.observed),
+         {:ok, physical} <- acquisition_physical_identity(observed.observed),
+         true <- physical == observed.physical,
+         :ok <- within_root(observed.observed.path, observed.root),
+         {:ok, task} <- TaskLedger.get(tx, old["task_key"]),
+         true <- task == entry.proof["prior_task"],
+         {:ok, disposition} <- Jason.decode(entry.proof["disposition_event"]["payload_json"]),
+         maximum = Store.one!(tx, "SELECT COALESCE(MAX(generation),0) AS generation FROM workspace_access WHERE canonical_path=? OR git_dir=?", [old["canonical_path"], old["git_dir"]]),
+         transfer = %{
+           "kind" => "CI_EVIDENCE_SUCCESSOR_TRANSFER_V1",
+           "ci_evidence_successor_key" => key,
+           "old_request_key" => entry.row["prior_request_key"],
+           "old_reservation_key" => old["reservation_key"],
+           "new_request_key" => attrs["request_key"],
+           "new_reservation_key" => attrs["reservation_key"],
+           "new_generation" => maximum["generation"] + 1,
+           "disposition_key" => disposition["disposition_key"],
+           "output_sha256" => entry.proof["prior_evidence"]["output_sha256"],
+           "checkout_head_sha" => current["candidate_sha"]
+         },
+         _ <-
+           Store.query!(tx, "UPDATE workspace_access SET released_at=?,release_receipt_json=? WHERE reservation_key=? AND released_at IS NULL", [now(), Jason.encode!(transfer), old["reservation_key"]]),
+         {:ok, access} <- insert_transferred_source(tx, old, attrs, observed.observed, task, current, %{"new_prompt_sha256" => attrs["prompt_sha256"]}) do
+      if access["generation"] == transfer["new_generation"], do: {:ok, access}, else: {:error, :ci_successor_source_generation_changed}
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :ci_successor_source_changed}
+    end
+  end
+
+  def transfer_ci_successor_source(_, _, _, _), do: {:error, :ci_successor_transaction_required}
+
+  @doc "Transfer only through an exact failed-turn quiescence authority; never ordinary release."
+  @spec transfer_failed_source(Store.connection(), String.t(), map()) :: {:ok, map()} | {:error, term()}
+  def transfer_failed_source(store, old_key, proof) do
+    transaction(store, fn tx ->
+      with :ok <- SymphonyElixir.Factory.FailedTurnRecovery.transfer_authority(tx, proof),
+           {:ok, old} <- get(tx, old_key),
+           {:ok, evidence} <- WorkerEvidence.get(tx, old["request_key"]),
+           true <- (digest(Jason.encode!(old)) == proof["old_access_sha256"] and digest(Jason.encode!(evidence)) == proof["old_evidence_sha256"]) or {:error, :failed_retry_binding_changed},
+           {:ok, task} <- TaskLedger.get(tx, old["task_key"]),
+           {:ok, run} <- RunLedger.get(tx, old["run_id"]),
+           {:ok, observed} <- observe(run, false, run["candidate_sha"]),
+           true <- (is_nil(old["released_at"]) and old["mode"] == "SOURCE") or {:error, :stale_workspace_reservation},
+           :ok <- SymphonyElixir.Factory.FailedTurnRecovery.transfer_authority(tx, proof),
+           attrs = Map.take(Jason.decode!(old["binding_json"]), @fields) |> Map.merge(%{"request_key" => proof["new_request_key"], "reservation_key" => proof["new_reservation_key"]}),
+           transfer = Map.take(proof, ~w(kind recovery_key old_request_key new_request_key new_reservation_key)) do
+        Store.query!(tx, "UPDATE workspace_access SET released_at = ?, release_receipt_json = ? WHERE reservation_key = ? AND released_at IS NULL", [now(), Jason.encode!(transfer), old_key])
+        insert_transferred_source(tx, old, attrs, observed, task, run, proof)
+      else
+        {:error, _} = error -> error
+      end
+    end)
   end
 
   @doc "Release is authorized by a consumed durable attempt, never by timeout or process absence."
@@ -595,10 +891,24 @@ defmodule SymphonyElixir.Factory.WorkspaceAccess do
          true <-
            (raw == intent["receipt_json"] and receipt_hash(raw) == intent["receipt_sha256"] and
               TicketPushIO.receipt_valid?(raw, intent)) or {:error, :controller_push_receipt_unproven} do
-      Store.query!(store, "UPDATE workspace_access SET released_at = ?, release_receipt_json = ? WHERE reservation_key = ? AND released_at IS NULL", [now(), run["candidate_handoff"], key])
-      get(store, key)
+      release_push_observed(store, run_id, key, generation, access, raw)
     else
       {:error, _} = error -> error
+    end
+  end
+
+  defp release_push_observed(store, run_id, key, generation, observed_access, raw) do
+    with {:ok, run} <- RunLedger.get(store, run_id),
+         {:ok, intent} <- Jason.decode(run["candidate_handoff"] || "null"),
+         true <- (intent["kind"] == "TICKET_PUSH" and intent["phase"] == "COMPLETED") or {:error, :controller_push_completion_unproven},
+         true <- {intent["reservation_key"], intent["reservation_generation"], intent["remote_sha"]} == {key, generation, run["candidate_sha"]} or {:error, :controller_push_completion_unproven},
+         {:ok, access} <- get(store, key),
+         true <- (access == observed_access and access["generation"] == generation and is_nil(access["released_at"])) or {:error, :stale_workspace_reservation},
+         true <- {access["run_id"], access["mode"], access["request_key"], access["task_key"]} == {run_id, "MAINTENANCE", key, nil} or {:error, :controller_push_completion_unproven},
+         :ok <- push_release_binding(run, intent, access),
+         true <- (raw == intent["receipt_json"] and receipt_hash(raw) == intent["receipt_sha256"] and TicketPushIO.receipt_valid?(raw, intent)) or {:error, :controller_push_receipt_unproven} do
+      Store.query!(store, "UPDATE workspace_access SET released_at = ?, release_receipt_json = ? WHERE reservation_key = ? AND released_at IS NULL", [now(), run["candidate_handoff"], key])
+      get(store, key)
     end
   end
 
@@ -628,6 +938,150 @@ defmodule SymphonyElixir.Factory.WorkspaceAccess do
   end
 
   defp receipt_hash(raw), do: Base.encode16(:crypto.hash(:sha256, raw), case: :lower)
+
+  @doc "Transfers a held input-fenced reservation only within its exact append-only retirement transaction."
+  @spec transfer_input_retirement(Store.connection(), map(), map(), keyword()) :: {:ok, map()} | {:error, term()}
+  def transfer_input_retirement(%DBConnection{} = tx, retirement, original_access, opts) do
+    with saved when is_map(saved) <- Store.one!(tx, "SELECT * FROM ticket_push_input_retirements WHERE retirement_key = ?", [retirement["retirement_key"]]),
+         true <- saved == retirement or {:error, :input_retirement_changed},
+         {:ok, run} <- RunLedger.get(tx, saved["run_id"]),
+         true <- run["candidate_handoff"] == saved["original_envelope"] or {:error, :input_retirement_envelope_changed},
+         {:ok, intent} <- Jason.decode(saved["original_envelope"]),
+         {:ok, access} <- get(tx, intent["reservation_key"]),
+         true <- (access == original_access and is_nil(access["released_at"]) and is_nil(access["release_receipt_json"])) or {:error, :input_retirement_reservation_changed},
+         true <-
+           {access["run_id"], access["request_key"], access["task_key"], access["mode"], access["generation"]} ==
+             {run["run_id"], intent["reservation_key"], nil, "MAINTENANCE", intent["reservation_generation"]} or {:error, :input_retirement_reservation_changed},
+         true <-
+           (intent["phase"] == "PUSH_UNCERTAIN" and Enum.all?(~w(helper_pid execution_json receipt_json receipt_sha256 remote_sha), &is_nil(intent[&1]))) or
+             {:error, :input_retirement_issuance_unproven},
+         {:ok, proof} <- Jason.decode(saved["proof_json"]),
+         true <- (proof["kind"] == "INPUT_NOT_ISSUED" and receipt_hash(saved["proof_json"]) == saved["proof_sha256"]) or {:error, :input_retirement_proof_changed},
+         {:ok, binding} <- Jason.decode(access["binding_json"]) do
+      release = Jason.encode!(%{"kind" => "INPUT_NOT_ISSUED", "retirement_key" => saved["retirement_key"], "original_envelope" => saved["original_envelope"], "proof_sha256" => saved["proof_sha256"]})
+
+      Store.query!(tx, "UPDATE workspace_access SET released_at = ?, release_receipt_json = ? WHERE reservation_key = ? AND generation = ? AND released_at IS NULL AND release_receipt_json IS NULL", [
+        now(),
+        release,
+        access["reservation_key"],
+        access["generation"]
+      ])
+
+      attrs = Map.take(binding, ~w(reservation_key run_id task_key request_key mode allowed_root expected_sha))
+      attrs = Map.merge(attrs, %{"reservation_key" => saved["successor_reservation_key"], "request_key" => saved["successor_reservation_key"]})
+      observed = Map.new([:path, :git_dir, :common_dir, :root_device, :root_inode], &{&1, binding[to_string(&1)]})
+      insert_observed(tx, attrs, opts, run, nil, observed)
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :input_retirement_unproven}
+    end
+  end
+
+  def transfer_input_retirement(_store, _retirement, _access, _opts), do: {:error, :input_retirement_transaction_required}
+
+  @spec transfer_preissuance_rejection(Store.connection(), map(), map(), keyword()) :: {:ok, map()} | {:error, term()}
+  def transfer_preissuance_rejection(%DBConnection{} = tx, retirement, original_access, opts) do
+    with ^retirement <- Store.one!(tx, "SELECT * FROM ticket_push_rejection_retirements WHERE retirement_key=?", [retirement["retirement_key"]]),
+         :ok <- TicketPushPreissuanceRejection.validate_retirement(retirement) do
+      transfer_closed_rejection(tx, retirement, original_access, opts)
+    end
+  end
+
+  def transfer_preissuance_rejection(_store, _retirement, _access, _opts), do: {:error, :push_rejection_transaction_required}
+
+  @spec transfer_ordinary_preissuance_rejection(Store.connection(), map(), map(), keyword()) ::
+          {:ok, map()} | {:error, term()}
+  def transfer_ordinary_preissuance_rejection(%DBConnection{} = tx, plan, original_access, opts) do
+    with {:ok, value} <- TicketPushOrdinaryRejection.validate_record(tx, plan["record"]),
+         true <- {value["run_id"], value["original_envelope"], plan["record"]["payload_json"]} == {plan["run_id"], plan["original_envelope"], plan["proof_json"]},
+         true <- :crypto.hash(:sha256, Jason.encode!(original_access)) |> Base.encode16(case: :lower) == value["prior_access_sha256"],
+         {:ok, original} <- Jason.decode(value["original_envelope"]),
+         ref = %{
+           "event_id" => plan["record"]["id"],
+           "event_sha256" => :crypto.hash(:sha256, plan["proof_json"]) |> Base.encode16(case: :lower),
+           "retirement_key" => value["retirement_key"],
+           "original_sha256" => value["original_sha256"],
+           "attempt" => 1
+         },
+         binding = Jason.decode!(original["binding_json"]) |> Map.put("ordinary_preissuance_retirement", ref) |> Jason.encode!(),
+         true <- plan["successor_reservation_key"] == "ticket-push:" <> (:crypto.hash(:sha256, binding) |> Base.encode16(case: :lower)) do
+      transfer_closed_rejection(tx, plan, original_access, opts)
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :ordinary_rejection_transfer_unproven}
+    end
+  end
+
+  def transfer_ordinary_preissuance_rejection(_store, _plan, _access, _opts), do: {:error, :push_rejection_transaction_required}
+
+  defp transfer_closed_rejection(tx, retirement, original_access, opts) do
+    with {:ok, run} <- RunLedger.get(tx, retirement["run_id"]),
+         true <- run["candidate_handoff"] == retirement["original_envelope"] or {:error, :push_rejection_envelope_changed},
+         {:ok, intent} <- Jason.decode(retirement["original_envelope"]),
+         {:ok, access} <- get(tx, intent["reservation_key"]),
+         true <- access == original_access and is_nil(access["released_at"]) and is_nil(access["release_receipt_json"]),
+         expected = {run["run_id"], intent["reservation_key"], nil, "MAINTENANCE", intent["reservation_generation"]},
+         true <- {access["run_id"], access["request_key"], access["task_key"], access["mode"], access["generation"]} == expected,
+         {:ok, binding} <- Jason.decode(access["binding_json"]) do
+      changed =
+        Store.query!(
+          tx,
+          "UPDATE workspace_access SET released_at=?,release_receipt_json=? WHERE reservation_key=? AND generation=? AND released_at IS NULL AND release_receipt_json IS NULL RETURNING reservation_key",
+          [now(), retirement["proof_json"], access["reservation_key"], access["generation"]]
+        ).rows
+
+      if changed == [[access["reservation_key"]]] do
+        attrs = Map.take(binding, ~w(reservation_key run_id task_key request_key mode allowed_root expected_sha))
+        attrs = Map.merge(attrs, %{"reservation_key" => retirement["successor_reservation_key"], "request_key" => retirement["successor_reservation_key"]})
+        observed = Map.new([:path, :git_dir, :common_dir, :root_device, :root_inode], &{&1, binding[to_string(&1)]})
+        insert_observed(tx, attrs, opts, run, nil, observed)
+      else
+        {:error, :push_rejection_reservation_changed}
+      end
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :push_rejection_transfer_unproven}
+    end
+  end
+
+  @doc false
+  @spec transfer_prepared_requalification(Store.connection(), map(), map(), keyword()) ::
+          {:ok, map()} | {:error, term()}
+  def transfer_prepared_requalification(%DBConnection{} = tx, row, original_access, opts) do
+    with ^row <- Store.one!(tx, "SELECT * FROM ticket_push_prepared_requalifications WHERE authorization_key=?", [row["authorization_key"]]),
+         :ok <- TicketPushRequalification.validate(row),
+         {:ok, run} <- RunLedger.get(tx, row["run_id"]),
+         true <- run["candidate_handoff"] == row["original_envelope"],
+         {:ok, original} <- Jason.decode(row["original_envelope"]),
+         {:ok, access} <- get(tx, original["reservation_key"]),
+         true <- access == original_access and is_nil(access["released_at"]) and is_nil(access["release_receipt_json"]),
+         {:ok, proof} <- Jason.decode(row["proof_json"]),
+         true <- proof["original_access"] == access,
+         {:ok, binding} <- Jason.decode(access["binding_json"]) do
+      changed =
+        Store.query!(
+          tx,
+          "UPDATE workspace_access SET released_at=?,release_receipt_json=? WHERE reservation_key=? AND generation=? AND released_at IS NULL AND release_receipt_json IS NULL RETURNING reservation_key",
+          [now(), row["proof_json"], access["reservation_key"], access["generation"]]
+        ).rows
+
+      if changed == [[access["reservation_key"]]] do
+        attrs =
+          binding
+          |> Map.take(~w(reservation_key run_id task_key request_key mode allowed_root expected_sha))
+          |> Map.merge(%{"reservation_key" => row["successor_reservation_key"], "request_key" => row["successor_reservation_key"]})
+
+        observed = Map.new([:path, :git_dir, :common_dir, :root_device, :root_inode], &{&1, binding[to_string(&1)]})
+        insert_observed(tx, attrs, opts, run, nil, observed)
+      else
+        {:error, :push_requalification_access_changed}
+      end
+    else
+      _ -> {:error, :push_requalification_transfer_unproven}
+    end
+  end
+
+  def transfer_prepared_requalification(_store, _row, _access, _opts), do: {:error, :push_requalification_transaction_required}
 
   @spec release_unissuable_push(Store.connection(), String.t(), String.t(), pos_integer()) ::
           {:ok, map()} | {:error, term()}

@@ -74,6 +74,32 @@ defmodule SymphonyElixir.Factory.TicketCheckout do
     end
   end
 
+  @doc "Admits a repaired initial checkout after a proven timeout; never reissues creation."
+  @spec recover_materialization(Store.connection(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
+  def recover_materialization(store, run_id, authorization, opts) do
+    with {:ok, intent} <- get(store, run_id),
+         true <- intent["phase"] == "RECONCILE_REQUIRED" or {:error, :ticket_checkout_recovery_not_admitted},
+         {:ok, raw} <- TicketCheckoutIO.readback(intent),
+         true <- TicketCheckoutIO.receipt_valid?(raw, intent) or {:error, :ticket_checkout_receipt_unproven},
+         receipt <- Jason.decode!(raw),
+         true <-
+           (receipt["timed_out"] == true and receipt["overflow"] == false and receipt["termination"] == %{"kind" => "signaled", "signal" => 9}) or
+             {:error, :ticket_checkout_timeout_unproven},
+         :ok <- inactive_process(intent["helper_pid"]),
+         :ok <- inactive_process(receipt["child_pid"]) do
+      finalize(store, intent, raw, authorization, opts, true)
+    end
+  end
+
+  defp inactive_process(pid) when is_integer(pid) and pid > 0 do
+    case System.cmd("/bin/kill", ["-0", Integer.to_string(pid)], stderr_to_stdout: true) do
+      {_output, 1} -> :ok
+      _ -> {:error, :ticket_checkout_process_not_proven_inactive}
+    end
+  end
+
+  defp inactive_process(_pid), do: {:error, :ticket_checkout_process_not_proven_inactive}
+
   defp reconcile_intent(store, %{"phase" => "READY"} = intent, _authorization, _opts) do
     with {:ok, run} <- RunLedger.get(store, intent["run_id"]),
          true <- (run["worktree"] == intent["canonical_path"] and run["branch"] == intent["branch"]) or {:error, :ticket_checkout_intent_changed} do
@@ -104,28 +130,44 @@ defmodule SymphonyElixir.Factory.TicketCheckout do
     {:error, reason}
   end
 
-  defp finalize(store, intent, raw, authorization, opts) do
-    case Exqlite.transaction(store, fn tx ->
-           rollback_error(tx, finalize_transaction(tx, intent, raw, authorization, opts))
-         end) do
+  defp finalize(store, intent, raw, authorization, opts, recovered \\ false) do
+    case Exqlite.transaction(
+           store,
+           fn tx ->
+             rollback_error(tx, finalize_transaction(tx, intent, raw, authorization, opts, recovered))
+           end,
+           timeout: 60_000
+         ) do
       {:ok, result} -> result
       {:error, reason} -> {:error, reason}
     end
   end
 
-  defp finalize_transaction(store, intent, raw, authorization, opts) do
+  defp finalize_transaction(store, intent, raw, authorization, opts, recovered) do
     receipt = Jason.decode!(raw)
     binding = Jason.decode!(intent["binding_json"])
 
     with {:ok, current} <- get(store, intent["run_id"]),
          true <- current == intent or {:error, :ticket_checkout_intent_changed},
-         true <- successful?(receipt) or {:error, :ticket_checkout_git_failed},
+         true <- successful?(receipt) or recovered or {:error, :ticket_checkout_git_failed},
          {:ok, run} <- RunLedger.get(store, intent["run_id"]),
          :ok <- finalization_binding(store, run, binding, authorization, opts),
          {:ok, checkout} <- checkout_admission(store, run, binding),
          :ok <- TicketWorkerRunner.validate_authorization(run, authorization),
-         {:ok, %{run: admitted}} <- RunLedger.update(store, run["run_id"], %{state: "PLANNING", worktree: checkout.path}) do
+         {:ok, %{run: admitted}} <- RunLedger.update(store, run["run_id"], %{state: "PLANNING", worktree: checkout.path, workspace_state: "MATERIALIZED"}) do
       Store.query!(store, "UPDATE ticket_checkout_intents SET phase = 'READY', receipt_json = ?, last_error = NULL WHERE run_id = ?", [raw, intent["run_id"]])
+
+      if recovered do
+        receipt_sha = :crypto.hash(:sha256, raw) |> Base.encode16(case: :lower)
+        payload = Jason.encode!(%{binding_sha256: intent["binding_sha256"], original_receipt_sha256: receipt_sha, base_sha: binding["base_sha"]})
+
+        Store.query!(store, "INSERT INTO events(occurred_at, event_type, run_id, payload_json) VALUES (?, 'TICKET_CHECKOUT_MATERIALIZATION_RECOVERED', ?, ?)", [
+          DateTime.to_iso8601(DateTime.utc_now()),
+          intent["run_id"],
+          payload
+        ])
+      end
+
       {:ok, %{status: "CHECKOUT_ADMITTED", run: admitted, model_invoked: false}}
     end
   end

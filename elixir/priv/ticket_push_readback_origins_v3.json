@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "manifest_path": "/Users/cgable/Library/Application Support/ai-factory/releases/symphony-verifier-repair-v1-49bc06715d/evidence/release-manifest.json",
+      "manifest_sha256": "e97da34d7c1bbfd9ede048b4f5709d958957ed4a8c2d59318d21291470197a48",
+      "helper_path": "/Users/cgable/Library/Application Support/ai-factory/releases/symphony-verifier-repair-v1-49bc06715d/dev/lib/symphony_elixir/priv/ticket_push_executor_v9.py",
+      "helper_sha256": "a362cc92abe82a14f2ae9f9f21afaa65bce8a47cc88820a4e2e7286b749ccd16",
+      "companion_path": "/Users/cgable/Library/Application Support/ai-factory/releases/symphony-verifier-repair-v1-49bc06715d/dev/lib/symphony_elixir/priv/worker_file_companion.py",
+      "companion_sha256": "87f3dd595ddc70205ed881b42ab5a9401b0705c13cdc8fda2c2b8b5bac4b0b3b"
+    }
+  ]
+}

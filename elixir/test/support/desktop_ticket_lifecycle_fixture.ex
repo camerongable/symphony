@@ -182,7 +182,7 @@ defmodule SymphonyElixir.DesktopTicketLifecycleFixture do
       turn = "turn-#{System.unique_integer([:positive])}"
       if session.files, do: :ok = WorkerFileTools.turn_preflight(session.files, session)
       opts[:on_message].(%{event: :session_started, thread_id: session.thread_id, turn_id: turn})
-      output = output(session, packet, turn)
+      output = output(session, packet, turn) |> structured_report(packet)
 
       opts[:on_message].(%{
         payload: %{
@@ -196,6 +196,30 @@ defmodule SymphonyElixir.DesktopTicketLifecycleFixture do
       })
 
       {:ok, %{turn_id: turn}}
+    end
+
+    defp structured_report(output, packet) do
+      base = packet["base_packet"] || packet
+
+      case base["review_protocol"] do
+        nil ->
+          output
+
+        protocol ->
+          rows = fn ids, status -> Enum.map(ids, &%{"id" => &1, "status" => status, "evidence" => ["Synthetic fixture boundary observation"]}) end
+
+          report = %{
+            "version" => 1,
+            "candidate_sha" => base["candidate_sha"] || base["base_sha"],
+            "block_reason" => "NONE",
+            "criteria" => rows.(protocol["criterion_ids"], "PASS"),
+            "closures" => rows.(Enum.map(protocol["finding_obligations"], & &1["id"]), "ADDRESSED"),
+            "boundary_sweeps" => Enum.map(rows.(protocol["criterion_ids"], "CHECKED"), &Map.put(&1, "paths", ["fixture.txt"])),
+            "finding_classifications" => []
+          }
+
+          Map.put(output, "review_report", report)
+      end
     end
 
     defp output(_session, %{"role" => "feature-planner"}, _turn) do
@@ -222,6 +246,18 @@ defmodule SymphonyElixir.DesktopTicketLifecycleFixture do
         %{"status" => "COMPLETE", "changed_paths" => [], "commit_message" => nil, "blockers" => [], "checks" => ["NOT_RUN: controller checks pending"]}
       end
     end
+
+    defp output(session, %{"role" => "feature-writer", "plan" => "file-io-blocked"} = packet, turn) do
+      session
+      |> output_source_slice(packet, turn)
+      |> Map.merge(%{"status" => "BLOCKED", "commit_message" => nil, "blockers" => ["file_worker_helper_exit_unproven; file_worker_edit_reconciliation_required"]})
+    end
+
+    defp output(session, %{"controller_infrastructure_recovery" => key, "base_packet" => packet}, turn) when is_binary(key),
+      do: output_source_slice(session, packet, turn)
+
+    defp output(session, %{"controller_failed_turn_recovery" => key, "base_packet" => packet}, turn) when is_binary(key),
+      do: output_source_slice(session, packet, turn)
 
     defp output(_session, %{"role" => "feature-writer", "plan" => "blocked"}, _turn),
       do: %{
@@ -400,6 +436,15 @@ defmodule SymphonyElixir.DesktopTicketLifecycleFixture do
     end
 
     def stop_session(session), do: WorkerServer.stop_session(session)
+  end
+
+  defmodule RejectedResumeServer do
+    @moduledoc false
+    def start_session(_workspace, opts),
+      do: {:error, {:response_error, %{"code" => -32600, "message" => "thread #{opts[:resume_thread_id]} already has an active writer"}}}
+
+    def run_turn(_session, _prompt, _issue, _opts), do: raise("a rejected resume must not start a turn")
+    def stop_session(_session), do: raise("a rejected resume has no session")
   end
 
   defmodule WrongResumeThreadServer do

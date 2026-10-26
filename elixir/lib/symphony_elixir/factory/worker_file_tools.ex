@@ -1,6 +1,7 @@
 defmodule SymphonyElixir.Factory.WorkerFileTools do
   @moduledoc "Controller-owned descriptor file tools; native admission remains fenced pending containment and recovery acceptance."
   alias SymphonyElixir.Factory.{RunLedger, Store, TaskLedger, WorkerEvidence, WorkerFileIO, WorkspaceAccess, Worktree}
+  alias SymphonyElixir.Factory.TicketCompletionConfirmation
 
   @max_file_bytes 262_144
   @max_output_bytes 16_384
@@ -218,6 +219,12 @@ defmodule SymphonyElixir.Factory.WorkerFileTools do
   defp dispatch(cap, "repo_mkdir", args, identity), do: write(cap, args, identity)
   defp dispatch(cap, "repo_write_binary", args, identity), do: write(cap, args, identity)
 
+  defp dispatch(cap, tool, %{"path" => ".symphony-base/" <> path} = args, identity) when tool in ~w(repo_read repo_read_binary) do
+    if byte_size(args["path"]) <= 1024,
+      do: read_revision(cap, tool, Map.put(args, "path", path), identity),
+      else: {:error, :file_worker_path_rejected}
+  end
+
   defp dispatch(cap, tool, args, identity) do
     Store.transaction!(cap.store, fn tx ->
       with {:ok, access} <- authorize(%{cap | store: tx}, identity),
@@ -226,6 +233,76 @@ defmodule SymphonyElixir.Factory.WorkerFileTools do
       end
     end)
   end
+
+  defp read_revision(cap, tool, args, identity) do
+    with :ok <- valid_path(args["path"], false),
+         {:ok, observed} <- revision_authority(cap, identity),
+         arguments = Map.merge(observed.arguments, %{"path" => args["path"], "binary" => tool == "repo_read_binary"}),
+         {:ok, value, _invocation} <- WorkerFileIO.request_revision(observed.access["canonical_path"], observed.root_binding, arguments),
+         {:ok, ^observed} <- revision_authority(cap, identity) do
+      historical = Map.merge(value, %{"source" => "CONTRACT_BASE", "write_cas_warning" => "Read the current file; never use this historical SHA as write CAS."})
+      revision_page(tool, historical, args)
+    else
+      {:error, reason, _invocation} -> {:error, reason}
+      {:ok, _changed} -> {:error, :file_worker_revision_authority_changed}
+      error -> error
+    end
+  end
+
+  defp revision_authority(cap, identity) do
+    with {:ok, access} <- authorize(cap, identity) do
+      Store.transaction!(cap.store, fn tx -> revision_snapshot(%{cap | store: tx}, identity, access) end, mode: :deferred)
+    end
+  end
+
+  defp revision_snapshot(cap, identity, access) do
+    with {:ok, ^access} <- WorkspaceAccess.get(cap.store, access["reservation_key"]),
+         {:ok, evidence} <- WorkerEvidence.get(cap.store, cap.key),
+         :ok <- matching(active?(evidence), true, :file_worker_not_active),
+         :ok <- matching({evidence["owner_id"], evidence["binding_sha256"]}, {cap.owner, cap.binding_sha256}, :file_worker_binding_changed),
+         :ok <- matching(native_identity(evidence), native_identity(identity), :file_worker_identity_mismatch),
+         {:ok, binding} <- intact_binding(evidence),
+         {:ok, run} <- RunLedger.get(cap.store, evidence["run_id"]),
+         {:ok, task} <- TaskLedger.get(cap.store, evidence["task_key"]),
+         {:ok, access_binding} <- Jason.decode(access["binding_json"]),
+         true <- Map.take(run, ~w(spec_revision contract_sha256 branch)) == Map.take(access_binding, ~w(spec_revision contract_sha256 branch)),
+         true <- Map.take(run, ~w(spec_revision contract_sha256)) == Map.take(binding, ~w(spec_revision contract_sha256)),
+         true <- task["prompt_sha256"] == access_binding["prompt_sha256"],
+         :ok <- current_inputs(task, binding),
+         true <- run["candidate_sha"] in [nil, binding["expected_sha"]],
+         pin when is_map(pin) <- Store.one!(cap.store, "SELECT base_sha FROM ticket_review_bases WHERE run_id = ?", [run["run_id"]]),
+         base when is_binary(base) <- binding["base_sha"],
+         true <- Regex.match?(~r/\A[0-9a-f]{40}\z/, base) and pin["base_sha"] == base and run["review_base_sha"] in [nil, base] do
+      arguments = %{"revision" => base, "expected_sha" => binding["expected_sha"], "branch" => run["branch"], "git_dir" => access["git_dir"], "common_dir" => access["common_dir"]}
+      {:ok, %{access: access, root_binding: Jason.decode!(access["binding_json"]), arguments: arguments}}
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :file_worker_revision_unproven}
+    end
+  end
+
+  defp revision_page("repo_read", %{"text" => raw} = value, %{"start_line" => start}) when is_integer(start) and start in 1..@max_file_bytes do
+    lines = String.split(raw, "\n")
+
+    if start <= length(lines) do
+      selected = lines |> Enum.drop(start - 1) |> Enum.take(100)
+      next = if start - 1 + length(selected) < length(lines), do: start + length(selected)
+      {:ok, value |> Map.delete("text") |> Map.merge(%{"text" => Enum.join(selected, "\n"), "start_line" => start, "next_line" => next})}
+    else
+      {:error, :file_worker_line_out_of_range}
+    end
+  end
+
+  defp revision_page("repo_read_binary", %{"content_base64" => encoded} = value, %{"offset" => offset}) when is_integer(offset) and offset in 0..@max_file_bytes do
+    with {:ok, raw} <- Base.decode64(encoded),
+         true <- offset <= byte_size(raw) or {:error, :file_worker_offset_out_of_range} do
+      count = min(8_192, byte_size(raw) - offset)
+      next = if offset + count < byte_size(raw), do: offset + count
+      {:ok, Map.merge(value, %{"content_base64" => Base.encode64(binary_part(raw, offset, count)), "offset" => offset, "next_offset" => next})}
+    end
+  end
+
+  defp revision_page(_tool, _value, _args), do: {:error, :file_worker_call_rejected}
 
   defp inspect_path("repo_list", access, args), do: file_io(access, "list", args)
 
@@ -295,11 +372,18 @@ defmodule SymphonyElixir.Factory.WorkerFileTools do
   defp prepare_write(cap, args, identity) do
     Store.transaction!(cap.store, fn tx ->
       with {:ok, access} <- authorize(%{cap | store: tx}, identity),
+           {:ok, evidence} <- WorkerEvidence.get(tx, cap.key),
+           :ok <- TicketCompletionConfirmation.authorize_mutation(evidence),
+           :ok <- SymphonyElixir.Factory.TicketCiRepair.authorize_mutation(tx, evidence["run_id"], args["path"], mutation_kind(args), cap.key),
            :ok <- valid_path(args["path"], false) do
         prepare_operation(tx, cap.key, identity["callId"], access, args)
       end
     end)
   end
+
+  defp mutation_kind(%{"content_base64" => _}), do: :binary
+  defp mutation_kind(args) when map_size(args) == 1, do: :directory
+  defp mutation_kind(_args), do: :text
 
   defp prepare_operation(store, key, call, access, args) do
     hash = digest(Jason.encode!(args))

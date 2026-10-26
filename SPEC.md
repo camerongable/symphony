@@ -2310,3 +2310,122 @@ Extension config:
 - Cleanup and observability:
   - Operators need to know which host owns a run, where its workspace lives, and whether cleanup
     happened on the right machine.
+
+## Appendix B. Factory role instruction snapshots (Elixir extension)
+
+Restricted native role prompts MUST contain the complete admitted shared role
+instructions and required review references; host filesystem access MUST NOT be
+assumed. The controller's restricted tool policy and structured result schema
+remain authoritative. Delivery verification MUST be independent, direct and
+source-read-only, bound to the confirmed contract and exact candidate/base.
+Required manual validation remains a separate exact-SHA delivery gate.
+
+Instruction content and digests MUST be pinned at admission and durable across
+restart. Readback and preflight MUST NOT reload shared files or silently retrofit
+an already admitted worker. Dynamic candidate, contract, iteration, repair round,
+CI evidence and manual-plan checks MUST remain current; instruction immutability
+MUST NOT turn a historical packet into authority for changed facts. The Elixir
+implementation uses schema 43 append-only packet-bound instruction snapshots.
+An append-only exact task/prompt-to-snapshot link MUST be committed atomically
+with task preparation. A replay MUST validate that link, not reconstruct it from
+host files. Authorized held amendments MAY inherit the exact captured
+predecessor's snapshot after validating amendment ancestry; that data link MUST
+NOT replace the existing source ownership and resume admission checks. Existing
+task rows and historical receipt shapes remain unchanged.
+
+Versioned ordinary native review admissions MUST separate factual verification
+from controller repair policy. New numbered-criterion contracts require complete
+criterion coverage, boundary evidence, prior-finding closure, and consolidated
+finding classifications. A code-fixable defect remains `REPAIR`; reaching the
+normal limit MUST NOT cause the verifier to relabel it `BLOCK`. The controller
+admits at most two automatic repairs after the initial review and stops earlier
+for an unresolved prior finding. The count follows the run and confirmed contract,
+not instruction bundle, CI round, tick, or process lifetime. Its durable decision
+MUST be atomic with consumption and ownership release. Policy stops MUST be shown
+with their rule and responsible next actor, separately from scheduler health.
+Legacy admissions and exact historical verdicts MUST remain valid and unchanged;
+a policy-stopped `REPAIR` MUST NOT inherit legacy `BLOCK` recovery authority.
+An operator-authorized one-repair exception MAY exceed the historical combined
+budget only for its exact run, candidate, contract, stopped verifier receipt,
+approval key, configured limit, and prior-to-next round. Next MUST equal prior
+plus one. The authorization MUST preserve configured and effective limits, MUST
+NOT waive implementation/capacity gates or authorize an automatic later repair,
+and MUST remain independently verifiable after application and policy removal.
+Physical publication MUST support both legacy and receipt-bound finding IDs
+using the exact admitted verifier schema; retained codecs MUST remain immutable.
+Writer finding classifications are advisory observations, not verifier verdicts.
+Writer COMPLETE denotes source readiness for controller validation and MAY retain
+NOT_CHECKED criteria when checks cannot execute in the writer sandbox. It MUST
+still have complete inspected evidence, checked boundaries, no failed criterion,
+no unresolved closure, and no blocker. Independent verifier PASS MUST continue to
+require every criterion to pass. A rejected stopped result MUST remain immutable
+and MUST expose a current, evidence-bound factory recovery action; healthy ticks
+MUST NOT hide that rejection or imply progress.
+
+An explicit source-completion confirmation MAY admit one read-only request at
+the implementation limit. It MUST bind the exact current run, candidate,
+contract/revision, repair/verifier counters, and prior consumed CONTINUE binding
+and output digests. It MUST authenticate the stopped owner, released source
+reservation, admitted structured report, and controller candidate check. Only
+that request may resume its own in-flight admission; failure, BLOCKED, or replay
+MUST NOT grant a second request automatically. The output schema MUST allow only COMPLETE or
+BLOCKED with no changed paths and a null commit message. Worker mutations MUST
+be denied before operation preparation. Global limits MUST remain unchanged;
+controller generation, exact-SHA CI, and independent verification MUST retain
+their normal authority. Completed admission evidence MUST remain verifiable
+after removing the entry, without authorizing another turn.
+
+A separately explicit schema-rejection authorization MAY permit one successor
+to that first confirmation only. It MUST bind the exact rejected request/turn,
+binding and complete evidence digests, native error digest and operator
+reference. Complete native history MUST prove a response-schema rejection
+before execution, with only the original user input and no output/tool items.
+Clean unchanged source, genuine owned shutdown, empty queues and stable inputs
+MUST be rechecked at preparation and immediately before the turn. The existing
+failed-turn transfer journal MUST retain the failed row and authenticate the
+one successor. This exception MUST NOT seed automatic retries, reset counters,
+permit edits, or grant recovery of a failed successor. Canonical internal
+schemas MUST remain unchanged by provider wire-format adaptation.
+
+Bounded CI workers MAY consume controller-provenanced failure evidence and
+adapted diagnosis guidance. General MR-maintenance skills MUST NOT grant them
+connector, retry, Git-write or MR-management authority. Only the controller owns
+delivery actions. Runtime parity requires actual compiled-release and admitted
+packet readback, not merely source changes or a successful synthetic test.
+
+Physical push admission MUST resolve the exact immutable diagnosis or collector
+reassessment pinned by the admitted CI-repair claim. An original blocked row
+MUST remain unchanged. A separately reviewed, exact preissuance disposition MAY
+journal a rejected attempt and prepare a distinct successor under the ordinary
+controller's fresh lease, ownership, authorization and human-input gates. It
+MUST NOT authorize generic retry, paused/read-only dispatch, or alter unknown
+historical outcomes. A stopped push with uncertain exit outcome MAY converge
+only after exact destination readback, retaining its truthful raw receipt.
+
+Forward publication codecs MUST preserve historical program bytes and validate
+both capability event projection and transfer authority. An audit that closes
+earlier retirement contexts MUST pin and fully validate their ordered identities;
+it MUST NOT invent an active predecessor link or extend a general retry budget.
+
+A separately operator-authorized restored-capability recovery MAY resume one
+exact stopped source result without inventing direct native human input. Its
+one-use grant MUST bind the original output, current contract/candidate/base,
+chronological physical file journal and final dirty bytes. Staging MUST append
+intent only. Normal controller-owned admission MUST refresh Jira, capacity,
+source ownership, native result and empty input queue before an atomic,
+once-only reservation transfer. A prepared restart MUST preserve that transfer
+and request identity and obtain fresh launch qualification. The newly owned
+actor MUST refresh native and ledger evidence before sending and reject stale
+observations at return. Existing raw results, receipts, tool policy and budgets
+MUST remain unchanged; this route MUST NOT silently authorize product decisions,
+unknown issuance or generic retry of arbitrary blocked work.
+
+Ordinary controller publishing MUST retain `PREPARED` until the exact execution
+and helper identity can be committed atomically with `PUSH_UNCERTAIN`. No helper
+input may precede that commit. Expensive preparation MUST NOT consume a single
+stale authorization unchecked: obtain a genuine fresh Jira observation near
+publication and recheck existing freshness and ownership bounds immediately
+before committing. Failures before publication remain retryable preparation;
+failures after publication remain uncertain and MUST NOT automatically reissue.
+Publication and recovery deferrals MUST be durably scoped to the attempted
+operation, including across scheduler ticks and restarts.

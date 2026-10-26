@@ -66,7 +66,8 @@ defmodule SymphonyElixir.Factory.TicketCheckoutIO do
         with {:ok, _} <- result do
           input = Jason.encode!(%{"execution_json" => encoded, "helper_pid" => original_pid || pid})
           true = Port.command(port, <<byte_size(input)::unsigned-big-32, input::binary>>)
-          collect(port, "", System.monotonic_time(:millisecond) + 35_000)
+          timeout_ms = if mode == "--execute", do: 610_000, else: 35_000
+          collect(port, "", System.monotonic_time(:millisecond) + timeout_ms)
         end
       after
         if Port.info(port) != nil, do: Port.close(port)

@@ -145,7 +145,7 @@ def start_git(intent, module):
     finally:
         os.close(descriptor)
     profile = READ_PROFILE + '(allow file-write* (subpath (param "COMMON_ROOT")) (subpath (param "WRITER_PARENT")))'
-    args = command(intent["repo_path"], ["worktree", "add", "-b", intent["run"]["branch"], "--", intent["path"], intent["base_sha"]], profile)
+    args = command(intent["repo_path"], ["-c", "checkout.workers=8", "worktree", "add", "-b", intent["run"]["branch"], "--", intent["path"], intent["base_sha"]], profile)
     args[1:1] = ["-D", "COMMON_ROOT=" + intent["repository_identity"]["common_path"], "-D", "WRITER_PARENT=" + parent]
     return subprocess.Popen(args, env=ENV, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
 
@@ -165,7 +165,7 @@ def execute(packet, execution, module, spool):
         signal.signal(sig, stop)
     output = bytearray()
     overflow = False
-    deadline = time.monotonic() + 25
+    deadline = time.monotonic() + 600
     try:
         while True:
             if time.monotonic() >= deadline:

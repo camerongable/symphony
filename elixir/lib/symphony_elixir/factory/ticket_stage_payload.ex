@@ -20,7 +20,7 @@ defmodule SymphonyElixir.Factory.TicketStagePayload do
       attrs = Map.merge(binding, %{"proposal_id" => "native-" <> digest(Jason.encode!(identity)), "body" => body, "operations" => operations})
       json = Jason.encode!(attrs)
       payload = Base.encode64(json)
-      command = "mise exec -- mix factory.ticket stage #{run_id} --payload-base64 #{payload} --workflow #{locator["workflow"]}"
+      command = "#{TicketContextReader.cli_prefix()} stage #{run_id} --payload-base64 #{payload} --workflow #{locator["workflow"]}"
 
       if byte_size(json) <= 24_576 and byte_size(payload) <= 32_768 do
         {:ok,

@@ -2,7 +2,7 @@ defmodule SymphonyElixir.Factory.TicketChatCommands do
   @moduledoc "Staged interpretations acquire authority only from completed, independently read native inputs."
 
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.Factory.{Contract, DesktopRequest, RunLedger, Store, TicketChat, TicketContext, WorkerEvidence}
+  alias SymphonyElixir.Factory.{Contract, DesktopRequest, RunLedger, Store, TicketChat, TicketContext, TicketReworkRecovery, WorkerEvidence}
   alias SymphonyElixir.Factory.TicketContractAmendment
 
   @binding ~w(generation spec_revision contract_sha256 candidate_sha)
@@ -969,12 +969,22 @@ defmodule SymphonyElixir.Factory.TicketChatCommands do
          true <- input["origin"] == "NATIVE_CLIENT_INPUT" and input["generation"] == binding_generation(command),
          true <- input["body_sha256"] == command["body_sha256"] and digest(input["body"] || "") == command["body_sha256"],
          true <- Regex.match?(~r/\A[0-9a-f]{64}\z/, input["readback_sha256"] || ""),
-         true <- historical_staging_matches?(command, input),
-         true <- command_created_during_input?(command, input) do
+         true <- historical_rework_proven?(store, command, input) do
       {:ok, input}
     else
       {:error, _} = error -> error
       _ -> {:error, :blocked_resume_native_input_unproven}
+    end
+  end
+
+  defp historical_rework_proven?(store, command, input) do
+    if historical_staging_matches?(command, input) and command_created_during_input?(command, input) do
+      true
+    else
+      case TicketChat.for_run(store, command["run_id"]) do
+        {:ok, chat} -> TicketReworkRecovery.valid?(command, input, chat)
+        _ -> false
+      end
     end
   end
 
@@ -1319,7 +1329,8 @@ defmodule SymphonyElixir.Factory.TicketChatCommands do
 
     valid =
       native_route_matches?(chat, input) and native_body_matches?(command, input) and
-        valid_staging_evidence?(command, input, receipt) and command_created_during_input?(command, input)
+        ((valid_staging_evidence?(command, input, receipt) and command_created_during_input?(command, input)) or
+           TicketReworkRecovery.valid?(command, input, chat))
 
     if valid, do: :ok, else: {:error, :native_input_evidence_mismatch}
   end
@@ -1465,9 +1476,37 @@ defmodule SymphonyElixir.Factory.TicketChatCommands do
          {:ok, request} <- DesktopRequest.get(store, chat["create_request_key"]),
          {:ok, proof} <- Jason.decode(request["target_observation_json"] || "null"),
          {:ok, _request} <- TicketChat.record_thread(store, request, chat["thread_id"], proof),
-         {:ok, native} <- native_reader.read_native_thread(chat["thread_id"], workspace: chat["cwd"]) do
-      admit_readback(store, run_id, native)
+         {:ok, native} <- native_reader.read_native_thread(chat["thread_id"], workspace: chat["cwd"]),
+         {:ok, collected} <- admit_readback(store, run_id, native),
+         {:ok, recovery} <- recover_failed_preparation(store, run_id, native) do
+      {:ok, %{collected | receipts: collected.receipts ++ recovery}}
     end
+  end
+
+  @doc false
+  @spec recover_failed_preparation(Store.connection(), String.t(), map()) :: {:ok, list()} | {:error, term()}
+  def recover_failed_preparation(store, run_id, native) do
+    atomic(store, fn tx ->
+      with {:ok, chat, run} <- bound(tx, run_id),
+           {:ok, context} <- TicketContext.context(tx, run_id),
+           {:ok, proof} <- TicketReworkRecovery.prepare(native, chat, run, context),
+           key <- "TIN-" <> digest(encode([chat["chat_key"], chat["generation"], proof["turn"]["id"], proof["human_item_id"]])),
+           input when is_map(input) <- Store.one!(tx, "SELECT * FROM ticket_chat_inputs WHERE input_key = ?", [key]),
+           nil <- Store.one!(tx, "SELECT command_key FROM ticket_chat_commands WHERE chat_key = ? AND run_id = ? LIMIT 1", [chat["chat_key"], run_id]),
+           proof <- TicketReworkRecovery.bind_input(proof, input),
+           attrs <-
+             Map.merge(proof["binding"], %{"proposal_id" => "recovered-" <> digest(encode([key, proof["binding"]])), "body" => input["body"], "operations" => [%{"operation" => "request_rework"}]}),
+           {:ok, command} <- stage_transaction(tx, run_id, attrs) do
+        receipt = %{status: "ACCEPTED", input_key: key, worker_started: false, external_changes_applied: false, recovery_evidence: proof, recovery_sha256: digest(encode(proof))}
+
+        with {:ok, accepted} <- persist_decision(tx, command, key, receipt),
+             true <- TicketReworkRecovery.valid?(accepted, input, chat) or {:error, :rework_recovery_evidence_invalid} do
+          {:ok, [accepted]}
+        end
+      else
+        _ -> {:ok, []}
+      end
+    end)
   end
 
   @doc false
@@ -1848,7 +1887,14 @@ defmodule SymphonyElixir.Factory.TicketChatCommands do
     do: OptionParser.split(command)
 
   defp unwrap_shell(arguments), do: arguments
+  defp staging_arguments(["mise", "exec", "--", "./scripts/factory-broker" | _arguments]), do: :none
   defp staging_arguments(["mise", "exec", "--" | arguments]), do: staging_arguments(arguments)
+
+  defp staging_arguments(["elixir", "-pa", "_build/dev/lib/*/ebin", "-S", "./scripts/factory-broker" | _arguments]), do: :none
+  defp staging_arguments(["elixir", "-pa", "_build/dev/lib/*/ebin", "-S" | arguments]), do: staging_arguments(arguments)
+
+  defp staging_arguments(["./scripts/factory-broker", "ticket", "stage", run_id, "--payload-base64", payload, "--workflow", workflow]),
+    do: staging_arguments(["mix", "factory.ticket", "stage", run_id, "--payload-base64", payload, "--workflow", workflow])
 
   defp staging_arguments(["mix", "factory.ticket", "stage", run_id | arguments]) do
     {opts, rest, invalid} = OptionParser.parse(arguments, strict: [workflow: :string, payload_base64: :string])
