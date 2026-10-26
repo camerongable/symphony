@@ -86,6 +86,10 @@ INSERT INTO events VALUES(1,'original');
 CREATE TABLE worker_instruction_snapshots(value TEXT);
 CREATE TABLE worker_instruction_task_bindings(value TEXT);
 CREATE TABLE worker_file_operations(value TEXT);
+CREATE TABLE ticket_mr_claims(value TEXT);
+CREATE TABLE ticket_mr_actor_bindings(value TEXT);
+CREATE TABLE synthetic_journal(phase TEXT,payload TEXT);
+INSERT INTO synthetic_journal VALUES('FIRST_UNCERTAIN','original');
 CREATE TABLE worker_evidence(request_key TEXT PRIMARY KEY,binding_json TEXT,binding_sha256 TEXT,
  output_json TEXT,output_sha256 TEXT,thread_id TEXT,turn_id TEXT,owner_stopped_at TEXT,owner_stop_json TEXT,status TEXT);
 INSERT INTO worker_evidence VALUES('request','binding','binding-sha','output','output-sha','thread','turn','stopped','stop-proof','RESULT_RECORDED');
@@ -105,6 +109,10 @@ INSERT INTO desktop_requests VALUES('old-uncertain','RECONCILE_REQUIRED');
             g.readonly = lambda: sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)
             g.historical_after_start()
             with sqlite3.connect(database) as db:
+                db.execute("UPDATE worker_evidence SET request_key=?", (cutover.REPORT,))
+            with sqlite3.connect(root / 'before-cutover.sqlite') as db:
+                db.execute("UPDATE worker_evidence SET request_key=?", (cutover.REPORT,))
+            with sqlite3.connect(database) as db:
                 db.execute("UPDATE worker_evidence SET status='CONSUMED'")
                 db.execute("INSERT INTO events VALUES(2,'ordinary adoption')")
             g.historical_after_start()
@@ -114,6 +122,7 @@ INSERT INTO desktop_requests VALUES('old-uncertain','RECONCILE_REQUIRED');
                 ("UPDATE worker_evidence SET owner_stop_json='rewritten'", "UPDATE worker_evidence SET owner_stop_json='stop-proof'"),
                 ("UPDATE factory_tasks SET output_json='rewritten'", "UPDATE factory_tasks SET output_json='original-output'"),
                 ("UPDATE desktop_requests SET status='PENDING'", "UPDATE desktop_requests SET status='RECONCILE_REQUIRED'"),
+                ("UPDATE synthetic_journal SET phase='CLEARED'", "UPDATE synthetic_journal SET phase='FIRST_UNCERTAIN'"),
                 ("UPDATE factory_schema_migrations SET version=55", "UPDATE factory_schema_migrations SET version=54"),
                 ("CREATE INDEX unexpected_history_index ON worker_evidence(status)", "DROP INDEX unexpected_history_index"),
             ):

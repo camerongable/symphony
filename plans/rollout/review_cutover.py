@@ -276,7 +276,7 @@ IO.puts("NATIVE_SOURCE_QUIET")
             assert current.execute('SELECT MAX(version) FROM factory_schema_migrations').fetchone()[0] == 54
             schema = [list(row) for row in current.execute('SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name')]
             assert hashlib.sha256(json.dumps(schema, separators=(',', ':'), ensure_ascii=False).encode()).hexdigest() == protected['schema_sha256']
-            for table in ('events', 'worker_instruction_snapshots', 'worker_instruction_task_bindings', 'worker_file_operations'):
+            for table in ('events', 'worker_instruction_snapshots', 'worker_instruction_task_bindings', 'worker_file_operations', 'ticket_mr_claims', 'ticket_mr_actor_bindings'):
                 quoted = '"' + table + '"'
                 limit = ' WHERE id <= ' + str(protected['event_limit']) if table == 'events' else ''
                 for row in prior.execute('SELECT rowid,* FROM ' + quoted + limit + ' ORDER BY rowid'):
@@ -288,12 +288,27 @@ IO.puts("NATIVE_SOURCE_QUIET")
                     updated_row = current.execute('SELECT * FROM ' + table + ' WHERE ' + key + '=?', (original[key],)).fetchone()
                     assert updated_row is not None
                     updated = dict(zip(columns, updated_row))
-                    mutable = {'status', 'consumed_at'} if table == 'worker_evidence' else set()
+                    mutable = set()
+                    if table == 'worker_evidence' and original[key] == REPORT:
+                        assert original['status'] == 'RESULT_RECORDED' and updated['status'] in ('RESULT_RECORDED', 'CONSUMED')
+                        mutable = {'status', 'consumed_at'}
                     if table == 'factory_tasks' and original[key] == RUN + ':feature-writer':
+                        assert original['status'] == 'COMPLETE' and updated['status'] in ('COMPLETE', 'CONSUMED')
                         mutable = {'status', 'updated_at'}
                     assert {name: original[name] for name in columns if name not in mutable} == {name: updated[name] for name in columns if name not in mutable}
-            for row in prior.execute("SELECT * FROM desktop_requests WHERE status IN ('RECONCILE_REQUIRED','CREATE_UNCERTAIN','FOLLOWUP_UNCERTAIN')"):
-                assert current.execute('SELECT * FROM desktop_requests WHERE request_key=?', (row[0],)).fetchone() == row
+            for (table,) in prior.execute("SELECT name FROM sqlite_master WHERE type='table'"):
+                quoted = '"' + table.replace('"', '""') + '"'
+                columns = [row[1] for row in prior.execute('PRAGMA table_info(' + quoted + ')')]
+                predicates = []
+                for name in ('status', 'phase'):
+                    if name in columns:
+                        value = 'upper(COALESCE("' + name + '",\'\'))'
+                        predicates += ["instr(" + value + ",'UNCERTAIN')>0", "instr(" + value + ",'UNKNOWN')>0", value + "='RECONCILE_REQUIRED'"]
+                if table == 'desktop_requests':
+                    predicates += ["request_key='desktop:c634fd01f6bdbc7dab875cddda848ad5fe1ca65086e1684dafc7957b7a351962'"]
+                if predicates:
+                    for row in prior.execute('SELECT rowid,* FROM ' + quoted + ' WHERE ' + ' OR '.join(predicates)):
+                        assert current.execute('SELECT rowid,* FROM ' + quoted + ' WHERE rowid=?', (row[0],)).fetchone() == row, table
 
     def start():
         value, _manifest, audit = g.qualified()
