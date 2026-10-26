@@ -79,6 +79,8 @@ defmodule SymphonyElixir.Factory.TickLease do
 
     {pid, monitor_ref} =
       spawn_monitor(fn ->
+        bind_callback_owner(caller)
+
         outcome =
           try do
             {:returned, fun.()}
@@ -98,6 +100,34 @@ defmodule SymphonyElixir.Factory.TickLease do
       renewal_interval_ms,
       renewer
     )
+  end
+
+  defp bind_callback_owner(owner) do
+    callback = self()
+    armed = make_ref()
+
+    # The renewing owner must stay monitor-only: renewal loss deliberately kills the callback.
+    guard =
+      spawn_link(fn ->
+        owner_ref = Process.monitor(owner)
+        callback_ref = Process.monitor(callback)
+
+        receive do
+          {:DOWN, ^owner_ref, :process, ^owner, _reason} -> Process.exit(callback, :kill)
+        after
+          0 ->
+            send(callback, {armed, self()})
+
+            receive do
+              {:DOWN, ^owner_ref, :process, ^owner, _reason} -> Process.exit(callback, :kill)
+              {:DOWN, ^callback_ref, :process, ^callback, _reason} -> :ok
+            end
+        end
+      end)
+
+    receive do
+      {^armed, ^guard} -> :ok
+    end
   end
 
   defp await_result(
