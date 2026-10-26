@@ -23,6 +23,8 @@ GUARD_SHA = '41c26ac2067bdba97ecbf92238e11f813e0e45c8068283b75565677abfe53482'
 THAW_SHA = 'cec22fd5003117f496bbe369baaf935f8c9f4797ae519ae0ca90578fb12b4534'
 OLD_RELEASE = Path('/Users/cgable/Library/Application Support/ai-factory/releases/symphony-ci-pass-overlay-cnRVdUfY-r20')
 OLD_MANIFEST_SHA = 'cb6e49358a07192ed847893990a327f450f4d6c2c6a6955d8f89cbf777810801'
+OLD_LAUNCHER_SHA = 'b20a594abb11e07bebb31643506d63e77d942d44b96f818c691add164aba49a0'
+OLD_BOOT_SHA = '5a7ac6ec35ba8465e0eedb4122940016dd30fec1306e0bd5d700ade2204f8de6'
 RUN = 'ab5ab1fe-32cc-48c1-985e-3c3800adcfa2'
 CANDIDATE = '4e5c48fc2150515c4cb5ce0771f4c204b10c532c'
 REPORT = 'desktop:b996c85fd59f267cb7ee029cac2f25f2e56e245de90f3945d6e8526a1b6c38bc'
@@ -30,6 +32,14 @@ REPORT = 'desktop:b996c85fd59f267cb7ee029cac2f25f2e56e245de90f3945d6e8526a1b6c38
 
 def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def validate_artifact_evidence(value, validation):
+    assert validation['source_tests_passed'] and validation['artifact_tests_passed']
+    assert validation['source_commit'] == value['source_commit']
+    assert validation['manifest_sha256'] == value['manifest_sha256']
+    assert validation['factory_beam_fingerprint'] == value['factory_beam_fingerprint']
+    assert validation['artifact_test_failures'] == 0
 
 
 def bind(evidence_root):
@@ -79,8 +89,7 @@ def bind(evidence_root):
             assert audit['replacement_build'] == value['build']
         return value, manifest, audit
 
-    def native_quiet():
-        value, _manifest, _audit = candidate()
+    def native_quiet_for(value):
         script = '''
 thread = "01a13272-9eb0-7550-8411-9dbb54b09c57"
 {:ok, queue} = SymphonyElixir.Factory.NativeQueueReadback.read("/Users/cgable/.codex/queue_1.sqlite", thread)
@@ -98,6 +107,28 @@ IO.puts("NATIVE_SOURCE_QUIET")
                                 cwd=Path(value['source']) / 'elixir', env=env,
                                 capture_output=True, text=True, timeout=20)
         assert result.returncode == 0 and result.stdout.strip() == 'NATIVE_SOURCE_QUIET'
+
+    def native_quiet():
+        value, _manifest, _audit = candidate()
+        native_quiet_for(value)
+
+    def original_pins():
+        path = OLD_RELEASE / 'evidence/overlay-manifest.json'
+        assert sha(path) == OLD_MANIFEST_SHA
+        assert sha(OLD_RELEASE / 'run-local-factory') == OLD_LAUNCHER_SHA
+        assert sha(OLD_RELEASE / 'overlay_boot_guard.exs') == OLD_BOOT_SHA
+        old = json.loads(path.read_bytes())
+        for name, digest in old['source_hashes'].items():
+            assert sha(Path(old['source_root']) / name) == digest, name
+        override = old['override']
+        assert sha(OLD_RELEASE / 'overrides' / (override['module'] + '.beam')) == override['sha256']
+        base = OLD_RELEASE.parent / 'symphony-generation-handoff-cnRVdUfY-r19f'
+        base_path = base / 'evidence/release-manifest.json'
+        assert sha(base_path) == old['base_manifest_sha256']
+        base_manifest = json.loads(base_path.read_bytes())
+        for name, entry in base_manifest['artifact'].items():
+            assert sha(base / 'dev' / name) == entry['sha256'], name
+        return {'build': str(base / 'dev'), 'source': old['source_root']}
 
     def eligible():
         with g.readonly() as db:
@@ -129,9 +160,7 @@ IO.puts("NATIVE_SOURCE_QUIET")
         for name, expected in approval['evidence'].items():
             assert sha(evidence_root / name) == expected, name
         validation = g.load('validation.json')
-        assert validation['source_tests_passed'] and validation['artifact_tests_passed']
-        assert validation['source_commit'] == value['source_commit']
-        assert validation['artifact_test_failures'] == 0
+        validate_artifact_evidence(value, validation)
         review = g.load('review-acceptance.json')
         assert review['result'] == 'ACCEPT' and review['source_commit'] == value['source_commit']
         cold = g.load('cold-boot.json')
@@ -219,11 +248,42 @@ IO.puts("NATIVE_SOURCE_QUIET")
                                     'schema_migration': None})
         print(json.dumps({'result': 'STARTED_HISTORY_PRESERVED', 'runtime': runtime}))
 
+    def restore_check():
+        # A broken replacement must not prevent recovery to the separately pinned original.
+        g.absent()
+        audit = g.load('cutover-audit.json')
+        captured = g.load('captured.json')
+        approval = g.load('rollout-approved.json')
+        assert sha(evidence_root / 'cutover-audit.json') == approval['evidence']['cutover-audit.json']
+        assert audit['kind'] == 'OWNED_REVIEW_REPORT_SERVICE_REPLACEMENT'
+        assert audit['issuer'] == {'pid': int(g.OLD_PID), 'started_at': g.OLD_START}
+        g.protected(audit)
+        with g.readonly() as db:
+            assert db.execute('SELECT MAX(version) FROM factory_schema_migrations').fetchone()[0] == 54
+        assert configuration() == captured['configuration']
+        saved = evidence_root / 'service.original.plist'
+        assert sha(saved) == captured['plist_sha256']
+        original = plistlib.loads(saved.read_bytes())
+        assert original['ProgramArguments'] == [str(OLD_RELEASE / 'run-local-factory'), str(g.WORKFLOW)]
+        original_runtime = g.original_pins()
+        assert original['EnvironmentVariables']['MIX_BUILD_PATH'] == original_runtime['build']
+        current = plistlib.loads(g.PLIST.read_bytes())
+        replacement = plistlib.loads(saved.read_bytes())
+        replacement['ProgramArguments'][0] = audit['replacement_launcher']
+        replacement['EnvironmentVariables']['MIX_BUILD_PATH'] = audit['replacement_build']
+        assert current == original or current == replacement
+        g.quiet()
+        g.native_quiet_for(original_runtime)
+        print('ORIGINAL_R20_RESTORE_ALLOWED_AFTER_EXACT_PLIST_RESTORATION')
+
     g.configuration = configuration
     g.candidate = candidate
     g.native_quiet = native_quiet
     g.qualified = qualified
     g.finish_start = finish_start
+    g.original_pins = original_pins
+    g.native_quiet_for = native_quiet_for
+    g.restore_check = restore_check
     return g, capture
 
 

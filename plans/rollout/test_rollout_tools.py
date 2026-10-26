@@ -2,7 +2,9 @@
 
 import importlib.util
 import json
+import plistlib
 from pathlib import Path
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -20,6 +22,17 @@ def module(name, path):
 
 
 class PreparationTests(unittest.TestCase):
+    def test_artifact_results_from_another_build_of_the_same_commit_are_rejected(self):
+        cutover = module('review_evidence_test', ROOT / 'review_cutover.py')
+        candidate = {'source_commit': 'same-commit', 'manifest_sha256': 'candidate-manifest',
+                     'factory_beam_fingerprint': 'candidate-fingerprint'}
+        validation = {**candidate, 'source_tests_passed': True, 'artifact_tests_passed': True,
+                      'artifact_test_failures': 0}
+        cutover.validate_artifact_evidence(candidate, validation)
+        for field in ('manifest_sha256', 'factory_beam_fingerprint'):
+            with self.subTest(field=field), self.assertRaises(AssertionError):
+                cutover.validate_artifact_evidence(candidate, {**validation, field: 'other-build'})
+
     def test_stale_commit_is_rejected_before_evidence_is_created(self):
         with tempfile.TemporaryDirectory() as temporary:
             target = Path(temporary) / 'evidence'
@@ -101,6 +114,47 @@ class PreparationTests(unittest.TestCase):
                 source_file.write_text('changed source')
                 with self.assertRaises(AssertionError):
                     g.candidate()
+
+    def test_restore_does_not_require_the_failed_replacement_candidate(self):
+        cutover = module('review_restore_test', ROOT / 'review_cutover.py')
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            g, _capture = cutover.bind(root)
+            g.BROKER, g.MONITOR, g.WORKFLOW = [root / name for name in ('broker.toml', 'monitor.toml', 'workflow.md')]
+            g.PLIST = root / 'service.plist'
+            g.BROKER.write_text('status="PAUSED"\nrrule="FREQ=MINUTELY;INTERVAL=1"\n')
+            g.MONITOR.write_text('status="PAUSED"\n')
+            g.WORKFLOW.write_text('fixture')
+            original_runtime = {'build': '/original/build', 'source': '/original/source'}
+            original = {'ProgramArguments': [str(cutover.OLD_RELEASE / 'run-local-factory'), str(g.WORKFLOW)],
+                        'EnvironmentVariables': {'MIX_BUILD_PATH': original_runtime['build']}}
+            saved = root / 'service.original.plist'
+            saved.write_bytes(plistlib.dumps(original))
+            changed = {'ProgramArguments': ['/broken/replacement/run-local-factory', str(g.WORKFLOW)],
+                       'EnvironmentVariables': {'MIX_BUILD_PATH': '/broken/replacement/dev'}}
+            g.PLIST.write_bytes(plistlib.dumps(changed))
+            audit = {'kind': 'OWNED_REVIEW_REPORT_SERVICE_REPLACEMENT',
+                     'issuer': {'pid': int(g.OLD_PID), 'started_at': g.OLD_START},
+                     'replacement_launcher': changed['ProgramArguments'][0],
+                     'replacement_build': changed['EnvironmentVariables']['MIX_BUILD_PATH']}
+            audit_path = root / 'cutover-audit.json'
+            audit_path.write_text(json.dumps(audit))
+            (root / 'rollout-approved.json').write_text(json.dumps({'evidence': {'cutover-audit.json': cutover.sha(audit_path)}}))
+            (root / 'captured.json').write_text(json.dumps({'configuration': g.configuration(), 'plist_sha256': cutover.sha(saved)}))
+            database = root / 'fixture.sqlite'
+            with sqlite3.connect(database) as db:
+                db.execute('CREATE TABLE factory_schema_migrations(version INTEGER)')
+                db.execute('INSERT INTO factory_schema_migrations VALUES (54)')
+            checked = []
+            g.absent = lambda: checked.append('absent')
+            g.protected = lambda _audit: checked.append('protected')
+            g.quiet = lambda: checked.append('quiet')
+            g.original_pins = lambda: original_runtime
+            g.native_quiet_for = lambda value: self.assertEqual(value, original_runtime)
+            g.readonly = lambda: sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)
+            g.candidate = lambda: (_ for _ in ()).throw(AssertionError('replacement is broken'))
+            g.restore_check()
+            self.assertEqual(checked, ['absent', 'protected', 'quiet'])
 
 
 if __name__ == '__main__':
