@@ -1,0 +1,12 @@
+{
+  "result": "PASS",
+  "manifest_sha256": "7863c80da984b39a307de1e5f72cf7aceca1f1d738955593a02b592b68471de7",
+  "guard_sha256": "418b1a40af2c0ae5059fd841b9191ecacc0b8de6b451a4dd499e97bffcb60fb8",
+  "launcher_sha256": "5114a428e69d276b61ae40f2f7d2fb3b966c5396eba6f9ea43567f94337feb06",
+  "factory_beam_fingerprint": "bc5fa35631c761e5b97924741500c903c0b17a6220f3855c2e84b3b6bf77a836",
+  "factory_module_count": 120,
+  "schema_version": 54,
+  "production_service_started": false,
+  "native_model_turns": 0,
+  "evidence": "cold-boot.log: FACTORY_REVIEW_REPORT_COLD_BOOT_ATTESTED"
+}
