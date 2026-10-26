@@ -123,6 +123,17 @@ defmodule SymphonyElixir.Factory.TicketPushWorkerHistory do
     end
   end
 
+  @doc "Captures additive review/correction decisions only for the new physical report codec."
+  @spec observe_review(Store.connection(), String.t(), :large | :capability) :: {:ok, map()} | {:error, term()}
+  def observe_review(store, run_id, mode) do
+    observed = if mode == :capability, do: observe_capability(store, run_id), else: observe_generated(store, run_id)
+
+    with {:ok, history} <- observed do
+      events = rows(store, "SELECT * FROM events WHERE run_id=? AND event_type IN ('TICKET_REVIEW_REPORT_CORRECTED','TICKET_REVIEW_DECISION') ORDER BY id", [run_id])
+      {:ok, Map.put(history, "review_events_json", compact(events, ~w(payload_json)))}
+    end
+  end
+
   defp consumed?(store, %{"status" => "CONSUMED"} = worker) do
     with {:ok, access} <- WorkspaceAccess.get(store, worker["reservation_key"]) do
       access["released_at"] != nil and WorkerEvidence.owner_stopped?(store, worker)

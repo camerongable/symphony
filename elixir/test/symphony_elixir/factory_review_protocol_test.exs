@@ -38,7 +38,7 @@ defmodule SymphonyElixir.FactoryReviewProtocolTest do
     packet = ReviewProtocol.attach(Map.drop(packet(), ["review_protocol"]), [])
     assert packet["review_protocol"]["version"] == 2
     result = output(packet) |> Map.delete("findings")
-    report = result["review_report"] |> Map.delete("finding_classifications") |> Map.put("version", 2)
+    report = result["review_report"] |> Map.delete("finding_classifications") |> Map.put("version", 2) |> Map.put("affected_path_checks", [])
 
     observation = %{
       "id" => "OBS-1",
@@ -60,7 +60,7 @@ defmodule SymphonyElixir.FactoryReviewProtocolTest do
   defp typed_result(packet, rows, status \\ "REPAIR") do
     result = output(packet, status) |> Map.delete("findings")
     ids = packet["review_protocol"]["review_scope"]["criterion_ids"]
-    report = result["review_report"] |> Map.delete("finding_classifications") |> Map.merge(%{"version" => 2, "findings" => rows})
+    report = result["review_report"] |> Map.delete("finding_classifications") |> Map.merge(%{"version" => 2, "findings" => rows, "affected_path_checks" => []})
     report = Map.update!(report, "criteria", &Enum.filter(&1, fn row -> row["id"] in ids end)) |> Map.update!("boundary_sweeps", &Enum.filter(&1, fn row -> row["id"] in ids end))
     Map.put(result, "review_report", report)
   end
@@ -127,6 +127,23 @@ defmodule SymphonyElixir.FactoryReviewProtocolTest do
     assert :repair = ReviewProtocol.decision(packet, result)
     invalid = put_in(result, ["review_report", "findings", Access.at(0), "id"], "unknown")
     assert {:error, _} = ReviewProtocol.validate(packet, binding(packet), invalid)
+  end
+
+  test "focused PASS cannot omit a criterion that the prior BLOCK never verified" do
+    history = %{
+      "status" => "BLOCK",
+      "repair_admitted" => false,
+      "request_key" => "blocked",
+      "output_sha256" => "blocked-output",
+      "candidate_sha" => "old",
+      "finding_entries" => [%{"id" => "F-privacy", "finding" => "Privacy failure", "basis" => %{"kind" => "ACCEPTANCE_CRITERION", "reference" => "AC-1"}}],
+      "criteria" => [%{"id" => "AC-1", "status" => "FAIL", "evidence" => ["Defect"]}, %{"id" => "AC-2", "status" => "NOT_CHECKED", "evidence" => ["Environment unavailable"]}]
+    }
+
+    packet = ReviewProtocol.attach(Map.drop(packet(), ["review_protocol"]), [history])
+    assert packet["review_protocol"]["review_scope"]["criterion_ids"] == ["AC-1", "AC-2"]
+    incomplete = typed_result(packet, [], "PASS") |> update_in(["review_report", "criteria"], &Enum.reject(&1, fn row -> row["id"] == "AC-2" end))
+    assert {:error, :review_report_criteria_incomplete} = ReviewProtocol.validate(packet, binding(packet), incomplete)
   end
 
   test "legacy schemas and evidence remain byte-identical" do

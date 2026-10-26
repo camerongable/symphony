@@ -20,7 +20,9 @@ defmodule SymphonyElixir.Factory.ReviewProtocol do
     :review_report_observation_blocks_acceptance,
     :review_report_finding_identity_changed,
     :review_report_unresolved_unproven,
-    :review_report_verdict_contradiction
+    :review_report_verdict_contradiction,
+    :review_report_scope_unproven,
+    :review_report_affected_paths_incomplete
   ]
 
   @spec attach(map(), [map()]) :: map()
@@ -57,11 +59,41 @@ defmodule SymphonyElixir.Factory.ReviewProtocol do
   defp review_scope(ids, history) do
     latest = List.last(history)
 
+    coverage = Enum.reduce(history, %{}, fn entry, covered -> Enum.reduce(entry["criteria"] || [], covered, fn row, current -> Map.put(current, row["id"], row) end) end)
+    unverified = Enum.reject(ids, &(get_in(coverage, [&1, "status"]) == "PASS"))
+
     affected =
       latest["finding_entries"] |> Enum.flat_map(fn row -> if get_in(row, ["basis", "kind"]) == "ACCEPTANCE_CRITERION", do: [row["basis"]["reference"]], else: ids end) |> Enum.uniq() |> Enum.sort()
 
-    %{"mode" => "FOCUSED", "criterion_ids" => if(affected == [], do: ids, else: affected), "carried_evidence" => Enum.map(history, &Map.take(&1, ~w(request_key output_sha256 candidate_sha criteria)))}
+    active = Enum.sort(Enum.uniq(affected ++ unverified))
+    %{"mode" => "FOCUSED", "criterion_ids" => if(active == [], do: ids, else: active), "carried_evidence" => Enum.map(history, &Map.take(&1, ~w(request_key output_sha256 candidate_sha criteria)))}
   end
+
+  @doc "Pins the real committed candidate delta; never grants source tools or claims inspection."
+  @spec bind_execution_scope(map(), map()) :: {:ok, map()} | {:error, term()}
+  def bind_execution_scope(%{"role" => "change-verifier", "review_protocol" => %{"version" => 2} = protocol} = packet, run) do
+    if Map.has_key?(protocol["review_scope"], "affected_paths") do
+      {:ok, packet}
+    else
+      prior = List.last(protocol["review_scope"]["carried_evidence"])
+      base = if is_map(prior), do: prior["candidate_sha"], else: packet["base_sha"]
+
+      with {:ok, paths} <- SymphonyElixir.Factory.Worktree.review_paths(run["repo_path"], run["worktree"], run["branch"], base, packet["candidate_sha"]) do
+        scope =
+          Map.merge(protocol["review_scope"], %{
+            "affected_paths" => paths,
+            "comparison_base_sha" => base,
+            "comparison_candidate_sha" => packet["candidate_sha"],
+            "regression_requirement" =>
+              "Inspect every changed path and its affected execution/error/fallback/public-entry paths for regressions; record discriminating evidence, not only diff coverage."
+          })
+
+        {:ok, put_in(packet, ["review_protocol", "review_scope"], scope)}
+      end
+    end
+  end
+
+  def bind_execution_scope(packet, _run), do: {:ok, packet}
 
   defp writer_instructions("feature-writer"),
     do:
@@ -313,13 +345,31 @@ defmodule SymphonyElixir.Factory.ReviewProtocol do
   @spec validate_result(Store.connection(), map(), map(), map()) :: :ok | {:error, atom()}
   def validate_result(store, task, binding, output) do
     with {:ok, packet} <- bound_context(store, task, binding),
-         :ok <- exact_input(packet, task, binding) do
+         :ok <- exact_input(packet, task, binding),
+         :ok <- validate_scope_history(store, packet) do
       case validate(packet, binding, output) do
         :ok -> :ok
         error -> validate_correction(store, packet, task, binding, output, error)
       end
     end
   end
+
+  defp validate_scope_history(store, %{"review_protocol" => %{"version" => 2, "review_scope" => scope}} = packet) do
+    proven = Enum.all?(scope["carried_evidence"], fn origin ->
+      with row when is_map(row) <- Store.one!(store, "SELECT * FROM worker_evidence WHERE request_key=? AND run_id=? AND status='CONSUMED'", [origin["request_key"], packet["run_id"]]),
+           true <- digest(row["binding_json"]) == row["binding_sha256"] and digest(row["output_json"]) == row["output_sha256"] and row["output_sha256"] == origin["output_sha256"],
+           {:ok, binding} <- Jason.decode(row["binding_json"]),
+           true <- Map.take(binding, ~w(run_id spec_revision contract_sha256)) == Map.take(packet, ~w(run_id spec_revision contract_sha256)),
+           true <- binding["role"] == "change-verifier" and WorkerEvidence.owner_stopped?(store, row),
+           {:ok, output} <- Jason.decode(row["output_json"]) do
+        output["candidate_sha"] == origin["candidate_sha"] and get_in(output, [@report, "criteria"]) == origin["criteria"]
+      else
+        _ -> false
+      end
+    end)
+    if proven, do: :ok, else: {:error, :review_report_scope_unproven}
+  end
+  defp validate_scope_history(_store, _packet), do: :ok
 
   @doc "Read-only exact report correction proposal. Only an explicit bijection of duplicated v1 prose is eligible."
   @spec prepare_correction(Store.connection(), map()) :: {:ok, map()} | {:error, atom()}
@@ -339,6 +389,8 @@ defmodule SymphonyElixir.Factory.ReviewProtocol do
          {:ok, projected} <- correction_projection(packet, binding, output, input["mapping"]) do
       {:ok,
        input
+       |> Map.merge(Map.take(run, ~w(candidate_sha contract_sha256 spec_revision)))
+       |> Map.merge(Map.take(task, ~w(task_key stage)))
        |> Map.put("status", "REPORT_CORRECTION_PREPARED")
        |> Map.put("projection_sha256", digest(Jason.encode!(projected)))
        |> Map.put("transform", "V1_CLASSIFICATION_DESCRIPTION_BIJECTION_V1")

@@ -12,6 +12,27 @@ spec.loader.exec_module(history)
 
 
 class ReviewCodecTest(unittest.TestCase):
+    def test_typed_physical_codec_projects_required_findings_once_and_preserves_v1(self):
+        typed_path = path.with_name('ticket_push_history_validator_v21.py')
+        typed_spec = importlib.util.spec_from_file_location('typed_review_history', typed_path)
+        typed = importlib.util.module_from_spec(typed_spec)
+        typed_spec.loader.exec_module(typed)
+        worker = {'request_key': 'review-request', 'output_sha256': 'a' * 64}
+        binding = {'expected_sha': 'b' * 40, 'schema': {'properties': {'review_report': {}}, 'required': ['review_report']}}
+        finding = {'id': 'F-1', 'description': 'Privacy defect', 'classification': 'NEW', 'disposition': 'REQUIRED_REPAIR', 'basis': {'kind': 'SAFETY_INVARIANT', 'reference': 'PRIVACY'}}
+        observation = dict(finding, id='OBS-1', description='Readability preference', disposition='OBSERVATION', basis={'kind': 'PREFERENCE', 'reference': 'Readability'})
+        output = {'status': 'REPAIR', 'candidate_sha': binding['expected_sha'], 'review_report': {'version': 2, 'candidate_sha': binding['expected_sha'], 'findings': [observation, finding]}}
+        packet = {'review_protocol': {'version': 2, 'criterion_ids': ['AC-1'], 'finding_obligations': []}}
+        self.assertEqual(typed.review_finding_entries('contract', worker, binding, output, packet), [{'id': 'F-1', 'finding': 'Privacy defect'}])
+        self.assertEqual(typed.required_findings(output), ['Privacy defect'])
+        with self.assertRaises((ValueError, KeyError)):
+            history.review_finding_entries('contract', worker, binding, output, packet)
+        for mutation in [dict(finding, id=''), dict(finding, disposition='OBSERVATION'), dict(finding, basis={'kind': 'ACCEPTANCE_CRITERION', 'reference': 'AC-stale'})]:
+            invalid = copy.deepcopy(output)
+            invalid['review_report']['findings'] = [mutation]
+            with self.assertRaises(ValueError):
+                typed.review_finding_entries('contract', worker, binding, invalid, packet)
+
     def test_legacy_and_receipt_bound_finding_identities(self):
         worker = {'request_key': 'review-request', 'output_sha256': 'a' * 64}
         binding = {'expected_sha': 'b' * 40, 'schema': {'properties': {}, 'required': []}}

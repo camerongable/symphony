@@ -20,6 +20,12 @@ with sqlite3.connect(Path(database).as_uri() + '?mode=ro', uri=True) as connecti
     binding, output = json.loads(worker['binding_json']), json.loads(worker['output_json'])
     mapping = dict(connection.execute('SELECT * FROM worker_instruction_task_bindings WHERE task_key=? AND prompt_sha256=?', (worker['task_key'], binding['input_sha256'])).fetchone())
     reviewed = json.loads(connection.execute('SELECT binding_json FROM worker_instruction_snapshots WHERE binding_sha256=?', (mapping['instruction_binding_sha256'],)).fetchone()[0])
+    if reviewed.get('review_protocol', {}).get('version') == 2:
+        typed_path = path.with_name('ticket_push_history_validator_v21.py')
+        typed_spec = importlib.util.spec_from_file_location('typed_review_history', typed_path)
+        history = importlib.util.module_from_spec(typed_spec)
+        typed_spec.loader.exec_module(history)
+        history.validate_review_admission(connection, worker, binding, output, reviewed)
     proof = {'operator_authorization': ref, 'reviewed_candidate_sha': packet['repair_review']['prior_candidate_sha'], 'round': run['code_repair_round'], 'verifier_round': run['verifier_round']}
     findings = history.review_finding_entries(run['contract_sha256'], worker, binding, output, reviewed)
     assert findings == packet['repair_review']['findings']

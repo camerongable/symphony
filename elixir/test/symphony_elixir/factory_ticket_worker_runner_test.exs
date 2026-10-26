@@ -115,7 +115,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
   test "stopped rejected reports are visible read-only and disappear after consumption or generation drift", ctx do
     {prompt, options} = prepare(ctx)
     packet = Jason.decode!(prompt)
-    report = %{"version" => 2, "candidate_sha" => ctx.sha, "block_reason" => "NONE", "criteria" => [], "closures" => [], "boundary_sweeps" => [], "findings" => []}
+    report = %{"version" => 2, "candidate_sha" => ctx.sha, "block_reason" => "NONE", "criteria" => [], "closures" => [], "boundary_sweeps" => [], "findings" => [], "affected_path_checks" => []}
     output = %{"status" => "CONTINUE", "changed_paths" => [], "commit_message" => nil, "blockers" => [], "checks" => [], "review_report" => report}
     Process.put(:worker_output, output)
     schema = ReviewProtocol.schema(packet, StageSchemas.for_stage(:native_feature_writer))
@@ -442,12 +442,17 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
     assert_structured_loop(ctx, 2, "REPAIR_LIMIT")
   end
 
+  @tag structured_review: true, legacy_report: true
+  test "public report correction after two repairs preserves raw history and reopens into an honest policy stop", ctx do
+    assert_structured_loop(ctx, 2, "REPAIR_LIMIT", true)
+  end
+
   @tag structured_review: true
   test "controller stops early when independent review leaves a prior finding unresolved", ctx do
     assert_structured_loop(ctx, 1, "UNRESOLVED_FINDING")
   end
 
-  defp assert_structured_loop(ctx, last_round, reason) do
+  defp assert_structured_loop(ctx, last_round, reason, correction? \\ false) do
     context = %{store: ctx.store, workspace_root: Path.join(ctx.root, "workspaces"), factory: %{maximum_code_repair_rounds: 25}}
     {:ok, _} = TaskLedger.update(ctx.store, "writer", %{status: "CONSUMED"})
 
@@ -461,6 +466,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
       packet = Jason.decode!(prompt)
       assert packet["review_protocol"]["repairs_used"] == round
       output = structured_repair(packet, candidate, "new finding #{round}")
+      output = if correction? and round == last_round, do: put_in(output, ["review_report", "finding_classifications", Access.at(0), "finding"], "Short summary of genuine final finding"), else: output
 
       output =
         if reason == "UNRESOLVED_FINDING" and round == last_round do
@@ -472,7 +478,26 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
       Process.put(:worker_output, output)
       schema = ReviewProtocol.schema_json(prompt, StageSchemas.for_stage(:change_verifier))
       assert {:ok, _} = TicketWorkerRunner.run(ctx.path, issue(), prompt, schema, options)
-      assert {:ok, %{status: "ADOPTED", run: run}} = Scheduler.ticket_step(context, "run", opts(ctx))
+      result = if correction? and round == last_round do
+        assert {:error, :review_protocol_evidence_incomplete} = Scheduler.ticket_step(context, "run", opts(ctx))
+        {:ok, raw_evidence} = WorkerEvidence.get(ctx.store, current.verifier_request_key)
+        {:ok, _} = TaskLedger.update(ctx.store, current.verifier_task_key, Map.merge(Map.take(raw_evidence, ~w(output_json thread_id turn_id)), %{"status" => "COMPLETE"}))
+        assert_report_correction_cli(ctx, raw_evidence)
+        {:ok, reopened} = Store.start_link(database: ctx.database)
+        try do
+          outcome = Scheduler.ticket_step(%{context | store: reopened}, "run", opts(ctx))
+          {:ok, preserved} = WorkerEvidence.get(reopened, current.verifier_request_key)
+          assert Map.take(preserved, ~w(output_json output_sha256 binding_json binding_sha256)) == Map.take(raw_evidence, ~w(output_json output_sha256 binding_json binding_sha256))
+          {:ok, task} = TaskLedger.get(reopened, current.verifier_task_key)
+          assert task["output_json"] == raw_evidence["output_json"]
+          outcome
+        after
+          GenServer.stop(reopened)
+        end
+      else
+        Scheduler.ticket_step(context, "run", opts(ctx))
+      end
+      assert {:ok, %{status: "ADOPTED", run: run}} = result
       assert run["state"] == if(round < last_round, do: "REPAIRING", else: "FAILED")
       assert run["code_repair_round"] == before["code_repair_round"] + if(round < last_round, do: 1, else: 0)
       assert {:ok, evidence} = WorkerEvidence.get(ctx.store, "review:#{round}")
@@ -501,6 +526,38 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
     after
       GenServer.stop(reopened)
     end
+  end
+
+  defp assert_report_correction_cli(ctx, evidence) do
+    workflow = Path.join(ctx.root, "report-workflow.md")
+    File.write!(workflow, "---\nfactory:\n  database: #{ctx.database}\n---\nSynthetic report-only correction.\n")
+    roles = Map.new(~w(orchestrator orchestrator-intake specification-author specification-critic feature-planner feature-writer feature-writer-high-risk change-verifier manual-validator explorer failure-triager), &{&1, %{"provider" => "codex", "model_class" => "test", "reasoning_effort" => "medium"}})
+    factory = %{
+      database: ctx.database, enabled: true, scope: "report-correction", dispatcher_id: "fixture", lease_seconds: 240,
+      cleanup: %{"enabled" => false}, review_feedback: %{"enabled" => false},
+      models: %{"default_provider" => "codex", "providers" => %{"codex" => %{"test" => "gpt-test"}}, "roles" => roles, "delivery_routing" => %{"default_role" => "feature-writer", "high_risk_role" => "feature-writer-high-risk", "high_risk_values" => ["high"], "unknown_risk_is_high" => true}},
+      repositories: %{"grail" => %{"path" => ctx.repo, "base_branch" => "master", "gitlab_project" => "fixture/project", "codex_project_id" => "fixture", "route_labels" => ["repo-grail"]}},
+      queue: %{"assignee" => "currentUser()", "statuses" => ["In Dev"], "factory_labels" => ["ai-running"]},
+      ticket_supervisor: %{"enabled" => true, "pilot_issue_keys" => ["PPL-123"], "ticket_workflow" => workflow}
+    }
+    assert :ok = SymphonyElixir.Factory.Policy.validate(factory)
+    start_supervised!({SymphonyElixir.Factory.BrokerRuntime, store: ctx.store, factory: factory, name: nil})
+    base = Map.take(evidence, ~w(run_id request_key binding_sha256 output_sha256)) |> Map.put("mapping", [%{"classification_index" => 0, "finding_index" => 0}])
+    invoke = fn action, input ->
+      payload = input |> Jason.encode!() |> Base.encode64()
+      ExUnit.CaptureIO.capture_io(fn -> Mix.Tasks.Factory.Ticket.run([action, "run", "--workflow", workflow, "--payload-base64", payload]) end) |> Jason.decode!()
+    end
+    for mapping <- [[], [%{"classification_index" => 0, "finding_index" => 2}], [%{"classification_index" => 0, "finding_index" => 0}, %{"classification_index" => 0, "finding_index" => 0}]] do
+      assert {:error, :review_report_correction_ineligible} = ReviewProtocol.prepare_correction(ctx.store, Map.put(base, "mapping", mapping))
+    end
+    assert Store.query!(ctx.store, "SELECT id FROM events WHERE event_type='TICKET_REVIEW_REPORT_CORRECTED'").rows == []
+    prepared = invoke.("prepare-report-correction", base)
+    assert prepared["automatic_repairs_used"] == 2 and prepared["verdict"] == "REPAIR"
+    application = Map.merge(base, %{"projection_sha256" => prepared["projection_sha256"], "authorization_reference" => "explicit isolated operator approval"})
+    receipt = invoke.("apply-report-correction", application)
+    assert receipt["status"] == "REPORT_CORRECTION_RECORDED"
+    assert invoke.("apply-report-correction", application) == receipt
+    assert length(Store.query!(ctx.store, "SELECT id FROM events WHERE event_type='TICKET_REVIEW_REPORT_CORRECTED'").rows) == 1
   end
 
   @tag structured_review: true
@@ -578,7 +635,12 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
         "basis" => if(prior && prior["basis"], do: prior["basis"], else: %{"kind" => "ACCEPTANCE_CRITERION", "reference" => "AC-1"})
       }
 
-      result |> Map.delete("findings") |> update_in(["review_report"], &(Map.delete(&1, "finding_classifications") |> Map.put("findings", [row])))
+      result
+      |> Map.delete("findings")
+      |> update_in(
+        ["review_report"],
+        &(Map.delete(&1, "finding_classifications") |> Map.put("findings", [row]) |> Map.put("affected_path_checks", rows.(protocol["review_scope"]["affected_paths"] || [], "CHECKED")))
+      )
     else
       result
     end

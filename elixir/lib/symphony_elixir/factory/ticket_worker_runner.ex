@@ -818,6 +818,7 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
       with {:ok, packet} <- ci_repair_packet(store, run, packet, role),
            {:ok, packet} <- validation_packet(store, packet, run, role),
            {:ok, packet} <- SymphonyElixir.Factory.RepairObligations.attach(store, packet),
+           {:ok, packet} <- ReviewProtocol.bind_execution_scope(packet, run),
            packet = TicketCompletionConfirmation.attach(store, packet),
            {:ok, packet} <- shared_instructions(store, packet, role, mode, run) do
         {:ok, Jason.encode!(packet)}

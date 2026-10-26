@@ -5,6 +5,7 @@ defmodule SymphonyElixir.Factory.TicketVerifierRepair do
     Control,
     JiraMcpReader,
     Policy,
+    ReviewProtocol,
     RunLedger,
     Store,
     TaskLedger,
@@ -60,7 +61,7 @@ defmodule SymphonyElixir.Factory.TicketVerifierRepair do
          true <- digest(verifier["binding_json"]) == verifier["binding_sha256"],
          {:ok, %{"status" => "BLOCK", "candidate_sha" => sha} = output} <- Jason.decode(verifier["output_json"]),
          true <- sha == prior["candidate_sha"],
-         true <- proof["findings"] == finding_ids(prior["contract_sha256"], output["findings"]),
+         true <- proof["findings"] == finding_ids(prior["contract_sha256"], ReviewProtocol.findings(output)),
          true <- proof["authorization_body_sha256"] == digest(input["authorization_body"]),
          true <- proof["repair_instructions_sha256"] == digest(input["repair_instructions"]),
          access when is_map(access) <- Store.one!(store, "SELECT * FROM workspace_access WHERE reservation_key=?", [verifier["reservation_key"]]),
@@ -165,7 +166,7 @@ defmodule SymphonyElixir.Factory.TicketVerifierRepair do
                state: "REPAIRING",
                failure_code: nil,
                last_error: nil,
-               repair_findings_json: Jason.encode!(observed.output["findings"]),
+               repair_findings_json: Jason.encode!(ReviewProtocol.findings(observed.output)),
                code_repair_round: observed.run["code_repair_round"] + 1
              }) do
         applied = %{
@@ -291,7 +292,8 @@ defmodule SymphonyElixir.Factory.TicketVerifierRepair do
          true <- evidence["output_sha256"] == input["verifier_output_sha256"],
          true <- WorkerEvidence.owner_stopped?(store, evidence),
          {:ok, binding} <- Jason.decode(evidence["binding_json"]),
-         {:ok, %{"status" => "BLOCK", "candidate_sha" => candidate, "findings" => findings} = output} <- Jason.decode(evidence["output_json"]),
+         {:ok, %{"status" => "BLOCK", "candidate_sha" => candidate} = output} <- Jason.decode(evidence["output_json"]),
+         findings = ReviewProtocol.findings(output),
          true <- candidate == run["candidate_sha"],
          true <- is_list(findings),
          true <- findings != [],
@@ -462,7 +464,7 @@ defmodule SymphonyElixir.Factory.TicketVerifierRepair do
       "terminal_sha256" => digest(observed.terminal.raw),
       "limits" => %{"maximum_implementation_iterations" => factory.maximum_implementation_iterations, "maximum_code_repair_rounds" => budget.limit},
       "control" => %{"scope" => factory.scope, "dispatcher_id" => factory.dispatcher_id},
-      "findings" => finding_ids(observed.run["contract_sha256"], observed.output["findings"]),
+      "findings" => finding_ids(observed.run["contract_sha256"], ReviewProtocol.findings(observed.output)),
       "jira" => %{"snapshot_sha256" => digest(observed.jira["snapshot_json"]), "observed_at" => observed.jira["observed_at"]},
       "authorized_at" => DateTime.to_iso8601(DateTime.utc_now())
     }

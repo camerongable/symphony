@@ -219,7 +219,12 @@ defmodule SymphonyElixir.DesktopTicketLifecycleFixture do
           }
 
           if protocol["version"] == 2 do
-            output |> Map.delete("findings") |> Map.put("review_report", report |> Map.delete("finding_classifications") |> Map.put("findings", []))
+            output
+            |> Map.delete("findings")
+            |> Map.put(
+              "review_report",
+              report |> Map.delete("finding_classifications") |> Map.put("findings", []) |> Map.put("affected_path_checks", rows.(protocol["review_scope"]["affected_paths"] || [], "CHECKED"))
+            )
           else
             Map.put(output, "review_report", report)
           end

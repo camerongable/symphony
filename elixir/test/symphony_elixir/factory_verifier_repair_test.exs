@@ -48,7 +48,7 @@ defmodule SymphonyElixir.FactoryVerifierRepairTest do
         if packet["review_protocol"] do
           rows = Enum.map(packet["review_protocol"]["criterion_ids"], &%{"id" => &1, "status" => "FAIL", "evidence" => ["fixture boundary"]})
 
-          Map.put(output, "review_report", %{
+          report = %{
             "version" => 1,
             "candidate_sha" => packet["candidate_sha"],
             "block_reason" => "HUMAN_DECISION",
@@ -56,7 +56,28 @@ defmodule SymphonyElixir.FactoryVerifierRepairTest do
             "closures" => [],
             "boundary_sweeps" => Enum.map(rows, &Map.merge(&1, %{"status" => "CHECKED", "paths" => ["fixture.txt"]})),
             "finding_classifications" => Enum.map(output["findings"], &%{"finding" => &1, "classification" => "NEW"})
-          })
+          }
+
+          if packet["review_protocol"]["version"] == 2 do
+            typed =
+              output["findings"]
+              |> Enum.with_index()
+              |> Enum.map(fn {description, index} ->
+                %{
+                  "id" => "F-#{index}",
+                  "description" => description,
+                  "classification" => "NEW",
+                  "disposition" => "REQUIRED_REPAIR",
+                  "basis" => %{"kind" => "ACCEPTANCE_CRITERION", "reference" => "AC-1"}
+                }
+              end)
+
+            output
+            |> Map.delete("findings")
+            |> Map.put("review_report", report |> Map.put("version", 2) |> Map.delete("finding_classifications") |> Map.put("findings", typed) |> Map.put("affected_path_checks", []))
+          else
+            Map.put(output, "review_report", report)
+          end
         else
           output
         end
@@ -118,6 +139,16 @@ defmodule SymphonyElixir.FactoryVerifierRepairTest do
 
     {:ok, _} = TicketWorkerRunner.bind_base(ctx.store, "run", ctx.sha)
     {:ok, prompt} = TicketWorkerRunner.packet(ctx.store, "run", "change-verifier", ctx.sha)
+
+    prompt =
+      if context[:legacy_report] do
+        base = Jason.decode!(prompt) |> Map.drop(~w(shared_instructions instruction_delivery instruction_snapshot_sha256 instruction_binding_sha256)) |> put_in(["review_protocol", "version"], 1)
+        {:ok, instructions} = WorkerInstructions.admit(ctx.store, base, "change-verifier", Path.join(System.user_home!(), ".agents"))
+        Jason.encode!(Map.merge(base, instructions))
+      else
+        prompt
+      end
+
     assert Map.has_key?(Jason.decode!(prompt), "review_protocol") == !!context[:structured_review]
     {:ok, _} = TaskLedger.update(ctx.store, "run:change-verifier:2", %{stage: "VERIFYING", role: "change-verifier", prompt_sha256: digest(prompt)})
     assert :ok = WorkerInstructions.bind_task(ctx.store, "run:change-verifier:2", digest(prompt), Jason.decode!(prompt)["instruction_binding_sha256"])
@@ -243,6 +274,7 @@ defmodule SymphonyElixir.FactoryVerifierRepairTest do
 
   @tag single_repair_budget: true
   @tag structured_review: true
+  @tag legacy_report: true
   test "retained V1 structured BLOCK authorization preserves prose IDs across restart and physical readback", ctx do
     assert {:ok, authorized} = TicketVerifierRepair.stage(ctx.store, ctx.input, ctx.factory, ctx.options)
     raw = Store.one!(ctx.store, "SELECT payload_json FROM events WHERE id=?", [authorized.authorization_event_id])["payload_json"]
@@ -261,6 +293,22 @@ defmodule SymphonyElixir.FactoryVerifierRepairTest do
     packet_path = Path.join(ctx.root, "retained-v1-packet.json")
     File.write!(packet_path, prompt)
     assert {"PHYSICAL_OPERATOR_AUTHORITY_PASS\n", 0} = System.cmd("python3", ["-B", "test/support/check_operator_budget_fixture.py", ctx.database, packet_path])
+  end
+
+  @tag structured_review: true
+  test "typed BLOCK supports exact operator authorization application and archived obligation recovery", ctx do
+    evidence = Store.one!(ctx.store, "SELECT * FROM worker_evidence WHERE request_key='verifier-request'")
+    original = evidence["output_json"]
+    refute Map.has_key?(Jason.decode!(original), "findings")
+    assert {:ok, _} = TicketVerifierRepair.stage(ctx.store, ctx.input, ctx.factory, ctx.options)
+    server = start_supervised!({ControlServer, [store: ctx.store, factory: ctx.factory, name: nil]})
+    assert {:ran, {:ok, %{status: "VERIFIER_REPAIR_APPLIED"}}} = owned_apply(ctx, server)
+    assert {:ok, prompt} = TicketWorkerRunner.packet(ctx.store, "run", "feature-writer", ctx.sha)
+    packet = Jason.decode!(prompt)
+    assert packet["review_protocol"]["repairs_used"] == 0
+    assert Enum.map(packet["repair_review"]["findings"], & &1["id"]) == ["F-0", "F-1"]
+    assert packet["repair_review"]["operator_authorization"]["authorization_key"] == ctx.input["authorization_key"]
+    assert Store.one!(ctx.store, "SELECT output_json FROM worker_evidence WHERE request_key='verifier-request'")["output_json"] == original
   end
 
   @tag single_repair_budget: true
