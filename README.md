@@ -115,7 +115,14 @@ remain in CI. See the implementation README for the local policy boundary.
 ## Shared factory instruction bundles
 
 New ordinary native review admissions add structured criterion coverage and
-prior-finding closure. The controller, not the reviewer, owns the normal limit of
+prior-finding closure. Version 2 authors each finding once with a stable ID,
+classification, required-repair or observation disposition, and a contract or
+established safety basis. An initial review is comprehensive; repair follow-ups
+bind closure, the exact changed-path delta, regressions, and any previously
+unverified criteria. Carried PASS evidence retains its original provenance.
+Optional observations do not block PASS or become writer obligations. A late
+mandatory new finding requires an explicit scope decision.
+The controller, not the reviewer, owns the normal limit of
 two automatic repairs after the initial review, with an earlier stop for an
 unresolved prior finding. Dashboard policy stops explain the rule independently
 of factory health. Legacy admitted instructions and verdicts remain unchanged.
@@ -125,6 +132,11 @@ The controller and successor physical publication codec both validate its scope.
 Source writers may report classified observations and honestly unrun checks;
 source-ready completion does not replace independent verifier acceptance. Rejected
 stopped reports surface a concrete factory action without discarding their edits.
+One explicit, deterministic report-only correction can reconcile duplicated v1
+finding descriptions without changing original bytes, evidence, verdict, or repair
+budget. An exact policy-stopped REPAIR can receive a separately journaled,
+operator-authorized one-repair continuation; automatic attempts remain two used,
+and another REPAIR stops again. Historical BLOCK authority remains distinct.
 One exact, explicitly authorized read-only completion confirmation can finish an
 adopted continuation at its implementation limit without reopening source edits,
 granting another repair, or replacing CI and independent verification.

@@ -68,7 +68,7 @@ defmodule SymphonyElixir.Factory.TicketPushPayloadBudget do
        when operation in ~w(GOFMT_DIFF GAZELLE_DIFF) do
     with run when is_map(run) <- value["run_preimage"],
          %{"version" => version, "kind" => "ORDINARY_VERIFIER_REPAIR_PREFLIGHT_V1"} = proof <- value["ordinary_verifier_repair"],
-         true <- is_integer(version) and version in [1, 2],
+         true <- is_integer(version) and version in [1, 2, 3],
          true <- hex?(proof["reviewed_candidate_sha"], 40) and hex?(proof["source_parent_sha"], 40),
          true <- proof["candidate_sha"] == proof["source_parent_sha"] and proof["source_parent_sha"] == run["candidate_sha"],
          raw when is_binary(raw) <- run["candidate_handoff"],

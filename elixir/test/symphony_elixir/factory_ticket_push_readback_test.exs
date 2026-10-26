@@ -634,11 +634,14 @@ defmodule SymphonyElixir.FactoryTicketPushReadbackTest do
     %{name: name, kind: kind, recorded_priv: recorded_priv, artifact_priv: artifact_priv, runtime_priv: runtime_priv, manifest: manifest_path, proof_path: proof_path}
   end
 
-  defp install_forward_attestation(priv, entry, 14) do
+  defp install_forward_attestation(priv, entry, version) when version in [14, 15] do
     forward = Jason.encode!(%{"version" => 15, "entries" => [entry]})
     File.write!(Path.join(priv, "ticket_push_readback_origins_v15.json"), forward)
-    next_reader = Path.join(priv, "ticket_push_status_reader_v14.py")
-    File.write!(next_reader, Regex.replace(~r/ORIGINS_SHA256 = "[0-9a-f]{64}"/, File.read!(next_reader), "ORIGINS_SHA256 = \"#{hash(forward)}\""))
+
+    for name <- ~w(ticket_push_status_reader_v14.py ticket_push_status_reader_v15.py) do
+      next_reader = Path.join(priv, name)
+      File.write!(next_reader, Regex.replace(~r/ORIGINS_SHA256 = "[0-9a-f]{64}"/, File.read!(next_reader), "ORIGINS_SHA256 = \"#{hash(forward)}\""))
+    end
   end
 
   defp install_forward_attestation(_priv, _entry, _version), do: :ok

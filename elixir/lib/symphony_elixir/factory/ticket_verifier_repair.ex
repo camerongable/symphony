@@ -1,5 +1,5 @@
 defmodule SymphonyElixir.Factory.TicketVerifierRepair do
-  @moduledoc "Explicit operator authorization to repair an exact consumed BLOCK; never rewrites the verdict."
+  @moduledoc "Exact operator repair authority for consumed BLOCK or versioned policy stops; never rewrites the verdict."
   alias SymphonyElixir.Factory.{
     Capacity,
     Control,
@@ -47,6 +47,7 @@ defmodule SymphonyElixir.Factory.TicketVerifierRepair do
          true <- proof["authority"] == "LOCAL_OPERATOR_AUTHORIZATION",
          :ok <- valid_input(proof["authorization"]),
          input = proof["authorization"],
+         true <- policy_stop?(input) == (proof["version"] == 3),
          prior = proof["run"],
          true <- valid_archived_budget?(proof, input, prior),
          true <- Map.take(input, ~w(run_id candidate_sha spec_revision contract_sha256)) == Map.take(prior, ~w(run_id candidate_sha spec_revision contract_sha256)),
@@ -59,39 +60,40 @@ defmodule SymphonyElixir.Factory.TicketVerifierRepair do
          true <- verifier["task_key"] == prior["run_id"] <> ":change-verifier:" <> to_string(prior["verifier_round"]),
          true <- digest(verifier["output_json"]) == verifier["output_sha256"],
          true <- digest(verifier["binding_json"]) == verifier["binding_sha256"],
-         {:ok, %{"status" => "BLOCK", "candidate_sha" => sha} = output} <- Jason.decode(verifier["output_json"]),
+         {:ok, %{"candidate_sha" => sha} = output} <- Jason.decode(verifier["output_json"]),
+         true <- output["status"] == expected_verdict(input),
          true <- sha == prior["candidate_sha"],
          true <- proof["findings"] == finding_ids(prior["contract_sha256"], ReviewProtocol.findings(output)),
          true <- proof["authorization_body_sha256"] == digest(input["authorization_body"]),
          true <- proof["repair_instructions_sha256"] == digest(input["repair_instructions"]),
          access when is_map(access) <- Store.one!(store, "SELECT * FROM workspace_access WHERE reservation_key=?", [verifier["reservation_key"]]),
          true <- digest(access["release_receipt_json"] || "") == proof["review_release_sha256"],
-         {:ok, terminal} <- terminal_record(store, prior, verifier),
+         {:ok, terminal} <- terminal_record(store, prior, verifier, input),
          true <- terminal.id == proof["terminal_event_id"],
          true <- digest(terminal.raw) == proof["terminal_sha256"],
          [[applied_id, applied_raw]] <-
            Store.query!(store, "SELECT id,payload_json FROM events WHERE event_type=? AND run_id=? AND json_extract(payload_json,'$.authorization_event_id')=?", [@applied, packet["run_id"], id]).rows,
          true <- byte_size(applied_raw) <= @limit,
          {:ok, applied} <- Jason.decode(applied_raw),
-         true <- applied["version"] == 1,
-         true <- applied["kind"] == "BLOCKED_VERIFIER_REPAIR_APPLIED_V1",
+         true <- {applied["version"], applied["kind"]} == applied_kind(input),
          true <- applied["authorization_sha256"] == digest(raw),
          true <- applied["prior_run"] == Map.take(prior, @terminal_fields),
          true <- applied["next_run"] == Map.update!(applied["prior_run"], "code_repair_round", &(&1 + 1)),
          true <- id < applied_id,
          true <- valid_applied_tick?(applied["tick"], proof["control"]) do
-      {:ok,
-       %{
-         "authorization_event_id" => id,
-         "authorization_sha256" => digest(raw),
-         "applied_event_id" => applied_id,
-         "applied_sha256" => digest(applied_raw),
-         "authorization_key" => input["authorization_key"],
-         "authorization_reference" => input["authorization_reference"],
-         "authorization_body_sha256" => proof["authorization_body_sha256"],
-         "repair_instructions" => input["repair_instructions"],
-         "repair_instructions_sha256" => proof["repair_instructions_sha256"]
-       }}
+      reference = %{
+        "authorization_event_id" => id,
+        "authorization_sha256" => digest(raw),
+        "applied_event_id" => applied_id,
+        "applied_sha256" => digest(applied_raw),
+        "authorization_key" => input["authorization_key"],
+        "authorization_reference" => input["authorization_reference"],
+        "authorization_body_sha256" => proof["authorization_body_sha256"],
+        "repair_instructions" => input["repair_instructions"],
+        "repair_instructions_sha256" => proof["repair_instructions_sha256"]
+      }
+
+      {:ok, if(policy_stop?(input), do: Map.put(reference, "review_policy_stop", input["review_policy_stop"]), else: reference)}
     else
       _ -> {:error, :verifier_repair_authority_unproven}
     end
@@ -169,9 +171,11 @@ defmodule SymphonyElixir.Factory.TicketVerifierRepair do
                repair_findings_json: Jason.encode!(ReviewProtocol.findings(observed.output)),
                code_repair_round: observed.run["code_repair_round"] + 1
              }) do
+        {version, kind} = applied_kind(proof["authorization"])
+
         applied = %{
-          "version" => 1,
-          "kind" => "BLOCKED_VERIFIER_REPAIR_APPLIED_V1",
+          "version" => version,
+          "kind" => kind,
           "authorization_event_id" => record.id,
           "authorization_sha256" => digest(record.raw),
           "prior_run" => Map.take(observed.run, @terminal_fields),
@@ -209,6 +213,11 @@ defmodule SymphonyElixir.Factory.TicketVerifierRepair do
       serialized(input["run_id"], fn -> stage_locked(store, input, factory, opts) end)
     end
   end
+
+  @doc "Stages one explicit continuation of an exact consumed two-repair policy stop; never changes automatic policy."
+  @spec stage_policy_stop(Store.connection(), map(), map(), keyword()) :: {:ok, map()} | {:error, term()}
+  def stage_policy_stop(store, %{"review_policy_stop" => _} = input, factory, opts), do: stage(store, input, factory, opts)
+  def stage_policy_stop(_, _, _, _), do: {:error, :verifier_repair_authorization_invalid}
 
   defp serialized(run_id, operation) do
     case :global.trans({{SymphonyElixir.Factory.Scheduler, :ticket_stage, run_id}, self()}, operation) do
@@ -292,12 +301,9 @@ defmodule SymphonyElixir.Factory.TicketVerifierRepair do
          true <- evidence["output_sha256"] == input["verifier_output_sha256"],
          true <- WorkerEvidence.owner_stopped?(store, evidence),
          {:ok, binding} <- Jason.decode(evidence["binding_json"]),
-         {:ok, %{"status" => "BLOCK", "candidate_sha" => candidate} = output} <- Jason.decode(evidence["output_json"]),
-         findings = ReviewProtocol.findings(output),
+         {:ok, %{"candidate_sha" => candidate} = output} <- Jason.decode(evidence["output_json"]),
+         true <- output["status"] == expected_verdict(input),
          true <- candidate == run["candidate_sha"],
-         true <- is_list(findings),
-         true <- findings != [],
-         true <- Enum.all?(findings, &is_binary/1),
          true <- binding["role"] == "change-verifier",
          true <- binding["stage"] == "VERIFYING",
          true <- binding["mode"] == "REVIEW",
@@ -309,6 +315,9 @@ defmodule SymphonyElixir.Factory.TicketVerifierRepair do
          true <- task["stage"] == "VERIFYING",
          true <- Map.take(task, ~w(thread_id turn_id output_json)) == Map.take(evidence, ~w(thread_id turn_id output_json)),
          true <- task["prompt_sha256"] == binding["input_sha256"],
+         :ok <- ReviewProtocol.validate_result(store, task, binding, output),
+         findings = ReviewProtocol.findings(output),
+         true <- is_list(findings) and findings != [] and Enum.all?(findings, &is_binary/1),
          true <- binding["input_sha256"] == binding["prompt_sha256"],
          {:ok, access} <- WorkspaceAccess.get(store, evidence["reservation_key"]),
          true <- released_review?(access, evidence, binding, run),
@@ -325,8 +334,8 @@ defmodule SymphonyElixir.Factory.TicketVerifierRepair do
          true <- packet["ci_evidence"] == ci,
          true <- run["ci_preflight_sha"] == candidate,
          true <- ci["pipeline_id"] == run["ci_pipeline_id"],
-         {:ok, terminal} <- terminal_record(store, run, evidence),
-         detail = inspect({:verification_blocked, findings}),
+         {:ok, terminal} <- terminal_record(store, run, evidence, input),
+         detail = inspect({if(policy_stop?(input), do: :verification_policy_stopped, else: :verification_blocked), findings}),
          true <- run["last_error"] == detail,
          true <- run["failure_code"] == String.slice(detail, 0, 200) do
       {:ok,
@@ -375,7 +384,7 @@ defmodule SymphonyElixir.Factory.TicketVerifierRepair do
     end
   end
 
-  defp terminal_record(store, run, evidence) do
+  defp terminal_record(store, run, evidence, input) do
     rows =
       Store.query!(store, "SELECT id,payload_json FROM events WHERE run_id=? AND event_type='TICKET_NATIVE_VERIFIER_TERMINAL' AND json_extract(payload_json,'$.request_key')=?", [
         run["run_id"],
@@ -384,14 +393,45 @@ defmodule SymphonyElixir.Factory.TicketVerifierRepair do
 
     with [[id, raw]] <- rows,
          {:ok, receipt} <- Jason.decode(raw),
-         true <- receipt["version"] == 1 and receipt["kind"] == "TICKET_VERIFIER_TERMINAL_V1" and receipt["reason"] == "verification_blocked",
+         true <- terminal_kind?(receipt, input),
          true <- receipt["output_sha256"] == evidence["output_sha256"] and receipt["binding_sha256"] == evidence["binding_sha256"] and receipt["task_key"] == evidence["task_key"],
-         true <- receipt["prior_run"] == Map.take(run, @terminal_fields) do
+         true <- receipt["prior_run"] == Map.take(run, @terminal_fields),
+         :ok <- policy_stop_proof(store, run, evidence, input, receipt) do
       {:ok, %{id: id, raw: raw}}
     else
       _ -> {:error, :verifier_repair_terminal_unproven}
     end
   end
+
+  defp policy_stop?(input), do: Map.has_key?(input, "review_policy_stop")
+  defp expected_verdict(input), do: if(policy_stop?(input), do: "REPAIR", else: "BLOCK")
+  defp applied_kind(input), do: if(policy_stop?(input), do: {2, "REVIEW_POLICY_STOP_CONTINUATION_APPLIED_V1"}, else: {1, "BLOCKED_VERIFIER_REPAIR_APPLIED_V1"})
+
+  defp terminal_kind?(receipt, input) do
+    if policy_stop?(input),
+      do: receipt["version"] == 2 and receipt["kind"] == "TICKET_VERIFIER_TERMINAL_V2" and receipt["reason"] == "verification_policy_stopped",
+      else: receipt["version"] == 1 and receipt["kind"] == "TICKET_VERIFIER_TERMINAL_V1" and receipt["reason"] == "verification_blocked"
+  end
+
+  defp policy_stop_proof(store, run, evidence, %{"review_policy_stop" => reference}, terminal) do
+    with %{"payload_json" => raw} <- Store.one!(store, "SELECT payload_json FROM events WHERE id=? AND run_id=? AND event_type='TICKET_REVIEW_DECISION'", [reference["policy_event_id"], run["run_id"]]),
+         true <- digest(raw) == reference["policy_sha256"],
+         {:ok, policy} <- Jason.decode(raw),
+         true <- policy["version"] === 1 and policy["kind"] == "REVIEW_POLICY_DECISION_V1" and policy["result"] == "POLICY_STOPPED",
+         true <- Map.take(policy, ~w(request_key binding_sha256 output_sha256)) == Map.take(evidence, ~w(request_key binding_sha256 output_sha256)),
+         true <- Map.take(policy, ~w(candidate_sha contract_sha256 spec_revision verifier_round)) == Map.take(run, ~w(candidate_sha contract_sha256 spec_revision verifier_round)),
+         true <- policy["repairs_used_before"] === 2 and policy["repairs_used_after"] === 2 and policy["repair_attempt_limit"] === 2,
+         true <- policy["stop"] == terminal["review_policy"] and policy["stop"]["reason"] == "REPAIR_LIMIT",
+         {:ok, output} <- Jason.decode(evidence["output_json"]),
+         entries = ReviewProtocol.finding_entries(run["contract_sha256"], evidence, output),
+         true <- reference["required_finding_ids"] == Enum.map(entries, & &1["id"]) do
+      :ok
+    else
+      _ -> {:error, :verifier_repair_policy_stop_unproven}
+    end
+  end
+
+  defp policy_stop_proof(_store, _run, _evidence, _input, _terminal), do: :ok
 
   defp available(store, run, factory, input) do
     latest = Store.one!(store, "SELECT run_id FROM runs WHERE issue_key=? AND kind='DELIVERY' ORDER BY created_at DESC,rowid DESC LIMIT 1", [run["issue_key"]])
@@ -428,14 +468,18 @@ defmodule SymphonyElixir.Factory.TicketVerifierRepair do
          {:ok, run} <- RunLedger.get(tx, observed.run["run_id"]),
          true <- run == observed.run,
          {:ok, current} <-
-           blocked_facts(tx, run, %{
-             "run_id" => run["run_id"],
-             "candidate_sha" => run["candidate_sha"],
-             "spec_revision" => run["spec_revision"],
-             "contract_sha256" => run["contract_sha256"],
-             "verifier_request_key" => observed.evidence["request_key"],
-             "verifier_output_sha256" => observed.evidence["output_sha256"]
-           }),
+           blocked_facts(
+             tx,
+             run,
+             Map.merge(observed.repair_input, %{
+               "run_id" => run["run_id"],
+               "candidate_sha" => run["candidate_sha"],
+               "spec_revision" => run["spec_revision"],
+               "contract_sha256" => run["contract_sha256"],
+               "verifier_request_key" => observed.evidence["request_key"],
+               "verifier_output_sha256" => observed.evidence["output_sha256"]
+             })
+           ),
          true <- Map.take(observed, Map.keys(current)) == current,
          :ok <- available(tx, run, factory, observed.repair_input) do
       :ok
@@ -469,10 +513,12 @@ defmodule SymphonyElixir.Factory.TicketVerifierRepair do
       "authorized_at" => DateTime.to_iso8601(DateTime.utc_now())
     }
 
+    proof = if policy_stop?(input), do: Map.merge(proof, %{"version" => 3, "kind" => "REVIEW_POLICY_STOP_CONTINUATION_V1", "automatic_repairs_used" => 2, "operator_repair_limit" => 1}), else: proof
+
     if budget.exception do
       proof
-      |> Map.put("version", 2)
-      |> Map.put("kind", "BLOCKED_VERIFIER_REPAIR_AUTHORIZATION_V2")
+      |> Map.put("version", if(policy_stop?(input), do: 3, else: 2))
+      |> Map.put("kind", if(policy_stop?(input), do: "REVIEW_POLICY_STOP_CONTINUATION_V1", else: "BLOCKED_VERIFIER_REPAIR_AUTHORIZATION_V2"))
       |> Map.put("budget_exception", budget.exception)
       |> Map.put("configured_limits", Map.put(proof["limits"], "maximum_code_repair_rounds", factory.maximum_code_repair_rounds))
     else
@@ -487,6 +533,7 @@ defmodule SymphonyElixir.Factory.TicketVerifierRepair do
 
     cond do
       run["code_repair_round"] < configured -> {:ok, %{limit: configured, exception: nil}}
+      policy_stop?(input) -> {:ok, %{limit: run["code_repair_round"] + 1, exception: budget_binding(input, run, configured)}}
       entry === budget_binding(input, run, configured) -> {:ok, %{limit: run["code_repair_round"] + 1, exception: entry}}
       true -> {:error, :verifier_repair_budget_exhausted}
     end
@@ -512,6 +559,12 @@ defmodule SymphonyElixir.Factory.TicketVerifierRepair do
       effective === Map.put(configured, "maximum_code_repair_rounds", prior["code_repair_round"] + 1)
   end
 
+  defp valid_archived_budget?(%{"version" => 3} = proof, input, prior) do
+    policy_stop?(input) and proof["automatic_repairs_used"] == 2 and proof["operator_repair_limit"] == 1 and valid_limits?(proof["limits"]) and
+      prior["code_repair_round"] < proof["limits"]["maximum_code_repair_rounds"] and prior["implementation_iteration"] < proof["limits"]["maximum_implementation_iterations"] and
+      valid_archived_budget?(Map.put(proof, "version", if(Map.has_key?(proof, "budget_exception"), do: 2, else: 1)), input, prior)
+  end
+
   defp valid_archived_budget?(proof, _input, _prior),
     do: proof["version"] == 1 and not Map.has_key?(proof, "budget_exception") and not Map.has_key?(proof, "configured_limits")
 
@@ -528,6 +581,7 @@ defmodule SymphonyElixir.Factory.TicketVerifierRepair do
 
   defp valid_authorization_version?(%{"version" => 1, "kind" => "BLOCKED_VERIFIER_REPAIR_AUTHORIZATION_V1"}), do: true
   defp valid_authorization_version?(%{"version" => 2, "kind" => "BLOCKED_VERIFIER_REPAIR_AUTHORIZATION_V2"}), do: true
+  defp valid_authorization_version?(%{"version" => 3, "kind" => "REVIEW_POLICY_STOP_CONTINUATION_V1"}), do: true
   defp valid_authorization_version?(_), do: false
 
   defp authorization(store, key) do
@@ -609,6 +663,20 @@ defmodule SymphonyElixir.Factory.TicketVerifierRepair do
        do: :ok
 
   defp idle_control(_, _), do: {:error, :verifier_repair_control_busy}
+
+  defp valid_input(%{"review_policy_stop" => reference} = input) when is_map(reference) do
+    with :ok <- valid_input(Map.delete(input, "review_policy_stop")),
+         true <- Enum.sort(Map.keys(reference)) == ~w(automatic_repairs_used policy_event_id policy_sha256 required_finding_ids version),
+         true <- reference["version"] === 1 and reference["automatic_repairs_used"] === 2,
+         true <- is_integer(reference["policy_event_id"]) and reference["policy_event_id"] > 0,
+         true <- is_binary(reference["policy_sha256"]) and Regex.match?(~r/\A[0-9a-f]{64}\z/, reference["policy_sha256"]),
+         ids = reference["required_finding_ids"],
+         true <- is_list(ids) and ids != [] and Enum.uniq(ids) == ids and Enum.all?(ids, &(is_binary(&1) and String.trim(&1) != "")) do
+      :ok
+    else
+      _ -> {:error, :verifier_repair_authorization_invalid}
+    end
+  end
 
   defp valid_input(input) when is_map(input) do
     with true <- MapSet.new(Map.keys(input)) == MapSet.new(@fields),

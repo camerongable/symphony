@@ -685,7 +685,7 @@ def push_size_project(value,kind):
     marker_run=value[key]
     if kind=='ordinary_generation':
         proof=value.get('ordinary_verifier_repair')
-        require(type(proof) is dict and type(proof.get('version')) is int and proof['version'] in (1,2) and proof.get('kind')=='ORDINARY_VERIFIER_REPAIR_PREFLIGHT_V1')
+        require(type(proof) is dict and type(proof.get('version')) is int and proof['version'] in (1,2,3) and proof.get('kind')=='ORDINARY_VERIFIER_REPAIR_PREFLIGHT_V1')
         require(hex_digest(proof.get('reviewed_candidate_sha'),40) and hex_digest(proof.get('source_parent_sha'),40))
         require(proof.get('candidate_sha')==proof['source_parent_sha']==marker_run['candidate_sha'])
         marker_run=dict(marker_run,candidate_sha=proof['reviewed_candidate_sha'])
@@ -1627,8 +1627,8 @@ def ordinary_repair(connection, execution, binding, run):
 def ordinary_repair_proof(connection, execution, binding, run, historical=False):
     proof = binding['ordinary_verifier_repair']
     fields = set('version kind candidate_sha source_parent_sha round verifier_round reviewed_candidate_sha verifier_request_key verifier_thread_id verifier_turn_id verifier_binding_sha256 verifier_output_sha256 writer_request_key writer_thread_id writer_turn_id writer_binding_sha256 writer_output_sha256 instruction_binding_sha256'.split())
-    require(type(proof) is dict and type(proof.get('version')) is int and proof['version'] in (1,2))
-    if proof['version']==2: fields.add('operator_authorization')
+    require(type(proof) is dict and type(proof.get('version')) is int and proof['version'] in (1,2,3))
+    if proof['version'] in (2,3): fields.add('operator_authorization')
     require(set(proof) == fields and proof == execution['ordinary_verifier_repair'])
     require(proof['kind'] == 'ORDINARY_VERIFIER_REPAIR_PREFLIGHT_V1')
     require(type(proof['round']) is int and proof['round'] == run['code_repair_round'] and type(proof['verifier_round']) is int and proof['verifier_round'] in (run['verifier_round'],run['verifier_round']-1))
@@ -1687,7 +1687,7 @@ def ordinary_repair_proof(connection, execution, binding, run, historical=False)
     findings = required_findings(verifier[2]); require(type(findings) is list and all(type(finding) is str for finding in findings))
     unique = list(dict.fromkeys(findings))
     expected_findings = review_finding_entries(run['contract_sha256'], verifier[0], verifier[1], verifier[2], verifier[3])
-    if proof['version']==2:
+    if proof['version'] in (2,3):
         operator_repair_authority(connection,proof,run,verifier,packet,expected_findings)
     if 'repair_review' in packet:
         review = packet['repair_review']; require(type(review) is dict)
@@ -1799,7 +1799,7 @@ def validate_report(packet, binding, output):
         require(all(row['evidence'] and all(type(value) is str and value.strip() for value in row['evidence']) for row in report['affected_path_checks']))
     if packet['role'] != 'change-verifier':
         if output['status'] == 'COMPLETE':
-            require(not output['blockers'] and report['block_reason'] == 'NONE' and not unresolved and all(row['status'] in ('PASS', 'NOT_CHECKED') for row in report['criteria']))
+            require(not output['blockers'] and report['block_reason'] == 'NONE' and not unresolved and all(row['status'] in ('PASS', 'NOT_CHECKED') for row in report['criteria']) and all(row['status'] == 'CHECKED' for row in report['boundary_sweeps'] + report.get('affected_path_checks', [])))
         return
     require(output['candidate_sha'] == binding['expected_sha'])
     findings = required_findings(output)
@@ -1844,6 +1844,9 @@ def validate_review_admission(connection, worker, binding, output, packet):
 
 
 def validate_operator_budget(auth, input, prior):
+    if auth.get('version') == 3:
+        require(auth['kind'] == 'REVIEW_POLICY_STOP_CONTINUATION_V1' and auth['automatic_repairs_used'] == 2 and auth['operator_repair_limit'] == 1 and 'review_policy_stop' in input)
+        return validate_operator_budget(dict(auth, version=2 if 'budget_exception' in auth else 1), input, prior)
     require(set(auth['limits']) == {'maximum_implementation_iterations', 'maximum_code_repair_rounds'})
     require(all(type(value) is int and value >= 0 for value in auth['limits'].values()))
     require(prior['implementation_iteration'] < auth['limits']['maximum_implementation_iterations'])
@@ -1868,7 +1871,9 @@ def validate_operator_budget(auth, input, prior):
 def operator_repair_authority(connection,proof,run,verifier,packet,findings):
     """An explicit local operator approval preserves BLOCK; it is not a native parent message."""
     ref=proof['operator_authorization']
-    require(type(ref) is dict and set(ref)==set('authorization_event_id authorization_sha256 applied_event_id applied_sha256 authorization_key authorization_reference authorization_body_sha256 repair_instructions repair_instructions_sha256'.split()))
+    ref_fields=set('authorization_event_id authorization_sha256 applied_event_id applied_sha256 authorization_key authorization_reference authorization_body_sha256 repair_instructions repair_instructions_sha256'.split())
+    if proof.get('version') == 3: ref_fields.add('review_policy_stop')
+    require(type(ref) is dict and set(ref)==ref_fields)
     require(packet['repair_review']['operator_authorization']==ref)
     events=[]
     for prefix,event_type in (('authorization','TICKET_VERIFIER_REPAIR_AUTHORIZED'),('applied','TICKET_VERIFIER_REPAIR_APPLIED')):
@@ -1877,10 +1882,13 @@ def operator_repair_authority(connection,proof,run,verifier,packet,findings):
         require(len(found)==1 and sha(found[0]['payload_json'].encode())==ref[prefix+'_sha256'])
         events.append(decode(found[0]['payload_json'],262144))
     auth,applied=events
-    require(type(auth['version']) is int and auth['version'] in (1,2) and auth['kind']=='BLOCKED_VERIFIER_REPAIR_AUTHORIZATION_V'+str(auth['version']) and auth['authority']=='LOCAL_OPERATOR_AUTHORIZATION')
+    continuation = auth.get('version') == 3
+    require(type(auth['version']) is int and auth['version'] in (1,2,3) and auth['kind']==('REVIEW_POLICY_STOP_CONTINUATION_V1' if continuation else 'BLOCKED_VERIFIER_REPAIR_AUTHORIZATION_V'+str(auth['version'])) and auth['authority']=='LOCAL_OPERATOR_AUTHORIZATION')
     input=auth['authorization']; prior=auth['run']
-    require(type(input) is dict and set(input)==set('authorization_key run_id candidate_sha spec_revision contract_sha256 verifier_request_key verifier_output_sha256 authorization_reference authorization_body repair_instructions'.split()))
-    require(type(input['spec_revision']) is int and input['spec_revision']>0 and all(type(value) is str and 1<=len(value.encode())<=8192 for key,value in input.items() if key!='spec_revision'))
+    input_fields=set('authorization_key run_id candidate_sha spec_revision contract_sha256 verifier_request_key verifier_output_sha256 authorization_reference authorization_body repair_instructions'.split())
+    if continuation: input_fields.add('review_policy_stop')
+    require(type(input) is dict and set(input)==input_fields and continuation == (proof.get('version') == 3))
+    require(type(input['spec_revision']) is int and input['spec_revision']>0 and all(type(value) is str and 1<=len(value.encode())<=8192 for key,value in input.items() if key not in ('spec_revision','review_policy_stop')))
     require(len(input['authorization_key'].encode())<=256 and len(input['authorization_reference'].encode())<=2048)
     require(hex_digest(input['candidate_sha'],40) and hex_digest(input['contract_sha256']) and hex_digest(input['verifier_output_sha256']))
     require(all(input[key]==prior[key]==run[key] for key in ('run_id','spec_revision','contract_sha256')) and input['candidate_sha']==prior['candidate_sha']==proof['reviewed_candidate_sha'])
@@ -1889,7 +1897,7 @@ def operator_repair_authority(connection,proof,run,verifier,packet,findings):
     validate_operator_budget(auth, input, prior)
     worker,wb,output,reviewed,mapping=verifier
     require(auth['verifier']=={key:worker[key] for key in 'request_key task_key thread_id turn_id binding_sha256 output_sha256 reservation_key consumed_at owner_stopped_at'.split()})
-    require(input['verifier_request_key']==worker['request_key'] and input['verifier_output_sha256']==worker['output_sha256'] and output['status']=='BLOCK')
+    require(input['verifier_request_key']==worker['request_key'] and input['verifier_output_sha256']==worker['output_sha256'] and output['status']==('REPAIR' if continuation else 'BLOCK'))
     authority_findings = [{'id':sha(json.dumps([run['contract_sha256'], finding], separators=(',', ':'), ensure_ascii=False).encode()), 'finding':finding} for finding in dict.fromkeys(required_findings(output))]
     require(auth['findings']==authority_findings and findings==review_finding_entries(run['contract_sha256'], worker, wb, output, reviewed))
     require(all(reviewed[key]==prior[key] for key in ('run_id','candidate_sha','spec_revision','contract_sha256','verifier_round','code_repair_round','implementation_iteration')))
@@ -1900,8 +1908,21 @@ def operator_repair_authority(connection,proof,run,verifier,packet,findings):
     tr=decode(terminal[0]['payload_json'],262144)
     keys='run_id candidate_sha spec_revision contract_sha256 verifier_round code_repair_round implementation_iteration'.split()
     before={key:prior[key] for key in keys}
-    require(tr=={'version':1,'kind':'TICKET_VERIFIER_TERMINAL_V1','reason':'verification_blocked','request_key':worker['request_key'],'task_key':worker['task_key'],'binding_sha256':worker['binding_sha256'],'output_sha256':worker['output_sha256'],'prior_run':before})
-    require(type(applied['version']) is int and applied['version']==1 and applied['kind']=='BLOCKED_VERIFIER_REPAIR_APPLIED_V1' and applied['authorization_event_id']==ref['authorization_event_id'] and applied['authorization_sha256']==ref['authorization_sha256'])
+    expected_terminal={'version':1,'kind':'TICKET_VERIFIER_TERMINAL_V1','reason':'verification_blocked','request_key':worker['request_key'],'task_key':worker['task_key'],'binding_sha256':worker['binding_sha256'],'output_sha256':worker['output_sha256'],'prior_run':before}
+    if continuation:
+        reference = input['review_policy_stop']
+        require(reference == ref['review_policy_stop'] and set(reference) == set('version automatic_repairs_used policy_event_id policy_sha256 required_finding_ids'.split()))
+        require(type(reference['policy_event_id']) is int and reference['policy_event_id'] > 0 and hex_digest(reference['policy_sha256']))
+        require(type(reference['version']) is int and reference['version'] == 1 and type(reference['automatic_repairs_used']) is int and reference['automatic_repairs_used'] == 2)
+        require(reference['required_finding_ids'] == [row['id'] for row in findings])
+        policy_rows = rows(connection, "SELECT * FROM events WHERE id=? AND run_id=? AND event_type='TICKET_REVIEW_DECISION'", (reference['policy_event_id'], run['run_id']))
+        require(len(policy_rows) == 1 and sha(policy_rows[0]['payload_json'].encode()) == reference['policy_sha256'])
+        policy=decode(policy_rows[0]['payload_json'])
+        require(policy['version'] == 1 and policy['kind'] == 'REVIEW_POLICY_DECISION_V1' and policy['result'] == 'POLICY_STOPPED' and policy['repairs_used_before'] == policy['repairs_used_after'] == policy['repair_attempt_limit'] == 2 and policy['stop']['reason'] == 'REPAIR_LIMIT')
+        require(all(policy[key] == worker[key] for key in ('request_key','binding_sha256','output_sha256')) and all(policy[key] == prior[key] for key in ('candidate_sha','contract_sha256','spec_revision','verifier_round')))
+        expected_terminal.update(version=2,kind='TICKET_VERIFIER_TERMINAL_V2',reason='verification_policy_stopped',review_policy=policy['stop'])
+    require(tr==expected_terminal)
+    require(type(applied['version']) is int and applied['version']==(2 if continuation else 1) and applied['kind']==('REVIEW_POLICY_STOP_CONTINUATION_APPLIED_V1' if continuation else 'BLOCKED_VERIFIER_REPAIR_APPLIED_V1') and applied['authorization_event_id']==ref['authorization_event_id'] and applied['authorization_sha256']==ref['authorization_sha256'])
     require(applied['prior_run']==before and applied['next_run']==dict(before,code_repair_round=before['code_repair_round']+1))
     require(auth['terminal_event_id']<ref['authorization_event_id']<ref['applied_event_id'])
     require(type(applied['tick']) is dict and set(applied['tick'])==set('scope dispatcher_id generation tick_id'.split()) and type(applied['tick']['generation']) is int and applied['tick']['generation']>0 and all(type(applied['tick'][key]) is str and applied['tick'][key] for key in ('scope','dispatcher_id','tick_id')))

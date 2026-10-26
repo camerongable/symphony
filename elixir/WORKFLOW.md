@@ -629,3 +629,19 @@ turn, authenticates the broker delegation and observed completed MCP records,
 and passes the unchanged final result to the existing strict validator. Missing,
 ambiguous, pending, errored or changed evidence is a refusal, not permission to
 transcribe success, start another turn or repeat a GitLab operation.
+
+Ordinary review protocol v2 binds typed findings once, initial comprehensive
+coverage, and controller-scoped follow-up closure, exact changed paths and
+regression evidence. Unverified criteria remain active; omitted historical PASS
+evidence retains its original request/output/candidate provenance. Optional
+preferences are observations, never mandatory repairs. Late mandatory NEW
+findings require a scope decision. The controller's two automatic repairs are
+not reset by report changes, CI, instruction snapshots or restart.
+
+`factory.ticket prepare-report-correction` is read-only; `apply-report-correction`
+journals one explicit v1 description-index mapping in the owning service without
+changing raw evidence, verdict, source or repair counters. A separately explicit
+`authorize-policy-stop-repair` binds the consumed REPAIR, two-used policy stop,
+mandatory finding IDs and operator scope to one ordinary-tick continuation. It
+does not inherit BLOCK authority, dispatch at staging, or authorize a later
+automatic repair. The implementation README defines the exact payloads.

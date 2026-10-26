@@ -137,7 +137,7 @@ defmodule SymphonyElixir.Factory.RepairObligations do
 
   defp operator_scope(proof, review) do
     case Map.fetch(review, "operator_authorization") do
-      {:ok, operator} -> Map.merge(proof, %{"version" => 2, "operator_authorization" => operator})
+      {:ok, operator} -> Map.merge(proof, %{"version" => if(Map.has_key?(operator, "review_policy_stop"), do: 3, else: 2), "operator_authorization" => operator})
       :error -> proof
     end
   end
@@ -300,6 +300,7 @@ defmodule SymphonyElixir.Factory.RepairObligations do
   end
 
   defp operator_authority(store, "BLOCK", packet, row), do: TicketVerifierRepair.review_authority(store, packet, row)
+  defp operator_authority(store, "REPAIR", packet, row), do: TicketVerifierRepair.review_authority(store, packet, row)
   defp operator_authority(_store, _status, _packet, _row), do: {:ok, nil}
 
   defp released_worker?(store, worker, binding, mode) do

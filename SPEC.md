@@ -2362,6 +2362,45 @@ require every criterion to pass. A rejected stopped result MUST remain immutable
 and MUST expose a current, evidence-bound factory recovery action; healthy ticks
 MUST NOT hide that rejection or imply progress.
 
+New version-2 reports MUST have one authoritative typed record per finding,
+including a stable ID, description, classification, disposition, and basis.
+Required repairs MUST cite an admitted criterion, an authenticated prior finding,
+or the established PRIVACY, SECURITY, CONTRACT_INTEGRITY, or EXACT_IDENTITY
+safety invariant. Only preferences MAY be observations. Observations MAY survive
+PASS but MUST NOT enter mandatory writer obligations. Reused finding IDs MUST
+preserve their admitted basis and required disposition; NEW IDs MUST be disjoint
+from prior obligations. Unresolved closure validity MUST depend on authenticated
+obligations, not the number of automatic repairs already used.
+
+Initial review scope MUST be comprehensive. A focused follow-up MUST bind all
+prior closures, the exact committed candidate delta and affected execution paths,
+regression evidence, and every criterion without an authenticated latest PASS.
+Omitted criteria MUST retain their original consumed-review request/output and
+candidate provenance; carried evidence MUST NOT imply new inspection. Missing
+legacy coverage MUST conservatively retain full criterion review. A late NEW
+mandatory finding MUST cause explicit policy escalation, not silent PASS or an
+automatically broadened repair.
+
+An eligible stopped rejected v1 report MAY receive one explicitly authorized
+report-only correction. It MUST be an exact bijection of classification indices
+to finding indices, changing only duplicated classification descriptions. The
+original schema, worker/task output bytes, digests, native history, verdict,
+coverage, closure and source effects MUST remain unchanged. The correction MUST
+be separately journaled with original binding/output and projected-output
+digests, and every admission/history/publication reader MUST authenticate it.
+Correction MUST NOT spend or reset a product-repair attempt.
+
+A consumed REPAIR stopped at exactly two automatic repairs MAY receive one
+separately versioned operator continuation, bound to the exact policy decision
+and terminal events, raw verifier receipt, candidate/contract, mandatory finding
+IDs, operator body and repair instructions. It MUST retain fresh authorization,
+clean checkout, capacity, stopped/released ownership, conflict and owned-tick
+gates. Application MUST advance only one combined repair round and MUST NOT
+reset the two-used automatic count. A subsequent REPAIR MUST stop again. This
+authority MUST NOT masquerade as legacy BLOCK recovery. Configured and effective
+combined limits MUST remain separately recorded; all retained codec bytes remain
+immutable.
+
 An explicit source-completion confirmation MAY admit one read-only request at
 the implementation limit. It MUST bind the exact current run, candidate,
 contract/revision, repair/verifier counters, and prior consumed CONTINUE binding
