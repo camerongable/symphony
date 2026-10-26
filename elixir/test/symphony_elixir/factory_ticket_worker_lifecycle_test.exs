@@ -5371,6 +5371,8 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
        ordinary_final_rollover: true,
        ordinary_go_generation: true,
        ordinary_go_path: "go/src/grail.com/workflows/docextract/workflow.go",
+       capability_recovery_native: false,
+       operator_verifier_repair: false,
        timeout: 900_000
   test "product Go workflow source generates and publishes through ordinary repair after restart", ctx do
     assert_mr_adoption(ctx)
@@ -5387,6 +5389,8 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
        ordinary_go_generation: true,
        ordinary_go_path: "go/src/grail.com/workflows/docextract/config/workflow.go",
        ordinary_policy_negative: true,
+       capability_recovery_native: false,
+       operator_verifier_repair: false,
        timeout: 900_000
   test "protected product workflow policy stops before ordinary generation observation or adoption", ctx do
     assert catch_throw(assert_mr_adoption(ctx)) == :protected_generation_denied
