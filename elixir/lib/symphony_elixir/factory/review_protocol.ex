@@ -355,20 +355,23 @@ defmodule SymphonyElixir.Factory.ReviewProtocol do
   end
 
   defp validate_scope_history(store, %{"review_protocol" => %{"version" => 2, "review_scope" => scope}} = packet) do
-    proven = Enum.all?(scope["carried_evidence"], fn origin ->
-      with row when is_map(row) <- Store.one!(store, "SELECT * FROM worker_evidence WHERE request_key=? AND run_id=? AND status='CONSUMED'", [origin["request_key"], packet["run_id"]]),
-           true <- digest(row["binding_json"]) == row["binding_sha256"] and digest(row["output_json"]) == row["output_sha256"] and row["output_sha256"] == origin["output_sha256"],
-           {:ok, binding} <- Jason.decode(row["binding_json"]),
-           true <- Map.take(binding, ~w(run_id spec_revision contract_sha256)) == Map.take(packet, ~w(run_id spec_revision contract_sha256)),
-           true <- binding["role"] == "change-verifier" and WorkerEvidence.owner_stopped?(store, row),
-           {:ok, output} <- Jason.decode(row["output_json"]) do
-        output["candidate_sha"] == origin["candidate_sha"] and get_in(output, [@report, "criteria"]) == origin["criteria"]
-      else
-        _ -> false
-      end
-    end)
+    proven =
+      Enum.all?(scope["carried_evidence"], fn origin ->
+        with row when is_map(row) <- Store.one!(store, "SELECT * FROM worker_evidence WHERE request_key=? AND run_id=? AND status='CONSUMED'", [origin["request_key"], packet["run_id"]]),
+             true <- digest(row["binding_json"]) == row["binding_sha256"] and digest(row["output_json"]) == row["output_sha256"] and row["output_sha256"] == origin["output_sha256"],
+             {:ok, binding} <- Jason.decode(row["binding_json"]),
+             true <- Map.take(binding, ~w(run_id spec_revision contract_sha256)) == Map.take(packet, ~w(run_id spec_revision contract_sha256)),
+             true <- binding["role"] == "change-verifier" and WorkerEvidence.owner_stopped?(store, row),
+             {:ok, output} <- Jason.decode(row["output_json"]) do
+          output["candidate_sha"] == origin["candidate_sha"] and get_in(output, [@report, "criteria"]) == origin["criteria"]
+        else
+          _ -> false
+        end
+      end)
+
     if proven, do: :ok, else: {:error, :review_report_scope_unproven}
   end
+
   defp validate_scope_history(_store, _packet), do: :ok
 
   @doc "Read-only exact report correction proposal. Only an explicit bijection of duplicated v1 prose is eligible."
