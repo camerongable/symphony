@@ -139,6 +139,70 @@ Policy stops are deliberate terminal records, not retry requests; the legacy
 authorization command below accepts only an exact preserved `BLOCK` and cannot
 silently override the new limit or turn a policy-stopped `REPAIR` into `BLOCK`.
 
+Version-2 reports author findings once in `review_report.findings`, with `id`,
+`description`, `classification` (`NEW`, `REGRESSION`, `UNRESOLVED`), `disposition`
+(`REQUIRED_REPAIR`, `OBSERVATION`), and `basis.kind/reference`. The controller
+derives legacy presentation and required writer obligations; the native model
+does not duplicate top-level finding prose. Required bases are an admitted
+`ACCEPTANCE_CRITERION`, authenticated `PRIOR_FINDING`, or established
+`SAFETY_INVARIANT` (`PRIVACY`, `SECURITY`, `CONTRACT_INTEGRITY`, `EXACT_IDENTITY`).
+Only `PREFERENCE` records may be observations, including on PASS.
+
+Initial `review_scope` is comprehensive. Focused follow-ups retain every prior
+closure, all previously unverified/non-PASS criteria, the exact registered
+checkout's committed delta, per-path checks, and affected-path regression
+requirements. Omitted criteria require authenticated historical PASS provenance;
+they are not new inspection claims. Legacy missing coverage is rechecked. Late
+NEW mandatory findings cause `LATE_FINDING_ESCALATION`; they do not silently
+broaden the repair loop. Unknown IDs, changed provenance and contradictory
+verdicts remain fail-closed with specific diagnostics.
+
+### Report-only correction and policy-stop continuation
+
+For an exact stopped rejected v1 verifier report, prepare a deterministic mapping:
+
+```sh
+mix factory.ticket prepare-report-correction RUN --workflow WORKFLOW.md --payload-base64 BASE64_JSON
+mix factory.ticket apply-report-correction RUN --workflow WORKFLOW.md --payload-base64 BASE64_JSON
+```
+
+Prepare accepts exactly `run_id`, `request_key`, `binding_sha256`,
+`output_sha256`, and `mapping`. Mapping is an explicit complete bijection such as
+`[{"classification_index":0,"finding_index":0}]`; no fuzzy or positional guess is
+made. Apply accepts those same fields plus the returned `projection_sha256` and
+an explicit operator `authorization_reference`. The only transformation replaces
+duplicated classification descriptions with the explicitly selected original
+finding descriptions. It must make the entire admitted v1 validator pass without
+changing verdict, evidence, identities, coverage or closures. Missing evidence,
+invalid identity, changed state and ambiguous mappings remain ineligible.
+
+Prepare is read-only. Apply runs in the existing controller through BrokerRuntime
+and writes one event, not worker/task JSON. It invokes no model/source worker,
+inspection, source tools, Git or external actions and spends no product repair.
+Ordinary scheduler adoption authenticates that projection while retaining the
+original raw result and its receipt hashes. Correction of REPAIR is not PASS.
+
+If adoption then records `REPAIR_LIMIT` at exactly two used automatic repairs,
+an explicit operator may stage one exact continuation:
+
+```sh
+mix factory.ticket authorize-policy-stop-repair RUN --workflow WORKFLOW.md --payload-base64 BASE64_JSON
+```
+
+The payload contains the ordinary authorization fields listed below plus
+`review_policy_stop`: `version:1`, `automatic_repairs_used:2`, exact
+`policy_event_id`/`policy_sha256`, and the ordered `required_finding_ids` from the
+preserved report. The operator body and `repair_instructions` explicitly bound
+that one repair. A new version-3 authorization and separate application receipt
+preserve the REPAIR verdict, exact terminal/policy events and original digests.
+Fresh Jira, capacity, clean checkout, ownership release, no conflicting work and
+the ordinary owned tick still gate application. Stage never dispatches. Apply
+advances one combined repair round, retaining configured/effective limits and
+automatic two used. Another REPAIR stops again; nothing grants a third automatic
+repair. Old BLOCK authorization versions and physical programs are unchanged.
+New physical history codec v21, push helpers v27/v28 and status reader v15 admit
+the new proofs; retained v1 and legacy histories keep their original codecs.
+
 A valid stopped native verifier `BLOCK` (or over-budget `REPAIR`) is adopted
 atomically as terminal `FAILED`, retaining its raw verdict, consuming the result,
 and releasing REVIEW ownership. Normal ticks do not retry it or create a new run.

@@ -137,7 +137,7 @@ defmodule SymphonyElixir.Factory.RepairObligations do
 
   defp operator_scope(proof, review) do
     case Map.fetch(review, "operator_authorization") do
-      {:ok, operator} -> Map.merge(proof, %{"version" => 2, "operator_authorization" => operator})
+      {:ok, operator} -> Map.merge(proof, %{"version" => if(Map.has_key?(operator, "review_policy_stop"), do: 3, else: 2), "operator_authorization" => operator})
       :error -> proof
     end
   end
@@ -272,7 +272,8 @@ defmodule SymphonyElixir.Factory.RepairObligations do
              Map.merge(Map.take(binding, ~w(run_id spec_revision contract_sha256 role stage)), %{"candidate_sha" => binding["expected_sha"]}),
          {:ok, output} <- Jason.decode(row["output_json"]),
          true <- output["candidate_sha"] == binding["expected_sha"] and is_binary(output["candidate_sha"]),
-         true <- output["status"] in ~w(PASS REPAIR BLOCK) and is_list(output["findings"]) and Enum.all?(output["findings"], &is_binary/1) do
+         :ok <- ReviewProtocol.validate_result(store, task, binding, output),
+         true <- output["status"] in ~w(PASS REPAIR BLOCK) and is_list(ReviewProtocol.findings(output)) and Enum.all?(ReviewProtocol.findings(output), &is_binary/1) do
       with true <- Map.take(binding, ~w(spec_revision contract_sha256)) == Map.take(packet, ~w(spec_revision contract_sha256)),
            {:ok, operator} <- operator_authority(store, output["status"], packet, row),
            true <- output["status"] == "REPAIR" or is_map(operator) do
@@ -282,9 +283,8 @@ defmodule SymphonyElixir.Factory.RepairObligations do
            "verifier_request_key" => row["request_key"],
            "verifier_output_sha256" => row["output_sha256"],
            "findings" =>
-             output["findings"]
-             |> Enum.with_index()
-             |> Enum.map(fn {finding, index} -> %{"id" => ReviewProtocol.finding_id(packet["contract_sha256"], row, output, index, finding), "finding" => finding} end)
+             ReviewProtocol.finding_entries(packet["contract_sha256"], row, output)
+             |> Enum.map(&Map.take(&1, ~w(id finding)))
              |> Enum.uniq_by(& &1["id"]),
            "closure_rules" =>
              "For each finding ID report addressed with code/check evidence, unresolved, or superseded with explicit justification. Classify additional findings as new or regression. Compare the prior reviewed candidate to the current candidate as well as reviewing the full contract diff. Do not weaken correctness, privacy, scope or exact-SHA CI requirements; style preferences alone do not create new acceptance criteria. A writer's addressed claim is not verifier closure."
@@ -300,6 +300,7 @@ defmodule SymphonyElixir.Factory.RepairObligations do
   end
 
   defp operator_authority(store, "BLOCK", packet, row), do: TicketVerifierRepair.review_authority(store, packet, row)
+  defp operator_authority(store, "REPAIR", packet, row), do: TicketVerifierRepair.review_authority(store, packet, row)
   defp operator_authority(_store, _status, _packet, _row), do: {:ok, nil}
 
   defp released_worker?(store, worker, binding, mode) do

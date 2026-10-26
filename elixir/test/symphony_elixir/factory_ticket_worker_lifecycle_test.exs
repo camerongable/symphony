@@ -756,13 +756,14 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
         criteria = Enum.map(packet["review_protocol"]["criterion_ids"], &%{"id" => &1, "status" => "NOT_CHECKED", "evidence" => ["Source ready; controller validation remains pending"]})
 
         report = %{
-          "version" => 1,
+          "version" => packet["review_protocol"]["version"],
           "candidate_sha" => packet["candidate_sha"],
           "block_reason" => "NONE",
           "criteria" => criteria,
           "closures" => Enum.map(packet["review_protocol"]["finding_obligations"], &%{"id" => &1["id"], "status" => "ADDRESSED", "evidence" => ["Source inspected"]}),
           "boundary_sweeps" => Enum.map(criteria, &(&1 |> Map.put("status", "CHECKED") |> Map.put("paths", ["fixture.txt"]))),
-          "finding_classifications" => []
+          "findings" => [],
+          "affected_path_checks" => []
         }
 
         output = %{"status" => "COMPLETE", "changed_paths" => [], "commit_message" => nil, "blockers" => [], "checks" => ["NOT_RUN: controller checks"], "review_report" => report}

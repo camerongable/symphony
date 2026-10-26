@@ -9,7 +9,7 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
   alias SymphonyElixir.{PathSafety, Workflow}
 
   @owner_operations ~w(prepare-ticket-mr-correction prepare-ticket-mr-claim prepare-ticket-mr-recovery finalize-ticket-mr-correction finalize-ticket-mr-claim finalize-ticket-mr-recovery)
-  @operations ~w(claim claim-ticket-followup claim-ticket-mr-owner correct-ticket-mr-owner complete-ticket-mr read-ticket-turn record-ticket-thread complete reconcile-negative-ticket-presentation prepare-ticket-stage authorize-ticket-verifier-repair inspect-ticket-capability-recovery inspect-ticket-capability-runtime authorize-ticket-capability-recovery) ++
+  @operations ~w(claim claim-ticket-followup claim-ticket-mr-owner correct-ticket-mr-owner complete-ticket-mr read-ticket-turn record-ticket-thread complete reconcile-negative-ticket-presentation prepare-ticket-stage authorize-ticket-verifier-repair authorize-ticket-policy-stop-repair prepare-ticket-report-correction apply-ticket-report-correction inspect-ticket-capability-recovery inspect-ticket-capability-runtime authorize-ticket-capability-recovery) ++
                 @owner_operations
   @max_bytes 131_072
   @max_owner_admissions 16
@@ -216,6 +216,12 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
 
   defp execute(["authorize-ticket-verifier-repair" | _] = args, store, factory),
     do: Ticket.runtime_authorize_verifier_repair(args, store, factory)
+
+  defp execute(["authorize-ticket-policy-stop-repair" | _] = args, store, factory),
+    do: Ticket.runtime_authorize_policy_stop_repair(args, store, factory)
+
+  defp execute([operation | _] = args, store, factory) when operation in ~w(prepare-ticket-report-correction apply-ticket-report-correction),
+    do: Ticket.runtime_report_correction(args, store, factory)
 
   defp execute([operation | _] = args, store, factory) when operation in ~w(inspect-ticket-capability-recovery inspect-ticket-capability-runtime authorize-ticket-capability-recovery),
     do: Ticket.runtime_capability_recovery(args, store, factory)

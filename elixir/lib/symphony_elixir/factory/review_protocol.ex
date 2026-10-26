@@ -1,6 +1,6 @@
 defmodule SymphonyElixir.Factory.ReviewProtocol do
   @moduledoc "Admission-bound review coverage and controller-owned repair limits."
-  alias SymphonyElixir.Factory.{StageSchemas, Store, TicketCompletionConfirmation, WorkerEvidence, WorkerInstructions}
+  alias SymphonyElixir.Factory.{ReviewReport, StageSchemas, Store, TicketCompletionConfirmation, WorkerEvidence, WorkerInstructions}
 
   @limit 2
   @roles ~w(feature-writer change-verifier)
@@ -8,7 +8,21 @@ defmodule SymphonyElixir.Factory.ReviewProtocol do
   @report_rejections [
     :review_protocol_evidence_incomplete,
     :review_protocol_schema_changed,
-    :review_protocol_admission_unproven
+    :review_protocol_admission_unproven,
+    :review_report_schema_invalid,
+    :review_report_candidate_changed,
+    :review_report_criteria_incomplete,
+    :review_report_closures_incomplete,
+    :review_report_boundaries_incomplete,
+    :review_report_evidence_missing,
+    :review_report_finding_id_invalid,
+    :review_report_finding_basis_invalid,
+    :review_report_observation_blocks_acceptance,
+    :review_report_finding_identity_changed,
+    :review_report_unresolved_unproven,
+    :review_report_verdict_contradiction,
+    :review_report_scope_unproven,
+    :review_report_affected_paths_incomplete
   ]
 
   @spec attach(map(), [map()]) :: map()
@@ -24,20 +38,62 @@ defmodule SymphonyElixir.Factory.ReviewProtocol do
         |> Enum.uniq_by(& &1["id"])
 
       Map.put(packet, "review_protocol", %{
-        "version" => 1,
+        "version" => 2,
         "lineage" => digest(Jason.encode!(Map.take(packet, ~w(run_id spec_revision contract_sha256)))),
         "criterion_ids" => ids,
+        "review_scope" => review_scope(ids, history),
         "finding_obligations" => obligations,
         "repair_attempt_limit" => @limit,
         "repairs_used" => Enum.count(history, & &1["repair_admitted"]),
         "instructions" =>
-          "Complete the entire contract review before returning findings, including success, failure, fallback, retry and public-entry boundaries. For each criterion record the boundary inventory, inspected paths and discriminating evidence in review_report. A repair covers the demonstrated failure family throughout the confirmed scope, not only the cited lines. Recheck every prior finding ID independently; a writer's addressed claim is not closure. Classify each current finding as NEW, REGRESSION or UNRESOLVED. Keep factual REPAIR for code-fixable findings regardless of prior review count. BLOCK is only CONTRACT_CHANGED, HUMAN_DECISION or ENVIRONMENT; the controller alone enforces repair limits. Coverage structure is not proof of correctness; unrun checks remain explicitly NOT_RUN." <>
+          "Follow the controller-bound review_scope. COMPREHENSIVE means the entire contract including success, failure, fallback, retry and public entry boundaries. FOCUSED means independently close all supplied obligations, inspect affected execution paths and regressions; carried evidence is historical provenance, never a claim of new inspection. Do not invent a full sweep of unchanged areas. Findings are authored once in review_report.findings: stable unique ID, description, classification, disposition and basis. REQUIRED_REPAIR requires a supplied AC, authenticated prior finding or established safety invariant PRIVACY, SECURITY, CONTRACT_INTEGRITY or EXACT_IDENTITY. Only preferences may be OBSERVATION. Reuse prior IDs for REGRESSION/UNRESOLVED; NEW IDs must be disjoint. Late NEW mandatory findings are escalated by the controller, not automatically broadened into repairs. Keep factual REPAIR for code-fixable findings regardless of review count; the controller alone enforces limits. BLOCK is only CONTRACT_CHANGED, HUMAN_DECISION or ENVIRONMENT. Unrun checks remain NOT_RUN." <>
             writer_instructions(role)
       })
     end
   end
 
   def attach(packet, _history), do: packet
+
+  defp review_scope(ids, []), do: %{"mode" => "COMPREHENSIVE", "criterion_ids" => ids, "carried_evidence" => []}
+
+  defp review_scope(ids, history) do
+    latest = List.last(history)
+
+    coverage = Enum.reduce(history, %{}, fn entry, covered -> Enum.reduce(entry["criteria"] || [], covered, fn row, current -> Map.put(current, row["id"], row) end) end)
+    unverified = Enum.reject(ids, &(get_in(coverage, [&1, "status"]) == "PASS"))
+
+    affected =
+      latest["finding_entries"] |> Enum.flat_map(fn row -> if get_in(row, ["basis", "kind"]) == "ACCEPTANCE_CRITERION", do: [row["basis"]["reference"]], else: ids end) |> Enum.uniq() |> Enum.sort()
+
+    active = Enum.sort(Enum.uniq(affected ++ unverified))
+    %{"mode" => "FOCUSED", "criterion_ids" => if(active == [], do: ids, else: active), "carried_evidence" => Enum.map(history, &Map.take(&1, ~w(request_key output_sha256 candidate_sha criteria)))}
+  end
+
+  @doc "Pins the real committed candidate delta; never grants source tools or claims inspection."
+  @spec bind_execution_scope(map(), map()) :: {:ok, map()} | {:error, term()}
+  def bind_execution_scope(%{"role" => "change-verifier", "review_protocol" => %{"version" => 2} = protocol} = packet, run) do
+    if Map.has_key?(protocol["review_scope"], "affected_paths") do
+      {:ok, packet}
+    else
+      prior = List.last(protocol["review_scope"]["carried_evidence"])
+      base = if is_map(prior), do: prior["candidate_sha"], else: packet["base_sha"]
+
+      with {:ok, paths} <- SymphonyElixir.Factory.Worktree.review_paths(run["repo_path"], run["worktree"], run["branch"], base, packet["candidate_sha"]) do
+        scope =
+          Map.merge(protocol["review_scope"], %{
+            "affected_paths" => paths,
+            "comparison_base_sha" => base,
+            "comparison_candidate_sha" => packet["candidate_sha"],
+            "regression_requirement" =>
+              "Inspect every changed path and its affected execution/error/fallback/public-entry paths for regressions; record discriminating evidence, not only diff coverage."
+          })
+
+        {:ok, put_in(packet, ["review_protocol", "review_scope"], scope)}
+      end
+    end
+  end
+
+  def bind_execution_scope(packet, _run), do: {:ok, packet}
 
   defp writer_instructions("feature-writer"),
     do:
@@ -123,7 +179,7 @@ defmodule SymphonyElixir.Factory.ReviewProtocol do
          true <- Map.take(task, ~w(thread_id turn_id output_json)) == Map.take(row, ~w(thread_id turn_id output_json)),
          true <- WorkerEvidence.owner_stopped?(store, row),
          :ok <- validate_result(store, task, binding, output),
-         true <- output["status"] in ~w(PASS REPAIR BLOCK) and is_list(output["findings"]) and Enum.all?(output["findings"], &is_binary/1) do
+         true <- output["status"] in ~w(PASS REPAIR BLOCK) and is_list(findings(output)) and Enum.all?(findings(output), &is_binary/1) do
       matching_history(store, packet, row, binding, output)
     else
       _ -> {:error, :review_protocol_history_unproven}
@@ -132,16 +188,41 @@ defmodule SymphonyElixir.Factory.ReviewProtocol do
 
   defp matching_history(store, packet, row, binding, output) do
     if Map.take(binding, ~w(spec_revision contract_sha256)) == Map.take(packet, ~w(spec_revision contract_sha256)) do
-      entries = output["findings"] |> Enum.with_index() |> Enum.map(fn {finding, index} -> %{"id" => finding_id(packet["contract_sha256"], row, output, index, finding), "finding" => finding} end)
-      {:ok, %{"status" => output["status"], "finding_entries" => entries, "repair_admitted" => repair_admitted?(store, row, output)}}
+      entries = finding_entries(packet["contract_sha256"], row, output)
+
+      {:ok,
+       %{
+         "status" => output["status"],
+         "finding_entries" => entries,
+         "repair_admitted" => repair_admitted?(store, row, output),
+         "request_key" => row["request_key"],
+         "output_sha256" => row["output_sha256"],
+         "candidate_sha" => output["candidate_sha"],
+         "criteria" => get_in(output, [@report, "criteria"])
+       }}
     else
       {:ok, nil}
     end
   end
 
   @spec finding_id(String.t(), map(), map(), non_neg_integer(), String.t()) :: String.t()
+  def finding_id(_contract, _row, %{@report => %{"version" => 2}} = output, index, _finding), do: Enum.at(ReviewReport.entries(output), index)["id"]
   def finding_id(contract, row, %{@report => _}, index, _finding), do: digest(Jason.encode!([contract, row["request_key"], row["output_sha256"], index]))
   def finding_id(contract, _row, _output, _index, finding), do: digest(Jason.encode!([contract, finding]))
+
+  @spec findings(map()) :: [String.t()]
+  def findings(%{@report => %{"version" => 2}} = output), do: ReviewReport.findings(output)
+  def findings(output), do: output["findings"]
+
+  @spec finding_entries(String.t(), map(), map()) :: [map()]
+  def finding_entries(_contract, _row, %{@report => %{"version" => 2}} = output), do: ReviewReport.entries(output)
+
+  def finding_entries(contract, row, output),
+    do: findings(output) |> Enum.with_index() |> Enum.map(fn {finding, index} -> %{"id" => finding_id(contract, row, output, index, finding), "finding" => finding} end)
+
+  @spec projection(map()) :: map()
+  def projection(%{@report => %{"version" => 2}} = output), do: Map.put(output, "findings", findings(output))
+  def projection(output), do: output
 
   defp repair_admitted?(store, row, %{@report => _}) do
     Store.one!(
@@ -154,6 +235,16 @@ defmodule SymphonyElixir.Factory.ReviewProtocol do
   defp repair_admitted?(_store, _row, output), do: output["status"] == "REPAIR"
 
   @spec schema(map(), map()) :: map()
+  def schema(%{"review_protocol" => %{"version" => 2} = protocol} = packet, legacy) do
+    schema =
+      legacy
+      |> Map.update!("required", &((&1 -- ["findings"]) ++ [@report]))
+      |> update_in(["properties"], &Map.delete(&1, "findings"))
+      |> put_in(["properties", @report], ReviewReport.schema(protocol))
+
+    TicketCompletionConfirmation.schema(packet, schema)
+  end
+
   def schema(%{"review_protocol" => %{"version" => 1} = protocol} = packet, legacy) do
     schema =
       legacy
@@ -181,7 +272,7 @@ defmodule SymphonyElixir.Factory.ReviewProtocol do
     end
   end
 
-  defp validate_packet_schema(%{"review_protocol" => %{"version" => 1}, "role" => role} = packet, output_schema) when role in @roles do
+  defp validate_packet_schema(%{"review_protocol" => %{"version" => version}, "role" => role} = packet, output_schema) when role in @roles and version in [1, 2] do
     if output_schema == schema(packet, legacy_schema(role)),
       do: :ok,
       else: {:error, :review_protocol_schema_changed}
@@ -222,6 +313,8 @@ defmodule SymphonyElixir.Factory.ReviewProtocol do
   end
 
   @spec validate(map(), map(), map()) :: :ok | {:error, atom()}
+  def validate(%{"review_protocol" => %{"version" => 2}} = packet, binding, output), do: ReviewReport.validate(packet, binding, output, schema(packet, legacy_schema(packet["role"])))
+
   def validate(%{"review_protocol" => %{"version" => 1} = protocol} = packet, binding, output) do
     legacy = legacy_schema(packet["role"])
 
@@ -252,10 +345,145 @@ defmodule SymphonyElixir.Factory.ReviewProtocol do
   @spec validate_result(Store.connection(), map(), map(), map()) :: :ok | {:error, atom()}
   def validate_result(store, task, binding, output) do
     with {:ok, packet} <- bound_context(store, task, binding),
-         :ok <- exact_input(packet, task, binding) do
-      validate(packet, binding, output)
+         :ok <- exact_input(packet, task, binding),
+         :ok <- validate_scope_history(store, packet) do
+      case validate(packet, binding, output) do
+        :ok -> :ok
+        error -> validate_correction(store, packet, task, binding, output, error)
+      end
     end
   end
+
+  defp validate_scope_history(store, %{"review_protocol" => %{"version" => 2, "review_scope" => scope}} = packet) do
+    proven = Enum.all?(scope["carried_evidence"], fn origin ->
+      with row when is_map(row) <- Store.one!(store, "SELECT * FROM worker_evidence WHERE request_key=? AND run_id=? AND status='CONSUMED'", [origin["request_key"], packet["run_id"]]),
+           true <- digest(row["binding_json"]) == row["binding_sha256"] and digest(row["output_json"]) == row["output_sha256"] and row["output_sha256"] == origin["output_sha256"],
+           {:ok, binding} <- Jason.decode(row["binding_json"]),
+           true <- Map.take(binding, ~w(run_id spec_revision contract_sha256)) == Map.take(packet, ~w(run_id spec_revision contract_sha256)),
+           true <- binding["role"] == "change-verifier" and WorkerEvidence.owner_stopped?(store, row),
+           {:ok, output} <- Jason.decode(row["output_json"]) do
+        output["candidate_sha"] == origin["candidate_sha"] and get_in(output, [@report, "criteria"]) == origin["criteria"]
+      else
+        _ -> false
+      end
+    end)
+    if proven, do: :ok, else: {:error, :review_report_scope_unproven}
+  end
+  defp validate_scope_history(_store, _packet), do: :ok
+
+  @doc "Read-only exact report correction proposal. Only an explicit bijection of duplicated v1 prose is eligible."
+  @spec prepare_correction(Store.connection(), map()) :: {:ok, map()} | {:error, atom()}
+  def prepare_correction(store, input) do
+    with true <- Enum.sort(Map.keys(input)) == ~w(binding_sha256 mapping output_sha256 request_key run_id),
+         row when is_map(row) <- Store.one!(store, "SELECT * FROM worker_evidence WHERE request_key=?", [input["request_key"]]),
+         true <- Map.take(row, ~w(run_id request_key binding_sha256 output_sha256)) == Map.take(input, ~w(run_id request_key binding_sha256 output_sha256)),
+         true <- digest(row["binding_json"]) == row["binding_sha256"] and digest(row["output_json"]) == row["output_sha256"],
+         run when is_map(run) <- Store.one!(store, "SELECT * FROM runs WHERE run_id=?", [input["run_id"]]),
+         task when is_map(task) <- Store.one!(store, "SELECT * FROM factory_tasks WHERE task_key=?", [row["task_key"]]),
+         true <- row["status"] == "RESULT_RECORDED" and WorkerEvidence.owner_stopped?(store, row),
+         {:ok, binding} <- Jason.decode(row["binding_json"]),
+         {:ok, output} <- Jason.decode(row["output_json"]),
+         true <- current_pending_report?(run, task, row, binding),
+         {:ok, packet} <- bound_context(store, task, binding),
+         :ok <- exact_input(packet, task, binding),
+         {:ok, projected} <- correction_projection(packet, binding, output, input["mapping"]) do
+      {:ok,
+       input
+       |> Map.merge(Map.take(run, ~w(candidate_sha contract_sha256 spec_revision)))
+       |> Map.merge(Map.take(task, ~w(task_key stage)))
+       |> Map.put("status", "REPORT_CORRECTION_PREPARED")
+       |> Map.put("projection_sha256", digest(Jason.encode!(projected)))
+       |> Map.put("transform", "V1_CLASSIFICATION_DESCRIPTION_BIJECTION_V1")
+       |> Map.put("verdict", output["status"])
+       |> Map.put("automatic_repairs_used", packet["review_protocol"]["repairs_used"])}
+    else
+      _ -> {:error, :review_report_correction_ineligible}
+    end
+  end
+
+  @doc "Journals at most one report-only correction without rewriting worker/task bytes or spending a product repair."
+  @spec correct_report(Store.connection(), map()) :: {:ok, map()} | {:error, atom()}
+  def correct_report(store, input) do
+    Store.transaction!(store, fn tx ->
+      base = Map.drop(input, ~w(projection_sha256 authorization_reference))
+
+      with true <- Enum.sort(Map.keys(input)) == ~w(authorization_reference binding_sha256 mapping output_sha256 projection_sha256 request_key run_id),
+           true <- is_binary(input["authorization_reference"]) and String.trim(input["authorization_reference"]) != "",
+           {:ok, prepared} <- prepare_correction(tx, base),
+           true <- prepared["projection_sha256"] == input["projection_sha256"] do
+        receipt =
+          Map.merge(prepared, %{"status" => "REPORT_CORRECTION_RECORDED", "version" => 1, "kind" => "REVIEW_REPORT_CORRECTION_V1", "authorization_reference" => input["authorization_reference"]})
+
+        prior =
+          Store.query!(tx, "SELECT payload_json FROM events WHERE run_id=? AND event_type='TICKET_REVIEW_REPORT_CORRECTED' AND json_extract(payload_json,'$.request_key')=?", [
+            input["run_id"],
+            input["request_key"]
+          ]).rows
+
+        case prior do
+          [] ->
+            Store.query!(tx, "INSERT INTO events(occurred_at,event_type,run_id,payload_json) VALUES (?,'TICKET_REVIEW_REPORT_CORRECTED',?,?)", [
+              DateTime.to_iso8601(DateTime.utc_now()),
+              input["run_id"],
+              Jason.encode!(receipt)
+            ])
+
+            {:ok, receipt}
+
+          [[raw]] ->
+            if Jason.decode!(raw) == receipt, do: {:ok, receipt}, else: {:error, :review_report_correction_already_used}
+
+          _ ->
+            {:error, :review_report_correction_already_used}
+        end
+      else
+        _ -> {:error, :review_report_correction_ineligible}
+      end
+    end)
+  end
+
+  defp validate_correction(store, packet, task, binding, output, original_error) do
+    rows =
+      Store.query!(
+        store,
+        "SELECT payload_json FROM events WHERE run_id=? AND event_type='TICKET_REVIEW_REPORT_CORRECTED' AND json_extract(payload_json,'$.binding_sha256')=? AND json_extract(payload_json,'$.output_sha256')=?",
+        [task["run_id"], digest(Jason.encode!(binding)), digest(Jason.encode!(output))]
+      ).rows
+
+    with [[raw]] <- rows,
+         {:ok, receipt} <- Jason.decode(raw),
+         true <- receipt["kind"] == "REVIEW_REPORT_CORRECTION_V1" and receipt["version"] == 1 and receipt["transform"] == "V1_CLASSIFICATION_DESCRIPTION_BIJECTION_V1",
+         row when is_map(row) <- Store.one!(store, "SELECT * FROM worker_evidence WHERE request_key=?", [receipt["request_key"]]),
+         true <- row["task_key"] == task["task_key"] and row["output_json"] == Jason.encode!(output) and row["binding_json"] == Jason.encode!(binding),
+         true <- WorkerEvidence.owner_stopped?(store, row),
+         {:ok, projected} <- correction_projection(packet, binding, output, receipt["mapping"]),
+         true <- digest(Jason.encode!(projected)) == receipt["projection_sha256"] do
+      :ok
+    else
+      _ -> original_error
+    end
+  end
+
+  defp correction_projection(%{"role" => "change-verifier", "review_protocol" => %{"version" => 1}} = packet, binding, output, mapping) when is_list(mapping) do
+    with {:error, :review_protocol_evidence_incomplete} <- validate(packet, binding, output),
+         :ok <- StageSchemas.validate(output, binding["schema"]),
+         true <- output["status"] in ~w(REPAIR BLOCK),
+         findings = output["findings"],
+         rows = output[@report]["finding_classifications"],
+         indices = Enum.to_list(0..(length(findings) - 1)),
+         true <- findings != [] and length(findings) == length(rows) and length(mapping) == length(rows),
+         true <- Enum.all?(mapping, &(is_map(&1) and Enum.sort(Map.keys(&1)) == ~w(classification_index finding_index))),
+         true <- Enum.sort(Enum.map(mapping, & &1["classification_index"])) == indices and Enum.sort(Enum.map(mapping, & &1["finding_index"])) == indices,
+         projected_rows = Enum.reduce(mapping, rows, fn item, current -> List.update_at(current, item["classification_index"], &Map.put(&1, "finding", Enum.at(findings, item["finding_index"]))) end),
+         projected = put_in(output, [@report, "finding_classifications"], projected_rows),
+         :ok <- validate(packet, binding, projected) do
+      {:ok, projected}
+    else
+      _ -> {:error, :review_report_correction_ineligible}
+    end
+  end
+
+  defp correction_projection(_, _, _, _), do: {:error, :review_report_correction_ineligible}
 
   defp exact_input(%{"review_protocol" => _} = packet, task, binding) do
     matching = Map.take(packet, ~w(run_id role stage spec_revision contract_sha256)) == Map.take(binding, ~w(run_id role stage spec_revision contract_sha256))
@@ -282,9 +510,17 @@ defmodule SymphonyElixir.Factory.ReviewProtocol do
     unresolved = protocol["repairs_used"] > 0 and unresolved_closure?(output[@report])
 
     cond do
-      unresolved -> {:stop, stop(protocol, "UNRESOLVED_FINDING")}
-      protocol["repairs_used"] >= @limit -> {:stop, stop(protocol, "REPAIR_LIMIT")}
-      true -> :repair
+      unresolved ->
+        {:stop, stop(protocol, "UNRESOLVED_FINDING")}
+
+      protocol["repairs_used"] >= @limit ->
+        {:stop, stop(protocol, "REPAIR_LIMIT")}
+
+      protocol["version"] == 2 and protocol["review_scope"]["mode"] == "FOCUSED" and Enum.any?(output[@report]["findings"], &(&1["disposition"] == "REQUIRED_REPAIR" and &1["classification"] == "NEW")) ->
+        {:stop, stop(protocol, "LATE_FINDING_ESCALATION")}
+
+      true ->
+        :repair
     end
   end
 
@@ -391,7 +627,7 @@ defmodule SymphonyElixir.Factory.ReviewProtocol do
       explanation: explanation,
       owner: "Requester decision",
       recorded_ci: recorded_ci(run),
-      findings: output["findings"],
+      findings: findings(output),
       verifier_task_key: task["task_key"],
       evidence_at: evidence["consumed_at"],
       next_action: "Review the findings in the ticket chat and decide on a separately authorized continuation. Automatic repair is stopped."
@@ -412,6 +648,11 @@ defmodule SymphonyElixir.Factory.ReviewProtocol do
     {"REVIEW_POLICY", "Verification stopped: a finding remains unresolved", "Stop early when a prior finding remains unresolved",
      "A previously reported finding remains unresolved after #{policy["repairs_used"]} repair attempt(s)."}
   end
+
+  defp stop_description(%{"reason" => "LATE_FINDING_ESCALATION"}, _output),
+    do:
+      {"REVIEW_POLICY", "New finding requires scope decision", "Focused repair review cannot restart unrestricted review",
+       "The report is preserved as non-PASS. A newly discovered mandatory defect requires an explicit operator scope decision."}
 
   defp stop_description(nil, output) do
     legacy_limit = not Map.has_key?(output, @report) and Enum.any?(output["checks"], &String.contains?(String.downcase(&1), ["two-consecutive-non-pass", "two consecutive non-pass"]))
@@ -464,7 +705,7 @@ defmodule SymphonyElixir.Factory.ReviewProtocol do
          true <- payload["output_sha256"] == evidence["output_sha256"] and payload["binding_sha256"] == evidence["binding_sha256"],
          true <- Map.take(payload, ~w(candidate_sha contract_sha256 spec_revision verifier_round)) == Map.take(run, ~w(candidate_sha contract_sha256 spec_revision verifier_round)),
          %{"version" => 1, "reason" => reason, "repair_attempt_limit" => 2} = stop <- payload["stop"],
-         true <- reason in ~w(REPAIR_LIMIT UNRESOLVED_FINDING) do
+         true <- reason in ~w(REPAIR_LIMIT UNRESOLVED_FINDING LATE_FINDING_ESCALATION) do
       stop
     else
       _ -> nil

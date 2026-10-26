@@ -527,6 +527,24 @@ defmodule SymphonyElixir.Factory.Worktree do
     end
   end
 
+  @doc "Reads a bounded review delta in an exact registered checkout; no fetch, writes, or route authority."
+  @spec review_paths(Path.t(), Path.t(), String.t(), String.t(), String.t()) :: {:ok, [String.t()]} | {:error, term()}
+  def review_paths(repo, path, branch, base, candidate) do
+    with true <- Enum.all?([base, candidate], &(is_binary(&1) and Regex.match?(~r/\A[0-9a-f]{40}\z/, &1))) or {:error, :review_diff_identity_unproven},
+         :ok <- require_registered(repo, path),
+         :ok <- require_clean(path),
+         {:ok, ^branch} <- trimmed_git(path, ["branch", "--show-current"], &identity_git/2),
+         {:ok, ^candidate} <- trimmed_git(path, ["rev-parse", "HEAD"], &identity_git/2),
+         {:ok, _} <- identity_git(path, ["merge-base", "--is-ancestor", base, candidate]),
+         {:ok, raw} <- identity_git(path, ["diff", "--name-only", "-z", "--no-renames", base <> ".." <> candidate]),
+         true <- byte_size(raw) <= 16_384 or {:error, :review_diff_too_large} do
+      {:ok, String.split(raw, "\0", trim: true) |> Enum.uniq() |> Enum.sort()}
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :review_diff_identity_unproven}
+    end
+  end
+
   @doc "Reads committed paths while independently fencing the one declared, stopped writer's dirty slice."
   @spec generation_candidate_paths(map(), Path.t(), String.t(), String.t(), String.t(), [String.t()]) :: {:ok, [String.t()]} | {:error, term()}
   def generation_candidate_paths(route, path, branch, base, candidate, dirty_paths) do

@@ -8,6 +8,7 @@ defmodule Mix.Tasks.Factory.Ticket do
   alias SymphonyElixir.Factory.{
     BrokerRuntime,
     Policy,
+    ReviewProtocol,
     Store,
     TicketCapabilityRecovery,
     TicketChat,
@@ -32,6 +33,9 @@ defmodule Mix.Tasks.Factory.Ticket do
       mix factory.ticket command RUN COMMAND_KEY --workflow WORKFLOW.md
       mix factory.ticket synchronization RUN --workflow WORKFLOW.md
       mix factory.ticket authorize-verifier-repair RUN --payload-base64 BASE64_JSON --workflow WORKFLOW.md
+      mix factory.ticket prepare-report-correction RUN --payload-base64 BASE64_JSON --workflow WORKFLOW.md
+      mix factory.ticket apply-report-correction RUN --payload-base64 BASE64_JSON --workflow WORKFLOW.md
+      mix factory.ticket authorize-policy-stop-repair RUN --payload-base64 BASE64_JSON --workflow WORKFLOW.md
       mix factory.ticket inspect-capability-recovery RUN --payload-base64 BASE64_JSON --workflow WORKFLOW.md
       mix factory.ticket inspect-capability-runtime RUN --payload-base64 BASE64_JSON --workflow WORKFLOW.md
       mix factory.ticket authorize-capability-recovery RUN --payload-base64 BASE64_JSON --workflow WORKFLOW.md
@@ -97,6 +101,27 @@ defmodule Mix.Tasks.Factory.Ticket do
       BrokerRuntime.call(["authorize-ticket-verifier-repair", run, "--workflow", Path.expand(opts[:workflow] || "WORKFLOW.md"), "--payload-base64", payload])
     else
       _ -> {:error, :verifier_repair_authorization_invalid}
+    end
+  end
+
+  defp execute(["authorize-policy-stop-repair", run], _store, opts) do
+    with payload when is_binary(payload) <- opts[:payload_base64],
+         true <- byte_size(payload) <= 43_692,
+         true <- Enum.all?(Keyword.keys(opts), &(&1 in [:workflow, :payload_base64])) do
+      BrokerRuntime.call(["authorize-ticket-policy-stop-repair", run, "--workflow", Path.expand(opts[:workflow] || "WORKFLOW.md"), "--payload-base64", payload])
+    else
+      _ -> {:error, :verifier_repair_authorization_invalid}
+    end
+  end
+
+  defp execute([action, run], _store, opts) when action in ~w(prepare-report-correction apply-report-correction) do
+    with payload when is_binary(payload) <- opts[:payload_base64],
+         true <- byte_size(payload) <= 43_692,
+         true <- Enum.all?(Keyword.keys(opts), &(&1 in [:workflow, :payload_base64])) do
+      operation = if action == "prepare-report-correction", do: "prepare-ticket-report-correction", else: "apply-ticket-report-correction"
+      BrokerRuntime.call([operation, run, "--workflow", Path.expand(opts[:workflow] || "WORKFLOW.md"), "--payload-base64", payload])
+    else
+      _ -> {:error, :review_report_correction_ineligible}
     end
   end
 
@@ -185,6 +210,42 @@ defmodule Mix.Tasks.Factory.Ticket do
   end
 
   def runtime_authorize_verifier_repair(_args, _store, _factory), do: {:error, :verifier_repair_authorization_invalid}
+
+  @doc "Stages an exact one-repair policy-stop continuation through the owning service; ordinary tick still owns application."
+  @spec runtime_authorize_policy_stop_repair([String.t()], Store.connection(), Factory.t()) :: {:ok, map()} | {:error, term()}
+  def runtime_authorize_policy_stop_repair(["authorize-ticket-policy-stop-repair", run, "--workflow", path, "--payload-base64", payload], store, factory) do
+    with true <- path == factory.ticket_supervisor["ticket_workflow"] and factory.ticket_supervisor["enabled"] == true,
+         :ok <- Policy.validate(factory),
+         true <- byte_size(payload) <= 43_692,
+         {:ok, raw} <- Base.decode64(payload),
+         true <- byte_size(raw) <= 32_768,
+         {:ok, %{"run_id" => ^run, "review_policy_stop" => _} = input} <- Jason.decode(raw) do
+      workspace = Path.join([Config.local_workspace_root(), "factory-controller", String.replace(factory.scope, ~r/[^a-zA-Z0-9._-]/, "_")])
+      TicketVerifierRepair.stage_policy_stop(store, input, factory, workspace: workspace)
+    else
+      _ -> {:error, :verifier_repair_authorization_invalid}
+    end
+  end
+
+  def runtime_authorize_policy_stop_repair(_, _, _), do: {:error, :verifier_repair_authorization_invalid}
+
+  @doc "Prepares or journals one exact report-only projection in the owning controller; never dispatches or changes verdict."
+  @spec runtime_report_correction([String.t()], Store.connection(), Factory.t()) :: {:ok, map()} | {:error, term()}
+  def runtime_report_correction([operation, run, "--workflow", path, "--payload-base64", payload], store, factory)
+      when operation in ~w(prepare-ticket-report-correction apply-ticket-report-correction) do
+    with true <- path == factory.ticket_supervisor["ticket_workflow"] and factory.ticket_supervisor["enabled"] == true,
+         :ok <- Policy.validate(factory),
+         true <- byte_size(payload) <= 43_692,
+         {:ok, raw} <- Base.decode64(payload),
+         true <- byte_size(raw) <= 32_768,
+         {:ok, %{"run_id" => ^run} = input} <- Jason.decode(raw) do
+      if operation == "prepare-ticket-report-correction", do: ReviewProtocol.prepare_correction(store, input), else: ReviewProtocol.correct_report(store, input)
+    else
+      _ -> {:error, :review_report_correction_ineligible}
+    end
+  end
+
+  def runtime_report_correction(_, _, _), do: {:error, :review_report_correction_ineligible}
 
   @doc "Observes or stages exact grant-backed operator authority in the existing owning service; never dispatches."
   @spec runtime_capability_recovery([String.t()], Store.connection(), Factory.t()) :: {:ok, map()} | {:error, term()}
