@@ -1138,7 +1138,7 @@ def consumed_check(connection, worker, access, next_binding):
     binding = decode(worker['binding_json'])
     require(worker['status'] == 'CONSUMED' and sha(worker['binding_json'].encode()) == worker['binding_sha256'] and sha(worker['output_json'].encode()) == worker['output_sha256'])
     require(decode(worker['output_json'])['status'] == 'CONTINUE')
-    admission_stop(worker,access)
+    admission_stop(connection,worker,access,{'kind':'CONTINUE'})
     receipt = {key:worker[key] for key in ('request_key','binding_sha256','output_sha256','consumed_at','owner_stopped_at')}
     require(decode(access['release_receipt_json']) == receipt)
     require(utc(access['acquired_at']) <= utc(worker['owner_stopped_at']) <= utc(worker['consumed_at']) <= utc(access['released_at']))
@@ -1342,7 +1342,7 @@ def rollover_verifier(connection, binding, run, qualifier):
     require(all(source[key] == run[key] for key in ('candidate_sha','spec_revision','contract_sha256','branch')) and source['expected_sha'] == run['candidate_sha'] and source['prompt_sha256'] == wb['prompt_sha256'])
     require(all(source[key] == binding['checkout'][key] for key in ('path','git_dir','common_dir','root_device','root_inode')) and source['path'] == access[0]['canonical_path'])
     require(type(source['allowed_root']) is str and os.path.isabs(source['allowed_root']) and os.path.normpath(source['allowed_root']) == source['allowed_root'] and os.path.commonpath([source['allowed_root'],source['path']]) == source['allowed_root'])
-    admission_stop(worker,access[0])
+    admission_stop(connection,worker,access[0],{'kind':'ROLLOVER_VERIFIER'})
     require(decode(access[0]['release_receipt_json']) == {key:worker[key] for key in ('request_key','binding_sha256','output_sha256','consumed_at','owner_stopped_at')})
     require(utc(worker['owner_stopped_at']) <= utc(worker['consumed_at']) <= utc(access[0]['released_at']))
     require(wb['input_sha256'] == wb['prompt_sha256'] == task['prompt_sha256'])
@@ -1443,12 +1443,102 @@ def complete_content(artifacts, snapshots):
     return members
 
 
-def admission_stop(worker, access):
+def admission_stop(connection, worker, access, horizon):
     stop, process = decode(worker['owner_stop_json']), decode(worker['owner_process_json'])
     require(type(stop) is dict and set(stop) == set('transport thread_id pid invocation_nonce exit_status cwd'.split()))
     require(stop['transport'] == 'owned_app_server' and stop['thread_id'] == worker['thread_id'] and stop['cwd'] == access['canonical_path'])
-    require(type(stop['exit_status']) is int and stop['exit_status'] == 0 and type(stop['pid']) is str and re.fullmatch('[1-9][0-9]*',stop['pid']) is not None and hex_digest(stop['invocation_nonce']))
+    require(type(stop['exit_status']) is int and type(stop['pid']) is str and re.fullmatch('[1-9][0-9]*',stop['pid']) is not None and hex_digest(stop['invocation_nonce']))
     require(process == {'pid':stop['pid'],'invocation_nonce':stop['invocation_nonce']} and type(worker['owner_stopped_at']) is str and worker['owner_stopped_at'])
+    if stop['exit_status'] != 0:
+        native_completion_receipt(connection,worker,access,horizon)
+
+
+def completion_text(value, maximum):
+    require(type(value) is str and 1 <= len(value.encode('utf-8')) <= maximum)
+
+
+def completion_horizon(connection, worker, access, binding, output, horizon):
+    require(type(horizon) is dict and type(horizon.get('kind')) is str)
+    kind = horizon['kind']
+    if kind == 'CI_SUCCESSOR':
+        require(set(horizon) == {'kind','disposition_event','admitted_at'})
+        require(worker['status'] == 'RESULT_RECORDED' and access['mode'] == 'SOURCE' and access['released_at'] is None and access['release_receipt_json'] is None)
+        require(binding['role'] == 'feature-writer' and binding['stage'] == 'REPAIRING' and output['status'] == 'BLOCKED')
+        disposition = horizon['disposition_event']
+        require(type(disposition) is dict and set(disposition) == {'id','occurred_at','event_type','run_id','payload_json'})
+        require(type(disposition['id']) is int and disposition['id'] > 0 and disposition['event_type'] == 'TICKET_NATIVE_WRITER_BLOCKED' and disposition['run_id'] == worker['run_id'])
+        require(rows(connection,'SELECT * FROM events WHERE id=?',(disposition['id'],)) == [disposition])
+        payload = decode(disposition['payload_json'])
+        require(all(payload[key] == worker[key] for key in ('request_key','task_key','reservation_key','output_json','output_sha256')) and payload['reservation_generation'] == access['generation'])
+        upper = utc(disposition['occurred_at'])
+        require(upper <= utc(horizon['admitted_at']))
+        return upper
+    contexts = {
+        'CONTINUE': ('feature-writer','SOURCE',{'CONTINUE'}),
+        'ORDINARY_WRITER': ('feature-writer','SOURCE',{'COMPLETE'}),
+        'ORDINARY_VERIFIER': ('change-verifier','REVIEW',{'BLOCK','REPAIR'}),
+        'ROLLOVER_VERIFIER': ('change-verifier','REVIEW',{'PASS'})}
+    require(set(horizon) == {'kind'} and kind in contexts)
+    role, mode, verdicts = contexts[kind]
+    require(worker['status'] == 'CONSUMED' and access['released_at'] is not None and binding['role'] == role and access['mode'] == binding['mode'] == mode and output['status'] in verdicts)
+    if kind == 'ORDINARY_WRITER': require(binding['stage'] == 'REPAIRING')
+    if kind in ('ORDINARY_VERIFIER','ROLLOVER_VERIFIER'): require(binding['stage'] == 'VERIFYING')
+    upper = utc(worker['consumed_at'])
+    require(upper <= utc(access['released_at']))
+    return upper
+
+
+def native_completion_receipt(connection, worker, access, horizon):
+    # A historical nonzero stop is adopted only through its atomic, body-free
+    # completion receipt. It is never rewritten or treated as execution authority.
+    require(len(worker['owner_stop_json'].encode()) <= 8192)
+    binding, output = decode(worker['binding_json']), decode(worker['output_json'])
+    require(sha(worker['binding_json'].encode()) == worker['binding_sha256'] and sha(worker['output_json'].encode()) == worker['output_sha256'])
+    require(all(worker[key] == access[key] == binding[key] for key in ('run_id','task_key','reservation_key')) and access['request_key'] == worker['request_key'])
+    require(type(binding['reservation_generation']) is int and binding['reservation_generation'] > 0 and type(access['generation']) is int and access['generation'] == binding['reservation_generation'])
+    require(binding['mode'] == access['mode'] and binding['policy']['cwd'] == access['canonical_path'])
+    upper = completion_horizon(connection,worker,access,binding,output,horizon)
+    found = []
+    for row in rows(connection,"SELECT * FROM events WHERE event_type='TICKET_WORKER_NATIVE_COMPLETION_RECOVERED' AND run_id=?",(worker['run_id'],)):
+        require(set(row) == {'id','occurred_at','event_type','run_id','payload_json'} and type(row['id']) is int and row['id'] > 0)
+        receipt = decode(row['payload_json'])
+        require(type(receipt) is dict)
+        completion_text(receipt.get('request_key'),4096)
+        require(connection.execute('SELECT 1 FROM worker_evidence WHERE request_key=? AND run_id=?',(receipt['request_key'],worker['run_id'])).fetchone() is not None)
+        if receipt['request_key'] == worker['request_key']:
+            require(len(row['payload_json'].encode()) <= 32768)
+            found.append((row,receipt))
+    require(len(found) == 1)
+    event, receipt = found[0]
+    require(set(receipt) == set('kind version request_key task_key run_id reservation_key reservation_generation owner_id owner_stopped_at binding_sha256 failure_code owner_stop_json native_parsed_json_sha256 native_completion native_observation thread_id turn_id item_id output_sha256'.split()))
+    require(receipt['kind'] == 'NATIVE_COMPLETION_RECEIPT_V1' and type(receipt['version']) is int and receipt['version'] == 1)
+    require(type(receipt['reservation_generation']) is int and receipt['reservation_generation'] == binding['reservation_generation'])
+    require(all(receipt[key] == worker[key] for key in ('request_key','task_key','run_id','reservation_key','owner_id','owner_stopped_at','binding_sha256','owner_stop_json','thread_id','turn_id','item_id','output_sha256')))
+    for keys, maximum in ((('request_key','task_key','reservation_key'),4096),(('run_id','owner_id'),256),(('thread_id','turn_id','item_id'),1024),(('failure_code',),128)):
+        for key in keys: completion_text(receipt[key],maximum)
+    require(receipt['failure_code'] == ':turn_timeout' or re.fullmatch(r'\{:port_exit, -?\d+\}',receipt['failure_code']) is not None)
+    require(all(hex_digest(receipt[key]) for key in ('binding_sha256','output_sha256','native_parsed_json_sha256')))
+    require(type(receipt['native_completion']) is dict and receipt['native_completion'] == {'status':'completed','error':None})
+    observed = receipt['native_observation']
+    require(type(observed) is dict and set(observed) == {'thread','latest','confirmation','queue'})
+    thread, latest, confirmation, queue = (observed[key] for key in ('thread','latest','confirmation','queue'))
+    require(all(type(value) is dict for value in (thread,latest,confirmation,queue)))
+    require(set(thread) == {'id','cwd','updatedAt','status'} and thread['id'] == worker['thread_id'] and thread['cwd'] == access['canonical_path'])
+    completion_text(thread['cwd'],4096)
+    require(type(thread['status']) is dict and set(thread['status']) == {'type'} and thread['status']['type'] in ('idle','notLoaded','systemError'))
+    require(type(thread['updatedAt']) in (int,float) and math.isfinite(thread['updatedAt']) and thread['updatedAt'] >= 0)
+    require(set(latest) == {'mode','parameters','sha256','updated_at','observed_at'} and latest['mode'] == 'LATEST_DESC')
+    require(type(latest['updated_at']) in (int,float) and math.isfinite(latest['updated_at']) and latest['updated_at'] == thread['updatedAt'])
+    parameters = latest['parameters']
+    require(type(parameters) is dict and set(parameters) == {'threadId','limit','sortDirection','itemsView'} and parameters['threadId'] == worker['thread_id'] and type(parameters['limit']) is int and parameters['limit'] == 1 and parameters['sortDirection'] == 'desc' and parameters['itemsView'] == 'full')
+    require(set(confirmation) == {'sha256','observed_at'})
+    require(set(queue) == {'thread_id','empty_complete','count_lower_bound','has_more','sha256','observed_at'} and queue['thread_id'] == worker['thread_id'] and queue['empty_complete'] is True and type(queue['count_lower_bound']) is int and queue['count_lower_bound'] == 0 and queue['has_more'] is False)
+    stopped, occurred = utc(worker['owner_stopped_at']), utc(event['occurred_at'])
+    require(utc(access['acquired_at']) <= stopped <= occurred <= upper)
+    for observation in (latest,confirmation,queue):
+        require(hex_digest(observation['sha256']))
+        at = utc(observation['observed_at'])
+        require(stopped <= at <= occurred and occurred-at <= datetime.timedelta(seconds=10))
 
 
 def validate_successors(connection, execution):
@@ -1495,7 +1585,6 @@ def validate_successors(connection, execution):
             instruction_claim(connection,worker,task,claim,before)
             require(decode(worker['binding_json'])['expected_sha'] == before['candidate_sha'])
             output = decode(worker['output_json']); require(output['status'] == 'BLOCKED' and output['changed_paths'] == [])
-            admission_stop(worker,access)
             current_access = rows(connection,'SELECT * FROM workspace_access WHERE reservation_key=?',(access['reservation_key'],))
             require(len(current_access) == 1 and {k:v for k,v in current_access[0].items() if k not in ('released_at','release_receipt_json')} == {k:v for k,v in access.items() if k not in ('released_at','release_receipt_json')} and current_access[0]['released_at'] is not None)
             source = proof['source_observation']; require(set(source) == {'canonical_path','head_sha','dirty_paths'} and source == {'canonical_path':access['canonical_path'],'head_sha':before['candidate_sha'],'dirty_paths':[]})
@@ -1509,6 +1598,7 @@ def validate_successors(connection, execution):
             require(type(payload['task']) is dict and set(payload['task']) == task_projection and payload['task'] == {key:task[key] for key in task_projection})
             require(type(payload['run_binding']) is dict and set(payload['run_binding']) == run_projection and payload['run_binding'] == {key:before[key] for key in run_projection})
             require(type(payload['disposition_key']) is str and payload['disposition_key'])
+            admission_stop(connection,worker,access,{'kind':'CI_SUCCESSOR','disposition_event':event,'admitted_at':proof['admitted_at']})
             content = complete_content(evidence['artifacts'],proof['ci_snapshots'])
             require(content and content == evidence['content_members'] == proof['content_members'] and digest(content) == row['evidence_content_sha256'])
             parent = validated.get(row['prior_successor_key'])
@@ -1727,7 +1817,7 @@ def ordinary_repair_proof(connection, execution, binding, run, historical=False)
         access = accesses[0]
         require(access['mode'] == mode and access['released_at'] is not None and access['run_id'] == run['run_id'] and access['task_key'] == task['task_key'] and access['request_key'] == worker['request_key'])
         require(access['generation'] == wb['reservation_generation'] and access['reservation_key'] == wb['reservation_key'] and access['canonical_path'] == run['worktree'])
-        admission_stop(worker,access)
+        admission_stop(connection,worker,access,{'kind':'ORDINARY_WRITER' if prefix == 'writer' else 'ORDINARY_VERIFIER'})
         require(decode(access['release_receipt_json']) == {key:worker[key] for key in ('request_key','binding_sha256','output_sha256','consumed_at','owner_stopped_at')})
         mapping = rows(connection,'SELECT * FROM worker_instruction_task_bindings WHERE task_key=? AND prompt_sha256=?',(task['task_key'],task['prompt_sha256']))
         require(len(mapping) == 1 and mapping[0]['run_id'] == run['run_id'] and mapping[0]['role'] == role)

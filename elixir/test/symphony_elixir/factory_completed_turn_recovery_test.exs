@@ -81,6 +81,137 @@ defmodule SymphonyElixir.FactoryCompletedTurnRecoveryTest do
     assert File.read!(trace) == requests
   end
 
+  test "native completion records a bounded typed receipt while retaining the genuine nonzero stop", ctx do
+    {trace, failed} = failed_attempt(ctx)
+    assert {:ok, _} = TicketWorkerRunner.reconcile_completed(ctx.store, "reservation:request")
+    assert {:ok, recorded} = WorkerEvidence.get(ctx.store, "reservation:request")
+    [proof] = recovery_events(ctx.store)
+    assert proof["kind"] == "NATIVE_COMPLETION_RECEIPT_V1"
+    assert proof["version"] === 1
+
+    assert Enum.sort(Map.keys(proof)) ==
+             Enum.sort(
+               ~w(kind version request_key task_key run_id reservation_key reservation_generation owner_id owner_stopped_at binding_sha256 failure_code owner_stop_json native_parsed_json_sha256 native_completion native_observation thread_id turn_id item_id output_sha256)
+             )
+
+    binding = Jason.decode!(failed["binding_json"])
+
+    assert Map.take(proof, ~w(request_key task_key run_id reservation_key owner_id owner_stopped_at binding_sha256 failure_code owner_stop_json thread_id turn_id)) ==
+             Map.take(failed, ~w(request_key task_key run_id reservation_key owner_id owner_stopped_at binding_sha256 failure_code owner_stop_json thread_id turn_id))
+
+    assert proof["reservation_generation"] == binding["reservation_generation"]
+    assert proof["item_id"] == recorded["item_id"] and proof["output_sha256"] == recorded["output_sha256"]
+    assert proof["native_completion"] == %{"status" => "completed", "error" => nil}
+    assert proof["owner_stop_json"] == failed["owner_stop_json"]
+    assert Jason.decode!(proof["owner_stop_json"])["exit_status"] == 7
+    assert recorded["owner_stop_json"] == failed["owner_stop_json"] and recorded["owner_stopped_at"] == failed["owner_stopped_at"]
+    assert byte_size(Jason.encode!(proof)) <= 32_768
+    refute Jason.encode!(proof) =~ "agentMessage"
+    assert execution_count(trace) == 1
+  end
+
+  @tag timeout: 180_000
+  test "atomic receipt insertion rejects fabricated or altered metadata without changing the failed preimage", ctx do
+    {trace, failed} = failed_attempt(ctx)
+    binding = Jason.decode!(failed["binding_json"])
+    {:ok, run} = RunLedger.get(ctx.store, failed["run_id"])
+    {:ok, task} = TaskLedger.get(ctx.store, failed["task_key"])
+    {:ok, access} = WorkspaceAccess.get(ctx.store, failed["reservation_key"])
+    stop = Jason.decode!(failed["owner_stop_json"])
+    before = %{evidence: failed, binding: binding, run: run, task: task, access: access, stop: stop}
+    copy_path = Path.join(ctx.root, "before-native-completion.sqlite")
+    assert {_, 0} = System.cmd("sqlite3", [ctx.database, ".backup '#{copy_path}'"])
+    copy = start_supervised!({Store, database: copy_path}, id: :receipt_copy)
+    assert {:ok, _observed} = TicketWorkerRunner.reconcile_completed(ctx.store, failed["request_key"])
+    [proof] = recovery_events(ctx.store)
+    missing = for key <- Map.keys(proof), do: fn result -> update_in(result, [:native_recovery], &Map.delete(&1, key)) end
+
+    changes = [
+      {["version"], true},
+      {["kind"], "UNKNOWN"},
+      {["request_key"], "foreign"},
+      {["task_key"], "foreign"},
+      {["run_id"], "foreign"},
+      {["reservation_key"], "foreign"},
+      {["reservation_generation"], 1.0},
+      {["owner_id"], "foreign"},
+      {["owner_stopped_at"], "2020-01-01T00:00:00Z"},
+      {["binding_sha256"], String.duplicate("f", 64)},
+      {["failure_code"], ":unknown"},
+      {["owner_stop_json"], "{}"},
+      {["native_parsed_json_sha256"], "not-a-hash"},
+      {["thread_id"], "foreign"},
+      {["turn_id"], "foreign"},
+      {["item_id"], "foreign"},
+      {["output_sha256"], String.duplicate("f", 64)},
+      {["native_completion"], %{"status" => "completed"}},
+      {["native_completion", "error"], %{}},
+      {["native_observation", "thread", "cwd"], ctx.repo},
+      {["native_observation", "thread", "id"], "foreign"},
+      {["native_observation", "thread", "updatedAt"], -1},
+      {["native_observation", "thread", "status"], %{"type" => "active"}},
+      {["native_observation", "latest", "mode"], "UNKNOWN"},
+      {["native_observation", "latest", "parameters", "limit"], 1.0},
+      {["native_observation", "latest", "updated_at"], false},
+      {["native_observation", "latest", "sha256"], "INVALID"},
+      {["native_observation", "confirmation", "sha256"], "INVALID"},
+      {["native_observation", "queue", "sha256"], "INVALID"},
+      {["native_observation", "queue", "empty_complete"], false},
+      {["native_observation", "queue", "count_lower_bound"], 0.0},
+      {["native_observation", "queue", "has_more"], true},
+      {["native_observation", "queue", "thread_id"], "foreign"}
+    ]
+
+    altered = for {path, value} <- changes, do: fn result -> put_in(result, [:native_recovery | path], value) end
+
+    extra =
+      for path <- [
+            ["native_observation"],
+            ["native_observation", "thread"],
+            ["native_observation", "thread", "status"],
+            ["native_observation", "latest"],
+            ["native_observation", "latest", "parameters"],
+            ["native_observation", "confirmation"],
+            ["native_observation", "queue"]
+          ],
+          do: fn result -> update_in(result, [:native_recovery | path], &Map.put(&1, "unknown", true)) end
+
+    times =
+      for field <- ~w(latest confirmation queue),
+          timestamp <- ["2020-01-01T00:00:00Z", "2999-01-01T00:00:00Z", "2026-10-27T00:00:00+00:00", nil],
+          do: fn result -> put_in(result, [:native_recovery, "native_observation", field, "observed_at"], timestamp) end
+
+    cases = missing ++ altered ++ extra ++ times ++ [&Map.delete(&1, :reconciliation_preimage)]
+
+    # Fresh source-validated observations keep expiry from explaining a negative.
+    for batch <- Enum.chunk_every(cases, 5) do
+      reset_receipt_fixture(ctx.store, failed)
+      assert {:ok, observed} = TicketWorkerRunner.reconcile_completed(ctx.store, failed["request_key"])
+      [fresh] = recovery_events(ctx.store)
+      recovered = observed |> Map.put(:reconciliation_preimage, before) |> Map.put(:native_recovery, fresh)
+
+      for mutate <- batch do
+        assert {:error, _} = WorkerEvidence.reconcile_completed(copy, failed["request_key"], failed["owner_id"], mutate.(recovered), stop)
+        assert {:ok, ^failed} = WorkerEvidence.get(copy, failed["request_key"])
+        assert recovery_events(copy) == []
+      end
+
+      assert {:ok, _} = WorkerEvidence.reconcile_completed(copy, failed["request_key"], failed["owner_id"], recovered, stop)
+      assert length(recovery_events(copy)) == 1
+      reset_receipt_fixture(copy, failed)
+    end
+
+    assert {:ok, ^failed} = WorkerEvidence.get(copy, failed["request_key"])
+    assert execution_count(trace) == 1
+  end
+
+  defp reset_receipt_fixture(store, failed) do
+    Store.query!(store, "DELETE FROM events WHERE event_type='TICKET_WORKER_NATIVE_COMPLETION_RECOVERED' AND run_id=?", [failed["run_id"]])
+    keys = ~w(status item_id output_json output_sha256 failure_code)
+    Store.query!(store, "UPDATE worker_evidence SET " <> Enum.map_join(keys, ",", &(&1 <> "=?")) <> " WHERE request_key=?", Enum.map(keys, &failed[&1]) ++ [failed["request_key"]])
+    assert {:ok, ^failed} = WorkerEvidence.get(store, failed["request_key"])
+  end
+
   test "rejected result persistence rolls back the recovery event with the result", ctx do
     {trace, failed} = failed_attempt(ctx)
 

@@ -663,17 +663,11 @@ defmodule SymphonyElixir.Factory.WorkerEvidence do
            :ok <- StageSchemas.validate(result[:output], binding["schema"]),
            :ok <- pinned_result(binding, result[:output]),
            raw = Jason.encode!(result[:output]),
+           occurred_at = now(),
            :ok <- recovered_output(evidence, raw, result[:item_id]),
            true <- valid_stop(tx, evidence, stop) or {:error, :worker_stop_receipt_invalid},
-           true <- is_nil(evidence["owner_stop_json"]) or evidence["owner_stop_json"] == Jason.encode!(stop) or {:error, :worker_stop_receipt_conflict} do
-        if provenance = result[:native_recovery] do
-          Store.query!(tx, "INSERT INTO events(occurred_at,event_type,run_id,payload_json) VALUES (?, 'TICKET_WORKER_NATIVE_COMPLETION_RECOVERED', ?, ?)", [
-            now(),
-            evidence["run_id"],
-            Jason.encode!(Map.merge(provenance, %{thread_id: result.thread_id, turn_id: result.turn_id, item_id: result.item_id, output_sha256: digest(raw)}))
-          ])
-        end
-
+           true <- is_nil(evidence["owner_stop_json"]) or evidence["owner_stop_json"] == Jason.encode!(stop) or {:error, :worker_stop_receipt_conflict},
+           :ok <- record_native_completion(tx, evidence, binding, result, occurred_at) do
         update(
           tx,
           key,
@@ -686,6 +680,37 @@ defmodule SymphonyElixir.Factory.WorkerEvidence do
             Jason.encode!(stop)
           ]
         )
+      end
+    end)
+  end
+
+  defp record_native_completion(store, evidence, binding, %{native_recovery: proof} = result, occurred_at) do
+    with %{evidence: ^evidence, binding: ^binding} = before <- result[:reconciliation_preimage],
+         :ok <- SymphonyElixir.Factory.CompletedTurnRecovery.validate_receipt(proof, before, result, occurred_at),
+         true <- native_completion_unrecorded?(store, evidence),
+         %{"id" => id} when is_integer(id) and id > 0 <-
+           Store.one!(store, "INSERT INTO events(occurred_at,event_type,run_id,payload_json) VALUES (?, 'TICKET_WORKER_NATIVE_COMPLETION_RECOVERED', ?, ?) RETURNING id", [
+             occurred_at,
+             evidence["run_id"],
+             Jason.encode!(proof)
+           ]) do
+      :ok
+    else
+      _ -> {:error, :completed_turn_receipt_unproven}
+    end
+  end
+
+  defp record_native_completion(_store, _evidence, _binding, _result, _occurred_at), do: :ok
+
+  defp native_completion_unrecorded?(store, evidence) do
+    Store.query!(store, "SELECT payload_json FROM events WHERE event_type='TICKET_WORKER_NATIVE_COMPLETION_RECOVERED' AND run_id=?", [evidence["run_id"]]).rows
+    |> Enum.all?(fn [raw] ->
+      with {:ok, %{"request_key" => request}} when is_binary(request) and byte_size(request) in 1..4096 <- Jason.decode(raw),
+           true <- request != evidence["request_key"],
+           %{"request_key" => ^request} <- Store.one!(store, "SELECT request_key FROM worker_evidence WHERE request_key=? AND run_id=?", [request, evidence["run_id"]]) do
+        true
+      else
+        _ -> false
       end
     end)
   end
