@@ -22,9 +22,9 @@ TOOLS = Path(__file__).resolve().parent
 HISTORICAL = Path('/private/tmp/symphony-push-handoff.cnRVdUfY/review-cutover-r19f2')
 GUARD_SHA = '41c26ac2067bdba97ecbf92238e11f813e0e45c8068283b75565677abfe53482'
 THAW_SHA = 'cec22fd5003117f496bbe369baaf935f8c9f4797ae519ae0ca90578fb12b4534'
-OLD_RELEASE = Path('/Users/cgable/Library/Application Support/ai-factory/releases/symphony-review-report-c64615d')
-OLD_MANIFEST_SHA = '7863c80da984b39a307de1e5f72cf7aceca1f1d738955593a02b592b68471de7'
-OLD_LAUNCHER_SHA = '5114a428e69d276b61ae40f2f7d2fb3b966c5396eba6f9ea43567f94337feb06'
+OLD_RELEASE = Path('/Users/cgable/Library/Application Support/ai-factory/releases/symphony-review-report-e47cce2-r2')
+OLD_MANIFEST_SHA = 'bef269d33f281ea679b9050f7e0cbe5f54f0ab4b30dc4790ee8709cf1b05cda3'
+OLD_LAUNCHER_SHA = '65693470cd838c9dcce60e8e9eb8898ddbc4e4d9118fd6e22433e7b2e50c42c5'
 OLD_BOOT_SHA = '418b1a40af2c0ae5059fd841b9191ecacc0b8de6b451a4dd499e97bffcb60fb8'
 RUN = 'ab5ab1fe-32cc-48c1-985e-3c3800adcfa2'
 CANDIDATE = 'eb9c67f06a00a38d98dd0d4ba1dd2e83a0883834'
@@ -70,9 +70,9 @@ def bind(evidence_root):
     g = importlib.util.module_from_spec(spec)
     exec(compile(raw, str(path), 'exec', dont_inherit=True), g.__dict__)
     g.ROOT = evidence_root
-    g.OLD_PID = '38770'
-    g.OLD_START = 'Mon Oct 26 20:12:20 2026'
-    g.OLD_FINGERPRINT = 'bc5fa35631c761e5b97924741500c903c0b17a6220f3855c2e84b3b6bf77a836'
+    g.OLD_PID = '3930'
+    g.OLD_START = 'Mon Oct 26 20:47:21 2026'
+    g.OLD_FINGERPRINT = 'ac0413df7d55651da903b14b0cbc6ffe589ce454669c31f07dfac9a5ce859051'
 
     def configuration():
         broker = tomllib.loads(g.BROKER.read_text())
@@ -156,6 +156,11 @@ IO.puts("NATIVE_SOURCE_QUIET")
             assert run['verifier_round'] == 5 and run['code_repair_round'] == 13
             assert run['implementation_iteration'] == 27
             assert run['ci_pipeline_id'] == 2987402948
+            assert hashlib.sha256(run['candidate_handoff'].encode()).hexdigest() == '5935494d2f4b8b2ec0c3e5778a2e297d64f138c73469140db4c20ae3f549c209'
+            intent = json.loads(run['candidate_handoff'])
+            assert intent['kind'] == 'TICKET_PUSH' and intent['phase'] == 'PUSH_UNCERTAIN' and intent['helper_pid'] == 5776
+            assert intent['binding_sha256'] == 'c74d7c25ae5f9d452aee999176cd6bc51ef8e8d0d20c30c157f45a0474d922da'
+            assert all(intent[name] is None for name in ('receipt_json', 'receipt_sha256', 'remote_sha'))
             evidence = dict(db.execute('SELECT * FROM worker_evidence WHERE request_key=?', (REPORT,)).fetchone())
             assert evidence['status'] == 'CONSUMED' and evidence['owner_stopped_at'] and evidence['consumed_at']
             assert json.loads(evidence['output_json'])['status'] == 'COMPLETE'
@@ -276,7 +281,7 @@ IO.puts("NATIVE_SOURCE_QUIET")
             assert current.execute('SELECT MAX(version) FROM factory_schema_migrations').fetchone()[0] == 54
             schema = [list(row) for row in current.execute('SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name')]
             assert hashlib.sha256(json.dumps(schema, separators=(',', ':'), ensure_ascii=False).encode()).hexdigest() == protected['schema_sha256']
-            for table in ('events', 'worker_instruction_snapshots', 'worker_instruction_task_bindings', 'worker_file_operations', 'ticket_mr_claims', 'ticket_mr_actor_bindings'):
+            for table in ('events', 'worker_instruction_snapshots', 'worker_instruction_task_bindings', 'worker_file_operations', 'ticket_mr_claims', 'ticket_mr_actor_bindings', 'ticket_push_rejection_retirements', 'ticket_ordinary_generation_intents', 'ticket_ordinary_generation_events'):
                 quoted = '"' + table + '"'
                 limit = ' WHERE id <= ' + str(protected['event_limit']) if table == 'events' else ''
                 for row in prior.execute('SELECT rowid,* FROM ' + quoted + limit + ' ORDER BY rowid'):

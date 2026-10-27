@@ -118,6 +118,12 @@ CREATE TABLE worker_instruction_task_bindings(value TEXT);
 CREATE TABLE worker_file_operations(value TEXT);
 CREATE TABLE ticket_mr_claims(value TEXT);
 CREATE TABLE ticket_mr_actor_bindings(value TEXT);
+CREATE TABLE ticket_push_rejection_retirements(value TEXT);
+INSERT INTO ticket_push_rejection_retirements VALUES('prior-retirement');
+CREATE TABLE ticket_ordinary_generation_intents(value TEXT);
+INSERT INTO ticket_ordinary_generation_intents VALUES('prior-generation');
+CREATE TABLE ticket_ordinary_generation_events(value TEXT);
+INSERT INTO ticket_ordinary_generation_events VALUES('prior-generation-event');
 CREATE TABLE synthetic_journal(phase TEXT,payload TEXT);
 INSERT INTO synthetic_journal VALUES('FIRST_UNCERTAIN','original');
 CREATE TABLE worker_evidence(request_key TEXT PRIMARY KEY,binding_json TEXT,binding_sha256 TEXT,
@@ -150,6 +156,9 @@ INSERT INTO desktop_requests VALUES('old-uncertain','RECONCILE_REQUIRED');
                 ("UPDATE events SET payload='changed' WHERE id=1", "UPDATE events SET payload='original' WHERE id=1"),
                 ("UPDATE worker_evidence SET output_json='rewritten'", "UPDATE worker_evidence SET output_json='output'"),
                 ("UPDATE worker_evidence SET owner_stop_json='rewritten'", "UPDATE worker_evidence SET owner_stop_json='stop-proof'"),
+                ("UPDATE ticket_push_rejection_retirements SET value='rewritten'", "UPDATE ticket_push_rejection_retirements SET value='prior-retirement'"),
+                ("UPDATE ticket_ordinary_generation_intents SET value='rewritten'", "UPDATE ticket_ordinary_generation_intents SET value='prior-generation'"),
+                ("UPDATE ticket_ordinary_generation_events SET value='rewritten'", "UPDATE ticket_ordinary_generation_events SET value='prior-generation-event'"),
                 ("UPDATE factory_tasks SET output_json='rewritten'", "UPDATE factory_tasks SET output_json='original-output'"),
                 ("UPDATE desktop_requests SET status='PENDING'", "UPDATE desktop_requests SET status='RECONCILE_REQUIRED'"),
                 ("UPDATE synthetic_journal SET phase='CLEARED'", "UPDATE synthetic_journal SET phase='FIRST_UNCERTAIN'"),
