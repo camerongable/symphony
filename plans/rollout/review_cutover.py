@@ -22,12 +22,12 @@ TOOLS = Path(__file__).resolve().parent
 HISTORICAL = Path('/private/tmp/symphony-push-handoff.cnRVdUfY/review-cutover-r19f2')
 GUARD_SHA = '41c26ac2067bdba97ecbf92238e11f813e0e45c8068283b75565677abfe53482'
 THAW_SHA = 'cec22fd5003117f496bbe369baaf935f8c9f4797ae519ae0ca90578fb12b4534'
-OLD_RELEASE = Path('/Users/cgable/Library/Application Support/ai-factory/releases/symphony-review-report-16ed7bf')
-OLD_MANIFEST_SHA = '7fc6eefc4f6157f5044fc0b4e9ea8b6965cbcd2e5ac0d395d5890595408acd7f'
-OLD_LAUNCHER_SHA = 'f0f068b51f4c5d362b5b1e0c703c9d039ac3cd6eac276dea4784ead6222a2c5f'
+OLD_RELEASE = Path('/Users/cgable/Library/Application Support/ai-factory/releases/symphony-review-report-c64615d')
+OLD_MANIFEST_SHA = '7863c80da984b39a307de1e5f72cf7aceca1f1d738955593a02b592b68471de7'
+OLD_LAUNCHER_SHA = '5114a428e69d276b61ae40f2f7d2fb3b966c5396eba6f9ea43567f94337feb06'
 OLD_BOOT_SHA = '418b1a40af2c0ae5059fd841b9191ecacc0b8de6b451a4dd499e97bffcb60fb8'
 RUN = 'ab5ab1fe-32cc-48c1-985e-3c3800adcfa2'
-CANDIDATE = '4e5c48fc2150515c4cb5ce0771f4c204b10c532c'
+CANDIDATE = 'eb9c67f06a00a38d98dd0d4ba1dd2e83a0883834'
 REPORT = 'desktop:11b288b43e59ae80afdfc26b01e1bcf2f2d297249cc54e8f0d0af98829629c5a'
 
 
@@ -70,9 +70,9 @@ def bind(evidence_root):
     g = importlib.util.module_from_spec(spec)
     exec(compile(raw, str(path), 'exec', dont_inherit=True), g.__dict__)
     g.ROOT = evidence_root
-    g.OLD_PID = '39368'
-    g.OLD_START = 'Mon Oct 26 12:43:25 2026'
-    g.OLD_FINGERPRINT = '7c3eac1ebec8b6307ea3cb1ccc9813348c39419b87e42c4d22b660d9071efe3b'
+    g.OLD_PID = '38770'
+    g.OLD_START = 'Mon Oct 26 20:12:20 2026'
+    g.OLD_FINGERPRINT = 'bc5fa35631c761e5b97924741500c903c0b17a6220f3855c2e84b3b6bf77a836'
 
     def configuration():
         broker = tomllib.loads(g.BROKER.read_text())
@@ -152,12 +152,12 @@ IO.puts("NATIVE_SOURCE_QUIET")
         with g.readonly() as db:
             db.row_factory = sqlite3.Row
             run = dict(db.execute('SELECT * FROM runs WHERE run_id=?', (RUN,)).fetchone())
-            assert run['state'] == 'REPAIRING' and run['candidate_sha'] == CANDIDATE
+            assert run['state'] == 'CI_PUSHING' and run['candidate_sha'] == CANDIDATE
             assert run['verifier_round'] == 5 and run['code_repair_round'] == 13
-            assert run['implementation_iteration'] == 26
+            assert run['implementation_iteration'] == 27
             assert run['ci_pipeline_id'] == 2987402948
             evidence = dict(db.execute('SELECT * FROM worker_evidence WHERE request_key=?', (REPORT,)).fetchone())
-            assert evidence['status'] == 'RESULT_RECORDED' and evidence['owner_stopped_at']
+            assert evidence['status'] == 'CONSUMED' and evidence['owner_stopped_at'] and evidence['consumed_at']
             assert json.loads(evidence['output_json'])['status'] == 'COMPLETE'
             assert db.execute('SELECT MAX(version) FROM factory_schema_migrations').fetchone()[0] == 54
             return {'run': {key: run[key] for key in ('state', 'candidate_sha', 'verifier_round', 'code_repair_round', 'implementation_iteration')},
@@ -289,10 +289,10 @@ IO.puts("NATIVE_SOURCE_QUIET")
                     assert updated_row is not None
                     updated = dict(zip(columns, updated_row))
                     mutable = set()
-                    if table == 'worker_evidence' and original[key] == REPORT:
+                    if table == 'worker_evidence' and original[key] == REPORT and original['status'] == 'RESULT_RECORDED':
                         assert original['status'] == 'RESULT_RECORDED' and updated['status'] in ('RESULT_RECORDED', 'CONSUMED')
                         mutable = {'status', 'consumed_at'}
-                    if table == 'factory_tasks' and original[key] == RUN + ':feature-writer':
+                    if table == 'factory_tasks' and original[key] == RUN + ':feature-writer' and original['status'] == 'COMPLETE':
                         assert original['status'] == 'COMPLETE' and updated['status'] in ('COMPLETE', 'CONSUMED')
                         mutable = {'status', 'updated_at'}
                     assert {name: original[name] for name in columns if name not in mutable} == {name: updated[name] for name in columns if name not in mutable}
