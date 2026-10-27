@@ -344,6 +344,7 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
   defp publish_uncertain(state, running, reason) do
     id = mailbox_id(running)
     response = Path.join(state.root, id <> ".response")
+    settle_publication(state, response, @max_response_bytes, &own_uncertainty_response?/1)
 
     result =
       case read_owned(state, response, @max_response_bytes) do
@@ -363,6 +364,9 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
     if result == :ok, do: finish(state, running, id)
     state
   end
+
+  defp own_uncertainty_response?(body),
+    do: body in [~s({"error":":broker_runtime_outcome_uncertain"}), ~s({"error":":broker_runtime_request_invalid_or_expired"})]
 
   defp publish_response(state, id, body) do
     response = Path.join(state.root, id <> ".response")

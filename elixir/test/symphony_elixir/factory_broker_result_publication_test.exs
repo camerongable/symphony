@@ -370,6 +370,85 @@ defmodule SymphonyElixir.FactoryBrokerResultPublicationTest do
     assert File.read!(ctx.trace) == "executed\n"
   end
 
+  @tag :uncertainty_residue
+  test "startup and polling settle only complete service uncertainty response residues", ctx do
+    cases = for phase <- [:startup, :poll], reason <- [:broker_runtime_outcome_uncertain, :broker_runtime_request_invalid_or_expired], do: {phase, reason}
+
+    for {{phase, reason}, index} <- Enum.with_index(cases) do
+      id = Integer.to_string(index) |> String.pad_leading(32, "0")
+      server = if phase == :poll, do: start_broker(ctx)
+      if server, do: :sys.get_state(server)
+      running = install_running(ctx, id)
+      body = Jason.encode!(%{"error" => inspect(reason)})
+      {response, temporary} = install_linked_response(ctx, id, body)
+      refute File.exists?(Path.join(ctx.root, id <> ".known"))
+      server = server || start_broker(ctx)
+      send(server, :poll)
+      :sys.get_state(server)
+      assert File.read!(response) == body
+      assert File.stat!(response).links == 1
+      refute File.exists?(temporary)
+      refute File.exists?(running)
+      assert File.regular?(Path.join(ctx.root, id <> ".finished"))
+      refute File.exists?(ctx.trace)
+      :ok = stop_supervised(BrokerRuntime)
+    end
+  end
+
+  @tag :uncertainty_residue
+  test "linked success unknown errors and untrusted uncertainty residues remain untouched", ctx do
+    variants = [
+      {:success, ~s({"ok":"not an uncertainty result"})},
+      {:unknown, ~s({"error":":some_other_error"})},
+      {:malformed, "{broken"},
+      {:shape, ~s({"error":":broker_runtime_outcome_uncertain","ok":true})},
+      {:duplicate, ~s({"error":":unknown","error":":broker_runtime_outcome_uncertain"})},
+      {:foreign, ~s({"error":":broker_runtime_outcome_uncertain"})},
+      {:multiple, ~s({"error":":broker_runtime_outcome_uncertain"})},
+      {:symlink, ~s({"error":":broker_runtime_outcome_uncertain"})}
+    ]
+
+    for {{kind, body}, index} <- Enum.with_index(variants) do
+      id = Integer.to_string(index) |> String.pad_leading(32, "0")
+      running = install_running(ctx, id)
+      {response, temporary} = install_linked_response(ctx, id, body)
+      extra = temporary <> ".foreign"
+
+      case kind do
+        :foreign ->
+          File.rename!(temporary, extra)
+          File.write!(temporary, "foreign bytes")
+
+        :multiple ->
+          File.ln!(response, String.replace_suffix(temporary, String.duplicate("b", 16), String.duplicate("c", 16)))
+
+        :symlink ->
+          File.rename!(temporary, extra)
+          File.ln_s!(response, temporary)
+
+        _ ->
+          :ok
+      end
+
+      original_stat = File.lstat!(response)
+      original_temporary = File.lstat!(temporary)
+      server = start_broker(ctx)
+
+      for _ <- 1..2 do
+        send(server, :poll)
+        :sys.get_state(server)
+      end
+
+      assert File.read!(response) == body
+      assert File.lstat!(response).links == original_stat.links
+      assert File.lstat!(temporary).type == original_temporary.type
+      assert File.exists?(running)
+      refute File.exists?(Path.join(ctx.root, id <> ".finished"))
+      refute File.exists?(ctx.trace)
+      :ok = stop_supervised(BrokerRuntime)
+    end
+  end
+
   test "corrupt known result metadata fails closed across restart", ctx do
     id = blocked_result(ctx, "f")
     :ok = stop_supervised(BrokerRuntime)
@@ -468,6 +547,25 @@ defmodule SymphonyElixir.FactoryBrokerResultPublicationTest do
 
   defp pending(ctx, id, expiry \\ System.system_time(:millisecond) + 50_000) do
     File.write!(Path.join(ctx.root, id <> ".pending"), Jason.encode!(%{"args" => ["claim", "request"], "expires_at" => expiry}))
+  end
+
+  defp install_running(ctx, id) do
+    pending(ctx, id)
+    running = Path.join(ctx.root, id <> ".running")
+    File.rename!(Path.join(ctx.root, id <> ".pending"), running)
+    running
+  end
+
+  defp install_linked_response(ctx, id, body) do
+    response = Path.join(ctx.root, id <> ".response")
+    temporary = response <> ".writing." <> String.duplicate("b", 16)
+    {:ok, file} = File.open(temporary, [:write, :exclusive, :binary])
+    File.chmod!(temporary, 0o600)
+    :ok = IO.binwrite(file, body)
+    :ok = :file.sync(file)
+    :ok = File.close(file)
+    File.ln!(temporary, response)
+    {response, temporary}
   end
 
   defp start_broker(ctx),

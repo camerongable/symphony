@@ -54,6 +54,12 @@ historical result, and republished preparation handles do not restore in-memory
 MR-owner authority. Linked/nonregular responses now deny publication rather than
 being replaced. The same exclusive publication primitive preserves pending-mailbox
 semantics; already-unlinked writer temporaries complete idempotently.
+Without a known result, the same owner may settle a linked response only when its
+bytes are exactly this publisher's canonical `:broker_runtime_outcome_uncertain`
+or `:broker_runtime_request_invalid_or_expired` single-error response. This finishes
+uncertainty bookkeeping, not successful work. Linked success, other errors,
+noncanonical encodings, and untrusted residues remain denied; existing single-link
+legacy response behavior is unchanged.
 
 Capability recovery reuses the stopped predecessor's immutable admitted packet and
 shared-instruction bytes. It revalidates all current packet facts except tool

@@ -145,3 +145,44 @@ must complete inside200ms.
 Process-restart-only durability, inherited directory enumeration cost,
 foreign-UID test limitation, unchanged private bytes, and deferred consolidated
 full quality gate remain as above. Slice4 remains unstarted.
+
+## Second bounded revision: own uncertainty-response residue
+
+Revision base: `9e428a38e8d1fa12262da33294d370b082180ea1`.
+Independent review reproduced a normal crash residue with no `.known`: the service
+had committed a complete synced uncertainty `.response` but died before removing
+its exact temporary link. `publish_uncertain` read the linked response before
+settlement, leaving its running slot permanently unfinished.
+
+This revision invokes only the existing strict settlement owner before that read.
+The sole added validator accepts the exact canonical service-produced single-error
+byte strings for `:broker_runtime_outcome_uncertain` and
+`:broker_runtime_request_invalid_or_expired`. It does not accept linked success,
+arbitrary errors, duplicate keys, whitespace variants, malformed data, or unknown
+shapes. All original owner/private/type/unique-temporary/inode/size/exact-two-link/
+bounded-byte checks remain. Original bytes are preserved, no executor is invoked,
+and existing single-link legacy handling is unchanged. No new edge hook,
+authority, cleanup framework, or policy was introduced.
+
+- New startup/poll regression RED:2tests/1failure in0.4s,
+  `_build/broker-result-uncertainty-red.log`; a complete response stayed links2.
+- Final focused selection:34/0 in4.7s,
+  `_build/broker-result-uncertainty-green.log`. Added cases cover both fixed errors
+  on startup and polling plus linked success, unknown/malformed/contradictory/
+  duplicate-key errors, foreign/multiple/symlink temporaries, original bytes, and
+  zero executor calls.
+- Both independent reproductions were rerun read-only against the revised source:
+  overwrite race1/0 in0.5s (`_build/broker-result-uncertainty-race-green.log`) and
+  own uncertainty residue1/0 in0.1s
+  (`_build/broker-result-uncertainty-critic-green.log`). Reviewer files were unchanged.
+
+- Existing owner lifecycle frozen-source rerun:1/0 in158.5s,158excluded,
+  `_build/broker-result-uncertainty-owner.log`.
+- `mix specs.check`, `mix format --check-formatted`, `git diff --check`, and the
+  private-helper preservation check passed. Logs
+  `_build/broker-result-uncertainty-specs.log` and
+  `_build/broker-result-uncertainty-format.log`.
+
+All prior durability/quality-gate/private-byte limitations remain. This is the
+second bounded independent Slice3 revision; any unresolved condition requires a
+refined plan rather than another patch loop. Slice4 is unstarted.
