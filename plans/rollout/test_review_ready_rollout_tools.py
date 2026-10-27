@@ -5,12 +5,14 @@ from contextlib import closing
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import plistlib
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 import urllib.error
 from unittest.mock import patch
@@ -27,6 +29,29 @@ def load_tools():
 
 
 class ReadyRolloutTests(unittest.TestCase):
+    def test_only_explicit_source_context_qualifies_the_exact_dangling_phoenix_placeholder(self):
+        tools = load_tools()
+        for name in ('symphony-review-report-216eadb', 'symphony-review-report-new-frozen'):
+            with self.subTest(release=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                build = root / 'releases' / name / 'dev'
+                source = root / 'source-snapshots' / name
+                placeholder = build / 'phoenix-colocated/symphony_elixir/node_modules'
+                placeholder.parent.mkdir(parents=True)
+                (source / 'elixir/assets').mkdir(parents=True)
+                (build / 'fixture.beam').write_bytes(b'compiled')
+                raw = '../../../../../source-snapshots/'+name+'/elixir/assets/node_modules'
+                placeholder.symlink_to(raw)
+                expected = {'fixture.beam': {'sha256': '64ebd267717810f9524a58c6d7715bd9502b3c9235b291a7104389b372aeec4b'}}
+                with self.assertRaises(AssertionError):
+                    tools.inventory(build)
+                self.assertEqual(tools.inventory(build, artifact_source=source), expected)
+                proof = tools.phoenix_placeholder(build, source)
+                self.assertEqual({key: proof[key] for key in ('path', 'raw_target', 'uid', 'gid', 'mode', 'nlink', 'dangling')},
+                                 {'path': 'phoenix-colocated/symphony_elixir/node_modules', 'raw_target': raw,
+                                  'uid': os.getuid(), 'gid': 20, 'mode': 0o755, 'nlink': 1, 'dangling': True})
+                self.assertFalse(os.path.lexists(source / 'elixir/assets/node_modules'))
+
     def test_ready_ticket_requires_exact_whole_row_and_completed_receipt(self):
         tools = load_tools()
         with tempfile.TemporaryDirectory() as directory:
@@ -157,6 +182,10 @@ INSERT INTO control VALUES('timer');
         (release / 'evidence').mkdir(parents=True)
         source.mkdir()
         build.mkdir()
+        (source / 'elixir/assets').mkdir(parents=True)
+        placeholder = build / 'phoenix-colocated/symphony_elixir/node_modules'
+        placeholder.parent.mkdir(parents=True)
+        placeholder.symlink_to(os.path.relpath(source / 'elixir/assets/node_modules', placeholder.parent))
         (source / 'fixture.ex').write_text('source')
         (build / 'fixture.beam').write_text('compiled')
         (release / 'run-local-factory').write_text('launcher')
@@ -168,7 +197,7 @@ INSERT INTO control VALUES('timer');
                     'deployed_baseline_commit': tools.OLD_SOURCE,
                     'previous_manifest_sha256': tools.OLD_MANIFEST,
                     'base_artifact_manifest_sha256': tools.OLD_MANIFEST,
-                    'artifact': tools.inventory(build), 'source': tools.inventory(source, True),
+                    'artifact': tools.inventory(build, artifact_source=source), 'source': tools.inventory(source, True),
                     'source_hashes': {'fixture.ex': tools.sha(source / 'fixture.ex')}}
         path = release / 'evidence/release-manifest.json'
         path.write_bytes(tools.encode(manifest))
@@ -495,6 +524,133 @@ CREATE TABLE worker_evidence(owner_process_json TEXT,owner_stopped_at TEXT);
             self.assertEqual(len(set(outputs)), 10)
             self.assertTrue(all(path.is_file() for path in outputs))
             self.assertEqual(len(commands), 10)
+
+    def test_placeholder_contract_rejects_changed_shape_target_context_and_other_links(self):
+        tools = load_tools()
+        changes = ('missing', 'file', 'directory', 'normalized-raw-alias', 'foreign-target',
+                   'existing-target-directory', 'dangling-target-alias', 'extra-artifact-link',
+                   'helper-link', 'redirected-placeholder-parent', 'redirected-root', 'redirected-source')
+        for change in changes:
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                candidate, _ = self.fixture_artifact(tools, root)
+                build, source = Path(candidate['build']), Path(candidate['source'])
+                placeholder = build / 'phoenix-colocated/symphony_elixir/node_modules'
+                target = source / 'elixir/assets/node_modules'
+                if change in ('missing', 'file', 'directory', 'normalized-raw-alias', 'foreign-target'):
+                    raw = os.readlink(placeholder)
+                    placeholder.unlink()
+                    if change == 'file':
+                        placeholder.write_bytes(b'must not be skipped')
+                    elif change == 'directory':
+                        placeholder.mkdir()
+                        (placeholder / 'unexpected.js').write_bytes(b'must not be traversed')
+                    elif change == 'normalized-raw-alias':
+                        placeholder.symlink_to('./'+raw)
+                    elif change == 'foreign-target':
+                        placeholder.symlink_to(root / 'foreign-absent')
+                elif change == 'existing-target-directory':
+                    target.mkdir()
+                elif change == 'dangling-target-alias':
+                    target.symlink_to(root / 'absent')
+                elif change in ('extra-artifact-link', 'helper-link'):
+                    path = build / ('other-link' if change == 'extra-artifact-link' else 'lib/symphony_elixir/priv/helper.py')
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.symlink_to(root / 'absent')
+                elif change == 'redirected-placeholder-parent':
+                    original = build / 'phoenix-colocated'
+                    destination = root / 'redirected-colocated'
+                    original.rename(destination)
+                    original.symlink_to(destination, target_is_directory=True)
+                elif change == 'redirected-root':
+                    alias = root / 'build-alias'
+                    alias.symlink_to(build, target_is_directory=True)
+                    build = alias
+                elif change == 'redirected-source':
+                    alias = root / 'source-alias'
+                    alias.symlink_to(source, target_is_directory=True)
+                    source = alias
+                with self.assertRaises((AssertionError, OSError)):
+                    tools.inventory(build, artifact_source=source)
+
+    def test_no_context_and_source_inventory_never_gain_a_link_exception(self):
+        tools = load_tools()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            candidate, _ = self.fixture_artifact(tools, root)
+            build, source = Path(candidate['build']), Path(candidate['source'])
+            with self.assertRaises(AssertionError):
+                tools.inventory(build)
+            with self.assertRaises(AssertionError):
+                tools.inventory(source, True, artifact_source=source)
+            link = source / 'elixir/priv/helper.py'
+            link.parent.mkdir()
+            link.symlink_to(root / 'absent')
+            with self.assertRaises(AssertionError):
+                tools.inventory(source, True)
+
+    def test_placeholder_metadata_must_match_owned_pilot_link_without_privileged_chown(self):
+        tools = load_tools()
+        fields = ('st_dev', 'st_ino', 'st_mode', 'st_uid', 'st_gid', 'st_nlink', 'st_mtime_ns', 'st_ctime_ns')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            candidate, _ = self.fixture_artifact(tools, root)
+            build, source = Path(candidate['build']), Path(candidate['source'])
+            placeholder = build / 'phoenix-colocated/symphony_elixir/node_modules'
+            original_lstat = Path.lstat
+            for field, value in (('st_uid', os.getuid()+1), ('st_gid', 21),
+                                 ('st_nlink', 2), ('st_mode', 0o120777)):
+                def metadata(path, *, _field=field, _value=value):
+                    original = original_lstat(path)
+                    if path == placeholder:
+                        values = {name: getattr(original, name) for name in fields}
+                        values[_field] = _value
+                        return types.SimpleNamespace(**values)
+                    return original
+                with self.subTest(field=field), patch.object(Path, 'lstat', metadata), self.assertRaises(AssertionError):
+                    tools.inventory(build, artifact_source=source)
+
+    def test_changed_placeholder_at_enumeration_is_not_blindly_skipped(self):
+        tools = load_tools()
+        original_rglob = Path.rglob
+        for replacement in ('file', 'directory', 'missing'):
+            with self.subTest(replacement=replacement), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                candidate, _ = self.fixture_artifact(tools, root)
+                build, source = Path(candidate['build']), Path(candidate['source'])
+                placeholder = build / 'phoenix-colocated/symphony_elixir/node_modules'
+
+                def changed_enumeration(path, pattern):
+                    for item in original_rglob(path, pattern):
+                        if item == placeholder:
+                            placeholder.unlink()
+                            if replacement == 'file':
+                                placeholder.write_bytes(b'changed after validation')
+                            elif replacement == 'directory':
+                                placeholder.mkdir()
+                        yield item
+
+                with patch.object(Path, 'rglob', changed_enumeration), self.assertRaises((AssertionError, OSError)):
+                    tools.inventory(build, artifact_source=source)
+
+    def test_replaced_equivalent_link_after_enumeration_fails_final_identity_confirmation(self):
+        tools = load_tools()
+        original_rglob = Path.rglob
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            candidate, _ = self.fixture_artifact(tools, root)
+            build, source = Path(candidate['build']), Path(candidate['source'])
+            placeholder = build / 'phoenix-colocated/symphony_elixir/node_modules'
+            raw = os.readlink(placeholder)
+            replacement = root / 'replacement-link'
+            replacement.symlink_to(raw)
+
+            def changed_after_enumeration(path, pattern):
+                yield from original_rglob(path, pattern)
+                os.replace(replacement, placeholder)
+
+            with patch.object(Path, 'rglob', changed_after_enumeration), self.assertRaises(AssertionError):
+                tools.inventory(build, artifact_source=source)
 
 
 if __name__ == '__main__':

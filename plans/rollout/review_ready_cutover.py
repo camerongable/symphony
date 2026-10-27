@@ -149,12 +149,43 @@ def preserve(db, expected):
         assert db.execute('SELECT COUNT(*) FROM '+quoted(table)+' WHERE rowid>?', (saved['max_rowid'],)).fetchone()[0] == 0, table
 
 
-def inventory(root, source=False):
+def phoenix_placeholder(root, artifact_source):
+    root, artifact_source = Path(root), Path(artifact_source)
+    assert root.is_absolute() and root.resolve() == root and stat.S_ISDIR(root.lstat().st_mode)
+    assert artifact_source.is_absolute() and artifact_source.resolve() == artifact_source
+    assert stat.S_ISDIR(artifact_source.lstat().st_mode)
+    relative = 'phoenix-colocated/symphony_elixir/node_modules'
+    path = root / relative
+    assert path.parent.resolve() == path.parent
+    before = path.lstat()
+    assert stat.S_ISLNK(before.st_mode) and before.st_uid == os.getuid()
+    assert before.st_gid == 20 and before.st_nlink == 1 and stat.S_IMODE(before.st_mode) == 0o755
+    target = artifact_source / 'elixir/assets/node_modules'
+    raw_target = os.readlink(path)
+    assert raw_target == os.path.relpath(target, path.parent)
+    assert not os.path.lexists(target) and path.resolve() == target
+    after = path.lstat()
+    fields = ('st_dev', 'st_ino', 'st_mode', 'st_uid', 'st_gid', 'st_nlink', 'st_mtime_ns', 'st_ctime_ns')
+    assert all(getattr(before, field) == getattr(after, field) for field in fields)
+    assert os.readlink(path) == raw_target and not os.path.lexists(target)
+    return {'path': relative, 'raw_target': raw_target, 'uid': before.st_uid,
+            'gid': before.st_gid, 'mode': stat.S_IMODE(before.st_mode), 'nlink': before.st_nlink,
+            'device': before.st_dev, 'inode': before.st_ino, 'mtime_ns': before.st_mtime_ns,
+            'ctime_ns': before.st_ctime_ns, 'dangling': True}
+
+
+def inventory(root, source=False, *, artifact_source=None):
+    assert not source or artifact_source is None
+    placeholder = phoenix_placeholder(root, artifact_source) if artifact_source is not None else None
     excluded = {'.git', '_build', 'deps', 'bin', 'log', 'logs', 'cover', '__pycache__'}
     result = {}
     for path in sorted(root.rglob('*')):
         relative = path.relative_to(root)
         if source and set(relative.parts) & excluded:
+            continue
+        if placeholder is not None and relative.as_posix() == placeholder['path']:
+            # The compiler placeholder is not executable content or a directory exemption.
+            assert phoenix_placeholder(root, artifact_source) == placeholder
             continue
         assert not path.is_symlink(), str(path)
         if path.is_file():
@@ -162,6 +193,8 @@ def inventory(root, source=False):
                 assert path.stat().st_size <= 1048576
                 continue
             result[relative.as_posix()] = {'sha256': sha(path)}
+    if placeholder is not None:
+        assert phoenix_placeholder(root, artifact_source) == placeholder
     return result
 
 
@@ -187,7 +220,7 @@ def validate_candidate(value, release_parent=OLD_RELEASE.parent):
     assert manifest['deployed_baseline_commit'] == OLD_SOURCE
     assert manifest['previous_manifest_sha256'] == manifest['base_artifact_manifest_sha256'] == OLD_MANIFEST
     assert len(manifest['factory_modules']) == value['factory_module_count']
-    assert inventory(Path(value['build'])) == manifest['artifact']
+    assert inventory(Path(value['build']), artifact_source=Path(manifest['source_root'])) == manifest['artifact']
     source = inventory(Path(value['source']), True)
     assert source == manifest['source']
     assert {name: entry['sha256'] for name, entry in source.items()} == manifest['source_hashes']
@@ -377,9 +410,10 @@ def bind(evidence_root):
         original = json.loads(path.read_bytes())
         assert original['kind'] == 'FACTORY_REVIEW_REPORT_RELEASE_V1'
         assert original['source_commit'] == OLD_SOURCE and original['schema_version'] == 54
-        assert inventory(Path(original['build'])) == original['artifact']
+        assert inventory(Path(original['build']), artifact_source=Path(original['source_root'])) == original['artifact']
         assert {name: entry['sha256'] for name, entry in inventory(Path(original['source_root']), True).items()} == original['source_hashes']
-        return {'build': original['build'], 'source': original['source_root']}
+        return {'build': original['build'], 'source': original['source_root'],
+                'phoenix_placeholder': phoenix_placeholder(Path(original['build']), Path(original['source_root']))}
 
     def eligible():
         with g.readonly() as db:
@@ -455,7 +489,7 @@ IO.puts("NATIVE_SOURCE_QUIET")
         return value, manifest, audit
 
     def capture():
-        value, _manifest, prior = candidate()
+        value, manifest, prior = candidate()
         assert prior is None
         old_binding(True)  # Fresh compact API before the read-only ledger capture.
         g.quiet()
@@ -466,7 +500,8 @@ IO.puts("NATIVE_SOURCE_QUIET")
         original = g.PLIST.read_bytes()
         plist = plistlib.loads(original)
         assert plist['ProgramArguments'] == [str(OLD_RELEASE / 'run-local-factory'), str(g.WORKFLOW)]
-        assert plist['EnvironmentVariables']['MIX_BUILD_PATH'] == original_pins()['build']
+        original_runtime = original_pins()
+        assert plist['EnvironmentVariables']['MIX_BUILD_PATH'] == original_runtime['build']
         with g.readonly() as db:
             saved = snapshot(db)
         g.save('audited-protected.json', saved)
@@ -486,6 +521,8 @@ IO.puts("NATIVE_SOURCE_QUIET")
         g.save('captured.json', {'old_pid': OLD_PID, 'old_start': OLD_START,
                                  'plist_sha256': sha(g.PLIST), 'configuration': pins,
                                  'manifest_sha256': value['manifest_sha256'], 'ticket': ticket, 'mailbox': mailbox_quiet(MAILBOX),
+                                 'artifact_placeholder': phoenix_placeholder(Path(value['build']), Path(manifest['source_root'])),
+                                 'original_placeholder': original_runtime['phoenix_placeholder'],
                                  'guard_ledger_row_writes': 0})
         protected(audit)
         print('READ_ONLY_READY_CUTOVER_CAPTURE_PASS')

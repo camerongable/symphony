@@ -28,7 +28,7 @@ def main():
     spec.loader.exec_module(tools)
     assert manifest['kind'] == 'FACTORY_REVIEW_REPORT_RELEASE_V1' and manifest['schema_version'] == 54
     assert manifest['previous_manifest_sha256'] == tools.OLD_MANIFEST
-    assert tools.inventory(Path(manifest['build'])) == manifest['artifact']
+    assert tools.inventory(Path(manifest['build']), artifact_source=source) == manifest['artifact']
     assert tools.inventory(source, True) == manifest['source']
     local = Path(manifest['build']) / 'lib/symphony_elixir/priv'
     history_path = local / 'ticket_push_history_validator_v26.py'
@@ -128,6 +128,7 @@ def main():
               'envelope_sha256': tools.TICKET['envelope_sha256'],
               'receipt_sha256': tools.TICKET['receipt_sha256'], 'receipt_bytes': tools.TICKET['receipt_bytes'],
               'history_sha256': tools.digest(history_raw), 'read_only_sqlite_reopens': 2,
+              'artifact_placeholder': tools.phoenix_placeholder(Path(manifest['build']), source),
               'full_physical_predecessor': True, 'retained_generation_authority': True,
               'recorded_git_diff_paths_and_generated_blobs': True, 'historical_rollover_verifier_and_ci': True,
               'entire_run_access_and_history_unchanged': True, 'human_head_unchanged': True,
