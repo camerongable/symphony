@@ -1,0 +1,32 @@
+{
+  "result": "PASS",
+  "manifest_sha256": "7863c80da984b39a307de1e5f72cf7aceca1f1d738955593a02b592b68471de7",
+  "source_commit": "c64615d0a572d1af76a90df0519368a25b588ff6",
+  "live_report_readiness": {
+    "evidence": "live-qualification.log",
+    "sha256": "f6e268b377f1abf4216cf1b01572f3500a4889888f224284b88440ac4a24d060",
+    "request_key": "desktop:11b288b43e59ae80afdfc26b01e1bcf2f2d297249cc54e8f0d0af98829629c5a",
+    "raw_worker_task_context_and_run_unchanged": true,
+    "changed_source_paths_classified": 6,
+    "protected_policy_paths_rejected": true
+  },
+  "authentic_retained_receipts": {
+    "versions": [29, 30, 31, 32],
+    "retained_replay_sha256": "8623c3d70a6c49a40a78d00bc7b3e1a8ea8841e23eae26c6e442a52af5cf723e",
+    "current_replay_sha256": "41fafa4959745fab25869a02789f0944fb6586b81efc084eca1d948556cbeeae",
+    "sqlite_reopens_each": 2,
+    "tampered_history_rejections_each": 4,
+    "main_database_bytes_unchanged": true
+  },
+  "runtime_preflight": {
+    "evidence": "runtime-preflight-final.log",
+    "sha256": "8b7ea7b2e6691b9872a64636125ddc79e2b6b5985182074903a312ee45e85910",
+    "completed_at": "2026-10-27T03:10:17Z",
+    "result": "RUNTIME_INITIALIZATION_PASS_NO_THREAD_NO_TURN"
+  },
+  "live_ledger_writes": 0,
+  "pushes": 0,
+  "native_chats": 0,
+  "native_model_turns": 0,
+  "limitation": "Read-only readiness and synthetic receipt compatibility, not actual product adoption, CI, verifier acceptance or human review."
+}
