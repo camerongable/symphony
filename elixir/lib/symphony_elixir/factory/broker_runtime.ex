@@ -60,6 +60,7 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
       owner_admissions: %{},
       known_results: %{},
       publication_cursor: nil,
+      after_known_link: Keyword.get(opts, :after_known_link),
       uid: File.stat!(root).uid
     }
 
@@ -111,8 +112,12 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
   defp service(state, pending) do
     running = String.replace_suffix(pending, ".pending", ".running")
     stem = String.replace_suffix(pending, ".pending", "")
+    settle_publication(state, pending, @max_bytes, &valid_request_record?/1)
 
     cond do
+      linked_file?(pending) ->
+        state
+
       present?(stem <> ".finished") or present?(stem <> ".response") or present?(stem <> ".known") or present?(running) ->
         File.rename(pending, stem <> ".duplicate")
         state
@@ -284,6 +289,10 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
     id = mailbox_id(running)
     known = Path.join(state.root, id <> ".known")
 
+    settle_publication(state, known, @max_known_bytes, fn raw ->
+      with {:ok, envelope} <- Jason.decode(raw), {:ok, _} <- known_response(state, running, id, envelope), true <- is_nil(state.known_results[id]) or state.known_results[id] == envelope, do: true
+    end)
+
     cond do
       present?(known) ->
         with {:ok, raw} <- read_owned(state, known, @max_known_bytes, true),
@@ -298,7 +307,7 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
         end
 
       envelope = state.known_results[id] ->
-        case publish(state.root, id <> ".known", Jason.encode!(envelope)) do
+        case publish(state.root, id <> ".known", Jason.encode!(envelope), state.after_known_link) do
           :ok -> recover_publication(state, running)
           _ -> state
         end
@@ -357,6 +366,7 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
 
   defp publish_response(state, id, body) do
     response = Path.join(state.root, id <> ".response")
+    settle_publication(state, response, @max_response_bytes, &(&1 == body))
 
     case read_owned(state, response, @max_response_bytes) do
       {:ok, ^body} -> :ok
@@ -392,17 +402,26 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
 
   defp mailbox_id(running), do: running |> Path.basename() |> String.replace_suffix(".running", "")
   defp present?(path), do: File.lstat(path) != {:error, :enoent}
+  defp linked_file?(path), do: match?({:ok, %File.Stat{type: :regular, links: links}} when links > 1, File.lstat(path))
   defp digest(body), do: :crypto.hash(:sha256, body) |> Base.encode16(case: :lower)
 
-  defp read_owned(state, path, maximum, private? \\ false) do
-    with {:ok, %File.Stat{type: :regular, uid: uid, links: 1, size: size, mode: mode} = before} <- File.lstat(path),
+  defp read_owned(state, path, maximum, private? \\ false, links \\ 1) do
+    with {:ok, %File.Stat{type: :regular, uid: uid, links: ^links, size: size, mode: mode} = before} <- File.lstat(path),
          true <- uid == state.uid and size <= maximum and (not private? or Bitwise.band(mode, 0o077) == 0),
          {:ok, {:ok, body}} <- File.open(path, [:read, :binary], &read_unchanged(&1, path, before, maximum)) do
       {:ok, body}
     else
-      {:error, :enoent} -> {:error, :enoent}
-      {:ok, {:error, :enoent}} -> {:error, :enoent}
-      _ -> {:error, :broker_runtime_file_invalid}
+      {:error, :enoent} ->
+        {:error, :enoent}
+
+      {:ok, {:error, :enoent}} ->
+        {:error, :enoent}
+
+      {:ok, %File.Stat{type: :regular, uid: uid, links: 2, size: size, mode: mode}} when uid == state.uid and size <= maximum ->
+        if Bitwise.band(mode, 0o077) == 0, do: {:error, :broker_runtime_publication_in_progress}, else: {:error, :broker_runtime_file_invalid}
+
+      _ ->
+        {:error, :broker_runtime_file_invalid}
     end
   end
 
@@ -422,15 +441,60 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
     end
   end
 
-  defp publish(root, name, body) do
+  defp publish(root, name, body, after_link \\ nil) do
     temporary = Path.join(root, name <> ".writing." <> Base.encode16(:crypto.strong_rand_bytes(8), case: :lower))
 
+    # The exclusive final link commits complete bytes without replacing a contender.
+    # Readers wait until the temporary link is settled, including after owner death.
     with {:ok, file} <- File.open(temporary, [:write, :exclusive, :binary]) do
-      result = with :ok <- File.chmod(temporary, 0o600), :ok <- IO.binwrite(file, body), :ok <- :file.sync(file), do: File.rename(temporary, Path.join(root, name))
+      result =
+        with :ok <- File.chmod(temporary, 0o600),
+             :ok <- IO.binwrite(file, body),
+             :ok <- :file.sync(file),
+             :ok <- File.ln(temporary, Path.join(root, name)) do
+          if is_function(after_link, 0), do: after_link.()
+          unlink_publication_temporary(temporary)
+        end
+
       File.close(file)
       if result != :ok, do: File.rm(temporary)
       result
     end
+  end
+
+  defp unlink_publication_temporary(path) do
+    case File.rm(path) do
+      :ok -> :ok
+      {:error, :enoent} -> :ok
+      error -> error
+    end
+  end
+
+  defp settle_publication(state, path, maximum, valid?) do
+    with {:ok, %File.Stat{type: :regular, uid: uid, links: 2, mode: mode, size: size} = final} <- File.lstat(path),
+         true <- uid == state.uid and size <= maximum and Bitwise.band(mode, 0o077) == 0,
+         {:ok, names} <- File.ls(state.root),
+         grammar = Regex.compile!("\\A" <> Regex.escape(Path.basename(path)) <> "\\.writing\\.[0-9a-f]{16}\\z"),
+         [name] <- Enum.filter(names, &Regex.match?(grammar, &1)),
+         temporary = Path.join(state.root, name),
+         {:ok, alias_stat} <- File.lstat(temporary),
+         true <- publication_identity(alias_stat) == publication_identity(final),
+         {:ok, body} <- read_owned(state, path, maximum, true, 2),
+         true <- valid?.(body) == true,
+         {:ok, destination} <- File.lstat(path),
+         true <- publication_identity(destination) == publication_identity(final),
+         {:ok, current} <- File.lstat(temporary),
+         true <- publication_identity(current) == publication_identity(final) do
+      unlink_publication_temporary(temporary)
+    else
+      _ -> :ok
+    end
+  end
+
+  defp publication_identity(stat), do: Map.take(stat, ~w(type uid gid links size mode mtime ctime inode major_device minor_device)a)
+
+  defp valid_request_record?(raw) do
+    with {:ok, %{"args" => args, "expires_at" => expiry}} <- Jason.decode(raw), true <- is_list(args) and Enum.all?(args, &is_binary/1) and bridged?(args), true <- is_integer(expiry), do: true
   end
 
   defp await(root, id, deadline) do
@@ -472,9 +536,11 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
           case read_owned(state, response, @max_response_bytes) do
             {:ok, ^expected} -> {:ok, expected}
             {:error, :enoent} = missing -> missing
+            {:error, :broker_runtime_publication_in_progress} = pending -> pending
             _ -> {:error, :broker_runtime_response_conflict}
           end
         else
+          {:error, :broker_runtime_publication_in_progress} = pending -> pending
           _ -> {:error, :broker_runtime_response_conflict}
         end
 

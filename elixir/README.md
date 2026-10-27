@@ -31,8 +31,14 @@ canonical database root, original request-byte SHA256, and exact serialized
 response-byte SHA256. The response bytes are base64 encoded, bounded at2MiB after
 JSON escaping; the complete envelope is bounded at2.8MB. Files must be regular,
 single-linked, and owned by the mailbox owner; known records are owner-private.
-Publication uses an exclusive same-directory temporary, file sync, and atomic
-rename. This supports process restart, not host power-loss durability: the existing
+Publication uses an exclusive same-directory temporary, file sync, and exclusive
+hard-link commit, followed by temporary unlink. The successful final link is the
+commit point; it cannot replace an existing destination. Callers wait through the
+two-link state rather than accepting it or reporting a false conflict. The owner
+may settle only a unique exactly named temporary with matching inode/owner/mode/
+size, exactly two links, and complete validated bytes. Foreign, extra, symlinked,
+and malformed residues remain denied and untouched. This supports process restart,
+not host power-loss durability: the existing
 mailbox lifecycle does not synchronize directory entries.
 
 The broker retries publication/bookkeeping only, at most one stopped mailbox per
@@ -46,7 +52,8 @@ the public caller. The original request can move from `.running` to `.finished`
 during readback without changing its bound bytes. Expired publication remains a
 historical result, and republished preparation handles do not restore in-memory
 MR-owner authority. Linked/nonregular responses now deny publication rather than
-being replaced.
+being replaced. The same exclusive publication primitive preserves pending-mailbox
+semantics; already-unlinked writer temporaries complete idempotently.
 
 Capability recovery reuses the stopped predecessor's immutable admitted packet and
 shared-instruction bytes. It revalidates all current packet facts except tool

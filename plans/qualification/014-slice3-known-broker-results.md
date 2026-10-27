@@ -11,7 +11,8 @@ One versioned immutable `.known` envelope binds the mailbox ID, canonical databa
 root, original request-byte digest, and exact serialized response-byte digest.
 Response bytes are base64 encoded, not reparsed/reserialized during recovery.
 The broker stores that envelope before publishing `.response`, using restrictive
-exclusive same-directory temporary creation, file sync, and atomic rename.
+exclusive same-directory temporary creation, file sync, and exclusive hard-link
+commit followed by temporary unlink (the independently reviewed revision below).
 Process restart is covered; host power-loss durability is explicitly not claimed
 because the existing running/response/finished lifecycle lacks directory sync.
 
@@ -77,7 +78,8 @@ The public matrix covers restart before/after known commit, response-present
 bookkeeping failure, conflicts, duplicate pending IDs, invalid version/digest/ID/
 root/shape/size, malformed JSON, links/private permissions, changed request bytes,
 escaped oversized/unserializable output, expired historical output, and bounded
-backlog rotation. No internal persistence hook or collaborator mock was added.
+backlog rotation. This initial checkpoint used no internal persistence hook or
+collaborator mock; the separately approved revision adds the single edge below.
 
 Intermediate diagnostics are retained: matrix2 had an uppercase synthetic hex-ID
 fixture error, corrected to the public lowercase mailbox grammar; matrix4 was
@@ -89,3 +91,57 @@ Full make/coverage/Dialyzer remain deferred to the consolidated plan gate. The
 known baseline StageRunner751 failure remains untouched. Separately identified
 physical stop-status/publication and cross-release compatibility work is not
 implemented or qualified by this slice. No ticket delivery is claimed.
+
+## Independent-review revision: exclusive publication
+
+Revision base: `3fe3497cbd8857a53dd4bb7107e851c59d8ad6c9`.
+The earlier absence check plus replace-capable rename was not atomic exclusion.
+Independent review's real Python contender installed a disagreeing final response
+after `.response.writing.*` appeared, and the broker overwrote it. The revision
+replaces final publication with `File.ln(temporary, final)`, which atomically refuses
+an existing destination; successful final link is the complete synced-byte commit
+point. Temporary unlink follows. Pending publication uses the same primitive, and
+an already-unlinked temporary is successful idempotent completion, not failure.
+
+The public reader never accepts a two-link record: it waits. The broker owner may
+unlink only one uniquely named `final.writing.[0-9a-f]{16}` temporary when final
+and temporary are regular, private, exactly two-linked files with the same inode,
+owner, mode, size, and stable metadata. It validates bounded complete record bytes
+against the request/known response and rechecks both paths before unlink. Unknown,
+foreign, symlinked, malformed, or multiply aliased files remain denied and are not
+removed. No additional outcome journal or authorization capability was added.
+
+One optional internal `start_link` test callback, `after_known_link`, exists only
+at the synced exclusive-known-link edge. It has no config, CLI, environment, or
+serialized route. A filesystem-only watcher can select an overwrite contender but
+cannot reliably stop an Erlang process in the link-to-unlink interval. The bounded
+callback lets the real mailbox test kill that process at the precise edge, reopen
+without the callback, recover exact bytes, and prove one external effect. This is
+the sole persistence-edge hook; ordinary tests use actual filesystem barriers.
+
+The expiry test now waits relative to the stored expiry, if still in the future,
+and proves expiration before recovery. It no longer assumes the external operation
+must complete inside200ms.
+
+- Public competing-writer plus transient-link RED:2/2 in1.4s,
+  `_build/broker-result-exclusive-red.log`. Both known and response destinations
+  are exercised by the final matrix; conflicting original bytes remain unchanged.
+- Revised matrix:32/0 in4.4s, `_build/broker-result-exclusive-final.log`.
+  It includes all26 earlier checks, both external contender phases, transient
+  public readback, actual crash after exclusive link/reopen, exact residual
+  bookkeeping, pending-link settlement, and foreign/multiple/invalid/symlink
+  no-unlink negatives.
+- Exact independent critic reproduction rerun against the revised source:1/0
+  in0.6s, `_build/broker-result-critic-race-green.log`. The external review script
+  was read and executed without modifying its checkout or evidence.
+
+- Existing owner lifecycle frozen-source rerun:1/0 in175.3s,158excluded,
+  `_build/broker-result-exclusive-owner.log`.
+- Final `mix specs.check`, `mix format --check-formatted`, `git diff --check`, and
+  private-helper preservation check passed. Logs
+  `_build/broker-result-exclusive-specs.log` and
+  `_build/broker-result-exclusive-format.log`.
+
+Process-restart-only durability, inherited directory enumeration cost,
+foreign-UID test limitation, unchanged private bytes, and deferred consolidated
+full quality gate remain as above. Slice4 remains unstarted.

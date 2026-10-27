@@ -25,7 +25,8 @@ A broker MUST preserve a known serialized result before response publication,
 bound to its mailbox identity, canonical database root, original request bytes,
 and exact response bytes. Publication recovery MUST NOT execute the operation
 again or restore in-memory authorization. Invalid records and disagreeing
-responses MUST fail closed. A crash before the known-result commit remains
+responses MUST fail closed, including a destination created concurrently during
+publication; the final commit MUST atomically refuse replacement. A crash before the known-result commit remains
 uncertain; incomplete temporary files alone are not proof. Implementations MUST
 bound retained results, record sizes, and per-poll recovery work, and state whether
 their durability guarantee covers process restart or host power loss.

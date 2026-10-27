@@ -82,9 +82,10 @@ defmodule SymphonyElixir.FactoryBrokerResultPublicationTest do
     :sys.get_state(server)
     running = Path.join(ctx.root, id <> ".running")
     request = File.read!(running)
-    assert Jason.decode!(request)["expires_at"] > System.system_time(:millisecond)
     :ok = stop_supervised(BrokerRuntime)
-    Process.sleep(250)
+    expiry = Jason.decode!(request)["expires_at"]
+    Process.sleep(max(expiry - System.system_time(:millisecond) + 25, 0))
+    assert expiry < System.system_time(:millisecond)
     File.rmdir!(Path.join(ctx.root, id <> ".response"))
     server = start_broker(ctx)
     :sys.get_state(server)
@@ -209,6 +210,166 @@ defmodule SymphonyElixir.FactoryBrokerResultPublicationTest do
     assert File.read!(ctx.trace) == "executed\n"
   end
 
+  @tag :exclusive_publication
+  test "an external contender cannot replace known or response publication with its own bytes", ctx do
+    workflow = Path.join(ctx.directory, "WORKFLOW.md")
+    File.write!(workflow, "---\nfactory:\n  database: #{ctx.factory.database}\n---\nSynthetic broker.\n")
+
+    for phase <- ~w(known response) do
+      marker = Path.join(ctx.directory, "contender-#{phase}")
+
+      executor = fn args, store, factory ->
+        ctx.executor.(args, store, factory)
+        running = Enum.find(Path.wildcard(Path.join(ctx.root, "*.running")), &(Jason.decode!(File.read!(&1))["args"] == args))
+        target = String.replace_suffix(running, ".running", "." <> phase)
+        Task.start(fn -> System.cmd("python3", [Path.expand("../support/broker_result_contender.py", __DIR__), target, marker]) end)
+        wait_for(marker <> ".ready")
+        {:ok, String.duplicate("x", 2_000_000)}
+      end
+
+      server = start_broker(%{ctx | executor: executor})
+      assert {:error, :broker_runtime_response_conflict} = BrokerRuntime.call(["claim", phase, "--workflow", workflow])
+      :sys.get_state(server)
+      wait_for(marker)
+      target = File.read!(marker)
+      assert File.read!(target) == ~s({"ok":"racing conflict"})
+      assert :ok = stop_supervised(BrokerRuntime)
+    end
+
+    assert File.read!(ctx.trace) == "executed\nexecuted\n"
+  end
+
+  @tag :exclusive_publication
+  test "the public caller waits for a complete transient hard-link publication", ctx do
+    workflow = Path.join(ctx.directory, "WORKFLOW.md")
+    File.write!(workflow, "---\nfactory:\n  database: #{ctx.factory.database}\n---\nSynthetic broker.\n")
+
+    executor = fn _args, _store, _factory ->
+      [running] = Path.wildcard(Path.join(ctx.root, "*.running"))
+      {output, 0} = System.cmd("python3", [Path.expand("../support/broker_result_executor.py", __DIR__), ctx.trace, running, "linked"])
+      {:ok, Jason.decode!(output)}
+    end
+
+    start_broker(%{ctx | executor: executor})
+    caller = Task.async(fn -> BrokerRuntime.call(["claim", "request", "--workflow", workflow]) end)
+    wait_for(ctx.trace <> ".ready")
+    assert Task.yield(caller, 150) == nil
+    File.write!(ctx.trace <> ".release", "release")
+    assert {:ok, %{"receipt" => "external-complete"}} = Task.await(caller, 5000)
+    assert File.read!(ctx.trace) == "executed\n"
+  end
+
+  test "restart settles exact committed link residues without executing again", ctx do
+    id = String.duplicate("8", 32)
+    finished = Path.join(ctx.root, id <> ".finished")
+    pending(ctx, id)
+    server = start_broker(%{ctx | executor: obstructing_executor(ctx, finished)})
+    :sys.get_state(server)
+    :ok = stop_supervised(BrokerRuntime)
+
+    for phase <- ~w(known response) do
+      final = Path.join(ctx.root, id <> "." <> phase)
+      File.ln!(final, final <> ".writing." <> String.duplicate("a", 16))
+    end
+
+    File.rmdir!(finished)
+    server = start_broker(ctx)
+    :sys.get_state(server)
+    assert File.read!(Path.join(ctx.root, id <> ".response")) == ~s({"ok":{"receipt":"external-complete"}})
+    assert File.regular?(finished)
+    assert Path.wildcard(Path.join(ctx.root, "*.writing.*")) == []
+    assert File.read!(ctx.trace) == "executed\n"
+  end
+
+  test "foreign multiple and invalid link residues remain denied without unlinking", ctx do
+    id = blocked_result(ctx, "9")
+    :ok = stop_supervised(BrokerRuntime)
+    path = Path.join(ctx.root, id <> ".known")
+    original = File.read!(path)
+    File.rmdir!(Path.join(ctx.root, id <> ".response"))
+    first = path <> ".writing." <> String.duplicate("a", 16)
+    second = path <> ".writing." <> String.duplicate("b", 16)
+    foreign = Path.join(ctx.directory, "foreign-alias")
+
+    for kind <- [:foreign, :multiple, :symlink, :invalid] do
+      case kind do
+        :foreign ->
+          File.ln!(path, foreign)
+          File.write!(first, "foreign bytes")
+
+        :multiple ->
+          File.ln!(path, first)
+          File.ln!(path, second)
+
+        :symlink ->
+          File.ln!(path, foreign)
+          File.ln_s!(path, first)
+
+        :invalid ->
+          File.write!(path, "null")
+          File.ln!(path, first)
+      end
+
+      server = start_broker(ctx)
+      :sys.get_state(server)
+      assert File.exists?(first)
+      if kind == :multiple, do: assert(File.exists?(second))
+      refute File.exists?(Path.join(ctx.root, id <> ".response"))
+      assert File.read!(ctx.trace) == "executed\n"
+      :ok = stop_supervised(BrokerRuntime)
+      Enum.each([first, second, foreign], &File.rm/1)
+      File.write!(path, original)
+    end
+  end
+
+  test "a crash at the synced exclusive known link recovers its exact bytes after reopen", ctx do
+    id = String.duplicate("0", 32)
+    pending(ctx, id)
+    owner = self()
+
+    edge = fn ->
+      send(owner, {:known_link_committed, self()})
+
+      receive do
+        :release -> :ok
+      end
+    end
+
+    server = start_broker(Map.put(ctx, :after_known_link, edge))
+    assert_receive {:known_link_committed, ^server}, 2000
+    known = Path.join(ctx.root, id <> ".known")
+    original = File.read!(known)
+    assert File.stat!(known).links == 2
+    assert File.read!(ctx.trace) == "executed\n"
+    ref = Process.monitor(server)
+    Process.exit(server, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^server, :killed}
+    stop_supervised(BrokerRuntime)
+    server = start_broker(ctx)
+    :sys.get_state(server)
+    assert File.read!(known) == original
+    assert File.stat!(known).links == 1
+    assert Path.wildcard(Path.join(ctx.root, "*.writing.*")) == []
+    assert File.read!(Path.join(ctx.root, id <> ".response")) == ~s({"ok":{"receipt":"external-complete"}})
+    assert File.regular?(Path.join(ctx.root, id <> ".finished"))
+    assert File.read!(ctx.trace) == "executed\n"
+  end
+
+  test "a committed pending link is settled before one execution", ctx do
+    id = String.duplicate("a", 32)
+    pending(ctx, id)
+    path = Path.join(ctx.root, id <> ".pending")
+    temporary = path <> ".writing." <> String.duplicate("a", 16)
+    File.ln!(path, temporary)
+    File.chmod!(path, 0o600)
+    request = File.read!(path)
+    server = start_broker(ctx)
+    :sys.get_state(server)
+    refute File.exists?(temporary)
+    assert File.read!(Path.join(ctx.root, id <> ".finished")) == request
+    assert File.read!(ctx.trace) == "executed\n"
+  end
+
   test "corrupt known result metadata fails closed across restart", ctx do
     id = blocked_result(ctx, "f")
     :ok = stop_supervised(BrokerRuntime)
@@ -309,6 +470,25 @@ defmodule SymphonyElixir.FactoryBrokerResultPublicationTest do
     File.write!(Path.join(ctx.root, id <> ".pending"), Jason.encode!(%{"args" => ["claim", "request"], "expires_at" => expiry}))
   end
 
-  defp start_broker(ctx), do: start_supervised!(Supervisor.child_spec({BrokerRuntime, factory: ctx.factory, store: ctx.store, name: nil, executor: ctx.executor}, restart: :temporary))
+  defp start_broker(ctx),
+    do:
+      start_supervised!(
+        Supervisor.child_spec({BrokerRuntime, factory: ctx.factory, store: ctx.store, name: nil, executor: ctx.executor, after_known_link: Map.get(ctx, :after_known_link)}, restart: :temporary)
+      )
+
   defp digest(body), do: :crypto.hash(:sha256, body) |> Base.encode16(case: :lower)
+
+  defp wait_for(path) do
+    Enum.reduce_while(1..500, nil, fn _, _ ->
+      if File.exists?(path),
+        do: {:halt, :ready},
+        else:
+          (
+            Process.sleep(10)
+            {:cont, nil}
+          )
+    end)
+
+    assert File.exists?(path)
+  end
 end
