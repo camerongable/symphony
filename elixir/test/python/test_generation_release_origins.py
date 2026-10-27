@@ -150,5 +150,44 @@ class GenerationReleaseOrigins(unittest.TestCase):
         self.assertNotEqual(before, self.reader.generation_file_identity(path.stat()))
 
 
+class CurrentGenerationReleaseOrigins(GenerationReleaseOrigins):
+    def setUp(self):
+        super().setUp()
+        source = PRIV / 'ticket_push_history_validator_v25.py'
+        target = self.new / source.name
+        shutil.copyfile(source, target)
+        shutil.copyfile(PRIV / 'ticket_generation_origins_v4.json', self.new / 'ticket_generation_origins_v4.json')
+        raw = (self.new / 'ticket_generation_origins_v1.json').read_bytes()
+        (self.new / 'ticket_generation_origins_v5.json').write_bytes(raw)
+        spec = importlib.util.spec_from_file_location('current_generation_history', target)
+        self.reader = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.reader)
+        self.reader.GENERATION_ORIGINS_SHA = digest(raw)
+
+    def test_catalog_bytes_are_not_caller_authority(self):
+        catalog = self.new / 'ticket_generation_origins_v5.json'
+        catalog.write_bytes(catalog.read_bytes() + b' ')
+        with self.assertRaises(ValueError):
+            self.validate(2)
+
+    def test_literal_catalog_adds_only_the_observed_generation_v2(self):
+        prior = json.loads((PRIV / 'ticket_generation_origins_v4.json').read_bytes())
+        current = json.loads((PRIV / 'ticket_generation_origins_v5.json').read_bytes())
+        self.assertEqual(current['version'], 1)
+        self.assertEqual(current['entries'][:-1], prior['entries'])
+        self.assertEqual(len(current['entries']), 8)
+        root = '/Users/cgable/Library/Application Support/ai-factory/releases/symphony-review-report-c64615d'
+        self.assertEqual(current['entries'][-1], {
+            'kind': 'RELEASE_GENERATION_ARTIFACT_V1', 'release_root': root,
+            'manifest_path': root + '/evidence/release-manifest.json',
+            'manifest_sha256': '7863c80da984b39a307de1e5f72cf7aceca1f1d738955593a02b592b68471de7',
+            'manifest_kind': 'FACTORY_REVIEW_REPORT_RELEASE_V1',
+            'helper_path': root + '/dev/lib/symphony_elixir/priv/controller_generation_executor_v2.py',
+            'helper_sha256': '945f8ac69cc25a8de98bfe74a8b38ecde47a1fab2e6a234f34905767a6de4f43',
+            'companion_path': root + '/dev/lib/symphony_elixir/priv/worker_file_companion.py',
+            'companion_sha256': '87f3dd595ddc70205ed881b42ab5a9401b0705c13cdc8fda2c2b8b5bac4b0b3b',
+        })
+
+
 if __name__ == '__main__':
     unittest.main()

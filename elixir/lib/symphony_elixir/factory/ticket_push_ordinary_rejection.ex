@@ -23,10 +23,15 @@ defmodule SymphonyElixir.Factory.TicketPushOrdinaryRejection do
   @forward_resource Path.expand("../../../priv/ticket_push_ordinary_rejection_v3.json", __DIR__)
   @external_resource @forward_resource
   @forward_resource_sha :crypto.hash(:sha256, File.read!(@forward_resource)) |> Base.encode16(case: :lower)
+  @generation_kind "AUDITED_V34_ORDINARY_PREISSUANCE_AUTHORITY_CLOSED"
+  @generation_resource Path.expand("../../../priv/ticket_push_ordinary_rejection_v4.json", __DIR__)
+  @external_resource @generation_resource
+  @generation_resource_sha :crypto.hash(:sha256, File.read!(@generation_resource)) |> Base.encode16(case: :lower)
   @audit_resources [
     {"ticket_push_ordinary_rejection_v1.json", @resource_sha, 1, @kind},
     {"ticket_push_ordinary_rejection_v2.json", @successor_resource_sha, 2, @successor_kind},
-    {"ticket_push_ordinary_rejection_v3.json", @forward_resource_sha, 3, @forward_kind}
+    {"ticket_push_ordinary_rejection_v3.json", @forward_resource_sha, 3, @forward_kind},
+    {"ticket_push_ordinary_rejection_v4.json", @generation_resource_sha, 4, @generation_kind}
   ]
   @audit_count length(@audit_resources)
   @direct_status_audits Enum.filter(@audit_resources, fn {_name, _sha, version, _kind} -> version in [1, 2] end)
@@ -251,8 +256,9 @@ defmodule SymphonyElixir.Factory.TicketPushOrdinaryRejection do
   end
 
   defp validate_closed_prefix(store, prefix, audit, sealed) do
-    with true <- audit["version"] == 3 and audit["kind"] == @forward_kind and is_nil(audit["prior_retirement_ref"]),
-         true <- length(prefix) == 2 and length(sealed) == 2,
+    with count when is_integer(count) <- closed_prefix_count(audit),
+         true <- is_nil(audit["prior_retirement_ref"]),
+         true <- length(prefix) == count and length(sealed) == count,
          {:ok, values} <- validated_records(store, prefix),
          true <- Enum.zip_with(prefix, values, &identity/2) == sealed,
          context when is_map(context) <- audit["current_context"],
@@ -263,6 +269,11 @@ defmodule SymphonyElixir.Factory.TicketPushOrdinaryRejection do
       _ -> {:error, :ordinary_rejection_lineage_changed}
     end
   end
+
+  # These are individually audited closures, not a version-based retry policy.
+  defp closed_prefix_count(%{"version" => 3, "kind" => @forward_kind}), do: 2
+  defp closed_prefix_count(%{"version" => 4, "kind" => @generation_kind}), do: 3
+  defp closed_prefix_count(_), do: nil
 
   defp validated_records(store, captured) do
     Enum.reduce_while(captured, {:ok, []}, fn record, {:ok, values} ->
