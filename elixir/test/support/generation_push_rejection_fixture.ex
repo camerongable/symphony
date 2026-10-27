@@ -299,11 +299,15 @@ defmodule SymphonyElixir.TestSupport.GenerationPushRejectionFixture do
         path = Path.join(root, "priv/ticket_push_history_validator_v#{history}.py")
         text = File.read!(path)
         assert length(String.split(text, old_sha)) in [1, 2]
-        if String.contains?(text, old_sha), do: File.write!(path, String.replace(text, old_sha, hash(raw)))
+        write_rebound_history(path, text, old_sha, hash(raw))
       end
     end
 
     hash(raw)
+  end
+
+  defp write_rebound_history(path, text, old_sha, new_sha) do
+    if String.contains?(text, old_sha), do: File.write!(path, String.replace(text, old_sha, new_sha))
   end
 
   defp select_capability(version) do
