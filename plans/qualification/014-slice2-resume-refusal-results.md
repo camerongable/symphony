@@ -65,3 +65,60 @@ After sealing, rerun the full Slice1/Slice2/WorkerEvidence selection and the tag
 ordinary rejected-resume lifecycle against the immutable candidate. Review should
 scrutinize scope binding, legacy separation, explicit controller compatibility,
 event integrity, cooldown, and all no-session/no-effect predicates.
+
+## Reviewed identity refinement (27 October 2026)
+
+Revision base: `1aee2a1a29528ad55a28d60411d29956495460e9`.
+This section supersedes the earlier claim that an event-local refusal digest
+alone closes the integrity gap. Independent review found two remaining defects:
+
+- An opaque array mutation beyond `inspect/1` limits, with its event-local digest
+  recomputed, could retain the original inspected failure identity and rearm.
+  RED: `_build/resume-refusal-independent-identity-red.log`,1/1 in4.0s.
+- A new unclassified failure with the exact legacy English could rearm after its
+  event payload became JSON null, because payload-key lookup treated it as absent.
+  RED: `_build/resume-refusal-marker-red.log`,1/1 in2.8s.
+
+The narrowed, independently design-reviewed contract now uses one shared
+`ResumeRefusal.failure_identity/1` formatter. A validated typed refusal stores a
+fixed `NATIVE_RESUME_REFUSAL_V1:` prefix plus SHA256 of its complete parsed JSON.
+WorkerEvidence and both TaskLauncher persistence paths use that same identity;
+rearming recomputes it from the event and compares it with both original current
+failure fields. Untyped and historical failure identities remain exactly
+`inspect(reason)`. The unchanged raw error remains in the scoped observation.
+
+Marker discovery uses stable outer `events.run_id`, not mutable payload request
+keys. Invalid JSON, null/scalar/list payloads, missing request keys, and foreign
+request keys fail closed. The conservative compatibility boundary is deliberate:
+only runs with no new marker can use the exact legacy path; a newer or ambiguously
+scoped marker on the same run denies fallback. No new table or authority was added.
+
+Discarded experiments remain in ignored logs: an after-raw-data digest still
+failed (`resume-refusal-independent-identity-green.log`, despite its name), while
+a sorted-key digest passed but was rejected as inspection-order coupling
+(`resume-refusal-independent-identity-green2.log`). Neither is the sealed design.
+
+Final frozen-source checks, with the same Elixir command prefix above:
+
+- `mix test test/symphony_elixir/factory_completed_turn_recovery_test.exs
+  test/symphony_elixir/factory_resume_refusal_test.exs
+  test/symphony_elixir/factory_worker_evidence_test.exs`:42/0 in139.5s
+  (11 Slice1,11 Slice2,20 WorkerEvidence).
+  Log `_build/handoff-slices12-prefix-combined.log`.
+- `mix test test/symphony_elixir/app_server_test.exs:1869
+  test/symphony_elixir/app_server_test.exs:1978`:2/0 in1.8s,80 excluded.
+  Log `_build/resume-refusal-prefix-controller.log`.
+- `mix test test/symphony_elixir/factory_ticket_worker_lifecycle_test.exs
+  --only resume_refusal`:1/0 in70.5s,158 excluded.
+  Log `_build/resume-refusal-prefix-lifecycle.log`. Existing compiler warnings
+  reference excluded GenerationOriginRelease fixtures; no assertion failed.
+- `mix specs.check`, `mix format --check-formatted`, and `git diff --check` passed.
+  Logs `_build/resume-refusal-prefix-specs.log` and
+  `_build/resume-refusal-prefix-format.log`.
+
+The full quality gate remains unproven at this intermediate checkpoint. Slice1
+tests prove native completion recovery and normal adoption to VERIFYING, not
+physical publication. A separately identified publication validator requires
+exit status zero; genuine recovered stop status7 remains unchanged and needs a
+separate reviewed compatibility contract. No deployment or ticket progression
+is claimed by these local checks. Slices3–4 remain unstarted.

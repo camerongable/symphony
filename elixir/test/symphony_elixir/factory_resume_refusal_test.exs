@@ -25,7 +25,7 @@ defmodule SymphonyElixir.FactoryResumeRefusalTest do
       assert {:error, {:native_resume_refused, refusal} = reason} = TicketWorkerRunner.run(ctx.path, %Issue{identifier: "PPL-123"}, prompt, StageSchemas.for_stage(:native_feature_writer), options)
       assert refusal["raw_error"] == raw
       assert TaskLauncher.retryable_writer_conflict?(reason)
-      {:ok, _} = TaskLedger.update(ctx.store, "writer", %{status: "STALE", failure_code: inspect(reason)})
+      {:ok, _} = TaskLedger.update(ctx.store, "writer", %{status: "STALE", failure_code: SymphonyElixir.Codex.ResumeRefusal.failure_identity(reason)})
       {:ok, failed} = WorkerEvidence.get(ctx.store, "reservation:request")
       assert failed["status"] == "RECONCILE_REQUIRED"
       assert Enum.all?(~w(thread_id turn_id item_id output_json policy_json owner_process_json owner_stop_json), &is_nil(failed[&1]))
@@ -86,7 +86,43 @@ defmodule SymphonyElixir.FactoryResumeRefusalTest do
     [observed] = outcomes(ctx.store)
     assert is_nil(observed["refusal"])
     assert observed["failure_code"] == inspect(reason)
+
+    {:ok, failed} = WorkerEvidence.get(ctx.store, "reservation:request")
+
+    for marker <- ["null", "[]", "7", "{}", "{broken", Jason.encode!(Map.delete(observed, "request_key")), Jason.encode!(Map.put(observed, "request_key", "foreign"))] do
+      Store.query!(ctx.store, "UPDATE events SET payload_json=? WHERE event_type='TICKET_WORKER_RESUME_FAILURE_OBSERVED'", [marker])
+      assert {:error, :worker_resume_rejection_unproven} = WorkerEvidence.rearm_rejected_resume(ctx.store, "reservation:request")
+      assert {:ok, ^failed} = WorkerEvidence.get(ctx.store, "reservation:request")
+    end
   end
+
+  @tag :refusal_identity
+  test "opaque raw data beyond inspect limits stays bound to the original correlated refusal", ctx do
+    {prompt, options} = prepare_resume(ctx)
+    values = Enum.map(1..250, &"opaque-value-#{&1}")
+    raw = %{"code" => -32_600, "message" => "Already has an active writer.", "data" => %{"opaque" => values}}
+    changed_raw = put_in(raw, ["data", "opaque", Access.at(200)], "changed-value")
+    assert inspect(raw) == inspect(changed_raw)
+    trace = configure_server(ctx, raw)
+    configure_worker(trace)
+    assert {:error, {:native_resume_refused, original} = reason} = TicketWorkerRunner.run(ctx.path, %Issue{identifier: "PPL-123"}, prompt, StageSchemas.for_stage(:native_feature_writer), options)
+    identity = SymphonyElixir.Codex.ResumeRefusal.failure_identity(reason)
+    assert identity == "NATIVE_RESUME_REFUSAL_V1:" <> digest_json(original)
+    stale(ctx, reason)
+    {:ok, failed} = WorkerEvidence.get(ctx.store, "reservation:request")
+    [event] = outcomes(ctx.store)
+    changed_refusal = Map.put(original, "raw_error", changed_raw)
+    refute SymphonyElixir.Codex.ResumeRefusal.failure_identity({:native_resume_refused, changed_refusal}) == identity
+    changed_event = event |> Map.put("refusal", changed_refusal) |> Map.put("refusal_parsed_json_sha256", digest_json(changed_refusal))
+    Store.query!(ctx.store, "UPDATE events SET payload_json=? WHERE event_type='TICKET_WORKER_RESUME_FAILURE_OBSERVED'", [Jason.encode!(changed_event)])
+    assert {:error, :worker_resume_rejection_unproven} = WorkerEvidence.rearm_rejected_resume(ctx.store, "reservation:request")
+    assert {:ok, ^failed} = WorkerEvidence.get(ctx.store, "reservation:request")
+    Store.query!(ctx.store, "UPDATE events SET payload_json=? WHERE event_type='TICKET_WORKER_RESUME_FAILURE_OBSERVED'", [Jason.encode!(event)])
+    assert {:ok, %{"status" => "RESERVED"}} = WorkerEvidence.rearm_rejected_resume(ctx.store, "reservation:request")
+    assert Enum.count(requests(trace), &(&1["method"] == "thread/resume")) == 1
+  end
+
+  defp digest_json(value), do: :crypto.hash(:sha256, Jason.encode!(value)) |> Base.encode16(case: :lower)
 
   test "turn-start errors with identical wording remain bound uncertain sessions, not resume refusals", ctx do
     {prompt, options} = prepare_resume(ctx)
@@ -184,7 +220,7 @@ defmodule SymphonyElixir.FactoryResumeRefusalTest do
   end
 
   defp stale(ctx, reason) do
-    {:ok, _} = TaskLedger.update(ctx.store, "writer", %{status: "STALE", failure_code: inspect(reason)})
+    {:ok, _} = TaskLedger.update(ctx.store, "writer", %{status: "STALE", failure_code: SymphonyElixir.Codex.ResumeRefusal.failure_identity(reason)})
     Store.query!(ctx.store, "UPDATE factory_tasks SET updated_at='2026-01-01T00:00:00Z' WHERE task_key='writer'")
   end
 

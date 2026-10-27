@@ -1123,7 +1123,7 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
           persist_result(store, key, digest(launch.prompt), result)
 
         {:error, reason} ->
-          TaskLedger.update_if_current(store, key, digest(launch.prompt), @in_flight_states, %{status: "STALE", failure_code: inspect(reason)})
+          TaskLedger.update_if_current(store, key, digest(launch.prompt), @in_flight_states, %{status: "STALE", failure_code: SymphonyElixir.Codex.ResumeRefusal.failure_identity(reason)})
       end
 
       send(recipient, {:factory_task_finished, key, result})
@@ -1237,7 +1237,7 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
       result =
         TaskLedger.update_if_current(tx, task_key, prompt_sha256, @in_flight_states, %{
           status: failed_task_status(reason),
-          failure_code: inspect(reason)
+          failure_code: SymphonyElixir.Codex.ResumeRefusal.failure_identity(reason)
         })
 
       maybe_record_task_failure(tx, task_key, request_key, reason, result)

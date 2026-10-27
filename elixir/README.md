@@ -16,8 +16,14 @@ response, before a session is bound. The versioned observation retains the exact
 requested thread and raw error, bound to the current request/task/input/reservation.
 Only supported active-writer refusals can rearm after the existing cooldown and
 all no-session/no-effect guards. Newly observed unclassified RPC errors cannot
-fall back to historical English matching; already-stored exact legacy failures
-remain readable. Explicit non-factory controller forking/waiting behavior is unchanged.
+fall back to historical English matching. One shared persisted identity formatter
+uses a fixed versioned prefix and the SHA256 of the complete structured refusal,
+independently of inspection limits, map printing order, or diagnostic prose.
+Rearming recomputes that identity and compares it with both original stored failures. The
+legacy fallback is limited to runs with no new resume-failure marker. A malformed
+or differently scoped marker on the same run fails closed rather than looking
+absent. Already-stored unmixed exact legacy failures remain readable. Explicit
+non-factory controller forking/waiting behavior is unchanged.
 
 Capability recovery reuses the stopped predecessor's immutable admitted packet and
 shared-instruction bytes. It revalidates all current packet facts except tool

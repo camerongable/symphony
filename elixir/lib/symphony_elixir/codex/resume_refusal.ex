@@ -26,6 +26,15 @@ defmodule SymphonyElixir.Codex.ResumeRefusal do
 
   def details(_), do: :unclassified
 
+  @doc "Persists complete typed identity independently of diagnostic inspection limits."
+  @spec failure_identity(term()) :: String.t()
+  def failure_identity(reason) do
+    case details(reason) do
+      {:ok, refusal} -> "NATIVE_RESUME_REFUSAL_V1:" <> (:crypto.hash(:sha256, Jason.encode!(refusal)) |> Base.encode16(case: :lower))
+      :unclassified -> inspect(reason)
+    end
+  end
+
   defp supported_error?(%{"code" => -32_600, "message" => message}) when is_binary(message) do
     normalized = message |> String.trim() |> String.replace(~r/[ \t]+/, " ")
 

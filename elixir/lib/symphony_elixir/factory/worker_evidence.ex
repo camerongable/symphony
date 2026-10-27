@@ -510,7 +510,7 @@ defmodule SymphonyElixir.Factory.WorkerEvidence do
   defp reconcile_failed_attempt(tx, key, reason, observed) do
     with {:ok, evidence} <- get(tx, key),
          true <- evidence["status"] != "CONSUMED" or {:error, :worker_already_consumed} do
-      {:ok, failed} = update(tx, key, "status = 'RECONCILE_REQUIRED', failure_code = ?", [inspect(reason)])
+      {:ok, failed} = update(tx, key, "status = 'RECONCILE_REQUIRED', failure_code = ?", [SymphonyElixir.Codex.ResumeRefusal.failure_identity(reason)])
 
       record_resume_outcome(tx, failed, reason)
 
@@ -613,10 +613,11 @@ defmodule SymphonyElixir.Factory.WorkerEvidence do
   end
 
   defp resume_rejection_reason(store, evidence, binding, task) do
-    case Store.one!(store, "SELECT payload_json FROM events WHERE event_type='TICKET_WORKER_RESUME_FAILURE_OBSERVED' AND json_extract(payload_json,'$.request_key')=? ORDER BY id DESC LIMIT 1", [
-           evidence["request_key"]
+    case Store.one!(store, "SELECT payload_json FROM events WHERE event_type='TICKET_WORKER_RESUME_FAILURE_OBSERVED' AND run_id=? ORDER BY id DESC LIMIT 1", [
+           evidence["run_id"]
          ]) do
       nil ->
+        # A malformed or differently scoped new marker must never look like a legacy run.
         inspect({:response_error, %{"code" => -32_600, "message" => "thread #{task["thread_id"]} already has an active writer"}})
 
       %{"payload_json" => raw} ->
@@ -627,8 +628,10 @@ defmodule SymphonyElixir.Factory.WorkerEvidence do
              {:ok, refusal} <- SymphonyElixir.Codex.ResumeRefusal.details({:native_resume_refused, observed["refusal"]}),
              true <- observed["refusal_parsed_json_sha256"] == digest(Jason.encode!(refusal)),
              true <- refusal["requested_thread_id"] == task["thread_id"],
+             identity = SymphonyElixir.Codex.ResumeRefusal.failure_identity({:native_resume_refused, refusal}),
+             true <- observed["failure_code"] == identity,
              true <- is_binary(observed["failure_code"]) and observed["failure_sha256"] == digest(observed["failure_code"]) do
-          observed["failure_code"]
+          identity
         else
           _ -> nil
         end
