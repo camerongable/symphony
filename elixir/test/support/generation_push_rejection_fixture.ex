@@ -25,6 +25,13 @@ defmodule SymphonyElixir.TestSupport.GenerationPushRejectionFixture do
 
     assert length(records(ctx.store)) == 3
     for record <- records(ctx.store), do: assert({:ok, _} = TicketPushOrdinaryRejection.validate_record(ctx.store, record))
+    fixture = Application.fetch_env!(:symphony_elixir, :ordinary_rejection_private_fixture)
+    current = retained_programs(fixture)
+
+    case Application.get_env(:symphony_elixir, :generation_rejection_sealed_programs) do
+      nil -> Application.put_env(:symphony_elixir, :generation_rejection_sealed_programs, current)
+      prior -> assert current == prior
+    end
   end
 
   defp seed_prefix(ctx, run) do
@@ -118,6 +125,7 @@ defmodule SymphonyElixir.TestSupport.GenerationPushRejectionFixture do
     assert Jason.decode!(raw)["reason"] == "ordinary_verifier_repair_unproven"
     assert Jason.decode!(raw)["child_pid"] == nil
     assert binding["ordinary_preissuance_retirement"] == nil
+    assert retained_programs(fixture) == Application.fetch_env!(:symphony_elixir, :generation_rejection_sealed_programs)
     {:ok, remote} = Worktree.read_remote_branch(%{"path" => ctx.repo}, run["branch"])
     prefix = Enum.map(records(ctx.store), &identity/1)
     audit = Map.take(run, ~w(run_id candidate_sha contract_sha256 code_repair_round))
@@ -142,6 +150,7 @@ defmodule SymphonyElixir.TestSupport.GenerationPushRejectionFixture do
 
     install_resource(fixture, 4, audit)
     select_capability(36)
+    assert retained_programs(fixture) == Application.fetch_env!(:symphony_elixir, :generation_rejection_sealed_programs)
     assert TicketPushOrdinaryRejection.eligible?(run)
     assert {:ok, _} = TicketPushOrdinaryRejection.closed_authority(run, intent)
     IO.puts("GENERATION_REJECTION_REAL_V34_REJECTED_WITHOUT_GIT")
@@ -265,7 +274,7 @@ defmodule SymphonyElixir.TestSupport.GenerationPushRejectionFixture do
         path = Path.join(root, "priv/ticket_push_history_validator_v#{history}.py")
         text = File.read!(path)
         assert length(String.split(text, old_sha)) in [1, 2]
-        File.write!(path, String.replace(text, old_sha, hash(raw)))
+        if String.contains?(text, old_sha), do: File.write!(path, String.replace(text, old_sha, hash(raw)))
       end
     end
 
@@ -282,6 +291,12 @@ defmodule SymphonyElixir.TestSupport.GenerationPushRejectionFixture do
         text
         |> String.replace("defp helper_name(:capability), do: \"ticket_push_executor_v36.py\"", "defp helper_name(:capability), do: \"ticket_push_executor_v34.py\"")
         |> String.replace("defp helper_sha(:capability), do: @generation_publisher_capability_helper_sha", "defp helper_sha(:capability), do: @retained_publisher_capability_helper_sha")
+        |> String.replace(":large -> \"ticket_push_executor_v35.py\"", ":large -> \"ticket_push_executor_v33.py\"")
+        |> String.replace("defp helper_sha(:large), do: @generation_publisher_helper_sha", "defp helper_sha(:large), do: @retained_publisher_helper_sha")
+        |> String.replace(
+          "defp history_program(:large), do: {\"ticket_push_history_validator_v25.py\", @generation_publisher_history_sha}",
+          "defp history_program(:large), do: {\"ticket_push_history_validator_v24.py\", @retained_publisher_history_sha}"
+        )
         |> String.replace(
           "defp history_program(:capability), do: {\"ticket_push_history_validator_v25.py\", @generation_publisher_history_sha}",
           "defp history_program(:capability), do: {\"ticket_push_history_validator_v24.py\", @retained_publisher_history_sha}"
@@ -302,6 +317,15 @@ defmodule SymphonyElixir.TestSupport.GenerationPushRejectionFixture do
   defp records(store) do
     result = Store.query!(store, "SELECT id,payload_json FROM events WHERE event_type='TICKET_ORDINARY_PUSH_REJECTION_RETIRED' ORDER BY id")
     Enum.map(result.rows, &Map.new(Enum.zip(result.columns, &1)))
+  end
+
+  defp retained_programs(fixture) do
+    for root <- [fixture.app, fixture.source],
+        name <- ~w(ticket_push_executor_v33.py ticket_push_executor_v34.py ticket_push_history_validator_v24.py),
+        into: %{} do
+      path = Path.join(root, "priv/" <> name)
+      {path, File.read!(path)}
+    end
   end
 
   defp identity(record) do

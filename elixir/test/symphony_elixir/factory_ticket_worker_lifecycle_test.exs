@@ -7897,7 +7897,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
       proof_script =
         "import importlib.util,json,sqlite3,sys; d=json.load(open(sys.argv[1])); s=importlib.util.spec_from_file_location('physical',sys.argv[3]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); c=sqlite3.connect('file:'+sys.argv[2]+'?mode=ro',uri=True); c.row_factory=sqlite3.Row; m.retained_history(c,d['execution'],d['binding'],d['run'])"
 
-      proof_script = if ctx[:generation_push_rejection_child], do: GenerationRejectionFixture.proof_script(), else: proof_script
+      proof_script = generation_rejection_proof_script(ctx, proof_script)
 
       proof_script =
         "import subprocess,sys; p=subprocess.Popen([sys.executable,'-I','-S','-B','-c'," <>
@@ -8299,6 +8299,11 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
   end
 
   defp assert_generation_rejection_programs(_ctx), do: :ok
+
+  defp generation_rejection_proof_script(%{generation_push_rejection_child: true}, _script),
+    do: GenerationRejectionFixture.proof_script()
+
+  defp generation_rejection_proof_script(_ctx, script), do: script
 
   defp with_generation_rejection_origin(%{generation_push_rejection_child: true}, operation) do
     GenerationRejectionFixture.activate_generation()
