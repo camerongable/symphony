@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
 from unittest.mock import patch
 
 
@@ -368,7 +369,9 @@ CREATE TABLE worker_evidence(owner_process_json TEXT,owner_stopped_at TEXT);
         tools = load_tools()
         original = plistlib.dumps({'ProgramArguments': [str(tools.OLD_RELEASE / 'run-local-factory'), '/workflow'],
                                   'EnvironmentVariables': {'MIX_BUILD_PATH': '/original/dev', 'KEEP': 'yes'}})
-        audit = {'replacement_launcher': '/replacement/run-local-factory', 'replacement_build': '/replacement/dev'}
+        audit = {'replacement_launcher': '/symphony-review-report-fixture/run-local-factory',
+                 'replacement_build': '/symphony-review-report-fixture/dev',
+                 'replacement_manifest': '/symphony-review-report-fixture/evidence/release-manifest.json'}
         tools.validate_restore_plist(original, original, audit, '/workflow', '/original/dev')
         replacement = tools.replacement_plist(original, audit['replacement_launcher'], audit['replacement_build'])
         tools.validate_restore_plist(original, replacement, audit, '/workflow', '/original/dev')
@@ -380,6 +383,52 @@ CREATE TABLE worker_evidence(owner_process_json TEXT,owner_stopped_at TEXT);
         for field in ('replacement_launcher', 'replacement_build'):
             with self.subTest(alive=field), self.assertRaises(AssertionError):
                 tools.validate_replacement_absent('456 '+audit[field], audit)
+
+    def test_beam_guard_and_manifest_argv_refuse_bound_absence_and_restore_before_bootstrap(self):
+        tools = load_tools()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            release = root / 'symphony-review-report-candidate'
+            audit = {'replacement_launcher': str(release / 'run-local-factory'),
+                     'replacement_build': str(release / 'dev'),
+                     'replacement_manifest': str(release / 'evidence/release-manifest.json')}
+            beam = ('123 /opt/erlang/erts/bin/beam.smp -- -extra -S mix run --no-compile --no-start -e '
+                    'path = "'+str(release / 'release_boot_guard.exs')+'"; '
+                    'ReviewReportReleaseBootGuard.load("'+audit['replacement_manifest']+'", "manifest"); '
+                    'SymphonyElixir.CLI.main(System.argv())')
+            self.assertNotIn(audit['replacement_launcher'], beam)
+            self.assertNotIn(audit['replacement_build'], beam)
+            with self.assertRaisesRegex(AssertionError, 'replacement process'):
+                tools.validate_replacement_absent(beam, audit)
+            (root / 'cutover-audit.json').write_bytes(tools.encode(audit))
+            guard, _ = tools.bind(root)
+            guard.DB = root / 'must-not-open.sqlite'
+            commands = []
+
+            def os_boundary(args, **_options):
+                commands.append(args)
+                if args == ['/bin/ps', '-p', tools.OLD_PID, '-o', 'pid=']:
+                    return subprocess.CompletedProcess(args, 1, '', '')
+                if args == ['/bin/launchctl', 'print', guard.SERVICE]:
+                    return subprocess.CompletedProcess(args, 1, '', '')
+                if args == ['/bin/ps', '-axo', 'pid=,command=']:
+                    return subprocess.CompletedProcess(args, 0, beam, '')
+                raise AssertionError('unexpected process-control call: '+repr(args))
+
+            with patch.object(guard.subprocess, 'run', side_effect=os_boundary), \
+                    patch.object(guard.urllib.request, 'urlopen', side_effect=urllib.error.URLError(ConnectionRefusedError())):
+                for operation in (guard.absent, guard.restore_check, guard.restore_original):
+                    with self.subTest(operation=operation.__name__), self.assertRaisesRegex(AssertionError, 'replacement process'):
+                        operation()
+            self.assertFalse(guard.DB.exists())
+            self.assertFalse(any('bootstrap' in args or 'bootout' in args for args in commands))
+            tools.validate_replacement_absent('456 /unrelated/process', audit)
+            for field, value in (('replacement_launcher', 'relative/run-local-factory'),
+                                 ('replacement_launcher', str(release / 'other-program')),
+                                 ('replacement_build', '/other/dev'),
+                                 ('replacement_manifest', str(release / 'other-manifest.json'))):
+                with self.subTest(malformed=field, value=value), self.assertRaises(AssertionError):
+                    tools.validate_replacement_absent('', {**audit, field: value})
 
 
 if __name__ == '__main__':

@@ -318,8 +318,15 @@ def mailbox_quiet(path):
 
 
 def validate_replacement_absent(process_listing, audit):
+    launcher = Path(audit['replacement_launcher'])
+    release = launcher.parent
+    assert launcher.is_absolute() and launcher.name == 'run-local-factory'
+    assert release.resolve() == release and release.name.startswith('symphony-review-report-')
+    assert audit['replacement_build'] == str(release / 'dev')
+    assert audit['replacement_manifest'] == str(release / 'evidence/release-manifest.json')
     for line in process_listing.splitlines():
-        assert audit['replacement_launcher'] not in line and audit['replacement_build'] not in line, 'replacement process may still be alive'
+        # exec replaces the launcher with BEAM; only guard/manifest argv may remain.
+        assert str(release) not in line, 'replacement process may still be alive'
 
 
 def bind(evidence_root):

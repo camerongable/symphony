@@ -2,12 +2,13 @@
 
 ## Result and boundary
 
-Offline tools checkpoint `e603df7` is prepared for independent review, not
+Initial offline tools checkpoint `e603df7` was prepared for independent review, not
 deployment. It starts from accepted combined source
 `4f58e6a86396bb76a57fca6cdeb519a91749afb2` on branch
 `cgable/review-ready-rollout-20261027`. No verified Jira belongs to this factory
 tooling change, so its conventional commit deliberately has no product-ticket
 scope. Parent owns final integration, artifact qualification, and service control.
+Revision1 below supersedes that checkpoint's replacement-process absence check.
 
 Plan023 and these reviewed tools must first be combined in one clean, accepted
 source commit. No release was built and neither new qualifier was run against
@@ -106,6 +107,35 @@ Full make/all, coverage and Dialyzer were not run for this plans-only preparatio
 The known inherited653-finding lint baseline is not a full-green quality gate;
 final combined023 must separately prove zero additions against it. There is no
 coverage or Dialyzer PASS claim here.
+
+## Revision1: exec-replaced BEAM absence
+
+Independent tool review found that an exec-replaced BEAM command line can contain
+only the replacement release's boot-guard and manifest paths, with neither its
+launcher nor its `/dev` build path. The initial scanner incorrectly accepted that
+process as absent. A new actual-style command-line fixture discriminated the bug:
+14tests ran with one failure before the fix (`AssertionError not raised`).
+
+The scanner now derives one canonical absolute replacement release root from the
+launcher parent, requires the exact launcher name, matching root/dev build and
+root/evidence/release-manifest.json path, and rejects that root anywhere in process
+argv. The existing issuer-PID, launchd and API absence checks remain mandatory.
+Tests exercise the bound absent, restore-check and restore-original paths using
+only mocked OS boundaries; a live-shaped BEAM is refused before a database open,
+bootout or bootstrap. Changed launcher/build/manifest tuples also reject.
+
+Final revision1 results, same commands as above:
+
+| Gate | Actual result | LogSHA256 |
+| --- | --- | --- |
+| New offline tools |14tests,0failures,0.576s; exit0|40ba7d1f894e19337ee17c1166607f6942adcdb45261ac2787a72977a6e60f87|
+| Historical tools unchanged |13tests,0failures,0.536s; exit0|eb90a3e474f40688001e859ed111287d8f5fd1b14ce8390bd114361f69decc28|
+
+Logs are new-tools-r1.log and legacy-tools-r1.log in the same ignored evidence
+directory. Python syntax and Elixir parse pass again; all148 private resources
+and historical tool/test bytes still match base4f58. This revision performs no
+build, live qualification, process control, service/schedule action or ledger write.
+It stops for detached re-review.
 
 ## Future exact command contract — not executed
 
