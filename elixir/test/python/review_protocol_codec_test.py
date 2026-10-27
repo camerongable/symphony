@@ -1,8 +1,13 @@
 import copy
+import contextlib
 import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import shutil
+import sqlite3
+import tempfile
+import types
 import unittest
 
 path = Path(__file__).resolve().parents[2] / 'priv/ticket_push_history_validator_v19.py'
@@ -13,15 +18,17 @@ spec.loader.exec_module(history)
 
 class ReviewCodecTest(unittest.TestCase):
     def test_completed_ordinary_push_binds_current_and_retained_history_programs(self):
-        codec_path = path.with_name('ticket_push_history_validator_v23.py')
+        codec_path = path.with_name('ticket_push_history_validator_v24.py')
         codec_spec = importlib.util.spec_from_file_location('ordinary_programs', codec_path)
         codec = importlib.util.module_from_spec(codec_spec)
         codec_spec.loader.exec_module(codec)
         local = path.parent
         producer = (local.parent / 'lib/symphony_elixir/factory/ticket_push_io.ex').read_text()
-        self.assertIn('defp helper_name(:capability), do: "ticket_push_executor_v32.py"', producer)
-        self.assertIn(':large -> "ticket_push_executor_v31.py"', producer)
+        self.assertIn('defp helper_name(:capability), do: "ticket_push_executor_v34.py"', producer)
+        self.assertIn(':large -> "ticket_push_executor_v33.py"', producer)
         for helper_name, history_name in (
+            ('ticket_push_executor_v33.py', 'ticket_push_history_validator_v24.py'),
+            ('ticket_push_executor_v34.py', 'ticket_push_history_validator_v24.py'),
             ('ticket_push_executor_v31.py', 'ticket_push_history_validator_v23.py'),
             ('ticket_push_executor_v32.py', 'ticket_push_history_validator_v23.py'),
             ('ticket_push_executor_v29.py', 'ticket_push_history_validator_v22.py'),
@@ -63,6 +70,82 @@ class ReviewCodecTest(unittest.TestCase):
                     changed['receipt_sha256'] = codec.sha(changed['receipt_json'].encode())
                     with self.subTest(field=field), self.assertRaises(ValueError):
                         codec.push_completed_marker(codec.canonical(changed).decode(), run)
+
+    def test_new_publishers_require_captured_generation_and_capability_evidence(self):
+        codec_path = path.with_name('ticket_push_history_validator_v24.py')
+        codec = types.ModuleType('current_fences')
+        codec.__file__ = str(codec_path)
+        exec(compile(codec_path.read_bytes(), str(codec_path), 'exec'), codec.__dict__)
+        with contextlib.closing(sqlite3.connect(':memory:')) as db:
+            db.executescript('''
+                CREATE TABLE ticket_ci_generation_intents(intent_key TEXT, run_id TEXT, claim_key TEXT, binding_json TEXT);
+                CREATE TABLE ticket_ci_repair_claims(claim_key TEXT, round INTEGER);
+            ''')
+            run = {'run_id': 'synthetic', 'code_repair_round': 0}
+            for version in (31, 32, 33, 34):
+                execution = {'helper_path': str(path.parent / f'ticket_push_executor_v{version}.py'), 'worker_history': {}}
+                with self.subTest(version=version), self.assertRaises(ValueError):
+                    codec.generated_only_commits(db, execution, {}, run)
+            legacy = {'helper_path': str(path.parent / 'ticket_push_executor_v10.py'), 'worker_history': {}}
+            self.assertIsNone(codec.generated_only_commits(db, legacy, {}, run))
+        for version in (32, 34):
+            execution = {'helper_path': f'/synthetic/ticket_push_executor_v{version}.py'}
+            with self.subTest(version=version), self.assertRaises(ValueError):
+                codec.capability_projection(execution, {})
+            self.assertTrue(codec.capability_projection(execution, {'capability_recovery_version': 1}))
+        for version in (31, 33):
+            execution = {'helper_path': f'/synthetic/ticket_push_executor_v{version}.py'}
+            self.assertFalse(codec.capability_projection(execution, {}))
+            with self.assertRaises(ValueError):
+                codec.capability_projection(execution, {'capability_recovery_version': 0})
+
+    def test_retained_publisher_origin_authenticates_manifest_and_history_without_execution(self):
+        codec_path = path.with_name('ticket_push_history_validator_v24.py')
+        original = json.loads(path.with_name('ticket_push_readback_origins_v18.json').read_text())['entries'][-1]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            local = root / 'current'
+            shutil.copytree(path.parent, local, ignore=shutil.ignore_patterns('__pycache__'))
+            release = root / 'retained-release'
+            artifact = release / 'dev/lib/symphony_elixir/priv'
+            artifact.mkdir(parents=True)
+            names = ('ticket_push_executor_v26.py', 'worker_file_companion.py', 'ticket_push_history_validator_v20.py')
+            for name in names:
+                shutil.copyfile(local / name, artifact / name)
+            manifest = {'kind': 'FACTORY_PUSH_HANDOFF_RELEASE_V1', 'release': str(release),
+                        'artifact': {'lib/symphony_elixir/priv/' + name: {'sha256': hashlib.sha256((artifact / name).read_bytes()).hexdigest()} for name in names}}
+            manifest_path = release / 'evidence/release-manifest.json'
+            manifest_path.parent.mkdir()
+            manifest_raw = json.dumps(manifest, separators=(',', ':')).encode()
+            manifest_path.write_bytes(manifest_raw)
+            entry = dict(original, release_root=str(release), manifest_path=str(manifest_path),
+                         manifest_sha256=hashlib.sha256(manifest_raw).hexdigest(),
+                         helper_path=str(artifact / names[0]), artifact_helper_path=str(artifact / names[0]),
+                         companion_path=str(artifact / names[1]), artifact_companion_path=str(artifact / names[1]))
+            catalog_raw = json.dumps({'version': 18, 'entries': [entry]}, separators=(',', ':')).encode()
+            (local / 'ticket_push_readback_origins_v18.json').write_bytes(catalog_raw)
+            source = codec_path.read_text().replace(original['release_root'], str(release)).replace(original['manifest_sha256'], entry['manifest_sha256'])
+            source = source.replace('eb5cd13394c12eb26d1f12991a4ce5027e3dbe46c5eb40e347345dfa8c7c0d01', hashlib.sha256(catalog_raw).hexdigest())
+            codec = types.ModuleType('retained_origin')
+            codec.__file__ = str(local / codec_path.name)
+            exec(compile(source, codec.__file__, 'exec'), codec.__dict__)
+            execution = {key: entry[key] for key in ('helper_path', 'helper_sha256', 'companion_path', 'companion_sha256')}
+            execution['history_program_sha256'] = hashlib.sha256((artifact / names[2]).read_bytes()).hexdigest()
+            codec.push_program_origin(execution, local)
+            before = {name: (artifact / name).read_bytes() for name in names}
+            for field, value in (('helper_path', str(root / 'sibling' / names[0])), ('helper_sha256', '0' * 64),
+                                 ('companion_path', str(root / 'sibling' / names[1])), ('companion_sha256', '0' * 64),
+                                 ('history_program_sha256', '0' * 64)):
+                with self.subTest(field=field), self.assertRaises(ValueError):
+                    codec.push_program_origin(dict(execution, **{field: value}), local)
+            for target in (manifest_path, *(artifact / name for name in names)):
+                raw = target.read_bytes()
+                target.write_bytes(raw + b'changed')
+                with self.subTest(target=target.name), self.assertRaises(ValueError):
+                    codec.push_program_origin(execution, local)
+                target.write_bytes(raw)
+                codec.push_program_origin(execution, local)
+            self.assertEqual(before, {name: (artifact / name).read_bytes() for name in names})
 
     def test_focused_writer_readiness_is_not_physical_verifier_acceptance(self):
         codec_spec = importlib.util.spec_from_file_location('writer_readiness', path.with_name('ticket_push_history_validator_v22.py'))
