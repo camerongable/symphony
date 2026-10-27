@@ -99,7 +99,7 @@ defmodule SymphonyElixir.FactoryCurrentPushRejectionTest do
     captured =
       Enum.reduce(1..4, [], fn version, captured ->
         prior = if version == 2, do: identity(hd(captured)), else: nil
-        context_number = if version <= 2, do: 1, else: if(version == 4 && opts[:same_context], do: 3, else: version)
+        context_number = context_number(version, opts)
         ordinary = %{"kind" => "ORDINARY_VERIFIER_REPAIR_PREFLIGHT_V1"}
 
         context = %{
@@ -207,4 +207,8 @@ defmodule SymphonyElixir.FactoryCurrentPushRejectionTest do
   end
 
   defp hash(raw), do: :crypto.hash(:sha256, raw) |> Base.encode16(case: :lower)
+
+  defp context_number(version, _opts) when version in [1, 2], do: 1
+  defp context_number(4, opts), do: if(opts[:same_context], do: 3, else: 4)
+  defp context_number(version, _opts), do: version
 end
