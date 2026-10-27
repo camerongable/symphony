@@ -18,15 +18,17 @@ spec.loader.exec_module(history)
 
 class ReviewCodecTest(unittest.TestCase):
     def test_completed_ordinary_push_binds_current_and_retained_history_programs(self):
-        codec_path = path.with_name('ticket_push_history_validator_v24.py')
+        codec_path = path.with_name('ticket_push_history_validator_v25.py')
         codec_spec = importlib.util.spec_from_file_location('ordinary_programs', codec_path)
         codec = importlib.util.module_from_spec(codec_spec)
         codec_spec.loader.exec_module(codec)
         local = path.parent
         producer = (local.parent / 'lib/symphony_elixir/factory/ticket_push_io.ex').read_text()
-        self.assertIn('defp helper_name(:capability), do: "ticket_push_executor_v34.py"', producer)
-        self.assertIn(':large -> "ticket_push_executor_v33.py"', producer)
+        self.assertIn('defp helper_name(:capability), do: "ticket_push_executor_v36.py"', producer)
+        self.assertIn(':large -> "ticket_push_executor_v35.py"', producer)
         for helper_name, history_name in (
+            ('ticket_push_executor_v35.py', 'ticket_push_history_validator_v25.py'),
+            ('ticket_push_executor_v36.py', 'ticket_push_history_validator_v25.py'),
             ('ticket_push_executor_v33.py', 'ticket_push_history_validator_v24.py'),
             ('ticket_push_executor_v34.py', 'ticket_push_history_validator_v24.py'),
             ('ticket_push_executor_v31.py', 'ticket_push_history_validator_v23.py'),
@@ -72,7 +74,7 @@ class ReviewCodecTest(unittest.TestCase):
                         codec.push_completed_marker(codec.canonical(changed).decode(), run)
 
     def test_new_publishers_require_captured_generation_and_capability_evidence(self):
-        codec_path = path.with_name('ticket_push_history_validator_v24.py')
+        codec_path = path.with_name('ticket_push_history_validator_v25.py')
         codec = types.ModuleType('current_fences')
         codec.__file__ = str(codec_path)
         exec(compile(codec_path.read_bytes(), str(codec_path), 'exec'), codec.__dict__)
@@ -82,18 +84,18 @@ class ReviewCodecTest(unittest.TestCase):
                 CREATE TABLE ticket_ci_repair_claims(claim_key TEXT, round INTEGER);
             ''')
             run = {'run_id': 'synthetic', 'code_repair_round': 0}
-            for version in (31, 32, 33, 34):
+            for version in (31, 32, 33, 34, 35, 36):
                 execution = {'helper_path': str(path.parent / f'ticket_push_executor_v{version}.py'), 'worker_history': {}}
                 with self.subTest(version=version), self.assertRaises(ValueError):
                     codec.generated_only_commits(db, execution, {}, run)
             legacy = {'helper_path': str(path.parent / 'ticket_push_executor_v10.py'), 'worker_history': {}}
             self.assertIsNone(codec.generated_only_commits(db, legacy, {}, run))
-        for version in (32, 34):
+        for version in (32, 34, 36):
             execution = {'helper_path': f'/synthetic/ticket_push_executor_v{version}.py'}
             with self.subTest(version=version), self.assertRaises(ValueError):
                 codec.capability_projection(execution, {})
             self.assertTrue(codec.capability_projection(execution, {'capability_recovery_version': 1}))
-        for version in (31, 33):
+        for version in (31, 33, 35):
             execution = {'helper_path': f'/synthetic/ticket_push_executor_v{version}.py'}
             self.assertFalse(codec.capability_projection(execution, {}))
             with self.assertRaises(ValueError):
