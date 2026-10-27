@@ -80,14 +80,17 @@ defmodule SymphonyElixir.Factory.CompletedTurnRecovery do
 
   defp native_result(before, native) when is_map(native) do
     evidence = before.evidence
-    latest = native["latest_turn_observation"] || %{}
-    confirmed = latest["confirmation"] || %{}
-    queue = native["queue_observation"] || %{}
+    status = native["status"]
+    latest = native["latest_turn_observation"]
+    confirmed = if is_map(latest), do: latest["confirmation"]
+    queue = native["queue_observation"]
     parameters = %{"threadId" => evidence["thread_id"], "limit" => 1, "sortDirection" => "desc", "itemsView" => "full"}
 
-    with true <- byte_size(Jason.encode!(native)) <= 2_097_152,
+    with {:ok, encoded} <- Jason.encode(native),
+         true <- byte_size(encoded) <= 2_097_152,
+         true <- is_map(status) and is_map(latest) and is_map(confirmed) and is_map(queue),
          true <- {native["id"], native["cwd"]} == {evidence["thread_id"], before.binding["policy"]["cwd"]},
-         true <- get_in(native, ["status", "type"]) in ~w(idle notLoaded systemError),
+         true <- status["type"] in ~w(idle notLoaded systemError),
          true <- is_number(native["updatedAt"]) and native["updatedAt"] == latest["updated_at"],
          true <- latest["mode"] == "LATEST_DESC" and latest["parameters"] == parameters,
          %{"data" => [%{"id" => turn, "status" => "completed", "error" => nil, "items" => items}]} = raw when is_list(items) <- latest["raw_response"],

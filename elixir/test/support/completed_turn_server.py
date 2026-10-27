@@ -33,6 +33,8 @@ for line in sys.stdin:
     elif method == "turn/start":
         item = {"id": "completed-final", "type": "agentMessage", "phase": "final_answer", "text": json.dumps({"status": "COMPLETE", "changed_paths": [], "commit_message": None, "blockers": [], "checks": []})}
         state = {"id": "completed-worker", "cwd": os.getcwd(), "status": {"type": "idle"}, "updatedAt": 1, "turns": [{"id": "completed-turn", "status": "completed", "error": None, "items": [item]}]}
+        if os.path.exists(trace + ".native-status"):
+            state["status"] = json.load(open(trace + ".native-status"))
         with open(trace + ".state", "w") as output:
             json.dump(state, output)
         send({"id": identifier, "result": {"turn": {"id": "completed-turn"}}})

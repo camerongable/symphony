@@ -46,3 +46,24 @@ unretested at this intermediate checkpoint.
 
 Remaining Slice1 review should scrutinize input/owner identity, transaction lifetime,
 committed readback, event privacy, compatibility, and absence of execution replay.
+
+## Robustness revision
+
+Malformed native status RED at the exact selected test failed1/1 with an
+`Access.get/3` exception (`_build/completed-turn-status-red2.log`). The first
+line-filter invocation selected an adjacent passing test instead; its log remains
+`completed-turn-status-red.log` and is not claimed as RED.
+
+Added explicit map-container and fallible parsed-JSON-encoding checks, not a broad
+catch-to-success. Three malformed-observation tests passed3/0 with8 excluded in30.3s
+(`completed-turn-status-green.log`). This covers six real subprocess status shapes,
+the immediate/scheduler denial path retaining the original stopped failure, and
+24 malformed container/timestamp variants through the existing native-reader seam
+after an actual AppServer read. The latter is defensive adapter parsing coverage,
+not a separate live-native acceptance claim.
+
+The pinned neighboring run at the first checkpoint completed54tests/1failure in75.7s
+(`completed-turn-neighbors.log`). The failure is an existing StageRunner assertion
+atline751 rejecting the substring `controller mode`, now present in its embedded
+complete skill reference. Slice1 does not change prompt generation or that assertion;
+independent baseline provenance is pending. No test or host skill was suppressed.

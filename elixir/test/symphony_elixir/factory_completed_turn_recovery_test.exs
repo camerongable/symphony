@@ -151,6 +151,63 @@ defmodule SymphonyElixir.FactoryCompletedTurnRecoveryTest do
     assert execution_count(trace) == 1
   end
 
+  @tag :malformed_observation
+  test "malformed native status shapes are explicit denials preserving the original failure", ctx do
+    {trace, failed} = failed_attempt(ctx)
+    native = Jason.decode!(File.read!(trace <> ".state"))
+
+    for status <- [nil, "invalid", [], ["idle"], 7, false] do
+      File.write!(trace <> ".state", Jason.encode!(Map.put(native, "status", status)))
+      assert {:error, :completed_turn_native_unproven} = TicketWorkerRunner.reconcile_completed(ctx.store, "reservation:request")
+      assert {:ok, ^failed} = WorkerEvidence.get(ctx.store, "reservation:request")
+      assert recovery_events(ctx.store) == []
+    end
+
+    assert execution_count(trace) == 1
+  end
+
+  @tag :malformed_observation
+  test "immediate and scheduler recovery preserve a malformed provider response as uncertainty", ctx do
+    {prompt, options} = prepare(ctx)
+    trace = configure_server(Map.put(ctx, :native_status, "invalid"))
+    assert {:error, {:port_exit, 7}} = TicketWorkerRunner.run(ctx.path, %Issue{identifier: "PPL-123"}, prompt, StageSchemas.for_stage(:native_feature_writer), options)
+    {:ok, failed} = WorkerEvidence.get(ctx.store, "reservation:request")
+    assert failed["failure_code"] == inspect({:port_exit, 7})
+    assert WorkerEvidence.owner_stopped?(ctx.store, failed)
+    factory = %{enabled: true, scope: "fixture", dispatcher_id: "fixture", lease_seconds: 240, repositories: %{}}
+    context = %{store: ctx.store, factory: factory, workspace_root: ctx.root}
+    assert {:error, _} = Scheduler.ticket_step(context, "run", opts(ctx))
+    assert {:ok, ^failed} = WorkerEvidence.get(ctx.store, "reservation:request")
+    assert recovery_events(ctx.store) == []
+    assert execution_count(trace) == 1
+  end
+
+  defmodule ObservationReader do
+    def read_native_thread(thread, opts) do
+      with {:ok, observed} <- SymphonyElixir.Codex.AppServer.read_native_thread(thread, opts),
+           {:ok, raw} <- File.read(Path.join(opts[:workspace], ".observation-shape")),
+           {:ok, %{"path" => path, "value" => value}} <- Jason.decode(raw) do
+        {:ok, put_in(observed, path, value)}
+      end
+    end
+  end
+
+  @tag :malformed_observation
+  test "malformed adapter observation containers and timestamps cannot become completion proof", ctx do
+    {_trace, failed} = failed_attempt(ctx)
+    containers = [["latest_turn_observation"], ["latest_turn_observation", "confirmation"], ["queue_observation"]]
+    timestamps = [["latest_turn_observation", "observed_at"], ["latest_turn_observation", "confirmation", "observed_at"], ["queue_observation", "observed_at"]]
+    cases = for path <- containers, value <- [nil, "invalid", [], 7], do: {path, value}
+    cases = cases ++ for(path <- timestamps, value <- [nil, "not-a-time", 7, []], do: {path, value})
+
+    for {path, value} <- cases do
+      File.write!(Path.join(ctx.path, ".observation-shape"), Jason.encode!(%{path: path, value: value}))
+      assert {:error, :completed_turn_native_unproven} = TicketWorkerRunner.reconcile_completed(ctx.store, "reservation:request", native_reader: ObservationReader)
+      assert {:ok, ^failed} = WorkerEvidence.get(ctx.store, "reservation:request")
+      assert recovery_events(ctx.store) == []
+    end
+  end
+
   test "missing stop, wrong process, changed generation and changed inputs cannot recover", ctx do
     {trace, failed} = failed_attempt(ctx)
     {:ok, access} = WorkspaceAccess.get(ctx.store, "reservation")
@@ -249,6 +306,7 @@ defmodule SymphonyElixir.FactoryCompletedTurnRecoveryTest do
   defp configure_server(ctx) do
     trace = Path.join(ctx.root, "completed.trace")
     if ctx[:deny_read], do: File.write!(trace <> ".deny-read", "unavailable")
+    if Map.has_key?(ctx, :native_status), do: File.write!(trace <> ".native-status", Jason.encode!(ctx.native_status))
     binary = Path.join(ctx.root, "completed-server")
     server = Path.expand("../support/completed_turn_server.py", __DIR__)
     File.write!(binary, "#!/bin/sh\nexec /usr/bin/python3 -I -S -B '#{server}' '#{trace}'\n")
