@@ -1,6 +1,7 @@
 defmodule SymphonyElixir.Factory.WorkerEvidence do
   @moduledoc "Immutable attempt bindings and exact worker receipts; model completion is not adoption."
   alias SymphonyElixir.Factory.{
+    CompletedTurnRecovery,
     ReviewProtocol,
     RunLedger,
     StageSchemas,
@@ -686,7 +687,7 @@ defmodule SymphonyElixir.Factory.WorkerEvidence do
 
   defp record_native_completion(store, evidence, binding, %{native_recovery: proof} = result, occurred_at) do
     with %{evidence: ^evidence, binding: ^binding} = before <- result[:reconciliation_preimage],
-         :ok <- SymphonyElixir.Factory.CompletedTurnRecovery.validate_receipt(proof, before, result, occurred_at),
+         :ok <- CompletedTurnRecovery.validate_receipt(proof, before, result, occurred_at),
          true <- native_completion_unrecorded?(store, evidence),
          %{"id" => id} when is_integer(id) and id > 0 <-
            Store.one!(store, "INSERT INTO events(occurred_at,event_type,run_id,payload_json) VALUES (?, 'TICKET_WORKER_NATIVE_COMPLETION_RECOVERED', ?, ?) RETURNING id", [

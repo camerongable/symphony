@@ -216,9 +216,8 @@ defmodule SymphonyElixir.Factory.CompletedTurnRecovery do
   end
 
   defp observation_time?(raw, stopped, event) do
-    with {:ok, observed} <- utc(raw) do
-      DateTime.compare(stopped, observed) != :gt and DateTime.diff(event, observed, :microsecond) in 0..10_000_000
-    else
+    case utc(raw) do
+      {:ok, observed} -> DateTime.compare(stopped, observed) != :gt and DateTime.diff(event, observed, :microsecond) in 0..10_000_000
       _ -> false
     end
   end
