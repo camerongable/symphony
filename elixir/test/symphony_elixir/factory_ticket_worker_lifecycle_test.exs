@@ -5352,6 +5352,8 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
        verifier_repair_cycle: true,
        ordinary_final_rollover: true,
        native_publication_completion: true,
+       capability_recovery_native: false,
+       operator_verifier_repair: false,
        timeout: 900_000
   test "recovered repairing writer and verifiers publish once with their genuine stopped seven receipts", ctx do
     assert_mr_adoption(ctx)
@@ -5415,6 +5417,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
       native = %{
         "id" => session.thread_id,
         "cwd" => session.workspace,
+        "projectId" => nil,
         "status" => %{"type" => "idle"},
         "updatedAt" => 1,
         "turns" => [%{"id" => turn, "status" => "completed", "error" => nil, "items" => [item]}]
@@ -5465,6 +5468,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
       }
 
       queued = %{"thread_id" => thread, "empty_complete" => true, "count_lower_bound" => 0, "has_more" => false, "sha256" => digest.(queue), "raw_response" => queue, "observed_at" => at}
+      if hook = Process.get(:ci_repair_source_observed), do: hook.()
       {:ok, native |> Map.put("latest_turn_observation", latest) |> Map.put("queue_observation", queued)}
     end
 
@@ -6498,7 +6502,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
         ci_generated_only: ctx[:ci_generated_only]
       )
 
-    options = if ctx[:native_publication_completion], do: Keyword.put(options, :native_reader, NativePublicationCompletionServer), else: options
+    options = native_completion_options(ctx, options)
 
     pipeline = %{
       "id" => "99",
@@ -6882,6 +6886,8 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
   defp ci_fixture_server(%{push_packet_history: true}), do: SymphonyElixir.CiRepairOwnedPythonWorkerServer
   defp ci_fixture_server(%{ci_repair_non_go: true}), do: SymphonyElixir.CiRepairPythonWorkerServer
   defp ci_fixture_server(_ctx), do: SymphonyElixir.CiRepairWorkerServer
+  defp native_completion_options(%{native_publication_completion: true}, options), do: Keyword.put(options, :native_reader, NativePublicationCompletionServer)
+  defp native_completion_options(_ctx, options), do: options
   defp ci_fixture_path(%{ci_repair_non_go: true}), do: "job.py"
   defp ci_fixture_path(_ctx), do: "job.go"
   defp handoff_reopen?(ctx, round), do: ctx[:ci_handoff_acceptance] == true and round == 4
@@ -10464,7 +10470,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
   defp prepared_mr_context(ctx) do
     {context, options} = controller(ctx)
     options = if ctx[:ci_repair_fixture], do: Keyword.put(options, :app_server, ci_fixture_server(ctx)), else: options
-    options = if ctx[:native_publication_completion], do: Keyword.put(options, :native_reader, NativePublicationCompletionServer), else: options
+    options = native_completion_options(ctx, options)
     assert complete_stage(context, options)["state"] == "VERIFYING"
     assert complete_stage(context, options)["state"] == "PUSHING"
     remote = Path.join(ctx.root, "mr-claim-origin.git")

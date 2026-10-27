@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.FactoryTicketPushReadbackTest do
   use ExUnit.Case, async: false
 
-  alias SymphonyElixir.Factory.Store
+  alias SymphonyElixir.Factory.{Store, TicketPushIO}
   alias SymphonyElixir.PathSafety
 
   test "the status catalog retains every prior origin and the last publishing release" do
@@ -188,7 +188,7 @@ defmodule SymphonyElixir.FactoryTicketPushReadbackTest do
     true = :code.replace_path(:symphony_elixir, String.to_charlist(Path.join(producer_app, "ebin")))
 
     try do
-      assert {:ok, ^receipt} = SymphonyElixir.Factory.TicketPushIO.readback(intent)
+      assert {:ok, ^receipt} = TicketPushIO.readback(intent)
     after
       true = :code.replace_path(:symphony_elixir, runtime_ebin)
     end
@@ -762,7 +762,7 @@ defmodule SymphonyElixir.FactoryTicketPushReadbackTest do
     File.write!(resource_path, resource)
     reader = Path.join(priv, reader_name)
 
-    if kind != :completed_publication_relocation or File.exists?(reader) do
+    if attested_reader_available?(reader, kind) do
       File.write!(reader, Regex.replace(~r/ORIGINS_SHA256 = "[0-9a-f]{64}"/, File.read!(reader), "ORIGINS_SHA256 = \"#{hash(resource)}\""))
     end
 
@@ -785,6 +785,8 @@ defmodule SymphonyElixir.FactoryTicketPushReadbackTest do
     on_exit(fn -> true = :code.replace_path(:symphony_elixir, original_ebin) end)
     %{name: name, kind: kind, recorded_priv: recorded_priv, artifact_priv: artifact_priv, runtime_priv: runtime_priv, manifest: manifest_path, proof_path: proof_path}
   end
+
+  defp attested_reader_available?(reader, kind), do: kind != :completed_publication_relocation or File.exists?(reader)
 
   defp install_forward_attestation(priv, entry, version) when version in [14, 15, 16, 17, 18, 19] do
     forward = Jason.encode!(%{"version" => 15, "entries" => [entry]})
