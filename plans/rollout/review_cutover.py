@@ -60,6 +60,10 @@ def validate_artifact_evidence(value, validation):
     assert validation['manifest_sha256'] == value['manifest_sha256']
     assert validation['factory_beam_fingerprint'] == value['factory_beam_fingerprint']
     assert validation['artifact_test_failures'] == 0
+    assert validation['source_composed_recovery_publication_passed'] is True
+    assert type(validation['source_composed_tests']) is int and validation['source_composed_tests'] == 1
+    assert type(validation['source_composed_failures']) is int and validation['source_composed_failures'] == 0
+    assert validation['test_commit_production_config_and_priv_diff_empty'] is True
 
 
 def validate_current_publication_evidence(value, manifest, chain, rejection):

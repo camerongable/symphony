@@ -234,11 +234,18 @@ INSERT INTO desktop_requests VALUES('old-uncertain','RECONCILE_REQUIRED');
         candidate = {'source_commit': 'same-commit', 'manifest_sha256': 'candidate-manifest',
                      'factory_beam_fingerprint': 'candidate-fingerprint'}
         validation = {**candidate, 'source_tests_passed': True, 'artifact_tests_passed': True,
-                      'artifact_test_failures': 0}
+                      'artifact_test_failures': 0, 'source_composed_recovery_publication_passed': True,
+                      'source_composed_tests': 1, 'source_composed_failures': 0,
+                      'test_commit_production_config_and_priv_diff_empty': True}
         cutover.validate_artifact_evidence(candidate, validation)
         for field in ('manifest_sha256', 'factory_beam_fingerprint'):
             with self.subTest(field=field), self.assertRaises(AssertionError):
                 cutover.validate_artifact_evidence(candidate, {**validation, field: 'other-build'})
+        for field, mutated in (('source_composed_recovery_publication_passed', False),
+                               ('source_composed_tests', 0), ('source_composed_failures', 1),
+                               ('test_commit_production_config_and_priv_diff_empty', False)):
+            with self.subTest(field=field), self.assertRaises(AssertionError):
+                cutover.validate_artifact_evidence(candidate, {**validation, field: mutated})
 
     def test_stale_commit_is_rejected_before_evidence_is_created(self):
         with tempfile.TemporaryDirectory() as temporary:
