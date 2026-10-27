@@ -17,8 +17,199 @@ spec.loader.exec_module(history)
 
 
 class ReviewCodecTest(unittest.TestCase):
+    @contextlib.contextmanager
+    def completion_receipt_fixture(self, role='feature-writer', stage='REPAIRING', mode='SOURCE', verdict='COMPLETE', status='CONSUMED'):
+        codec_path = path.with_name('ticket_push_history_validator_v26.py')
+        codec = types.ModuleType('completion_history')
+        codec.__file__ = str(codec_path)
+        exec(compile(codec_path.read_bytes(), str(codec_path), 'exec'), codec.__dict__)
+        with tempfile.TemporaryDirectory() as temporary:
+            cwd = str(Path(temporary).resolve() / 'source')
+            binding = {'run_id': 'run', 'task_key': 'task', 'reservation_key': 'source', 'reservation_generation': 7,
+                       'role': role, 'stage': stage, 'mode': mode, 'contract_sha256': 'c' * 64,
+                       'spec_revision': 1, 'input_sha256': 'd' * 64, 'policy': {'cwd': cwd}}
+            raw_binding = json.dumps(binding, separators=(',', ':'))
+            raw_output = json.dumps({'status': verdict}, separators=(',', ':'))
+            process = {'pid': '123', 'invocation_nonce': 'f' * 64}
+            stop = dict(process, transport='owned_app_server', thread_id='thread', exit_status=7, cwd=cwd)
+            raw_stop = json.dumps(stop, separators=(',', ':'))
+            worker = {'run_id': 'run', 'task_key': 'task', 'request_key': 'request', 'reservation_key': 'source',
+                      'owner_id': 'owner', 'owner_stopped_at': '2026-10-27T01:02:01Z', 'owner_stop_json': raw_stop,
+                      'owner_process_json': json.dumps(process), 'binding_json': raw_binding,
+                      'binding_sha256': codec.sha(raw_binding.encode()), 'output_json': raw_output,
+                      'output_sha256': codec.sha(raw_output.encode()), 'thread_id': 'thread', 'turn_id': 'turn',
+                      'item_id': 'final', 'status': status, 'failure_code': None,
+                      'consumed_at': '2026-10-27T01:02:04Z' if status == 'CONSUMED' else None}
+            access = {'run_id': 'run', 'task_key': 'task', 'request_key': 'request', 'reservation_key': 'source',
+                      'generation': 7, 'canonical_path': cwd, 'mode': mode, 'acquired_at': '2026-10-27T01:02:00Z',
+                      'released_at': '2026-10-27T01:02:05Z' if status == 'CONSUMED' else None}
+            payload = {key: worker[key] for key in ('request_key', 'task_key', 'run_id', 'reservation_key', 'owner_id',
+                                                   'owner_stopped_at', 'binding_sha256', 'owner_stop_json',
+                                                   'thread_id', 'turn_id', 'item_id', 'output_sha256')}
+            payload.update(kind='NATIVE_COMPLETION_RECEIPT_V1', version=1, reservation_generation=7,
+                           failure_code='{:port_exit, 7}', native_parsed_json_sha256='9' * 64,
+                           native_completion={'status': 'completed', 'error': None}, native_observation={
+                               'thread': {'id': 'thread', 'cwd': cwd, 'updatedAt': 1, 'status': {'type': 'idle'}},
+                               'latest': {'mode': 'LATEST_DESC', 'parameters': {'threadId': 'thread', 'limit': 1,
+                                          'sortDirection': 'desc', 'itemsView': 'full'}, 'sha256': '1' * 64,
+                                          'updated_at': 1, 'observed_at': '2026-10-27T01:02:02Z'},
+                               'confirmation': {'sha256': '2' * 64, 'observed_at': '2026-10-27T01:02:02.100000Z'},
+                               'queue': {'thread_id': 'thread', 'empty_complete': True, 'count_lower_bound': 0,
+                                         'has_more': False, 'sha256': '3' * 64, 'observed_at': '2026-10-27T01:02:02.200000Z'}})
+            database = Path(temporary) / 'history.sqlite'
+            with sqlite3.connect(database) as writer:
+                writer.executescript('CREATE TABLE events(id INTEGER PRIMARY KEY,occurred_at TEXT,event_type TEXT,run_id TEXT,payload_json TEXT); CREATE TABLE worker_evidence(request_key TEXT,run_id TEXT);')
+                writer.execute('INSERT INTO worker_evidence VALUES (?,?)', ('request', 'run'))
+                writer.execute('INSERT INTO events VALUES (?,?,?,?,?)', (1, '2026-10-27T01:02:03Z', 'TICKET_WORKER_NATIVE_COMPLETION_RECOVERED', 'run', json.dumps(payload)))
+            writer.close()
+            with contextlib.closing(sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True)) as reader:
+                reader.row_factory = sqlite3.Row
+                reader.execute('PRAGMA query_only=ON')
+                yield codec, reader, worker, access, payload, database
+                self.assertEqual(reader.total_changes, 0)
+
+    def test_a_consumed_recovered_writer_keeps_stop_seven_and_qualifies_only_with_its_typed_receipt(self):
+        with self.completion_receipt_fixture() as (codec, reader, worker, access, _payload, _database):
+            before = worker['owner_stop_json']
+            prior_path = path.with_name('ticket_push_history_validator_v25.py')
+            prior = types.ModuleType('prior_completion_history')
+            prior.__file__ = str(prior_path)
+            exec(compile(prior_path.read_bytes(), str(prior_path), 'exec'), prior.__dict__)
+            zero = dict(worker, owner_stop_json=json.dumps(dict(json.loads(before), exit_status=0)))
+            prior.admission_stop(zero, access)
+            with self.assertRaises(ValueError):
+                prior.admission_stop(worker, access)
+            codec.admission_stop(reader, worker, access, {'kind': 'ORDINARY_WRITER'})
+            self.assertEqual(worker['owner_stop_json'], before)
+            self.assertEqual(json.loads(before)['exit_status'], 7)
+
+    def replace_completion_event(self, database, payload, **changes):
+        row = dict(id=1, occurred_at='2026-10-27T01:02:03Z', event_type='TICKET_WORKER_NATIVE_COMPLETION_RECOVERED', run_id='run', payload_json=json.dumps(payload))
+        row.update(changes)
+        with contextlib.closing(sqlite3.connect(database)) as writer, writer:
+            writer.execute('DELETE FROM events')
+            writer.execute('INSERT INTO events VALUES (:id,:occurred_at,:event_type,:run_id,:payload_json)', row)
+
+    def test_nonzero_adoption_requires_every_exact_receipt_field_and_native_projection(self):
+        with self.completion_receipt_fixture() as (codec, reader, worker, access, payload, database):
+            variants = [(key, dict(payload, **{key: None})) for key in payload]
+            variants += [(key + '-missing', {k: v for k, v in payload.items() if k != key}) for key in payload]
+            changes = [
+                (('version',), True), (('reservation_generation',), 7.0),
+                (('failure_code',), 'prefix {:port_exit, 7}'), (('request_key',), 'foreign'),
+                (('owner_stop_json',), '{}'), (('native_completion',), {'status': 'completed'}),
+                (('native_completion', 'error'), 'failed'), (('native_parsed_json_sha256',), 'F' * 64),
+                (('native_observation', 'thread', 'id'), 'foreign'),
+                (('native_observation', 'thread', 'cwd'), '/foreign'),
+                (('native_observation', 'thread', 'updatedAt'), True),
+                (('native_observation', 'thread', 'updatedAt'), float('inf')),
+                (('native_observation', 'thread', 'status', 'type'), 'active'),
+                (('native_observation', 'latest', 'updated_at'), False),
+                (('native_observation', 'latest', 'mode'), 'UNKNOWN'),
+                (('native_observation', 'latest', 'parameters', 'limit'), True),
+                (('native_observation', 'latest', 'parameters', 'limit'), 1.0),
+                (('native_observation', 'queue', 'count_lower_bound'), False),
+                (('native_observation', 'queue', 'empty_complete'), 1),
+                (('native_observation', 'queue', 'has_more'), 0),
+                (('native_observation', 'queue', 'thread_id'), 'foreign')]
+            for path_parts, value in changes:
+                changed = copy.deepcopy(payload)
+                target = changed
+                for part in path_parts[:-1]: target = target[part]
+                target[path_parts[-1]] = value
+                variants.append(('.'.join(path_parts), changed))
+            for field in ('latest', 'confirmation', 'queue'):
+                for name, value in (('sha256', 'invalid'), ('observed_at', '2026-10-27T01:01:59Z'),
+                                    ('observed_at', '2026-10-27T01:02:04Z'), ('observed_at', '2026-10-27T01:02:02+00:00')):
+                    changed = copy.deepcopy(payload)
+                    changed['native_observation'][field][name] = value
+                    variants.append((field + '.' + name, changed))
+            for parts in ((), ('native_completion',), ('native_observation',), ('native_observation', 'thread'),
+                          ('native_observation', 'thread', 'status'), ('native_observation', 'latest'),
+                          ('native_observation', 'latest', 'parameters'), ('native_observation', 'confirmation'),
+                          ('native_observation', 'queue')):
+                changed = copy.deepcopy(payload)
+                target = changed
+                for part in parts: target = target[part]
+                target['unknown'] = True
+                variants.append(('extra.' + '.'.join(parts), changed))
+            for label, changed in variants:
+                with self.subTest(label=label, changed=changed):
+                    self.replace_completion_event(database, changed)
+                    with self.assertRaises((ValueError, KeyError, TypeError)):
+                        codec.admission_stop(reader, worker, access, {'kind': 'ORDINARY_WRITER'})
+            self.replace_completion_event(database, payload)
+            codec.admission_stop(reader, worker, access, {'kind': 'ORDINARY_WRITER'})
+
+    def test_nonzero_receipt_scan_rejects_hidden_or_ambiguous_markers_but_ignores_a_bound_other_request(self):
+        with self.completion_receipt_fixture() as (codec, reader, worker, access, payload, database):
+            for raw in ('{}', '{"request_key":null}', '{"request_key":"unknown"}',
+                        json.dumps(payload)[:-1] + ',"version":1}'):
+                with self.subTest(raw=raw[:80]):
+                    self.replace_completion_event(database, payload)
+                    with contextlib.closing(sqlite3.connect(database)) as writer, writer:
+                        writer.execute('INSERT INTO events VALUES (2,?,?,?,?)', ('2026-10-27T01:02:03Z', 'TICKET_WORKER_NATIVE_COMPLETION_RECOVERED', 'run', raw))
+                    with self.assertRaises(ValueError):
+                        codec.admission_stop(reader, worker, access, {'kind': 'ORDINARY_WRITER'})
+            self.replace_completion_event(database, payload)
+            with contextlib.closing(sqlite3.connect(database)) as writer, writer:
+                writer.execute('INSERT INTO worker_evidence VALUES (?,?)', ('other', 'run'))
+                writer.execute('INSERT INTO events VALUES (2,?,?,?,?)', ('2026-10-27T01:02:03Z', 'TICKET_WORKER_NATIVE_COMPLETION_RECOVERED', 'run', '{"request_key":"other"}'))
+            codec.admission_stop(reader, worker, access, {'kind': 'ORDINARY_WRITER'})
+            with contextlib.closing(sqlite3.connect(database)) as writer, writer:
+                writer.execute('UPDATE events SET payload_json=? WHERE id=2', (json.dumps(payload),))
+            with self.assertRaises(ValueError):
+                codec.admission_stop(reader, worker, access, {'kind': 'ORDINARY_WRITER'})
+            self.replace_completion_event(database, payload, run_id='foreign')
+            with self.assertRaises(ValueError):
+                codec.admission_stop(reader, worker, access, {'kind': 'ORDINARY_WRITER'})
+
+    def test_each_consumed_adoption_horizon_uses_its_own_binding_not_a_later_task(self):
+        contexts = [('CONTINUE', 'feature-writer', 'WRITING', 'SOURCE', 'CONTINUE'),
+                    ('ORDINARY_WRITER', 'feature-writer', 'REPAIRING', 'SOURCE', 'COMPLETE'),
+                    ('ORDINARY_VERIFIER', 'change-verifier', 'VERIFYING', 'REVIEW', 'BLOCK'),
+                    ('ORDINARY_VERIFIER', 'change-verifier', 'VERIFYING', 'REVIEW', 'REPAIR'),
+                    ('ROLLOVER_VERIFIER', 'change-verifier', 'VERIFYING', 'REVIEW', 'PASS')]
+        for kind, role, stage, mode, verdict in contexts:
+            with self.subTest(kind=kind, verdict=verdict), self.completion_receipt_fixture(role, stage, mode, verdict) as (codec, reader, worker, access, payload, database):
+                # No factory_tasks row exists: historical task reuse cannot replace
+                # the authenticated worker binding/output that owns this receipt.
+                codec.admission_stop(reader, worker, access, {'kind': kind})
+                for changed_worker, changed_access in ((dict(worker, consumed_at='2026-10-27T01:02:02Z'), access),
+                                                       (worker, dict(access, released_at='2026-10-27T01:02:02Z')),
+                                                       (worker, dict(access, acquired_at='2026-10-27T01:02:02Z')),
+                                                       (worker, dict(access, generation=True))):
+                    with self.assertRaises(ValueError):
+                        codec.admission_stop(reader, changed_worker, changed_access, {'kind': kind})
+                self.replace_completion_event(database, payload, occurred_at='2026-10-27T01:02:20Z')
+                with self.assertRaises(ValueError):
+                    codec.admission_stop(reader, worker, access, {'kind': kind})
+
+    def test_ci_successor_uses_the_authenticated_unreleased_snapshot_and_disposition_horizon(self):
+        with self.completion_receipt_fixture(verdict='BLOCKED', status='RESULT_RECORDED') as (codec, reader, worker, access, _payload, database):
+            access['release_receipt_json'] = None
+            disposition = dict(id=2, occurred_at='2026-10-27T01:02:04Z', event_type='TICKET_NATIVE_WRITER_BLOCKED', run_id='run',
+                               payload_json=json.dumps(dict({key: worker[key] for key in ('request_key', 'task_key', 'reservation_key', 'output_json', 'output_sha256')}, reservation_generation=7)))
+            with contextlib.closing(sqlite3.connect(database)) as writer, writer:
+                writer.execute('INSERT INTO events VALUES (:id,:occurred_at,:event_type,:run_id,:payload_json)', disposition)
+            horizon = dict(kind='CI_SUCCESSOR', disposition_event=disposition, admitted_at='2026-10-27T01:02:05Z')
+            codec.admission_stop(reader, worker, access, horizon)
+            for changed in (dict(horizon, admitted_at='2026-10-27T01:02:03Z'),
+                            dict(horizon, disposition_event=dict(disposition, occurred_at='2026-10-27T01:02:02Z'))):
+                with self.assertRaises(ValueError): codec.admission_stop(reader, worker, access, changed)
+            with self.assertRaises(ValueError): codec.admission_stop(reader, dict(worker, status='CONSUMED'), access, horizon)
+            with self.assertRaises(ValueError): codec.admission_stop(reader, worker, dict(access, released_at='2026-10-27T01:02:05Z'), horizon)
+
+    def test_zero_exit_requires_no_completion_event_and_never_changes_original_stop_bytes(self):
+        with self.completion_receipt_fixture() as (codec, reader, worker, access, payload, database):
+            self.replace_completion_event(database, payload, payload_json='{}')
+            zero = dict(worker, owner_stop_json=json.dumps(dict(json.loads(worker['owner_stop_json']), exit_status=0)))
+            before = dict(zero)
+            codec.admission_stop(reader, zero, access, {'kind': 'ORDINARY_WRITER'})
+            self.assertEqual(zero, before)
+
     def generation_budget_fixture(self):
-        codec_path = path.with_name('ticket_push_history_validator_v25.py')
+        codec_path = path.with_name('ticket_push_history_validator_v26.py')
         codec = types.ModuleType('generation_budget')
         codec.__file__ = str(codec_path)
         exec(compile(codec_path.read_bytes(), str(codec_path), 'exec'), codec.__dict__)
@@ -128,15 +319,17 @@ class ReviewCodecTest(unittest.TestCase):
         self.assertEqual(codec.push_budget_decode('{"legacy":"small"}', 'ordinary_generation'), {'legacy': 'small'})
 
     def test_completed_ordinary_push_binds_current_and_retained_history_programs(self):
-        codec_path = path.with_name('ticket_push_history_validator_v25.py')
+        codec_path = path.with_name('ticket_push_history_validator_v26.py')
         codec_spec = importlib.util.spec_from_file_location('ordinary_programs', codec_path)
         codec = importlib.util.module_from_spec(codec_spec)
         codec_spec.loader.exec_module(codec)
         local = path.parent
         producer = (local.parent / 'lib/symphony_elixir/factory/ticket_push_io.ex').read_text()
-        self.assertIn('defp helper_name(:capability), do: "ticket_push_executor_v36.py"', producer)
-        self.assertIn(':large -> "ticket_push_executor_v35.py"', producer)
+        self.assertIn('defp helper_name(:capability), do: "ticket_push_executor_v38.py"', producer)
+        self.assertIn(':large -> "ticket_push_executor_v37.py"', producer)
         for helper_name, history_name in (
+            ('ticket_push_executor_v37.py', 'ticket_push_history_validator_v26.py'),
+            ('ticket_push_executor_v38.py', 'ticket_push_history_validator_v26.py'),
             ('ticket_push_executor_v35.py', 'ticket_push_history_validator_v25.py'),
             ('ticket_push_executor_v36.py', 'ticket_push_history_validator_v25.py'),
             ('ticket_push_executor_v33.py', 'ticket_push_history_validator_v24.py'),
@@ -184,7 +377,7 @@ class ReviewCodecTest(unittest.TestCase):
                         codec.push_completed_marker(codec.canonical(changed).decode(), run)
 
     def test_new_publishers_require_captured_generation_and_capability_evidence(self):
-        codec_path = path.with_name('ticket_push_history_validator_v25.py')
+        codec_path = path.with_name('ticket_push_history_validator_v26.py')
         codec = types.ModuleType('current_fences')
         codec.__file__ = str(codec_path)
         exec(compile(codec_path.read_bytes(), str(codec_path), 'exec'), codec.__dict__)
@@ -194,18 +387,18 @@ class ReviewCodecTest(unittest.TestCase):
                 CREATE TABLE ticket_ci_repair_claims(claim_key TEXT, round INTEGER);
             ''')
             run = {'run_id': 'synthetic', 'code_repair_round': 0}
-            for version in (31, 32, 33, 34, 35, 36):
+            for version in (31, 32, 33, 34, 35, 36, 37, 38):
                 execution = {'helper_path': str(path.parent / f'ticket_push_executor_v{version}.py'), 'worker_history': {}}
                 with self.subTest(version=version), self.assertRaises(ValueError):
                     codec.generated_only_commits(db, execution, {}, run)
             legacy = {'helper_path': str(path.parent / 'ticket_push_executor_v10.py'), 'worker_history': {}}
             self.assertIsNone(codec.generated_only_commits(db, legacy, {}, run))
-        for version in (32, 34, 36):
+        for version in (32, 34, 36, 38):
             execution = {'helper_path': f'/synthetic/ticket_push_executor_v{version}.py'}
             with self.subTest(version=version), self.assertRaises(ValueError):
                 codec.capability_projection(execution, {})
             self.assertTrue(codec.capability_projection(execution, {'capability_recovery_version': 1}))
-        for version in (31, 33, 35):
+        for version in (31, 33, 35, 37):
             execution = {'helper_path': f'/synthetic/ticket_push_executor_v{version}.py'}
             self.assertFalse(codec.capability_projection(execution, {}))
             with self.assertRaises(ValueError):

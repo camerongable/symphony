@@ -16,7 +16,7 @@ defmodule SymphonyElixir.Factory.CompletedTurnRecovery do
          reader = Keyword.get(opts, :native_reader, AppServer),
          {:ok, native} <- reader.read_native_thread(before.evidence["thread_id"], workspace: before.binding["policy"]["cwd"], include_turns: false, include_latest_turn: true, include_queue: true),
          {:ok, result} <- native_result(before, native) do
-      recovered = result |> Map.put(:reconciliation_preimage, before) |> Map.put(:native_recovery, provenance(before, native))
+      recovered = result |> Map.put(:reconciliation_preimage, before) |> Map.put(:native_recovery, provenance(before, native, result))
 
       with {:ok, _evidence} <- WorkerEvidence.reconcile_completed(store, key, before.evidence["owner_id"], recovered, before.stop) do
         {:ok, result |> Map.put(:policy, before.binding["policy"]) |> Map.put(:owner_stop, before.stop) |> Map.put(:worker_request_key, key)}
@@ -115,23 +115,128 @@ defmodule SymphonyElixir.Factory.CompletedTurnRecovery do
 
   defp native_result(_before, _native), do: {:error, :completed_turn_native_unproven}
 
-  defp provenance(before, native) do
+  defp provenance(before, native, result) do
     latest = native["latest_turn_observation"]
 
     %{
-      request_key: before.evidence["request_key"],
-      binding_sha256: before.evidence["binding_sha256"],
-      failure_code: before.evidence["failure_code"],
-      owner_stop_json: before.evidence["owner_stop_json"],
-      native_parsed_json_sha256: digest(native),
-      native_observation: %{
-        thread: Map.take(native, ~w(id cwd updatedAt)) |> Map.put("status", Map.take(native["status"], ~w(type))),
-        latest: Map.take(latest, ~w(mode parameters sha256 updated_at observed_at)),
-        confirmation: Map.take(latest["confirmation"], ~w(sha256 observed_at)),
-        queue: Map.take(native["queue_observation"], ~w(thread_id empty_complete count_lower_bound has_more sha256 observed_at))
+      "kind" => "NATIVE_COMPLETION_RECEIPT_V1",
+      "version" => 1,
+      "request_key" => before.evidence["request_key"],
+      "task_key" => before.evidence["task_key"],
+      "run_id" => before.evidence["run_id"],
+      "reservation_key" => before.evidence["reservation_key"],
+      "reservation_generation" => before.binding["reservation_generation"],
+      "owner_id" => before.evidence["owner_id"],
+      "owner_stopped_at" => before.evidence["owner_stopped_at"],
+      "binding_sha256" => before.evidence["binding_sha256"],
+      "failure_code" => before.evidence["failure_code"],
+      "owner_stop_json" => before.evidence["owner_stop_json"],
+      "native_parsed_json_sha256" => digest(native),
+      "native_completion" => %{"status" => "completed", "error" => nil},
+      "thread_id" => result.thread_id,
+      "turn_id" => result.turn_id,
+      "item_id" => result.item_id,
+      "output_sha256" => digest(result.output),
+      "native_observation" => %{
+        "thread" => Map.take(native, ~w(id cwd updatedAt)) |> Map.put("status", Map.take(native["status"], ~w(type))),
+        "latest" => Map.take(latest, ~w(mode parameters sha256 updated_at observed_at)),
+        "confirmation" => Map.take(latest["confirmation"], ~w(sha256 observed_at)),
+        "queue" => Map.take(native["queue_observation"], ~w(thread_id empty_complete count_lower_bound has_more sha256 observed_at))
       }
     }
   end
+
+  @doc "Checks the bounded projection against the original atomic recovery preimage."
+  @spec validate_receipt(map(), map(), map(), String.t()) :: :ok | {:error, atom()}
+  def validate_receipt(proof, %{evidence: evidence, binding: binding, access: access}, result, occurred_at) when is_map(proof) do
+    keys =
+      ~w(kind version request_key task_key run_id reservation_key reservation_generation owner_id owner_stopped_at binding_sha256 failure_code owner_stop_json native_parsed_json_sha256 native_completion native_observation thread_id turn_id item_id output_sha256)
+
+    identity = ~w(request_key task_key run_id reservation_key owner_id owner_stopped_at binding_sha256 failure_code owner_stop_json thread_id turn_id)
+
+    with true <- exact_keys?(proof, keys),
+         true <- proof["kind"] == "NATIVE_COMPLETION_RECEIPT_V1" and proof["version"] === 1,
+         true <- Map.take(proof, identity) == Map.take(evidence, identity),
+         true <- Map.take(evidence, ~w(run_id task_key request_key reservation_key)) == Map.take(access, ~w(run_id task_key request_key reservation_key)),
+         true <- Map.take(evidence, ~w(run_id task_key reservation_key)) == Map.take(binding, ~w(run_id task_key reservation_key)),
+         true <- is_integer(proof["reservation_generation"]) and proof["reservation_generation"] > 0,
+         true <- proof["reservation_generation"] == binding["reservation_generation"] and proof["reservation_generation"] == access["generation"],
+         true <- proof["binding_sha256"] == digest_raw(evidence["binding_json"]),
+         true <- {proof["thread_id"], proof["turn_id"], proof["item_id"]} == {result[:thread_id], result[:turn_id], result[:item_id]},
+         true <- proof["output_sha256"] == digest(result[:output]),
+         true <- valid_receipt_identity?(proof) and transport_failure?(proof["failure_code"]),
+         true <- is_binary(proof["owner_stop_json"]) and byte_size(proof["owner_stop_json"]) <= 8192,
+         true <- proof["native_completion"] == %{"status" => "completed", "error" => nil},
+         true <- valid_observation?(proof["native_observation"], evidence, access, occurred_at),
+         {:ok, acquired} <- utc(access["acquired_at"]),
+         {:ok, stopped} <- utc(proof["owner_stopped_at"]),
+         true <- DateTime.compare(acquired, stopped) != :gt,
+         {:ok, raw} <- Jason.encode(proof),
+         true <- byte_size(raw) <= 32_768 do
+      :ok
+    else
+      _ -> {:error, :completed_turn_receipt_unproven}
+    end
+  end
+
+  def validate_receipt(_proof, _before, _result, _occurred_at), do: {:error, :completed_turn_receipt_unproven}
+
+  defp valid_receipt_identity?(proof) do
+    limits = [{~w(request_key task_key reservation_key), 4096}, {~w(run_id owner_id), 256}, {~w(thread_id turn_id item_id), 1024}, {~w(failure_code), 128}]
+
+    Enum.all?(limits, fn {keys, maximum} -> Enum.all?(keys, &bounded_text?(proof[&1], maximum)) end) and
+      Enum.all?(~w(binding_sha256 output_sha256 native_parsed_json_sha256), &hex_digest?(proof[&1]))
+  end
+
+  defp valid_observation?(observed, evidence, access, occurred_at) do
+    with true <- exact_keys?(observed, ~w(thread latest confirmation queue)),
+         thread = observed["thread"],
+         latest = observed["latest"],
+         confirmation = observed["confirmation"],
+         queue = observed["queue"],
+         true <- exact_keys?(thread, ~w(id cwd updatedAt status)) and exact_keys?(thread["status"], ~w(type)),
+         true <- {thread["id"], thread["cwd"]} == {evidence["thread_id"], access["canonical_path"]},
+         true <- bounded_text?(thread["cwd"], 4096) and thread["status"]["type"] in ~w(idle notLoaded systemError),
+         true <- is_number(thread["updatedAt"]) and thread["updatedAt"] >= 0,
+         true <- exact_keys?(latest, ~w(mode parameters sha256 updated_at observed_at)),
+         true <- latest["mode"] == "LATEST_DESC" and latest["updated_at"] === thread["updatedAt"],
+         true <- latest["parameters"] === %{"threadId" => evidence["thread_id"], "limit" => 1, "sortDirection" => "desc", "itemsView" => "full"},
+         true <- exact_keys?(confirmation, ~w(sha256 observed_at)),
+         true <- exact_keys?(queue, ~w(thread_id empty_complete count_lower_bound has_more sha256 observed_at)),
+         true <-
+           Map.take(queue, ~w(thread_id empty_complete count_lower_bound has_more)) === %{"thread_id" => evidence["thread_id"], "empty_complete" => true, "count_lower_bound" => 0, "has_more" => false},
+         true <- Enum.all?([latest, confirmation, queue], &hex_digest?(&1["sha256"])),
+         {:ok, stopped} <- utc(evidence["owner_stopped_at"]),
+         {:ok, event} <- utc(occurred_at),
+         true <- Enum.all?([latest, confirmation, queue], &observation_time?(&1["observed_at"], stopped, event)) do
+      true
+    else
+      _ -> false
+    end
+  end
+
+  defp observation_time?(raw, stopped, event) do
+    case utc(raw) do
+      {:ok, observed} -> DateTime.compare(stopped, observed) != :gt and DateTime.diff(event, observed, :microsecond) in 0..10_000_000
+      _ -> false
+    end
+  end
+
+  defp exact_keys?(value, keys), do: is_map(value) and Enum.sort(Map.keys(value)) == Enum.sort(keys)
+  defp bounded_text?(value, maximum), do: is_binary(value) and String.valid?(value) and byte_size(value) in 1..maximum
+  defp hex_digest?(value), do: is_binary(value) and Regex.match?(~r/\A[0-9a-f]{64}\z/, value)
+
+  defp utc(raw) when is_binary(raw) do
+    with true <- Regex.match?(~r/\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z\z/, raw),
+         {:ok, at, 0} <- DateTime.from_iso8601(raw),
+         true <- at.year > 0 do
+      {:ok, at}
+    else
+      _ -> {:error, :invalid_utc_timestamp}
+    end
+  end
+
+  defp utc(_raw), do: {:error, :invalid_utc_timestamp}
 
   defp fresh?(at) when is_binary(at) do
     case DateTime.from_iso8601(at) do

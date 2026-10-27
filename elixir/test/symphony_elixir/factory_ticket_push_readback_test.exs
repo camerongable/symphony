@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.FactoryTicketPushReadbackTest do
   use ExUnit.Case, async: false
 
-  alias SymphonyElixir.Factory.Store
+  alias SymphonyElixir.Factory.{Store, TicketPushIO}
   alias SymphonyElixir.PathSafety
 
   test "the status catalog retains every prior origin and the last publishing release" do
@@ -150,6 +150,65 @@ defmodule SymphonyElixir.FactoryTicketPushReadbackTest do
              System.cmd("/usr/bin/python3", ["-I", "-S", "-B", "-c", script, context.attested.runtime_priv], stderr_to_stdout: true)
   end
 
+  test "the publication catalog retains every origin and adds only the completed v36 release", context do
+    old = Jason.decode!(File.read!(Path.join(context.priv, "ticket_push_readback_origins_v19.json")))
+    raw = File.read!(Path.join(context.priv, "ticket_push_readback_origins_v20.json"))
+    current = Jason.decode!(raw)
+    assert byte_size(raw) <= 65_536
+    assert current["version"] == 20 and length(current["entries"]) == 15
+    assert Enum.drop(current["entries"], -1) == old["entries"]
+    assert length(Enum.uniq_by(current["entries"], & &1["helper_path"])) == 15
+    root = "/Users/cgable/Library/Application Support/ai-factory/releases/symphony-review-report-216eadb"
+    helper = root <> "/dev/lib/symphony_elixir/priv/ticket_push_executor_v36.py"
+    companion = root <> "/dev/lib/symphony_elixir/priv/worker_file_companion.py"
+
+    assert List.last(current["entries"]) == %{
+             "kind" => "RELEASE_ARTIFACT_V2",
+             "release_root" => root,
+             "manifest_path" => root <> "/evidence/release-manifest.json",
+             "manifest_sha256" => "8119af4273e08dd17442790236bbcacecb884e3e8997dc99ba36a2159093af65",
+             "expected_manifest_kind" => "FACTORY_REVIEW_REPORT_RELEASE_V1",
+             "helper_path" => helper,
+             "artifact_helper_path" => helper,
+             "helper_sha256" => "7c023c0e853aaea8a809280cd7c67f5182a85cc2199cdb5d074786c938083238",
+             "companion_path" => companion,
+             "artifact_companion_path" => companion,
+             "companion_sha256" => "87f3dd595ddc70205ed881b42ab5a9401b0705c13cdc8fda2c2b8b5bac4b0b3b"
+           }
+  end
+
+  @tag attested_readback: :completed_publication_relocation
+  test "a completed publisher stays readable after the current runtime relocates", context do
+    fixture = context.attested
+    {intent, receipt} = recorded(context, fixture.name, fixture.recorded_priv)
+    assert context.module.receipt_valid?(receipt, intent)
+    producer_app = Path.dirname(fixture.recorded_priv)
+    File.cp_r!(Path.join(Path.dirname(fixture.runtime_priv), "ebin"), Path.join(producer_app, "ebin"))
+    runtime_ebin = String.to_charlist(Path.join(Path.dirname(fixture.runtime_priv), "ebin"))
+    true = :code.replace_path(:symphony_elixir, String.to_charlist(Path.join(producer_app, "ebin")))
+
+    try do
+      assert {:ok, ^receipt} = TicketPushIO.readback(intent)
+    after
+      true = :code.replace_path(:symphony_elixir, runtime_ebin)
+    end
+
+    before = spool_bytes(context.spool)
+    origin = Map.new(Path.wildcard(Path.join(fixture.recorded_priv, "*")), &{&1, File.read!(&1)})
+    digest = hash(receipt)
+
+    try do
+      assert {:ok, ^receipt} = context.module.readback(intent)
+      assert context.module.receipt_valid?(receipt, intent)
+      assert {:error, :ticket_push_program_changed} = context.module.execute(Jason.decode!(intent["execution_json"]), fn _, _ -> flunk("historical completion granted issuance") end)
+    after
+      assert spool_bytes(context.spool) == before
+      assert File.read!(Path.join(context.spool, intent["owner_nonce"] <> ".push-receipt")) == receipt
+      assert hash(File.read!(Path.join(context.spool, intent["owner_nonce"] <> ".push-receipt"))) == digest
+      for {path, raw} <- origin, do: assert(File.read!(path) == raw)
+    end
+  end
+
   setup tags do
     {:ok, temporary} = PathSafety.canonicalize(System.tmp_dir!())
     base = Path.join(temporary, "push-readback-#{System.unique_integer([:positive])}")
@@ -219,6 +278,8 @@ defmodule SymphonyElixir.FactoryTicketPushReadbackTest do
         :retained_publisher_capability,
         :generation_publisher_ordinary,
         :generation_publisher_capability,
+        :publication_compat_ordinary,
+        :publication_compat_capability,
         :typed_ordinary,
         :typed_capability,
         :capability_legacy_v20,
@@ -652,7 +713,7 @@ defmodule SymphonyElixir.FactoryTicketPushReadbackTest do
     source = Path.join(base, "retired-source")
     recorded_priv = if release?, do: artifact_priv, else: Path.join(source, "elixir/priv")
 
-    files = if kind == :capability_prior_history, do: [name, "worker_file_companion.py", "ticket_push_history_validator_v16.py"], else: [name, "worker_file_companion.py"]
+    files = attested_files(priv, kind, name)
 
     for directory <- Enum.uniq([artifact_priv, recorded_priv]) do
       File.mkdir_p!(directory)
@@ -676,8 +737,9 @@ defmodule SymphonyElixir.FactoryTicketPushReadbackTest do
       "compile_proof_path" => proof_path
     }
 
-    manifest = if kind == :capability_prior_history, do: Map.merge(manifest, %{"kind" => "TEST_SEALED_RELEASE", "release" => release}), else: manifest
-    manifest_path = if kind == :capability_prior_history, do: Path.join(release, "evidence/release-manifest.json"), else: Path.join(release, "manifest.json")
+    sealed = kind in [:capability_prior_history, :completed_publication_relocation]
+    manifest = if sealed, do: Map.merge(manifest, %{"kind" => "TEST_SEALED_RELEASE", "release" => release}), else: manifest
+    manifest_path = if sealed, do: Path.join(release, "evidence/release-manifest.json"), else: Path.join(release, "manifest.json")
     File.mkdir_p!(Path.dirname(manifest_path))
     File.write!(manifest_path, Jason.encode!(manifest))
 
@@ -694,12 +756,15 @@ defmodule SymphonyElixir.FactoryTicketPushReadbackTest do
     }
 
     entry = if release?, do: entry, else: Map.put(entry, "compile_proof_raw", raw_proof)
-    entry = if kind == :capability_prior_history, do: Map.merge(entry, %{"kind" => "RELEASE_ARTIFACT_V2", "release_root" => release, "expected_manifest_kind" => manifest["kind"]}), else: entry
+    entry = if sealed, do: Map.merge(entry, %{"kind" => "RELEASE_ARTIFACT_V2", "release_root" => release, "expected_manifest_kind" => manifest["kind"]}), else: entry
     resource = Jason.encode!(%{"version" => version, "entries" => [entry]})
     resource_path = Path.join(priv, "ticket_push_readback_origins_v#{version}.json")
     File.write!(resource_path, resource)
     reader = Path.join(priv, reader_name)
-    File.write!(reader, Regex.replace(~r/ORIGINS_SHA256 = "[0-9a-f]{64}"/, File.read!(reader), "ORIGINS_SHA256 = \"#{hash(resource)}\""))
+
+    if attested_reader_available?(reader, kind) do
+      File.write!(reader, Regex.replace(~r/ORIGINS_SHA256 = "[0-9a-f]{64}"/, File.read!(reader), "ORIGINS_SHA256 = \"#{hash(resource)}\""))
+    end
 
     install_forward_attestation(priv, entry, version)
 
@@ -721,7 +786,9 @@ defmodule SymphonyElixir.FactoryTicketPushReadbackTest do
     %{name: name, kind: kind, recorded_priv: recorded_priv, artifact_priv: artifact_priv, runtime_priv: runtime_priv, manifest: manifest_path, proof_path: proof_path}
   end
 
-  defp install_forward_attestation(priv, entry, version) when version in [14, 15, 16, 17, 18] do
+  defp attested_reader_available?(reader, kind), do: kind != :completed_publication_relocation or File.exists?(reader)
+
+  defp install_forward_attestation(priv, entry, version) when version in [14, 15, 16, 17, 18, 19] do
     forward = Jason.encode!(%{"version" => 15, "entries" => [entry]})
     File.write!(Path.join(priv, "ticket_push_readback_origins_v15.json"), forward)
 
@@ -749,11 +816,25 @@ defmodule SymphonyElixir.FactoryTicketPushReadbackTest do
     File.write!(Path.join(priv, "ticket_push_readback_origins_v19.json"), generation)
     generation_reader = Path.join(priv, "ticket_push_status_reader_v19.py")
     File.write!(generation_reader, Regex.replace(~r/ORIGINS_SHA256 = "[0-9a-f]{64}"/, File.read!(generation_reader), "ORIGINS_SHA256 = \"#{hash(generation)}\""))
+
+    publication = Jason.encode!(%{"version" => 20, "entries" => [entry]})
+    File.write!(Path.join(priv, "ticket_push_readback_origins_v20.json"), publication)
+    publication_reader = Path.join(priv, "ticket_push_status_reader_v20.py")
+    File.write!(publication_reader, Regex.replace(~r/ORIGINS_SHA256 = "[0-9a-f]{64}"/, File.read!(publication_reader), "ORIGINS_SHA256 = \"#{hash(publication)}\""))
   end
 
   defp install_forward_attestation(_priv, _entry, _version), do: :ok
 
+  defp attested_files(priv, :completed_publication_relocation, _name),
+    do: Path.wildcard(Path.join(priv, "*")) |> Enum.filter(&File.regular?/1) |> Enum.map(&Path.basename/1)
+
+  defp attested_files(_priv, :capability_prior_history, name), do: [name, "worker_file_companion.py", "ticket_push_history_validator_v16.py"]
+  defp attested_files(_priv, _kind, name), do: [name, "worker_file_companion.py"]
+
   defp attestation_kind(:bounded), do: {"ticket_push_executor_v11.py", true, 4, "ticket_push_status_reader_v2.py"}
+  defp attestation_kind(:completed_publication_relocation), do: {"ticket_push_executor_v36.py", true, 20, "ticket_push_status_reader_v20.py"}
+  defp attestation_kind(:publication_compat_ordinary), do: {"ticket_push_executor_v37.py", true, 20, "ticket_push_status_reader_v20.py"}
+  defp attestation_kind(:publication_compat_capability), do: {"ticket_push_executor_v38.py", true, 20, "ticket_push_status_reader_v20.py"}
   defp attestation_kind(:ordinary_bindings), do: {"ticket_push_executor_v31.py", true, 17, "ticket_push_status_reader_v17.py"}
   defp attestation_kind(:ordinary_bindings_capability), do: {"ticket_push_executor_v32.py", true, 17, "ticket_push_status_reader_v17.py"}
   defp attestation_kind(:retained_publisher_ordinary), do: {"ticket_push_executor_v33.py", true, 18, "ticket_push_status_reader_v18.py"}
