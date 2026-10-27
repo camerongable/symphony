@@ -430,6 +430,72 @@ CREATE TABLE worker_evidence(owner_process_json TEXT,owner_stopped_at TEXT);
                 with self.subTest(malformed=field, value=value), self.assertRaises(AssertionError):
                     tools.validate_replacement_absent('', {**audit, field: value})
 
+    def test_partial_and_complete_poststart_proofs_never_block_fresh_read_only_reconciliation(self):
+        tools = load_tools()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            candidate, manifest = self.fixture_artifact(tools, root)
+            manifest['artifact']['lib/symphony_elixir/priv/ticket_push_history_validator_v26.py'] = {'sha256': 'd'*64}
+            manifest_path = Path(candidate['release']) / 'evidence/release-manifest.json'
+            manifest_path.write_bytes(tools.encode(manifest))
+            candidate['manifest_sha256'] = tools.sha(manifest_path)
+            public_old = root / 'poststart-public-completed.json'
+            public_old.write_text('retained partial proof bytes')
+            common = {'result': 'PASS', 'manifest_sha256': candidate['manifest_sha256'],
+                      'source_commit': candidate['source_commit'], 'run_id': tools.RUN,
+                      'current_candidate_sha': tools.CANDIDATE, 'envelope_sha256': tools.TICKET['envelope_sha256'],
+                      'receipt_sha256': tools.TICKET['receipt_sha256'], 'receipt_bytes': 387927,
+                      'read_only_sqlite_reopens': 2, 'live_ledger_writes': 0, 'pushes': 0,
+                      'native_chats': 0, 'native_model_turns': 0,
+                      'entire_run_access_and_history_unchanged': True, 'human_head_unchanged': True}
+            commands, outputs, fail_history = [], [], [False]
+
+            def subprocess_boundary(args, **_options):
+                commands.append(args)
+                self.assertNotIn('bootstrap', args)
+                self.assertNotIn('bootout', args)
+                self.assertEqual(_options['env'].get('MIX_BUILD_PATH'), candidate['build'])
+                path = Path(args[-1])
+                self.assertFalse(path.exists(), 'each qualification needs a fresh exclusive output')
+                if any(str(arg).endswith('qualify_review_ready_publication.exs') for arg in args):
+                    proof = {**common, 'kind': 'READY_COMPLETED_PUBLIC_PROOF_V1',
+                             'public_readback': True, 'receipt_valid': True,
+                             'completed_proof': True, 'validate_completed_proof': True}
+                else:
+                    proof = {**common, 'kind': 'READY_COMPLETED_HISTORY_PROOF_V1',
+                             'history_sha256': 'd'*64, 'full_physical_predecessor': True,
+                             'retained_generation_authority': True, 'recorded_git_diff_paths_and_generated_blobs': True,
+                             'historical_rollover_verifier_and_ci': True,
+                             'issuance_freshness': 'NOT_RERUN_HISTORICAL_READ_ONLY'}
+                    if fail_history[0]:
+                        proof['result'] = 'FAIL'
+                        fail_history[0] = False
+                with path.open('xb') as stream:
+                    stream.write(tools.encode(proof))
+                outputs.append(path)
+                return subprocess.CompletedProcess(args, 0, '', '')
+
+            with patch.object(tools.subprocess, 'run', side_effect=subprocess_boundary), \
+                    patch.dict(tools.os.environ, {'MIX_BUILD_PATH': '/hostile-caller-build'}):
+                self.assertTrue(tools.run_qualifiers(candidate, root, 'poststart'))
+                history_old = root / 'poststart-historical-completed.json'
+                history_old.write_text('retained complete proof bytes')
+                self.assertTrue(tools.run_qualifiers(candidate, root, 'poststart'))
+                self.assertTrue(tools.run_qualifiers(candidate, root, 'poststart'))
+                fail_history[0] = True
+                with self.assertRaises(AssertionError):
+                    tools.run_qualifiers(candidate, root, 'poststart')
+                retained = {path: path.read_bytes() for path in outputs}
+                self.assertTrue(tools.run_qualifiers(candidate, root, 'poststart'))
+                self.assertTrue(all(path.read_bytes() == raw for path, raw in retained.items()))
+                self.assertTrue(any(json.loads(raw)['result'] == 'FAIL' for raw in retained.values()))
+            self.assertEqual(public_old.read_text(), 'retained partial proof bytes')
+            self.assertEqual(history_old.read_text(), 'retained complete proof bytes')
+            self.assertEqual(len(outputs), 10)
+            self.assertEqual(len(set(outputs)), 10)
+            self.assertTrue(all(path.is_file() for path in outputs))
+            self.assertEqual(len(commands), 10)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -137,6 +137,42 @@ and historical tool/test bytes still match base4f58. This revision performs no
 build, live qualification, process control, service/schedule action or ledger write.
 It stops for detached re-review.
 
+## Revision2: repeatable read-only post-start proof
+
+Review found a separate reconciliation failure: the qualifier scripts require new
+exclusive output files, but fixed post-start filenames prevented another
+finish-start read-only proof after a partial or completed attempt. The new
+subprocess-seam regression first failed with15tests/1failure because an old public
+proof file already existed.
+
+Each invocation now allocates a nonce-qualified public/history output pair. Prior
+files, including failed evidence, are retained unchanged. The freshly produced
+maps are still fully validated. finish-start's stable `public_completed_requalified`
+boolean does not include changing paths, so its canonical started.json remains
+idempotent. No bootstrap, bootout or producer action is retried by this mechanism.
+The regression covers an old public-only file, an old pair, repeated fresh proof,
+a fresh FAIL result and a subsequent fresh successful proof; all ten output files
+and prior bytes remain. Only the subprocess boundary is simulated.
+
+Root also identified the unchanged boot guard's explicit MIX_BUILD_PATH contract.
+A negative environment fixture failed because cleaning caller overrides left that
+value absent. The runner now supplies exactly the accepted candidate build after
+cleaning the environment; a hostile caller build cannot leak through. The direct
+public qualifier command below explicitly supplies the same accepted build, which
+the unchanged boot guard verifies. This is exact routing, not a path override.
+
+Final revision2 results:
+
+| Gate | Actual result | LogSHA256 |
+| --- | --- | --- |
+| New offline tools |15tests,0failures,0.564s; exit0|3b6e91ad4ef8f02801b3c900b875dc1be2ee350cc4964c6ddcd6b75af40c6c52|
+| Historical tools unchanged |13tests,0failures,0.532s; exit0|81e5b89a0a2e147e64fc60ce26fb9d76123f8e68541f26e687e1f9dba794cff1|
+
+Logs are new-tools-r2.log and legacy-tools-r2.log. Python syntax and Elixir parse
+pass; all148 private resources and historical tools/tests remain byte-identical.
+No build, live qualification, service/schedule/control action or ledger write was
+performed. This second distinct reviewed finding stops for detached re-review.
+
 ## Future exact command contract — not executed
 
 After source/tool acceptance and final clean merge, the builder CLI is unchanged:
@@ -156,7 +192,7 @@ accepted artifact's source snapshot, using only its packaged modules:
 
 ```sh
 cd ABS_PACKAGED_SOURCE/elixir
-ERL_FLAGS='+S 4:4' PYTHONDONTWRITEBYTECODE=1 /opt/homebrew/bin/mise exec -- elixir -pa 'ABS_PACKAGED_BUILD/lib/*/ebin' ABS_PACKAGED_SOURCE/plans/rollout/qualify_review_ready_publication.exs ABS_MANIFEST EXACT_MANIFEST_SHA NEW_ABS_PUBLIC_JSON
+ERL_FLAGS='+S 4:4' MIX_BUILD_PATH=ABS_PACKAGED_BUILD PYTHONDONTWRITEBYTECODE=1 /opt/homebrew/bin/mise exec -- elixir -pa 'ABS_PACKAGED_BUILD/lib/*/ebin' ABS_PACKAGED_SOURCE/plans/rollout/qualify_review_ready_publication.exs ABS_MANIFEST EXACT_MANIFEST_SHA NEW_ABS_PUBLIC_JSON
 python3 -I -B ABS_PACKAGED_SOURCE/plans/rollout/qualify_review_ready_publication_history.py ABS_MANIFEST EXACT_MANIFEST_SHA NEW_ABS_HISTORY_JSON
 ```
 

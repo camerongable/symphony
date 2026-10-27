@@ -579,9 +579,12 @@ def clean_env():
 def run_qualifiers(value, evidence, prefix):
     source = Path(value['source'])
     args = [str(Path(value['release']) / 'evidence/release-manifest.json'), value['manifest_sha256']]
-    public = evidence / (prefix+'-public-completed.json')
-    history = evidence / (prefix+'-historical-completed.json')
+    attempt = prefix+'-'+secrets.token_hex(16)
+    public = evidence / (attempt+'-public-completed.json')
+    history = evidence / (attempt+'-historical-completed.json')
+    assert not public.exists() and not history.exists()
     env = clean_env()
+    env['MIX_BUILD_PATH'] = value['build']
     result = subprocess.run(['/opt/homebrew/bin/mise', 'exec', '--', 'elixir', '-pa',
                              str(Path(value['build']) / 'lib/*/ebin'),
                              str(source / 'plans/rollout/qualify_review_ready_publication.exs'), *args, str(public)],
