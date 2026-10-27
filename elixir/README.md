@@ -61,6 +61,31 @@ uncertainty bookkeeping, not successful work. Linked success, other errors,
 noncanonical encodings, and untrusted residues remain denied; existing single-link
 legacy response behavior is unchanged.
 
+MR `:claim` and `:correct` preparation now opens/initializes a native reader before
+runtime/physical/push/history qualification and the final actual branch read.
+Only the existing ephemeral owner-admission context holds it: no reader port,
+process binding, or reference enters prepare output, mailbox records, or SQLite.
+The reader is bound to its owning Erlang process, connected port, actual app-server
+PID, and canonical cwd. Warm readers stay linked to their owner so supervisor
+shutdown and abrupt owner death close them; no caller exit flags are changed.
+Legacy one-call native reads retain their unlinked lifetime and total20s budget.
+
+After the owning Desktop observation arrives, finalize consumes its handle,
+retains final physical delivery-facts equality, and collects fresh thread/latest/
+queue/version/confirmation data on that same initialized reader. Collection is
+bounded by min20s and remaining admission lifetime; expiry stays exactly the
+minimum of authorization+60s, runtime+60s, and remote+10s. No initialization or
+model command occurs in finalize. A slow final physical/read still fails closed.
+
+Preparation errors, all finalize outcomes, parse-rejected finalize with a known
+reader handle, expiry, registered idle-port data/death, and broker termination
+close the reader. Wrong-bound finalize now also consumes the associated native
+reader handle rather than retaining a port for a later retry. Unknown messages
+are not suppressed. Close validates ownership; repeat cleanup of an owned dead
+port is effect-free. Restart restores neither reader nor handle. The `:recover`
+ordering, one-call reader path, stable broker-before/evidence/broker-after and
+source-freshness proofs remain unchanged in this slice.
+
 Capability recovery reuses the stopped predecessor's immutable admitted packet and
 shared-instruction bytes. It revalidates all current packet facts except tool
 guidance, which is supplied by the recovery wrapper; it does not admit a replacement

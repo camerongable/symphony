@@ -16,6 +16,11 @@ executing the operation again. Conflicting or invalid files fail closed; saved
 results do not restore expired permissions or in-memory admission handles. This
 does not claim durability across host power loss.
 
+MR owner preparation initializes its read-only native actor before the short
+remote/owner window. Finalization still checks the physical checkout and collects
+fresh latest-turn, queue, and confirmation evidence after the owning Desktop read.
+Reader lifetime never authorizes another model turn or restores a consumed handle.
+
 Symphony turns project work into isolated, autonomous implementation runs, allowing teams to manage
 work instead of supervising coding agents.
 

@@ -40,6 +40,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @mcp_startup_statuses_key {__MODULE__, :mcp_startup_statuses}
   @mcp_approval_state_key {__MODULE__, :mcp_approval_state}
   @turn_event_state_key {__MODULE__, :turn_event_state}
+  @type native_reader :: %{owner: pid(), port: port(), app_server_pid: String.t(), cwd: Path.t(), identity: reference()}
   @type session :: %{
           port: port(),
           metadata: map(),
@@ -607,41 +608,146 @@ defmodule SymphonyElixir.Codex.AppServer do
   def read_native_thread(thread_id, opts) when is_binary(thread_id) and byte_size(thread_id) in 1..256 do
     workspace = Keyword.get(opts, :workspace, File.cwd!())
 
-    with {:ok, port} <- start_port(workspace, nil, DynamicTool.bind()) do
-      Process.unlink(port)
-      Process.put(@native_read_deadline_key, System.monotonic_time(:millisecond) + 20_000)
+    native_read_scope(20_000, fn ->
+      with {:ok, reader} <- open_native_reader(workspace, false) do
+        try do
+          read_native_thread(reader, thread_id, opts)
+        after
+          close_native_reader(reader)
+        end
+      end
+    end)
+  end
+
+  def read_native_thread(_thread_id, _opts), do: {:error, :invalid_native_thread_id}
+
+  @doc "Initializes a linked read-only actor; owner exit closes it without changing the caller's exit flags."
+  @spec open_native_reader(Path.t()) :: {:ok, native_reader()} | {:error, term()}
+  def open_native_reader(workspace), do: open_native_reader(workspace, true)
+
+  defp open_native_reader(workspace, linked?) when is_binary(workspace) do
+    with {:ok, cwd} <- PathSafety.canonicalize(Path.expand(workspace)),
+         true <- File.dir?(cwd) or {:error, :native_reader_cwd_invalid},
+         {:ok, port} <- start_port(cwd, nil, DynamicTool.bind()) do
+      if not linked?, do: Process.unlink(port)
+      reader = %{owner: self(), port: port, app_server_pid: port_metadata(port, nil)[:codex_app_server_pid], cwd: cwd, identity: make_ref()}
+      Process.put({__MODULE__, :native_reader, port}, reader)
 
       try do
-        with :ok <- send_initialize(port) do
-          include_turns = Keyword.get(opts, :include_turns, true)
-          send_message(port, %{"method" => "thread/read", "id" => @thread_read_id, "params" => %{"threadId" => thread_id, "includeTurns" => include_turns}})
+        case native_read_scope(20_000, fn -> send_initialize(port) end) do
+          :ok ->
+            {:ok, reader}
 
-          case await_response(port, @thread_read_id) do
-            {:ok, %{"thread" => %{"id" => ^thread_id} = thread}} ->
-              with true <-
-                     not include_turns or is_list(thread["turns"]) or
-                       {:error, :native_read_identity_or_history_mismatch},
-                   {:ok, observed} <- maybe_read_complete_history(port, thread, opts),
-                   {:ok, observed} <- maybe_read_latest_turn(port, observed, opts),
-                   {:ok, observed} <- maybe_read_native_queue(port, observed, opts) do
-                recheck_latest_queue_version(port, observed, opts)
-              end
-
-            {:ok, _} ->
-              {:error, :native_read_identity_or_history_mismatch}
-
-            error ->
-              error
-          end
+          error ->
+            close_native_reader(reader)
+            error
         end
-      after
-        Process.delete(@native_read_deadline_key)
-        stop_port(port)
+      rescue
+        error ->
+          close_native_reader(reader)
+          reraise error, __STACKTRACE__
+      catch
+        kind, reason ->
+          close_native_reader(reader)
+          :erlang.raise(kind, reason, __STACKTRACE__)
       end
     end
   end
 
-  def read_native_thread(_thread_id, _opts), do: {:error, :invalid_native_thread_id}
+  defp open_native_reader(_workspace, _linked?), do: {:error, :native_reader_cwd_invalid}
+
+  @doc "Collects fresh persisted history on the same initialized owned reader."
+  @spec read_native_thread(native_reader(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def read_native_thread(reader, thread_id, opts) when is_binary(thread_id) and byte_size(thread_id) in 1..256 do
+    timeout = Keyword.get(opts, :timeout_ms, 20_000)
+
+    with :ok <- native_reader_owned(reader),
+         true <- (is_integer(timeout) and timeout > 0) or {:error, :native_read_deadline_expired} do
+      native_read_scope(min(timeout, 20_000), fn -> collect_native_thread(reader.port, thread_id, opts) end)
+    end
+  end
+
+  def read_native_thread(_reader, _thread_id, _opts), do: {:error, :invalid_native_thread_id}
+
+  @doc "Closes only this process's native reader; repeated owned dead-reader cleanup is harmless."
+  @spec close_native_reader(native_reader()) :: :ok | {:error, term()}
+  def close_native_reader(%{owner: owner, port: port} = reader) when owner == self() and is_port(port) do
+    binding = Process.get({__MODULE__, :native_reader, port})
+
+    cond do
+      is_nil(Port.info(port)) and binding in [nil, reader] ->
+        Process.delete({__MODULE__, :native_reader, port})
+        drain_native_reader(port)
+
+      native_reader_owned(reader, false) == :ok ->
+        stop_port(port)
+        Process.delete({__MODULE__, :native_reader, port})
+        drain_native_reader(port)
+
+      true ->
+        {:error, :native_reader_not_owned}
+    end
+  end
+
+  def close_native_reader(_reader), do: {:error, :native_reader_not_owned}
+
+  defp native_reader_owned(reader, check_cwd? \\ true)
+
+  defp native_reader_owned(%{owner: owner, port: port, app_server_pid: pid, cwd: cwd} = reader, check_cwd?) when owner == self() and is_port(port) do
+    with true <- Process.get({__MODULE__, :native_reader, port}) === reader,
+         {:connected, ^owner} <- Port.info(port, :connected),
+         {:os_pid, actual} <- Port.info(port, :os_pid),
+         true <- to_string(actual) == pid,
+         true <- not check_cwd? or PathSafety.canonicalize(cwd) == {:ok, cwd} do
+      :ok
+    else
+      _ -> {:error, :native_reader_not_owned}
+    end
+  end
+
+  defp native_reader_owned(_reader, _check_cwd?), do: {:error, :native_reader_not_owned}
+
+  defp drain_native_reader(port) do
+    receive do
+      {^port, _} -> drain_native_reader(port)
+      {:EXIT, ^port, _} -> drain_native_reader(port)
+    after
+      0 -> :ok
+    end
+  end
+
+  defp native_read_scope(timeout, callback) do
+    previous = Process.get(@native_read_deadline_key)
+    deadline = System.monotonic_time(:millisecond) + timeout
+    Process.put(@native_read_deadline_key, if(is_integer(previous), do: min(previous, deadline), else: deadline))
+
+    try do
+      callback.()
+    after
+      if is_nil(previous), do: Process.delete(@native_read_deadline_key), else: Process.put(@native_read_deadline_key, previous)
+    end
+  end
+
+  defp collect_native_thread(port, thread_id, opts) do
+    include_turns = Keyword.get(opts, :include_turns, true)
+    send_message(port, %{"method" => "thread/read", "id" => @thread_read_id, "params" => %{"threadId" => thread_id, "includeTurns" => include_turns}})
+
+    case await_response(port, @thread_read_id) do
+      {:ok, %{"thread" => %{"id" => ^thread_id} = thread}} ->
+        with true <- not include_turns or is_list(thread["turns"]) or {:error, :native_read_identity_or_history_mismatch},
+             {:ok, observed} <- maybe_read_complete_history(port, thread, opts),
+             {:ok, observed} <- maybe_read_latest_turn(port, observed, opts),
+             {:ok, observed} <- maybe_read_native_queue(port, observed, opts) do
+          recheck_latest_queue_version(port, observed, opts)
+        end
+
+      {:ok, _} ->
+        {:error, :native_read_identity_or_history_mismatch}
+
+      error ->
+        error
+    end
+  end
 
   @doc "Reads latest-turn and queue evidence using the worker's existing owned native actor."
   @spec read_owned_native_thread(session()) :: {:ok, map()} | {:error, term()}

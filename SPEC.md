@@ -31,6 +31,16 @@ uncertain; incomplete temporary files alone are not proof. Implementations MUST
 bound retained results, record sizes, and per-poll recovery work, and state whether
 their durability guarantee covers process restart or host power loss.
 
+MR owner admission MAY retain an initialized read-only native actor only in its
+ephemeral service context. Initialization MUST precede the final real branch
+observation; fresh latest-turn, complete empty queue, version, and confirmation
+collection MUST follow the owning Desktop evidence. Retain final physical checkout
+equality, all current input/owner/history checks, unchanged freshness windows, and
+consumed-once handles. Collection MUST be bounded by both the existing read ceiling
+and remaining admission lifetime. Close the actor on failure, expiry, or owner
+exit; never persist or reopen it as authority. Recovery-specific observation order
+remains a separate unchanged boundary.
+
 ## Normative Language
 
 The key words `MUST`, `MUST NOT`, `REQUIRED`, `SHOULD`, `SHOULD NOT`, `RECOMMENDED`, `MAY`, and

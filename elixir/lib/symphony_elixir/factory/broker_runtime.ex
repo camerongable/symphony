@@ -84,9 +84,26 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
   end
 
   @impl true
+  def handle_info({port, {:data, _}}, state) when is_port(port), do: invalidate_reader(state, port)
+
+  def handle_info({port, {:exit_status, _}}, state) when is_port(port), do: invalidate_reader(state, port)
+
+  @impl true
   def terminate(_reason, state) do
+    Enum.each(state.owner_admissions, fn {_, context} -> TicketMrOwnerAdmission.close(context) end)
     if :global.whereis_name({__MODULE__, state.root}) == self(), do: :global.unregister_name({__MODULE__, state.root})
     :ok
+  end
+
+  defp invalidate_reader(state, port) do
+    case Enum.find(state.owner_admissions, fn {_, context} -> match?(%{port: ^port}, context.native_reader) end) do
+      {handle, context} ->
+        TicketMrOwnerAdmission.close(context)
+        {:noreply, %{state | owner_admissions: Map.delete(state.owner_admissions, handle)}}
+
+      nil ->
+        {:stop, :unexpected_broker_reader_port, state}
+    end
   end
 
   @doc false
@@ -155,11 +172,30 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
     case Mix.Tasks.Factory.Desktop.owner_runtime_args(args, state.store, state.factory) do
       {:ok, %{phase: :prepare} = input} -> prepare_owner(state, input)
       {:ok, %{phase: :finalize} = input} -> finalize_owner(state, input)
-      {:error, _} = error -> {error, state}
+      {:error, _} = error -> {error, discard_rejected_reader(state, args)}
     end
   end
 
   defp dispatch(state, args), do: {state.executor.(args, state.store, state.factory), state}
+
+  defp discard_rejected_reader(state, args) do
+    {_, action, _} = OptionParser.parse(args, strict: [workflow: :string, source_thread_id: :string, payload_base64: :string])
+
+    case action do
+      [command, _key, handle | _] when command in ~w(finalize-ticket-mr-correction finalize-ticket-mr-claim finalize-ticket-mr-recovery) ->
+        case state.owner_admissions[handle] do
+          %TicketMrOwnerAdmission{native_reader: reader} = context when not is_nil(reader) ->
+            TicketMrOwnerAdmission.close(context)
+            %{state | owner_admissions: Map.delete(state.owner_admissions, handle)}
+
+          _ ->
+            state
+        end
+
+      _ ->
+        state
+    end
+  end
 
   defp prepare_owner(state, input) do
     state = expire_owner_admissions(state)
@@ -193,7 +229,17 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
   end
 
   defp expire_owner_admissions(state) do
-    %{state | owner_admissions: Map.reject(state.owner_admissions, fn {_handle, context} -> DateTime.compare(DateTime.utc_now(), context.expires_at) == :gt end)}
+    alive =
+      Enum.reduce(state.owner_admissions, %{}, fn {handle, context}, current ->
+        if DateTime.compare(DateTime.utc_now(), context.expires_at) == :gt do
+          TicketMrOwnerAdmission.close(context)
+          current
+        else
+          Map.put(current, handle, context)
+        end
+      end)
+
+    %{state | owner_admissions: alive}
   end
 
   defp finalize_owner(state, input) do
@@ -219,6 +265,7 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
         _, _ -> {:error, :broker_runtime_operation_failed}
       after
         Process.delete({__MODULE__, :owner_admission})
+        TicketMrOwnerAdmission.close(context)
       end
 
     {result, consumed}

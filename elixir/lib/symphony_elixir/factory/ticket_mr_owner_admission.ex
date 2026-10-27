@@ -6,7 +6,7 @@ defmodule SymphonyElixir.Factory.TicketMrOwnerAdmission do
   alias SymphonyElixir.Factory.{TicketMrOperation, TicketMrPresendRecovery, TicketWorkerRunner}
 
   @type t :: %__MODULE__{}
-  defstruct ~w(action key broker factory prepared opts inputs workflow_sha256 expires_at authority presend_recovery handle)a
+  defstruct ~w(action key broker factory prepared opts inputs workflow_sha256 expires_at authority presend_recovery handle native_reader)a
   @unissued ~w(claimed_at thread_id turn_id target_observation_json verified_cwd verified_project_id verified_head_sha output_json rejected_tool_call_id failure_code superseded_by)
 
   @doc false
@@ -21,7 +21,30 @@ defmodule SymphonyElixir.Factory.TicketMrOwnerAdmission do
          {:ok, inputs} <- input_snapshot(store, request),
          {:ok, workflow_sha} <- workflow_sha(factory),
          {:ok, recovery} <- observe_recovery(store, request, action, broker, opts),
-         {:ok, prepared} <- prepare_authority(store, key, action, factory, broker, opts),
+         {:ok, reader} <- open_reader(action, request) do
+      try do
+        case prepare_context(store, key, action, factory, broker, opts, request, inputs, workflow_sha, recovery, reader) do
+          {:ok, _} = result ->
+            result
+
+          error ->
+            close_reader(reader)
+            error
+        end
+      rescue
+        error ->
+          close_reader(reader)
+          reraise error, __STACKTRACE__
+      catch
+        kind, reason ->
+          close_reader(reader)
+          :erlang.raise(kind, reason, __STACKTRACE__)
+      end
+    end
+  end
+
+  defp prepare_context(store, key, action, factory, broker, opts, request, inputs, workflow_sha, recovery, reader) do
+    with {:ok, prepared} <- prepare_authority(store, key, action, factory, broker, opts),
          true <- prepared.request == request or {:error, :ticket_mr_request_changed},
          {:ok, auth_at, _} <- DateTime.from_iso8601(prepared.authorization["observed_at"]),
          expiry = Enum.min_by([DateTime.add(auth_at, 60, :second), DateTime.add(prepared.runtime_at, 60, :second), DateTime.add(prepared.remote_at, 10, :second)], &DateTime.to_unix(&1, :microsecond)),
@@ -36,7 +59,8 @@ defmodule SymphonyElixir.Factory.TicketMrOwnerAdmission do
            workflow_sha256: workflow_sha,
            expires_at: expiry,
            authority: make_ref(),
-           presend_recovery: recovery
+           presend_recovery: recovery,
+           native_reader: reader
          },
          :ok <- recheck(store, context, factory) do
       {:ok, context}
@@ -48,21 +72,44 @@ defmodule SymphonyElixir.Factory.TicketMrOwnerAdmission do
   @doc false
   @spec finalize(Store.connection(), t(), map(), map()) :: {:ok, map()} | {:error, term()}
   def finalize(store, %__MODULE__{} = context, factory, owner) do
-    with true <- BrokerRuntime.owner_admission_active?(context) or {:error, :mr_owner_service_authority_required},
-         :ok <- recheck(store, context, factory),
-         request = context.prepared.request,
-         {:ok, facts} <- TicketWorkerRunner.delivery_facts(store, context.prepared.run, context.opts),
-         true <- facts == Map.delete(context.prepared.admitted, :retained_mr_history) or {:error, :ticket_delivery_binding_changed},
-         {:ok, native} <- AppServer.read_native_thread(request["existing_thread_id"], workspace: request["cwd"], include_turns: false, include_latest_turn: true, include_queue: true),
-         :ok <- workflow_current(context),
-         :ok <- recheck(store, context, factory) do
-      case context.action do
-        :correct -> TicketMrCwdCorrection.finalize_owner_admission(store, context, owner, native)
-        :claim -> finalize_claim(store, context, owner, native)
-        :recover -> TicketMrPresendRecovery.finalize(store, context, owner, native)
+    try do
+      with true <- BrokerRuntime.owner_admission_active?(context) or {:error, :mr_owner_service_authority_required},
+           :ok <- recheck(store, context, factory),
+           request = context.prepared.request,
+           {:ok, facts} <- TicketWorkerRunner.delivery_facts(store, context.prepared.run, context.opts),
+           true <- facts == Map.delete(context.prepared.admitted, :retained_mr_history) or {:error, :ticket_delivery_binding_changed},
+           {:ok, native} <- collect_native(context, request),
+           :ok <- workflow_current(context),
+           :ok <- recheck(store, context, factory) do
+        case context.action do
+          :correct -> TicketMrCwdCorrection.finalize_owner_admission(store, context, owner, native)
+          :claim -> finalize_claim(store, context, owner, native)
+          :recover -> TicketMrPresendRecovery.finalize(store, context, owner, native)
+        end
       end
+    after
+      close(context)
     end
   end
+
+  defp open_reader(:recover, _request), do: {:ok, nil}
+  defp open_reader(_action, request), do: AppServer.open_native_reader(request["cwd"])
+
+  defp collect_native(%{action: :recover}, request),
+    do: AppServer.read_native_thread(request["existing_thread_id"], workspace: request["cwd"], include_turns: false, include_latest_turn: true, include_queue: true)
+
+  defp collect_native(context, request) do
+    remaining = DateTime.diff(context.expires_at, DateTime.utc_now(), :millisecond)
+    AppServer.read_native_thread(context.native_reader, request["existing_thread_id"], include_turns: false, include_latest_turn: true, include_queue: true, timeout_ms: remaining)
+  end
+
+  @doc false
+  @spec close(t() | nil) :: :ok | {:error, term()}
+  def close(%__MODULE__{native_reader: reader}), do: close_reader(reader)
+  def close(nil), do: :ok
+
+  defp close_reader(nil), do: :ok
+  defp close_reader(reader), do: AppServer.close_native_reader(reader)
 
   defp finalize_claim(store, context, owner, native) do
     request = context.prepared.request

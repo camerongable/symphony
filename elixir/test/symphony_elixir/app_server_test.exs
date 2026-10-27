@@ -238,6 +238,56 @@ defmodule SymphonyElixir.AppServerTest do
     )
   end
 
+  @tag :native_reader
+  test "initialized native readers are owner-bound read-only and close idempotently" do
+    handler = """
+    case "$line" in
+      *'"method":"thread/read"'*) printf '%s\\n' '{"id":9,"result":{"thread":{"id":"parent","turns":[]}}}' ;;
+    esac
+    """
+
+    with_thread_listing_server("owned-native-reader", handler, fn workspace, trace ->
+      assert {:ok, reader} = AppServer.open_native_reader(workspace)
+      assert reader.owner == self()
+      foreign = Task.async(fn -> {AppServer.read_native_thread(reader, "parent", []), AppServer.close_native_reader(reader)} end)
+      assert {{:error, :native_reader_not_owned}, {:error, :native_reader_not_owned}} = Task.await(foreign)
+
+      for changed <- [%{reader | cwd: workspace <> "/foreign"}, %{reader | app_server_pid: "999999999"}, %{reader | identity: make_ref()}] do
+        assert {:error, :native_reader_not_owned} = AppServer.read_native_thread(changed, "parent", [])
+        assert {:error, :native_reader_not_owned} = AppServer.close_native_reader(changed)
+      end
+
+      assert {:ok, %{"id" => "parent"}} = AppServer.read_native_thread(reader, "parent", [])
+      send(self(), {:unrelated_reader_message, :preserved})
+      assert :ok = AppServer.close_native_reader(reader)
+      assert :ok = AppServer.close_native_reader(reader)
+      assert {:error, :native_reader_not_owned} = AppServer.read_native_thread(reader, "parent", [])
+      assert_receive {:unrelated_reader_message, :preserved}
+      requests = File.read!(trace) |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!(String.trim_leading(&1, "JSON:")))
+      assert Enum.map(requests, & &1["method"]) == ["initialize", "initialized", "thread/read"]
+    end)
+  end
+
+  @tag :native_reader
+  test "dead native readers never reopen and collection respects the remaining deadline" do
+    handler = """
+    case "$line" in
+      *'"method":"thread/read"'*) sleep 0.5; printf '%s\\n' '{"id":9,"result":{"thread":{"id":"parent","turns":[]}}}' ;;
+    esac
+    """
+
+    with_thread_listing_server("deadline-native-reader", handler, fn workspace, trace ->
+      assert {:ok, reader} = AppServer.open_native_reader(workspace)
+      assert {:error, :response_timeout} = AppServer.read_native_thread(reader, "parent", timeout_ms: 50)
+      Port.close(reader.port)
+      assert {:error, :native_reader_not_owned} = AppServer.read_native_thread(reader, "parent", [])
+      assert :ok = AppServer.close_native_reader(reader)
+      requests = File.read!(trace) |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!(String.trim_leading(&1, "JSON:")))
+      assert Enum.count(requests, &(&1["method"] == "initialize")) == 1
+      refute Enum.any?(requests, &(&1["method"] in ~w(thread/start thread/resume thread/fork turn/start)))
+    end)
+  end
+
   test "controller catalog reads use the existing thread and never start a model turn" do
     tools = %{"get_pipeline" => %{"name" => "get_pipeline", "inputSchema" => %{"type" => "object"}}}
     catalog = Jason.encode!(%{"data" => [%{"name" => "GitLab", "tools" => tools, "toolsError" => nil}], "nextCursor" => nil})

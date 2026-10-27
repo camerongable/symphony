@@ -10621,6 +10621,301 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     assert Store.query!(ctx.store, "SELECT * FROM ticket_mr_claims").rows == []
   end
 
+  @tag mr_reader_lifetime: true
+  @tag mr_preflight: true
+  @tag mr_owner_service: true
+  @tag mr_projectless: true
+  @tag broker_thread_id: "00000000-0000-0000-0000-000000000001"
+  test "MR owner initializes its reader before the remote window and collects only after owner evidence", ctx do
+    fixture = mr_reader_lifetime_fixture(ctx)
+    server = start_supervised!({BrokerRuntime, factory: fixture.factory, store: ctx.store, name: nil})
+    args = ["prepare-ticket-mr-correction", fixture.request["request_key"], fixture.request["payload_sha256"], "--source-thread-id", fixture.proof["source_thread_id"], "--workflow", fixture.workflow]
+    assert {:ok, prepared} = BrokerRuntime.call(args)
+    reader = :sys.get_state(server).owner_admissions[prepared["handle"]].native_reader
+    File.write!(fixture.phase, "finalize")
+    owner = put_in(fixture.frame, ["owner", "observed_at"], DateTime.to_iso8601(DateTime.utc_now()))
+
+    finalize = [
+      "finalize-ticket-mr-correction",
+      fixture.request["request_key"],
+      prepared["handle"],
+      "--source-thread-id",
+      fixture.proof["source_thread_id"],
+      "--payload-base64",
+      owner |> Jason.encode!() |> Base.encode64(),
+      "--workflow",
+      fixture.workflow
+    ]
+
+    assert {:ok, %{"status" => "MR_ACTOR_CWD_CORRECTED"}} = BrokerRuntime.call(finalize)
+    assert :sys.get_state(server).owner_admissions == %{}
+    assert_mr_reader_closed(reader)
+    events = fixture.trace |> File.read!() |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!/1)
+    native = Enum.find(events, &(&1["method"] == "thread/read" and &1["thread"] == fixture.request["existing_thread_id"]))
+    initialize = Enum.filter(events, &(&1["event"] == "initialized" and &1["pid"] == native["pid"]))
+    assert [%{"phase" => "prepare", "elapsed_ms" => elapsed}] = initialize
+    assert elapsed >= 10_900
+    initialized_index = Enum.find_index(events, &(&1["event"] == "initialized" and &1["pid"] == native["pid"]))
+    branch_index = Enum.find_index(events, &(&1["tool"] == "get_branch"))
+    assert initialized_index < branch_index
+    assert native["phase"] == "finalize"
+    assert Enum.all?(Enum.filter(events, &(&1["pid"] == native["pid"] and &1["method"] in ~w(thread/turns/list thread/queue/list))), &(&1["phase"] == "finalize"))
+    refute Enum.any?(events, &(&1["pid"] == native["pid"] and &1["method"] in ~w(thread/start thread/resume thread/fork turn/start)))
+  end
+
+  @tag mr_reader_matrix: true
+  @tag mr_preflight: true
+  @tag mr_owner_service: true
+  @tag mr_projectless: true
+  @tag broker_thread_id: "00000000-0000-0000-0000-000000000001"
+  @tag timeout: 360_000
+  test "MR reader observes post-prepare changes and closes on every denied lifetime", ctx do
+    fixture = mr_reader_lifetime_fixture(ctx)
+    File.write!(fixture.config["slow_first_initialize"], "already selected by slow-positive test")
+    original_workflow = File.read!(fixture.workflow)
+    original_source = File.read!(Path.join(ctx.path, "fixture.txt"))
+    tables = ~w(runs control factory_tasks worker_evidence workspace_access ticket_mr_claims desktop_requests ticket_mr_actor_bindings events)
+    snapshot = fn -> Map.new(tables, &{&1, Store.query!(ctx.store, "SELECT * FROM #{&1} ORDER BY 1").rows}) end
+    original = snapshot.()
+
+    for defect <- [:latest, :queue, :malformed_owner, :wrong_binding, :missing_key, :workflow, :expiry, :port_death, :idle_data, :restart, :kill_restart, :final_physical] do
+      File.write!(fixture.phase, "prepare")
+      server = start_supervised!(Supervisor.child_spec({BrokerRuntime, factory: fixture.factory, store: ctx.store, name: nil}, restart: :temporary))
+
+      prepare = [
+        "prepare-ticket-mr-correction",
+        fixture.request["request_key"],
+        fixture.request["payload_sha256"],
+        "--source-thread-id",
+        fixture.proof["source_thread_id"],
+        "--workflow",
+        fixture.workflow
+      ]
+
+      assert {:ok, prepared} = BrokerRuntime.call(prepare)
+      context = :sys.get_state(server).owner_admissions[prepared["handle"]]
+      reader = context.native_reader
+      owner = put_in(fixture.frame, ["owner", "observed_at"], DateTime.to_iso8601(DateTime.utc_now()))
+
+      finalize = [
+        "finalize-ticket-mr-correction",
+        fixture.request["request_key"],
+        prepared["handle"],
+        "--source-thread-id",
+        fixture.proof["source_thread_id"],
+        "--payload-base64",
+        owner |> Jason.encode!() |> Base.encode64(),
+        "--workflow",
+        fixture.workflow
+      ]
+
+      File.write!(fixture.phase, "finalize")
+
+      finalize =
+        case defect do
+          :latest ->
+            changed = put_in(fixture.config["latest"], ["data", Access.at(0), "id"], "newer-native-turn")
+            File.write!(fixture.config["latest_file"], Jason.encode!(changed))
+            finalize
+
+          :queue ->
+            File.write!(fixture.config["queue_file"], Jason.encode!(%{"data" => [%{"id" => "pending-native-input"}], "nextCursor" => nil}))
+            finalize
+
+          :malformed_owner ->
+            List.replace_at(finalize, 6, Base.encode64("{}"))
+
+          :wrong_binding ->
+            List.replace_at(finalize, 0, "finalize-ticket-mr-claim")
+
+          :missing_key ->
+            List.replace_at(finalize, 1, "missing-request-key")
+
+          :workflow ->
+            File.write!(fixture.workflow, original_workflow <> "\nChanged fixture workflow\n")
+            finalize
+
+          :expiry ->
+            :sys.replace_state(server, fn state -> put_in(state, [:owner_admissions, prepared["handle"], Access.key(:expires_at)], DateTime.add(DateTime.utc_now(), -1, :second)) end)
+            send(server, :poll)
+            :sys.get_state(server)
+            finalize
+
+          :port_death ->
+            System.cmd("/bin/kill", ["-TERM", reader.app_server_pid])
+            wait_mr_reader_removed(server, prepared["handle"])
+            finalize
+
+          :idle_data ->
+            File.write!(fixture.config["idle_file"], "emit")
+            wait_mr_reader_removed(server, prepared["handle"])
+            finalize
+
+          :restart ->
+            stop_supervised!(BrokerRuntime)
+            start_supervised!(Supervisor.child_spec({BrokerRuntime, factory: fixture.factory, store: ctx.store, name: nil}, restart: :temporary))
+            finalize
+
+          :kill_restart ->
+            ref = Process.monitor(server)
+            Process.exit(server, :kill)
+            assert_receive {:DOWN, ^ref, :process, ^server, :killed}
+            stop_supervised(BrokerRuntime)
+            start_supervised!(Supervisor.child_spec({BrokerRuntime, factory: fixture.factory, store: ctx.store, name: nil}, restart: :temporary))
+            finalize
+
+          :final_physical ->
+            File.write!(Path.join(ctx.path, "fixture.txt"), original_source <> "changed after prepare\n")
+            finalize
+        end
+
+      assert {:error, _} = BrokerRuntime.call(finalize), "unexpected success for #{defect}"
+      assert Port.info(reader.port) == nil, "reader remained live after #{defect}"
+      assert_mr_reader_closed(reader)
+      assert snapshot.() == original
+      File.write!(fixture.workflow, original_workflow)
+      File.write!(Path.join(ctx.path, "fixture.txt"), original_source)
+      Enum.each(~w(latest_file queue_file idle_file), &File.rm(fixture.config[&1]))
+      stop_supervised!(BrokerRuntime)
+    end
+
+    File.write!(fixture.phase, "prepare")
+    before = if File.exists?(fixture.trace), do: length(String.split(File.read!(fixture.trace), "\n", trim: true)), else: 0
+
+    branch =
+      fixture.config["branch"] |> put_in(["commit", "id"], String.duplicate("f", 40)) |> put_in(["commit", "web_url"], "https://gitlab.com/fixture/repository/-/commit/" <> String.duplicate("f", 40))
+
+    File.write!(fixture.config["branch_file"], Jason.encode!(branch))
+    server = start_supervised!({BrokerRuntime, factory: fixture.factory, store: ctx.store, name: nil})
+
+    assert {:error, _} =
+             BrokerRuntime.call([
+               "prepare-ticket-mr-correction",
+               fixture.request["request_key"],
+               fixture.request["payload_sha256"],
+               "--source-thread-id",
+               fixture.proof["source_thread_id"],
+               "--workflow",
+               fixture.workflow
+             ])
+
+    assert :sys.get_state(server).owner_admissions == %{}
+    initialized = fixture.trace |> File.read!() |> String.split("\n", trim: true) |> Enum.drop(before) |> Enum.map(&Jason.decode!/1) |> Enum.filter(&(&1["event"] == "initialized"))
+    assert initialized != []
+    Enum.each(initialized, &assert_mr_reader_pid_closed(Integer.to_string(&1["pid"])))
+    assert snapshot.() == original
+  end
+
+  defp assert_mr_reader_closed(reader) do
+    assert Port.info(reader.port) == nil
+    assert_mr_reader_pid_closed(reader.app_server_pid)
+  end
+
+  defp assert_mr_reader_pid_closed(pid) do
+    assert Enum.reduce_while(1..100, false, fn _, _ ->
+             case System.cmd("/bin/kill", ["-0", pid], stderr_to_stdout: true) do
+               {_, 0} ->
+                 Process.sleep(10)
+                 {:cont, false}
+
+               _ ->
+                 {:halt, true}
+             end
+           end)
+  end
+
+  defp wait_mr_reader_removed(server, handle) do
+    assert Enum.reduce_while(1..100, false, fn _, _ ->
+             if Map.has_key?(:sys.get_state(server).owner_admissions, handle),
+               do:
+                 (
+                   Process.sleep(10)
+                   {:cont, false}
+                 ),
+               else: {:halt, true}
+           end)
+  end
+
+  defp mr_reader_lifetime_fixture(ctx) do
+    {factory, _, _, request, _} = prepared_mr(ctx)
+    roles = ~w(orchestrator orchestrator-intake specification-author specification-critic feature-planner change-verifier manual-validator explorer failure-triager)
+
+    factory =
+      update_in(factory, [:models, "roles"], fn existing -> Enum.reduce(roles, existing, &Map.put_new(&2, &1, %{"provider" => "codex", "model_class" => "fast", "reasoning_effort" => "low"})) end)
+
+    factory = update_in(factory, [:repositories, "grail"], &Map.merge(&1, %{"codex_project_id" => "project-grail", "route_labels" => ["repo-grail"]}))
+    workflow = Path.join(ctx.root, "mr-reader-lifetime.md")
+    factory = factory |> put_in([:ticket_supervisor, "ticket_workflow"], workflow) |> Map.put(:database, ctx.database)
+    proof = mr_guard(request)
+    actor = Path.join(ctx.root, "dated-reader-actor")
+    File.mkdir_p!(actor)
+    proof = proof |> put_in(["owner", "response", "thread", "cwd"], actor) |> put_in(["native", "cwd"], actor)
+    {:ok, snapshot} = JiraReader.issue("PPL-123", store: ctx.store)
+
+    snapshot =
+      snapshot
+      |> Map.merge(%{"summary" => "Fixture", "description" => snapshot["description"] || "Fixture", "project_key" => "PPL"})
+      |> Map.update!("comments", fn comments -> Enum.with_index(comments, &Map.put(&1, "id", Integer.to_string(&2 + 1))) end)
+
+    native = proof["native"] |> Map.take(~w(id cwd projectId updatedAt)) |> Map.put("status", %{"type" => "idle"}) |> Map.put("projectId", nil)
+    {broker_native, broker_latest} = MrPresendFixture.native(proof["source_thread_id"], actor)
+    {:ok, current} = RunLedger.get(ctx.store, "run")
+    {:ok, tools} = CiReader.catalog([])
+    phase = Path.join(ctx.root, "mr-reader-phase")
+    trace = Path.join(ctx.root, "mr-reader.trace")
+    File.write!(phase, "prepare")
+
+    config = %{
+      "phase" => phase,
+      "trace" => trace,
+      "slow_first_initialize" => Path.join(ctx.root, "mr-reader-first-initialize"),
+      "delays" => %{"prepare" => 0.25, "finalize" => 11},
+      "initialize" => %{
+        "codexHome" => System.get_env("CODEX_HOME") || Path.join(System.user_home!(), ".codex"),
+        "platformFamily" => "unix",
+        "platformOs" => "macos",
+        "userAgent" => "symphony-orchestrator/0.160.0 (fixture)"
+      },
+      "catalog" => %{"data" => [%{"name" => "GitLab", "tools" => tools, "toolsError" => nil}], "nextCursor" => nil},
+      "snapshot" => snapshot,
+      "branch" => %{
+        "name" => current["branch"],
+        "web_url" => "https://gitlab.com/fixture/repository/-/tree/#{current["branch"]}",
+        "commit" => %{"id" => current["candidate_sha"], "web_url" => "https://gitlab.com/fixture/repository/-/commit/#{current["candidate_sha"]}"}
+      },
+      "native" => native,
+      "latest" => proof["native"]["latest_turn_observation"]["raw_response"],
+      "broker" => proof["source_thread_id"],
+      "broker_native" => broker_native,
+      "broker_latest" => broker_latest,
+      "latest_file" => Path.join(ctx.root, "reader-latest.json"),
+      "queue_file" => Path.join(ctx.root, "reader-queue.json"),
+      "branch_file" => Path.join(ctx.root, "reader-branch.json"),
+      "idle_file" => Path.join(ctx.root, "reader-idle")
+    }
+
+    config_path = Path.join(ctx.root, "reader-config.json")
+    File.write!(config_path, Jason.encode!(config))
+    executable = Path.join(ctx.root, "mr-reader-runtime")
+    File.write!(executable, "#!/bin/sh\nexec /usr/bin/python3 '#{Path.expand("../support/mr_owner_reader_server.py", __DIR__)}' '#{config_path}'\n")
+    File.chmod!(executable, 0o755)
+    SymphonyElixir.TestSupport.write_workflow_file!(workflow, codex_command: "#{executable} app-server", codex_read_timeout_ms: 15_000, workspace_root: Path.join(ctx.root, "workspaces"))
+    File.write!(workflow, String.replace(File.read!(workflow), "\n---\n", "\nfactory:\n  database: #{ctx.database}\n---\n", global: false))
+    SymphonyElixir.Workflow.set_workflow_file_path(workflow)
+
+    %{
+      factory: factory,
+      workflow: workflow,
+      request: request,
+      proof: proof,
+      frame: Map.take(proof, ~w(request_key source_thread_id owner)) |> Map.put("request_key", request["request_key"]),
+      phase: phase,
+      trace: trace,
+      config: config,
+      config_path: config_path
+    }
+  end
+
   @tag mr_preflight: true
   @tag mr_projectless: true
   @tag broker_thread_id: "00000000-0000-0000-0000-000000000001"
@@ -11184,9 +11479,9 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
       File.write!(workflow, original_workflow)
 
       if defect == :key do
-        assert map_size(:sys.get_state(server).owner_admissions) == 1
+        assert :sys.get_state(server).owner_admissions == %{}
 
-        assert {:error, ":mr_owner_admission_binding_mismatch"} =
+        assert {:error, ":mr_owner_admission_unavailable"} =
                  SymphonyElixir.Factory.BrokerRuntime.call(List.replace_at(negative_args, 1, key) |> List.replace_at(0, "finalize-ticket-mr-correction"))
       else
         assert {:error, ":mr_owner_admission_unavailable"} = SymphonyElixir.Factory.BrokerRuntime.call(negative_args)
