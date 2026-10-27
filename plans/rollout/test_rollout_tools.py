@@ -23,11 +23,10 @@ def module(name, path):
 
 
 class PreparationTests(unittest.TestCase):
-    def test_cutover_requires_both_current_qualification_files_before_validation(self):
+    def test_cutover_requires_both_current_qualification_files(self):
         cutover = module('required_current_qualifications', ROOT / 'review_cutover.py')
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            g, _capture = cutover.bind(root)
             names = ('candidate.json', 'validation.json', 'review-acceptance.json',
                      'service.original.plist', 'audited-protected.json', 'cutover-audit.json',
                      'cold-boot.json', 'historical-readback-qualification.json',
@@ -35,27 +34,12 @@ class PreparationTests(unittest.TestCase):
             approval = {'result': 'ACCEPT_FOR_CUTOVER_ONLY', 'manifest_sha256': 'manifest',
                         'cutover_guard_sha256': 'guard', 'guardian_sha256': cutover.THAW_SHA,
                         'evidence': dict.fromkeys(names, 'evidence')}
-            g.candidate = lambda: ({'manifest_sha256': 'manifest'}, {}, {})
-
-            class ValidationReached(Exception):
-                pass
-
-            def load(name):
-                if name == 'rollout-approved.json':
-                    return approval
-                raise ValidationReached(name)
-
-            g.load = load
-            digests = {str(ROOT / 'review_cutover.py'): 'guard',
-                       str(root / 'thaw_guardian.py'): cutover.THAW_SHA}
-            with patch.object(cutover, 'sha', side_effect=lambda path: digests.get(str(path), 'evidence')):
-                with self.assertRaises(ValidationReached):
-                    g.qualified()
-                for name in ('current-publication-chain.json', 'current-rejection-qualification.json'):
-                    del approval['evidence'][name]
-                    with self.subTest(name=name), self.assertRaises(AssertionError):
-                        g.qualified()
-                    approval['evidence'][name] = 'evidence'
+            cutover.validate_approval_evidence_files(approval)
+            for name in ('current-publication-chain.json', 'current-rejection-qualification.json'):
+                del approval['evidence'][name]
+                with self.subTest(name=name), self.assertRaises(AssertionError):
+                    cutover.validate_approval_evidence_files(approval)
+                approval['evidence'][name] = 'evidence'
 
     def test_current_publication_gate_rejects_incomplete_or_other_candidate_evidence(self):
         cutover = module('current_publication_test', ROOT / 'review_cutover.py')

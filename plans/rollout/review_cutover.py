@@ -87,6 +87,14 @@ def validate_current_publication_evidence(value, manifest, chain, rejection):
     assert rejection['original_run_and_three_prior_retirements_unchanged'] is True
 
 
+def validate_approval_evidence_files(approval):
+    required = {'candidate.json', 'validation.json', 'review-acceptance.json',
+                'service.original.plist', 'audited-protected.json', 'cutover-audit.json',
+                'cold-boot.json', 'historical-readback-qualification.json',
+                'current-publication-chain.json', 'current-rejection-qualification.json'}
+    assert required <= approval['evidence'].keys()
+
+
 def bind(evidence_root):
     path = HISTORICAL / 'cutover_guard.py'
     raw = path.read_bytes()
@@ -201,11 +209,7 @@ IO.puts("NATIVE_SOURCE_QUIET")
         assert approval['manifest_sha256'] == value['manifest_sha256']
         assert approval['cutover_guard_sha256'] == sha(Path(__file__))
         assert approval['guardian_sha256'] == THAW_SHA == sha(evidence_root / 'thaw_guardian.py')
-        required = {'candidate.json', 'validation.json', 'review-acceptance.json',
-                    'service.original.plist', 'audited-protected.json', 'cutover-audit.json',
-                    'cold-boot.json', 'historical-readback-qualification.json',
-                    'current-publication-chain.json', 'current-rejection-qualification.json'}
-        assert required <= approval['evidence'].keys()
+        validate_approval_evidence_files(approval)
         for name, expected in approval['evidence'].items():
             assert sha(evidence_root / name) == expected, name
         validation = g.load('validation.json')
