@@ -52,6 +52,13 @@ defmodule SymphonyElixir.FactoryTicketPushReadbackTest do
     assert current["entries"] == previous["entries"]
   end
 
+  test "ordinary bindings status catalog preserves every historical origin", context do
+    previous = Jason.decode!(File.read!(Path.join(context.priv, "ticket_push_readback_origins_v16.json")))
+    current = Jason.decode!(File.read!(Path.join(context.priv, "ticket_push_readback_origins_v17.json")))
+    assert current["version"] == 17
+    assert current["entries"] == previous["entries"]
+  end
+
   @tag attested_readback: :capability_prior_history
   test "the next push history validator accepts the pinned predecessor but not a sibling or changed program", context do
     {intent, receipt} = recorded(context, context.attested.name, context.attested.recorded_priv)
@@ -143,6 +150,8 @@ defmodule SymphonyElixir.FactoryTicketPushReadbackTest do
         :forward_capability,
         :writer_readiness_ordinary,
         :writer_readiness_capability,
+        :ordinary_bindings,
+        :ordinary_bindings_capability,
         :typed_ordinary,
         :typed_capability,
         :capability_legacy_v20,
@@ -645,7 +654,7 @@ defmodule SymphonyElixir.FactoryTicketPushReadbackTest do
     %{name: name, kind: kind, recorded_priv: recorded_priv, artifact_priv: artifact_priv, runtime_priv: runtime_priv, manifest: manifest_path, proof_path: proof_path}
   end
 
-  defp install_forward_attestation(priv, entry, version) when version in [14, 15] do
+  defp install_forward_attestation(priv, entry, version) when version in [14, 15, 16] do
     forward = Jason.encode!(%{"version" => 15, "entries" => [entry]})
     File.write!(Path.join(priv, "ticket_push_readback_origins_v15.json"), forward)
 
@@ -658,11 +667,18 @@ defmodule SymphonyElixir.FactoryTicketPushReadbackTest do
     File.write!(Path.join(priv, "ticket_push_readback_origins_v16.json"), latest)
     next_reader = Path.join(priv, "ticket_push_status_reader_v16.py")
     File.write!(next_reader, Regex.replace(~r/ORIGINS_SHA256 = "[0-9a-f]{64}"/, File.read!(next_reader), "ORIGINS_SHA256 = \"#{hash(latest)}\""))
+
+    current = Jason.encode!(%{"version" => 17, "entries" => [entry]})
+    File.write!(Path.join(priv, "ticket_push_readback_origins_v17.json"), current)
+    current_reader = Path.join(priv, "ticket_push_status_reader_v17.py")
+    File.write!(current_reader, Regex.replace(~r/ORIGINS_SHA256 = "[0-9a-f]{64}"/, File.read!(current_reader), "ORIGINS_SHA256 = \"#{hash(current)}\""))
   end
 
   defp install_forward_attestation(_priv, _entry, _version), do: :ok
 
   defp attestation_kind(:bounded), do: {"ticket_push_executor_v11.py", true, 4, "ticket_push_status_reader_v2.py"}
+  defp attestation_kind(:ordinary_bindings), do: {"ticket_push_executor_v31.py", true, 17, "ticket_push_status_reader_v17.py"}
+  defp attestation_kind(:ordinary_bindings_capability), do: {"ticket_push_executor_v32.py", true, 17, "ticket_push_status_reader_v17.py"}
   defp attestation_kind(:forward_ordinary), do: {"ticket_push_executor_v25.py", true, 15, "ticket_push_status_reader_v14.py"}
   defp attestation_kind(:writer_readiness_ordinary), do: {"ticket_push_executor_v29.py", true, 16, "ticket_push_status_reader_v16.py"}
   defp attestation_kind(:writer_readiness_capability), do: {"ticket_push_executor_v30.py", true, 16, "ticket_push_status_reader_v16.py"}

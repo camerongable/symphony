@@ -1327,8 +1327,21 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
   defp complete_stage(context, options) do
     key = finish_worker(context, options)
     if context[:generation_root], do: generation_native_reader(context.store, context.generation_root, key)
-    assert {:ok, %{status: "ADOPTED", run: run}} = Scheduler.ticket_step(context, "run", options)
-    run
+
+    if context[:owned_generation_adoption_tick] && context[:generation_control] do
+      {previous_tick, result} =
+        run_generation_fixture_tick(context, fn tick ->
+          current = %{context | factory: context.generation_owner_factory}
+          Scheduler.ticket_step(current, "run", Keyword.put(options, :operator_tick, tick))
+        end)
+
+      assert {:ran, {:ok, %{status: "ADOPTED", run: run}}} = result
+      resume_generation_fixture_tick(context.store, context.generation_owner_factory, previous_tick)
+      run
+    else
+      assert {:ok, %{status: "ADOPTED", run: run}} = Scheduler.ticket_step(context, "run", options)
+      run
+    end
   end
 
   defp finish_worker(context, options) do
@@ -5371,6 +5384,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
        ordinary_final_rollover: true,
        ordinary_go_generation: true,
        ordinary_go_path: "go/src/grail.com/workflows/docextract/workflow.go",
+       owned_generation_adoption_tick: true,
        capability_recovery_native: false,
        operator_verifier_repair: false,
        timeout: 900_000
@@ -5388,6 +5402,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
        verifier_repair_cycle: true,
        ordinary_go_generation: true,
        ordinary_go_path: "go/src/grail.com/workflows/docextract/config/workflow.go",
+       owned_generation_adoption_tick: true,
        ordinary_policy_negative: true,
        capability_recovery_native: false,
        operator_verifier_repair: false,
@@ -5413,6 +5428,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
        ordinary_go_generation: true,
        operator_verifier_repair: true,
        capability_recovery_native: true,
+       owned_generation_adoption_tick: true,
        timeout: 900_000
   test "grant-backed stopped capability recovery preserves dirty history and reaches fresh verification with retained budgets and MR", ctx do
     Application.put_env(:symphony_elixir, :operator_verifier_repair_fixture, true)
@@ -6823,7 +6839,12 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     current = Control.status(ctx.store, factory.scope)
     if current["tick_id"], do: Control.release_tick(ctx.store, factory, factory.dispatcher_id, current["tick_id"])
     assert %{result: "ACQUIRED"} = Control.acquire_tick(ctx.store, factory, factory.dispatcher_id)
-    context |> Map.put(:generation_root, ctx.root) |> Map.put(:generation_control, control)
+
+    context
+    |> Map.put(:generation_root, ctx.root)
+    |> Map.put(:generation_control, control)
+    |> Map.put(:generation_owner_factory, factory)
+    |> Map.put(:owned_generation_adoption_tick, ctx[:owned_generation_adoption_tick] == true)
   end
 
   defp assert_generation_route_fences(ctx, key) do
@@ -7390,6 +7411,24 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     tick
   end
 
+  defp run_generation_fixture_tick(context, callback) do
+    factory = context.generation_owner_factory
+    previous_tick = release_generation_fixture_tick(context.store, factory)
+    state = push_tick_fixture_state(context.store)
+
+    result =
+      TickLease.run(
+        factory,
+        fn tick ->
+          install_push_tick_fixture_state(state)
+          callback.(tick)
+        end,
+        control_server: context.generation_control
+      )
+
+    {previous_tick, result}
+  end
+
   defp push_tick_fixture_state(store) do
     keys = ~w(fixture_project_id ci_successor_control_workspace lifecycle_broker_thread_id ticket_chat_parent_thread ticket_chat_parent_workspace ticket_chat_parent_readback)a
     keys |> Enum.map(&{&1, Process.get(&1)}) |> Enum.reject(fn {_key, value} -> is_nil(value) end) |> Map.new() |> Map.put(:ci_repair_fixture_store, store)
@@ -7402,6 +7441,43 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     assert %{result: "ACQUIRED", tick_id: fresh_tick} = Control.acquire_tick(store, factory, factory.dispatcher_id)
     refute fresh_tick == previous_tick
     fresh_tick
+  end
+
+  @tag push_requalification_lease_fixture: true
+  test "generation adoption fixture replaces its manual tick with owned callback and fresh manual identities", ctx do
+    factory = %{enabled: true, scope: "scope", dispatcher_id: "fixture", lease_seconds: 240}
+    Control.initialize(ctx.store, factory)
+    assert {:ok, _} = Control.activate(ctx.store, factory, factory.dispatcher_id)
+    acquired = Control.acquire_tick(ctx.store, factory, factory.dispatcher_id)
+    assert %{result: "ACQUIRED", tick_id: original_tick} = acquired
+    control = start_supervised!({ControlServer, store: ctx.store, factory: factory, name: nil}, id: :adoption_control)
+    recipient = self()
+
+    context = %{
+      store: ctx.store,
+      factory: %{factory | enabled: false, dispatcher_id: "unowned-context"},
+      generation_owner_factory: factory,
+      generation_control: control,
+      recipient: recipient
+    }
+
+    {released_tick, result} =
+      run_generation_fixture_tick(context, fn tick ->
+        refute self() == recipient
+        assert context.recipient == recipient
+        assert Process.get(:ci_repair_fixture_store) == ctx.store
+        refute tick["tick_id"] == original_tick
+        assert Control.status(ctx.store, factory.scope)["tick_id"] == tick["tick_id"]
+        tick
+      end)
+
+    assert released_tick == original_tick
+    assert {:ran, owned_tick} = result
+    assert Control.status(ctx.store, factory.scope)["tick_id"] == nil
+    fresh_tick = resume_generation_fixture_tick(ctx.store, factory, original_tick)
+    refute fresh_tick == original_tick
+    refute fresh_tick == owned_tick["tick_id"]
+    assert Control.status(ctx.store, factory.scope)["tick_id"] == fresh_tick
   end
 
   @tag push_requalification_lease_fixture: true
