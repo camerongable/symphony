@@ -734,7 +734,29 @@ def push_size_project(value,kind):
         require(proof.get('candidate_sha')==proof['source_parent_sha']==marker_run['candidate_sha'])
         marker_run=dict(marker_run,candidate_sha=proof['reviewed_candidate_sha'])
     marker=push_completed_marker(value[key]['candidate_handoff'],marker_run)
-    return dict(value,**{key:dict(value[key],candidate_handoff=marker)}),[marker['sha256']]
+    projected=dict(value,**{key:dict(value[key],candidate_handoff=marker)})
+    if kind=='ordinary_generation': projected=confirmed_generation_response_size(projected)
+    return projected,[marker['sha256']]
+
+
+def confirmed_generation_response_size(value):
+    """Discount only an authenticated duplicate; keep the complete first response."""
+    observation=value.get('observation')
+    if type(observation) is not dict:return value
+    native=observation.get('native')
+    if type(native) is not dict:return value
+    latest=native.get('latest_turn_observation')
+    if type(latest) is not dict:return value
+    confirmation=latest.get('confirmation')
+    if type(confirmation) is not dict:return value
+    primary=latest.get('raw_response'); duplicate=confirmation.get('raw_response')
+    if type(primary) is not dict or type(duplicate) is not dict:return value
+    raw=canonical(primary); digest=sha(raw)
+    if canonical(duplicate)!=raw or latest.get('sha256')!=digest or confirmation.get('sha256')!=digest:return value
+    marker={'kind':'CONFIRMED_NATIVE_RESPONSE_SIZE_V1','sha256':digest,'bytes':len(raw)}
+    # This projection must never alter the decoded journal returned to validators.
+    return dict(value,observation=dict(observation,native=dict(native,latest_turn_observation=
+                dict(latest,confirmation=dict(confirmation,raw_response=marker)))))
 
 
 def push_budget_decode(raw,kind):

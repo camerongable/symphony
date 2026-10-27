@@ -17,6 +17,116 @@ spec.loader.exec_module(history)
 
 
 class ReviewCodecTest(unittest.TestCase):
+    def generation_budget_fixture(self):
+        codec_path = path.with_name('ticket_push_history_validator_v25.py')
+        codec = types.ModuleType('generation_budget')
+        codec.__file__ = str(codec_path)
+        exec(compile(codec_path.read_bytes(), str(codec_path), 'exec'), codec.__dict__)
+        local = path.parent
+        run = dict.fromkeys('run_id issue_key repo_path worktree branch base_branch contract_sha256 spec_revision'.split(), 'identity')
+        run['candidate_sha'] = 'c' * 40
+        binding_raw = codec.canonical(run).decode()
+        execution = {
+            'helper_path': str(local / 'ticket_push_executor_v34.py'),
+            'helper_sha256': codec.sha((local / 'ticket_push_executor_v34.py').read_bytes()),
+            'companion_path': str(local / 'worker_file_companion.py'),
+            'companion_sha256': codec.PUSH_COMPANION_SHA,
+            'history_program_path': str(local / 'ticket_push_history_validator_v24.py'),
+            'history_program_sha256': codec.sha((local / 'ticket_push_history_validator_v24.py').read_bytes()),
+            'run_id': run['run_id'], 'invocation': 'a' * 64,
+            'intent_json': binding_raw, 'intent_sha256': codec.sha(binding_raw.encode()),
+        }
+        execution_raw = codec.canonical(execution).decode()
+        receipt = {'version': 1, 'execution_json': execution_raw, 'helper_pid': 123, 'child_pid': 124,
+                   'termination': {'kind': 'exited', 'code': 0}, 'timed_out': False, 'overflow': False,
+                   'output_base64': '', 'output_sha256': codec.sha(b''),
+                   'stderr_code': 'GIT_EXIT_ZERO', 'stderr_bytes': 0, 'stderr_sha256': codec.sha(b'')}
+        receipt_raw = codec.canonical(receipt).decode()
+        intent = {'version': 1, 'kind': 'TICKET_PUSH', 'phase': 'COMPLETED', 'binding_json': binding_raw,
+                  'binding_sha256': execution['intent_sha256'], 'reservation_key': 'ticket-push:' + execution['intent_sha256'],
+                  'reservation_generation': 1, 'owner_nonce': 'a' * 64, 'helper_pid': 123,
+                  'execution_json': execution_raw, 'receipt_json': receipt_raw,
+                  'receipt_sha256': codec.sha(receipt_raw.encode()), 'remote_sha': run['candidate_sha']}
+        response = {'backwardsCursor': None, 'nextCursor': 'next', 'data': [{'id': 'turn', 'text': 'x' * 1_100_000}]}
+        digest = codec.sha(codec.canonical(response))
+        latest = {'raw_response': response, 'sha256': digest, 'parameters': {'limit': 1},
+                  'confirmation': {'raw_response': copy.deepcopy(response), 'sha256': digest, 'observed_at': 'second'},
+                  'observed_at': 'first', 'mode': 'native', 'updated_at': 'fresh'}
+        value = {'version': 1, 'kind': 'CONTROLLER_ORDINARY_GENERATION', 'operation': 'GOFMT_DIFF',
+                 'run_preimage': dict(run, candidate_sha='b' * 40, candidate_handoff=codec.canonical(intent).decode()),
+                 'ordinary_verifier_repair': {'version': 3, 'kind': 'ORDINARY_VERIFIER_REPAIR_PREFLIGHT_V1',
+                                            'candidate_sha': 'b' * 40, 'source_parent_sha': 'b' * 40,
+                                            'reviewed_candidate_sha': 'c' * 40},
+                 'observation': {'native': {'latest_turn_observation': latest}}}
+        return codec, value
+
+    def test_generation_size_accounting_retains_the_original_confirmed_response(self):
+        codec, value = self.generation_budget_fixture()
+        raw = codec.canonical(value).decode()
+        before = codec.sha(raw.encode())
+        self.assertGreater(len(raw.encode()), codec.PUSH_REMAINDER_LIMIT)
+        self.assertEqual(codec.push_budget_decode(raw, 'ordinary_generation'), value)
+        projected, copies = codec.push_size_project(value, 'ordinary_generation')
+        latest = projected['observation']['native']['latest_turn_observation']
+        self.assertEqual(latest['raw_response'], value['observation']['native']['latest_turn_observation']['raw_response'])
+        self.assertNotIn('data', latest['confirmation']['raw_response'])
+        self.assertEqual(codec.sha(codec.canonical(value)), before)
+        self.assertEqual(len(copies), 1)
+
+    def test_generation_duplicate_size_exemption_is_exact_and_does_not_relax_caps(self):
+        codec, original = self.generation_budget_fixture()
+
+        def latest(value):
+            return value['observation']['native']['latest_turn_observation']
+
+        def changed_confirmation(value, field, content):
+            confirmation = latest(value)['confirmation']
+            confirmation['raw_response'][field] = content
+            confirmation['sha256'] = codec.sha(codec.canonical(confirmation['raw_response']))
+
+        def bool_integer(value):
+            current = latest(value)
+            current['raw_response']['typed'] = True
+            current['confirmation']['raw_response']['typed'] = 1
+            current['sha256'] = codec.sha(codec.canonical(current['raw_response']))
+            current['confirmation']['sha256'] = codec.sha(codec.canonical(current['confirmation']['raw_response']))
+
+        def wrong_path(value):
+            native = value['observation']['native']
+            native['another_observation'] = native.pop('latest_turn_observation')
+
+        def invalid_marker(value):
+            intent = json.loads(value['run_preimage']['candidate_handoff'])
+            intent['phase'] = 'PREPARED'
+            value['run_preimage']['candidate_handoff'] = codec.canonical(intent).decode()
+
+        mutations = [
+            ('rehashed changed body', lambda value: changed_confirmation(value, 'data', [{'text': 'y' * 1_100_000}])),
+            ('wrong primary hash', lambda value: latest(value).__setitem__('sha256', '0' * 64)),
+            ('wrong confirmation hash', lambda value: latest(value)['confirmation'].__setitem__('sha256', '0' * 64)),
+            ('same data different cursor', lambda value: changed_confirmation(value, 'nextCursor', 'another')),
+            ('booleans are not integers', bool_integer),
+            ('unsupported path', wrong_path),
+            ('response list', lambda value: latest(value).__setitem__('raw_response', [latest(value)['raw_response']])),
+            ('confirmation list', lambda value: latest(value).__setitem__('confirmation', [latest(value)['confirmation']])),
+            ('remaining primary and metadata too large', lambda value: value.__setitem__('metadata', 'z' * 1_100_000)),
+            ('invalid completed predecessor', invalid_marker),
+        ]
+        for name, mutation in mutations:
+            value = copy.deepcopy(original)
+            mutation(value)
+            raw = codec.canonical(value).decode()
+            self.assertGreater(len(raw.encode()), codec.PUSH_REMAINDER_LIMIT)
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                codec.push_budget_decode(raw, 'ordinary_generation')
+            self.assertEqual(codec.canonical(value).decode(), raw)
+
+        value = copy.deepcopy(original)
+        value['unrelated'] = 'x' * codec.push_absolute_limit('ordinary_generation')
+        with self.assertRaises(ValueError):
+            codec.push_budget_decode(codec.canonical(value).decode(), 'ordinary_generation')
+        self.assertEqual(codec.push_budget_decode('{"legacy":"small"}', 'ordinary_generation'), {'legacy': 'small'})
+
     def test_completed_ordinary_push_binds_current_and_retained_history_programs(self):
         codec_path = path.with_name('ticket_push_history_validator_v25.py')
         codec_spec = importlib.util.spec_from_file_location('ordinary_programs', codec_path)
