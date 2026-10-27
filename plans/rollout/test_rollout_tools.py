@@ -27,7 +27,9 @@ class PreparationTests(unittest.TestCase):
         cutover = module('current_publication_test', ROOT / 'review_cutover.py')
         candidate = {'source_commit': 'frozen-commit', 'manifest_sha256': 'candidate-manifest'}
         manifest = {'artifact': {'lib/symphony_elixir/priv/ticket_push_history_validator_v25.py':
-                                {'sha256': 'frozen-history'}}}
+                                {'sha256': 'frozen-history'},
+                                'lib/symphony_elixir/priv/ticket_push_ordinary_rejection_v4.json':
+                                {'sha256': 'dfc045f0753fa7d7ddaa3ddd28bbfe0c00031391bef216903a75c0c48314101f'}}}
         common = {'result': 'PASS', 'manifest_sha256': candidate['manifest_sha256'],
                   'current_candidate_sha': cutover.CANDIDATE, 'live_ledger_writes': 0,
                   'pushes': 0, 'native_chats': 0, 'native_model_turns': 0}
@@ -43,6 +45,10 @@ class PreparationTests(unittest.TestCase):
                      'exact_audited_closed_authority': True,
                      'original_run_and_three_prior_retirements_unchanged': True}
         cutover.validate_current_publication_evidence(candidate, manifest, chain, rejection)
+        for artifact in manifest['artifact']:
+            mutated_manifest = {'artifact': {**manifest['artifact'], artifact: {'sha256': 'different-build'}}}
+            with self.subTest(artifact=artifact), self.assertRaises(AssertionError):
+                cutover.validate_current_publication_evidence(candidate, mutated_manifest, chain, rejection)
         for target, original in (('chain', chain), ('rejection', rejection)):
             for field, old in original.items():
                 new = not old if type(old) is bool else 7 if old is None or type(old) is int else 'other'

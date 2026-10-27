@@ -80,6 +80,8 @@ def validate_current_publication_evidence(value, manifest, chain, rejection):
     assert rejection['original_envelope_sha256'] == '5935494d2f4b8b2ec0c3e5778a2e297d64f138c73469140db4c20ae3f549c209'
     assert rejection['rejection_sha256'] == '44477a82a476e1f83f47b5af4a3182ee4b9962be537e5c542989aa20dea6c40b'
     assert rejection['audit_sha256'] == 'dfc045f0753fa7d7ddaa3ddd28bbfe0c00031391bef216903a75c0c48314101f'
+    assert rejection['audit_sha256'] == manifest['artifact'][
+        'lib/symphony_elixir/priv/ticket_push_ordinary_rejection_v4.json']['sha256']
     assert rejection['child_pid'] is None and rejection['rejection_bytes'] == 365726
     assert rejection['exact_audited_closed_authority'] is True
     assert rejection['original_run_and_three_prior_retirements_unchanged'] is True
