@@ -8423,6 +8423,11 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     module.ordinary_repair(source,execution,binding,run)
     module.worker_history(source,execution)
     module.validate_archived_ci_authority(source,run,binding,execution)
+    missing_retirement=copy.deepcopy(binding)
+    missing_retirement['ordinary_preissuance_retirement']={'event_id':2147483647,'event_sha256':'0'*64,'retirement_key':'missing','original_sha256':'0'*64,'attempt':1}
+    try: module.validate_archived_ci_authority(source,run,missing_retirement,execution)
+    except (ValueError,KeyError,TypeError): pass
+    else: raise AssertionError('unproven ordinary retirement accepted by current publisher')
     operator=binding['ordinary_verifier_repair'].get('operator_authorization')
     if operator is not None:
         for kind in ('missing_authorization','missing_application','changed_original_block','wrong_applied_round','zero_tick_generation','wrong_operator_reference','bare_block_v1'):

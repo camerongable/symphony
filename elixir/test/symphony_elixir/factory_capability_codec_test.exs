@@ -5,7 +5,9 @@ defmodule SymphonyElixir.FactoryCapabilityCodecTest do
   alias SymphonyElixir.Factory.{BrokerRuntime, Store, TicketCapabilityRecovery, TicketPushIO}
 
   test "current capability codec is exact while legacy large payload origin remains supported" do
-    for {issuer, history} <- [{31, 23}, {32, 23}, {29, 22}, {30, 22}, {16, 13}, {15, 12}, {14, 11}] do
+    programs = [{33, 24}, {34, 24}, {31, 23}, {32, 23}, {29, 22}, {30, 22}, {16, 13}, {15, 12}, {14, 11}]
+
+    for {issuer, history} <- programs do
       helper = Application.app_dir(:symphony_elixir, "priv/ticket_push_executor_v#{issuer}.py")
       program = Application.app_dir(:symphony_elixir, "priv/ticket_push_history_validator_v#{history}.py")
       companion = Application.app_dir(:symphony_elixir, "priv/worker_file_companion.py")
