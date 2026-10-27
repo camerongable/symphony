@@ -2604,12 +2604,13 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     assert {:error, :ticket_delivery_review_history_absent} = TicketWorkerRunner.retained_review_preimage(ctx.store, current_run)
   end
 
+  @tag :resume_refusal
   test "an exactly rejected pre-turn writer resume retries the same applied request after cooldown", ctx do
     {context, options} = controller(ctx)
     blocked = stage_blocked_rework(ctx, context, options, "rejected-start")
     rejecting = Keyword.put(options, :app_server, SymphonyElixir.DesktopTicketLifecycleFixture.RejectedResumeServer)
     assert {:ok, %{launches: [_]}} = normal_poll(context, rejecting, blocked.reader_options)
-    assert_receive {:factory_task_finished, "run:feature-writer", {:error, {:response_error, _}}}, 60_000
+    assert_receive {:factory_task_finished, "run:feature-writer", {:error, {:native_resume_refused, _}}}, 60_000
     refute_receive {:factory_task_started, "run:feature-writer", _}
     [attempt] = WorkerEvidence.pending(ctx.store, "run")
     assert attempt["status"] == "RECONCILE_REQUIRED"

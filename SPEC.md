@@ -13,6 +13,14 @@ recording recovery and the result. Preserve original failure/stop evidence, reta
 normal controller adoption checks, and leave insufficient proof uncertain. A final
 message or an absent process alone MUST NOT authorize recovery or another execution.
 
+A new ordinary source resume refusal MUST be correlated to `thread/resume` and
+the actual requested thread before it can support rearming. Preserve the raw
+error and bind the typed observation to the current request, task, input, and
+reservation generation. A newly observed unclassified RPC error MUST NOT inherit
+retry authority from a matching legacy message. Historical exact legacy reads and
+explicit non-factory controller behavior MAY remain compatible. A definitive
+pre-session refusal does not waive cooldown, sole ownership, or zero-effect checks.
+
 ## Normative Language
 
 The key words `MUST`, `MUST NOT`, `REQUIRED`, `SHOULD`, `SHOULD NOT`, `RECOMMENDED`, `MAY`, and

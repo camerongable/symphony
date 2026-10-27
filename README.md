@@ -6,6 +6,10 @@ proves the same exact turn completed. The controller reconciles that result thro
 ordinary adoption, preserving the original failure and stop evidence. Missing or
 contradictory completion proof remains uncertain.
 
+Pre-session resume conflicts use correlated typed evidence rather than requiring
+the worker and controller to independently reconstruct an English error. Other
+RPC failures and ambiguous starts remain protected from automatic source retries.
+
 Symphony turns project work into isolated, autonomous implementation runs, allowing teams to manage
 work instead of supervising coding agents.
 

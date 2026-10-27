@@ -1739,7 +1739,9 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:invalid_thread_payload, payload}}
 
       {:error, {:response_error, error}} ->
-        maybe_fork_active_writer(port, workspace, session_policies, thread_options, error)
+        if thread_options.fork_on_active_writer,
+          do: maybe_fork_active_writer(port, workspace, session_policies, thread_options, error),
+          else: {:error, SymphonyElixir.Codex.ResumeRefusal.classify(error, thread_options.resume_thread_id)}
 
       other ->
         other

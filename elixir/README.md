@@ -11,6 +11,14 @@ same rollback transaction as the event and result. Original stop bytes and time
 are preserved. A committed duplicate is read back without another native read;
 the scheduler still performs normal exact-candidate checks and adoption.
 
+New ordinary worker resume refusals are typed at the correlated `thread/resume`
+response, before a session is bound. The versioned observation retains the exact
+requested thread and raw error, bound to the current request/task/input/reservation.
+Only supported active-writer refusals can rearm after the existing cooldown and
+all no-session/no-effect guards. Newly observed unclassified RPC errors cannot
+fall back to historical English matching; already-stored exact legacy failures
+remain readable. Explicit non-factory controller forking/waiting behavior is unchanged.
+
 Capability recovery reuses the stopped predecessor's immutable admitted packet and
 shared-instruction bytes. It revalidates all current packet facts except tool
 guidance, which is supplied by the recovery wrapper; it does not admit a replacement

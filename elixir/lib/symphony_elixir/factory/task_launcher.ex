@@ -1248,7 +1248,7 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
 
   defp failed_task_status(reason) do
     cond do
-      retryable_writer_conflict?(reason) -> "WAITING_FOR_WRITER"
+      legacy_controller_writer_conflict?(reason) -> "WAITING_FOR_WRITER"
       broker_wait?(reason) -> "WAITING_FOR_BROKER"
       true -> "FAILED"
     end
@@ -1271,12 +1271,16 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
 
   @doc "Whether Codex refused to resume a task because another writer still owns it."
   @spec retryable_writer_conflict?(term()) :: boolean()
-  def retryable_writer_conflict?({:response_error, %{"code" => -32_600, "message" => message}})
+  def retryable_writer_conflict?(reason), do: match?({:ok, _}, SymphonyElixir.Codex.ResumeRefusal.details(reason))
+
+  @doc "Preserves legacy waiting behavior only for controller and non-ticket task paths."
+  @spec legacy_controller_writer_conflict?(term()) :: boolean()
+  def legacy_controller_writer_conflict?({:response_error, %{"code" => -32_600, "message" => message}})
       when is_binary(message) do
     String.contains?(String.downcase(message), "active writer")
   end
 
-  def retryable_writer_conflict?(_reason), do: false
+  def legacy_controller_writer_conflict?(reason), do: retryable_writer_conflict?(reason)
 
   @doc "Returns the live local stage process for a durable task key, if any."
   @spec active_owner(String.t()) :: pid() | nil

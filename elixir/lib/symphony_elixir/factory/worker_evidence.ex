@@ -512,6 +512,8 @@ defmodule SymphonyElixir.Factory.WorkerEvidence do
          true <- evidence["status"] != "CONSUMED" or {:error, :worker_already_consumed} do
       {:ok, failed} = update(tx, key, "status = 'RECONCILE_REQUIRED', failure_code = ?", [inspect(reason)])
 
+      record_resume_outcome(tx, failed, reason)
+
       if failed_stop_matches?(tx, failed, observed) and is_nil(failed["owner_stopped_at"]),
         do: update(tx, key, "owner_stopped_at = ?, owner_stop_json = ?", [now(), Jason.encode!(observed.owner_stop)])
 
@@ -519,6 +521,34 @@ defmodule SymphonyElixir.Factory.WorkerEvidence do
       get(tx, failed["request_key"])
     end
   end
+
+  defp record_resume_outcome(store, evidence, {kind, _} = reason) when kind in [:native_resume_refused, :response_error] do
+    refusal =
+      case SymphonyElixir.Codex.ResumeRefusal.details(reason) do
+        {:ok, observed} -> observed
+        :unclassified -> nil
+      end
+
+    binding = Jason.decode!(evidence["binding_json"])
+
+    payload = %{
+      kind: "NATIVE_RESUME_FAILURE_OBSERVATION_V1",
+      request_key: evidence["request_key"],
+      task_key: evidence["task_key"],
+      run_id: evidence["run_id"],
+      binding_sha256: evidence["binding_sha256"],
+      input_sha256: binding["input_sha256"],
+      reservation_generation: binding["reservation_generation"],
+      refusal: refusal,
+      refusal_parsed_json_sha256: digest(Jason.encode!(refusal)),
+      failure_code: evidence["failure_code"],
+      failure_sha256: digest(evidence["failure_code"])
+    }
+
+    Store.query!(store, "INSERT INTO events(occurred_at,event_type,run_id,payload_json) VALUES (?, 'TICKET_WORKER_RESUME_FAILURE_OBSERVED', ?, ?)", [now(), evidence["run_id"], Jason.encode!(payload)])
+  end
+
+  defp record_resume_outcome(_store, _evidence, _reason), do: :ok
 
   @doc "Retains a genuine bound-session or exact-turn shutdown without inventing a turn or result."
   @spec record_failed_stop(Store.connection(), String.t(), map()) :: {:ok, map()} | {:error, term()}
@@ -555,11 +585,11 @@ defmodule SymphonyElixir.Factory.WorkerEvidence do
     transition(store, key, fn tx, evidence, binding ->
       {:ok, task} = TaskLedger.get(tx, evidence["task_key"])
       {:ok, run} = RunLedger.get(tx, evidence["run_id"])
-      reason = inspect({:response_error, %{"code" => -32_600, "message" => "thread #{task["thread_id"]} already has an active writer"}})
+      reason = resume_rejection_reason(tx, evidence, binding, task)
 
       with true <- evidence["status"] == "RECONCILE_REQUIRED" and task["status"] == "STALE",
            true <- is_binary(task["thread_id"]) and task["thread_id"] != "",
-           true <- {evidence["failure_code"], task["failure_code"]} == {reason, reason},
+           true <- is_binary(reason) and {evidence["failure_code"], task["failure_code"]} == {reason, reason},
            true <- {run["execution_mode"], run["state"], binding["role"], binding["mode"]} == {"TICKET_SUPERVISOR_V1", "WRITING", "feature-writer", "SOURCE"},
            true <- Enum.all?(~w(thread_id turn_id item_id output_json output_sha256 policy_json owner_process_json owner_stopped_at owner_stop_json), &is_nil(evidence[&1])),
            [current] <- pending(tx, evidence["run_id"]),
@@ -580,6 +610,29 @@ defmodule SymphonyElixir.Factory.WorkerEvidence do
         _ -> {:error, :worker_resume_rejection_unproven}
       end
     end)
+  end
+
+  defp resume_rejection_reason(store, evidence, binding, task) do
+    case Store.one!(store, "SELECT payload_json FROM events WHERE event_type='TICKET_WORKER_RESUME_FAILURE_OBSERVED' AND json_extract(payload_json,'$.request_key')=? ORDER BY id DESC LIMIT 1", [
+           evidence["request_key"]
+         ]) do
+      nil ->
+        inspect({:response_error, %{"code" => -32_600, "message" => "thread #{task["thread_id"]} already has an active writer"}})
+
+      %{"payload_json" => raw} ->
+        with {:ok, observed} when is_map(observed) <- Jason.decode(raw),
+             true <- observed["kind"] == "NATIVE_RESUME_FAILURE_OBSERVATION_V1",
+             true <- Map.take(observed, ~w(request_key task_key run_id binding_sha256)) == Map.take(evidence, ~w(request_key task_key run_id binding_sha256)),
+             true <- observed["input_sha256"] == binding["input_sha256"] and observed["reservation_generation"] == binding["reservation_generation"],
+             {:ok, refusal} <- SymphonyElixir.Codex.ResumeRefusal.details({:native_resume_refused, observed["refusal"]}),
+             true <- observed["refusal_parsed_json_sha256"] == digest(Jason.encode!(refusal)),
+             true <- refusal["requested_thread_id"] == task["thread_id"],
+             true <- is_binary(observed["failure_code"]) and observed["failure_sha256"] == digest(observed["failure_code"]) do
+          observed["failure_code"]
+        else
+          _ -> nil
+        end
+    end
   end
 
   defp resume_retry_due(task) do

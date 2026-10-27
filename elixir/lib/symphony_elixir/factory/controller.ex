@@ -274,6 +274,6 @@ defmodule SymphonyElixir.Factory.Controller do
   defp result_label({:ok, _result}), do: "ok"
   defp result_label({:error, reason}), do: "error:#{inspect(reason)}"
 
-  defp writer_conflict?({:error, reason}), do: Factory.TaskLauncher.retryable_writer_conflict?(reason)
+  defp writer_conflict?({:error, reason}), do: Factory.TaskLauncher.legacy_controller_writer_conflict?(reason)
   defp writer_conflict?(_result), do: false
 end
