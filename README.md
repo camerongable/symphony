@@ -1,5 +1,11 @@
 # Symphony
 
+A lost worker transport acknowledgement does not require another execution when
+the original owned process is proven stopped and a read-only native observation
+proves the same exact turn completed. The controller reconciles that result through
+ordinary adoption, preserving the original failure and stop evidence. Missing or
+contradictory completion proof remains uncertain.
+
 Symphony turns project work into isolated, autonomous implementation runs, allowing teams to manage
 work instead of supervising coding agents.
 

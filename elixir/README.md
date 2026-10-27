@@ -1,5 +1,16 @@
 # Symphony Elixir
 
+Completed-turn recovery reads native history without starting a thread or model
+turn, only after a recognized timeout/port-exit failure and genuine original stop.
+It requires the bound latest completed turn, an explicit nil error, one identified
+final-answer item, stable native version/confirmation, and an empty complete queue.
+The transient parsed observation is bounded at 2MiB; the durable event stores only
+safe identity/status metadata and parsed-JSON digests, not reasoning or tool history.
+The full prepared run/task/evidence/reservation snapshot is checked again in the
+same rollback transaction as the event and result. Original stop bytes and time
+are preserved. A committed duplicate is read back without another native read;
+the scheduler still performs normal exact-candidate checks and adoption.
+
 Capability recovery reuses the stopped predecessor's immutable admitted packet and
 shared-instruction bytes. It revalidates all current packet facts except tool
 guidance, which is supplied by the recovery wrapper; it does not admit a replacement

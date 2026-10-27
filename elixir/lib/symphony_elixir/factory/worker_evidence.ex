@@ -601,23 +601,56 @@ defmodule SymphonyElixir.Factory.WorkerEvidence do
     transition(store, key, fn tx, evidence, binding ->
       with true <- evidence["status"] == "RECONCILE_REQUIRED" or {:error, :worker_reconciliation_not_pending},
            true <- evidence["owner_id"] == owner or {:error, :worker_owner_mismatch},
+           :ok <- recovered_preimage(tx, evidence, binding, result[:reconciliation_preimage]),
            :ok <- result_identity(evidence, result),
            true <- (is_binary(result[:item_id]) and result[:item_id] != "") or {:error, :worker_result_item_missing},
            :ok <- StageSchemas.validate(result[:output], binding["schema"]),
            :ok <- pinned_result(binding, result[:output]),
            raw = Jason.encode!(result[:output]),
            :ok <- recovered_output(evidence, raw, result[:item_id]),
-           true <- valid_stop(tx, evidence, stop) or {:error, :worker_stop_receipt_invalid} do
-        update(tx, key, "status = 'RESULT_RECORDED', item_id = ?, output_json = ?, output_sha256 = ?, owner_stopped_at = ?, owner_stop_json = ?, failure_code = NULL", [
-          result[:item_id],
-          raw,
-          digest(raw),
-          now(),
-          Jason.encode!(stop)
-        ])
+           true <- valid_stop(tx, evidence, stop) or {:error, :worker_stop_receipt_invalid},
+           true <- is_nil(evidence["owner_stop_json"]) or evidence["owner_stop_json"] == Jason.encode!(stop) or {:error, :worker_stop_receipt_conflict} do
+        if provenance = result[:native_recovery] do
+          Store.query!(tx, "INSERT INTO events(occurred_at,event_type,run_id,payload_json) VALUES (?, 'TICKET_WORKER_NATIVE_COMPLETION_RECOVERED', ?, ?)", [
+            now(),
+            evidence["run_id"],
+            Jason.encode!(Map.merge(provenance, %{thread_id: result.thread_id, turn_id: result.turn_id, item_id: result.item_id, output_sha256: digest(raw)}))
+          ])
+        end
+
+        update(
+          tx,
+          key,
+          "status = 'RESULT_RECORDED', item_id = ?, output_json = ?, output_sha256 = ?, owner_stopped_at = COALESCE(owner_stopped_at, ?), owner_stop_json = COALESCE(owner_stop_json, ?), failure_code = NULL",
+          [
+            result[:item_id],
+            raw,
+            digest(raw),
+            now(),
+            Jason.encode!(stop)
+          ]
+        )
       end
     end)
   end
+
+  defp recovered_preimage(_store, _evidence, _binding, nil), do: :ok
+
+  defp recovered_preimage(store, evidence, binding, before) when is_map(before) do
+    with {:ok, run} <- RunLedger.get(store, evidence["run_id"]),
+         {:ok, task} <- TaskLedger.get(store, evidence["task_key"]),
+         [current] <- pending(store, evidence["run_id"]),
+         true <- current == evidence,
+         {:ok, access} <- WorkspaceAccess.validate(store, evidence["reservation_key"], binding["reservation_generation"]),
+         {:ok, stop} <- Jason.decode(evidence["owner_stop_json"]),
+         true <- %{evidence: evidence, binding: binding, run: run, task: task, access: access, stop: stop} == before do
+      :ok
+    else
+      _ -> {:error, :completed_turn_inputs_changed}
+    end
+  end
+
+  defp recovered_preimage(_store, _evidence, _binding, _before), do: {:error, :completed_turn_inputs_changed}
 
   defp recovered_output(evidence, raw, item) do
     if evidence["output_json"] == nil or {evidence["output_json"], evidence["item_id"]} == {raw, item},

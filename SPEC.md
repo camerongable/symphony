@@ -4,6 +4,15 @@ Status: Draft v1 (language-agnostic)
 
 Purpose: Define a service that orchestrates coding agents to get project work done.
 
+An implementation MAY reconcile a completed worker turn after a recognized
+transport failure without executing the work again. It MUST prove the original
+owned process stopped, the exact bound latest turn completed with an explicit nil
+error and one identified final result, and stable native history/queue observations.
+It MUST recheck current durable inputs and reservation generation atomically with
+recording recovery and the result. Preserve original failure/stop evidence, retain
+normal controller adoption checks, and leave insufficient proof uncertain. A final
+message or an absent process alone MUST NOT authorize recovery or another execution.
+
 ## Normative Language
 
 The key words `MUST`, `MUST NOT`, `REQUIRED`, `SHOULD`, `SHOULD NOT`, `RECOMMENDED`, `MAY`, and

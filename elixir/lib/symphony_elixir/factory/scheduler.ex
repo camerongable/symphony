@@ -310,6 +310,13 @@ defmodule SymphonyElixir.Factory.Scheduler do
   end
 
   defp retry_ordinary_rejected_resume(context, run, key, opts) do
+    case TicketWorkerRunner.reconcile_completed(context.store, key, opts) do
+      {:ok, _} -> adopt_ticket_stage(context, key)
+      {:error, _} -> rearm_ordinary_rejected_resume(context, run, key, opts)
+    end
+  end
+
+  defp rearm_ordinary_rejected_resume(context, run, key, opts) do
     case WorkerEvidence.rearm_rejected_resume(context.store, key) do
       {:ok, _} -> launch_ticket_stage(context, run, opts)
       {:error, :worker_resume_retry_not_due} -> {:ok, %{status: "WAITING_FOR_WRITER", reason: "Native resume retry cooldown", model_invoked: false}}

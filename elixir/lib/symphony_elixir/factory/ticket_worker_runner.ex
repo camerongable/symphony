@@ -24,6 +24,10 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
   alias SymphonyElixir.Factory.Worktree
   alias SymphonyElixir.Tracker.Issue
 
+  @doc "Recovers only an exact completed native result; never starts another worker."
+  @spec reconcile_completed(Store.connection(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def reconcile_completed(store, key, opts \\ []), do: SymphonyElixir.Factory.CompletedTurnRecovery.reconcile(store, key, opts)
+
   @doc "Admits a writer in the existing pinned checkout; does not launch or allocate source work."
   @spec admit_writer(Store.connection(), map(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def admit_writer(store, run, authorization, opts) do
@@ -1327,7 +1331,11 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
     case result do
       {:error, {:worker_failed, reason, observed}} ->
         WorkerEvidence.reconcile_required(store, key, reason, observed)
-        {:error, reason}
+
+        case reconcile_completed(store, key, opts) do
+          {:ok, recovered} -> {:ok, recovered}
+          {:error, _} -> {:error, reason}
+        end
 
       {:ok, observed} ->
         finish_result(store, attempt, observed)
