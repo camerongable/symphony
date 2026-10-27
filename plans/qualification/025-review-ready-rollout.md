@@ -57,7 +57,7 @@ git diff --check
 ```
 
 Observed final logs under the isolated checkout's ignored
-`_build/plan025-tools-evidence/`:
+`elixir/_build/plan025-tools-evidence/`:
 
 | Gate | Actual result | LogSHA256 |
 | --- | --- | --- |
