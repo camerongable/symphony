@@ -71,6 +71,14 @@ class ReviewCodecTest(unittest.TestCase):
     def test_a_consumed_recovered_writer_keeps_stop_seven_and_qualifies_only_with_its_typed_receipt(self):
         with self.completion_receipt_fixture() as (codec, reader, worker, access, _payload, _database):
             before = worker['owner_stop_json']
+            prior_path = path.with_name('ticket_push_history_validator_v25.py')
+            prior = types.ModuleType('prior_completion_history')
+            prior.__file__ = str(prior_path)
+            exec(compile(prior_path.read_bytes(), str(prior_path), 'exec'), prior.__dict__)
+            zero = dict(worker, owner_stop_json=json.dumps(dict(json.loads(before), exit_status=0)))
+            prior.admission_stop(zero, access)
+            with self.assertRaises(ValueError):
+                prior.admission_stop(worker, access)
             codec.admission_stop(reader, worker, access, {'kind': 'ORDINARY_WRITER'})
             self.assertEqual(worker['owner_stop_json'], before)
             self.assertEqual(json.loads(before)['exit_status'], 7)
