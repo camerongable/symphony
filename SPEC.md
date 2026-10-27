@@ -2486,6 +2486,17 @@ both capability event projection and transfer authority. An audit that closes
 earlier retirement contexts MUST pin and fully validate their ordered identities;
 it MUST NOT invent an active predecessor link or extend a general retry budget.
 
+A recovered native completion with a genuine nonzero owned process stop MUST
+retain its original stop bytes and timestamp. Physical publication MAY adopt it
+only with exactly one bounded, versioned native-completion receipt atomically
+committed with the same result. The receipt MUST bind the original worker,
+reservation generation, immutable binding/output bytes, native identities,
+original failure/stop and body-free validated native observations. Missing,
+malformed, duplicate, conflicting or foreign receipts MUST reject. Historical
+freshness MUST be bounded by the original event and the caller's authenticated
+consumption/release or successor-disposition/admission horizon, never today's
+mutable task or wall clock. This proof MUST NOT authorize execution or retry.
+
 A separately operator-authorized restored-capability recovery MAY resume one
 exact stopped source result without inventing direct native human input. Its
 one-use grant MUST bind the original output, current contract/candidate/base,

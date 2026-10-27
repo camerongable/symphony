@@ -127,8 +127,10 @@ criterion and authenticated latest historical PASS evidence for that criterion.
 No prior PASS, missing provenance, or a comprehensive scope permits that exception.
 Independent verifier PASS remains strict: all criteria PASS, admitted boundaries
 and path checks CHECKED, resolved closures, exact candidate, and no required finding.
-New physical publication uses validator v22 and executors v29/v30; reader v16
-retains historical helper identities without modifying retained programs.
+New physical publication uses validator v26 and executors v37/v38; reader v20
+retains historical helper identities, including the exact completed216/v36
+release origin, without modifying retained programs or granting old issuers
+new execution authority.
 
 An explicitly configured `ticket_supervisor.source_completion_confirmations`
 entry may authorize one read-only confirmation at the exhausted implementation
@@ -1945,6 +1947,17 @@ success or independent verification. MR adoption still requires the exact
 candidate SHA; stale MR references never authorize another push or acceptance
 of an older pipeline. Versioned programs and the previous publishing release's
 read-only receipt origin remain retained across rollout.
+
+A completed native worker whose terminal acknowledgement was lost may retain a
+genuine nonzero owned stop. Publication accepts that stop only with one exact
+`NATIVE_COMPLETION_RECEIPT_V1` event atomically recorded with its recovered result.
+The bounded event contains identity, original failure/stop, output digests and
+safe native-read metadata, never raw native bodies. Physical validation binds
+the worker's own immutable binding and access generation, including consumed
+historical workers when a task has since been reused. Observation freshness is
+checked at the original event; adoption must precede its authenticated consumption
+or successor-disposition horizon. Missing, duplicate, foreign or altered proof
+cannot waive a nonzero stop, authorize another turn, or issue another push.
 
 The explicit `prepare-unattached-push-retirement` and
 `execute-unattached-push-retirement` controller commands apply only to the

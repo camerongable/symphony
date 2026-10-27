@@ -72,6 +72,13 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
   setup :setup_fixture
 
   setup context do
+    if context[:native_publication_completion] do
+      root = Path.join(context.root, "completed-publication-native")
+      File.mkdir_p!(root)
+      Application.put_env(:symphony_elixir, :completed_publication_native_root, root)
+      on_exit(fn -> Application.delete_env(:symphony_elixir, :completed_publication_native_root) end)
+    end
+
     if context[:ordinary_push_rejection_child] || context[:forward_push_rejection_child] ||
          context[:generation_push_rejection_child] do
       RejectionFixture.activate()
@@ -5341,6 +5348,132 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
   @tag broker_thread_id: "00000000-0000-0000-0000-000000000001", mr_preflight: true
   @tag ci_repair_fixture: true,
        ci_repair_native: true,
+       ci_repair_non_go: true,
+       verifier_repair_cycle: true,
+       ordinary_final_rollover: true,
+       native_publication_completion: true,
+       timeout: 900_000
+  test "recovered repairing writer and verifiers publish once with their genuine stopped seven receipts", ctx do
+    assert_mr_adoption(ctx)
+    assert {:ok, ready} = RunLedger.get(ctx.store, "run")
+    assert ready["state"] == "READY_FOR_REVIEW"
+    rows = Store.query!(ctx.store, "SELECT * FROM worker_evidence WHERE status='CONSUMED' AND json_extract(owner_stop_json,'$.exit_status')=7")
+    workers = Enum.map(rows.rows, &Map.new(Enum.zip(rows.columns, &1)))
+    assert Enum.any?(workers, &(Jason.decode!(&1["binding_json"])["role"] == "feature-writer"))
+    assert Enum.any?(workers, &(Jason.decode!(&1["output_json"])["status"] == "REPAIR"))
+    assert Enum.any?(workers, &(Jason.decode!(&1["output_json"])["status"] == "PASS"))
+
+    for worker <- workers do
+      [event] =
+        Store.query!(ctx.store, "SELECT payload_json FROM events WHERE event_type='TICKET_WORKER_NATIVE_COMPLETION_RECOVERED' AND json_extract(payload_json,'$.request_key')=?", [worker["request_key"]]).rows
+
+      proof = Jason.decode!(hd(event))
+      assert proof["owner_stop_json"] == worker["owner_stop_json"] and proof["owner_stopped_at"] == worker["owner_stopped_at"]
+      assert proof["binding_sha256"] == worker["binding_sha256"] and proof["output_sha256"] == worker["output_sha256"]
+      assert proof["failure_code"] == "{:port_exit, 7}"
+    end
+
+    envelope = Jason.decode!(ready["candidate_handoff"])
+    assert envelope["phase"] == "COMPLETED"
+    assert Path.basename(Jason.decode!(envelope["execution_json"])["helper_path"]) == "ticket_push_executor_v37.py"
+    reflog = git(Path.join(ctx.root, "mr-claim-origin.git"), ["reflog", "show", "--format=%H", "refs/heads/" <> ready["branch"]])
+    assert Enum.count(String.split(reflog, "\n", trim: true), &(&1 == ready["candidate_sha"])) == 1
+  end
+
+  defmodule NativePublicationCompletionServer do
+    @moduledoc false
+    alias SymphonyElixir.CiRepairPythonWorkerServer
+
+    def start_session(workspace, opts) do
+      {:ok, session} = CiRepairPythonWorkerServer.start_session(workspace, opts)
+
+      port =
+        Port.open({:spawn_executable, ~c"/usr/bin/python3"}, [:binary, :exit_status, :use_stdio, args: ["-I", "-S", "-B", "-c", "import sys;sys.exit(7 if sys.stdin.buffer.read(1)==b'x' else 124)"]])
+
+      {:os_pid, pid} = Port.info(port, :os_pid)
+      {:ok, session |> Map.put(:completion_port, port) |> put_in([:metadata, :codex_app_server_pid], to_string(pid))}
+    end
+
+    def run_turn(session, prompt, issue, opts) do
+      Process.delete(:completed_publication_item)
+
+      observe = fn message ->
+        case message do
+          %{payload: %{"method" => "item/completed", "params" => %{"turnId" => turn, "item" => item}}} ->
+            Process.put(:completed_publication_item, {turn, Map.put(item, "phase", "final_answer")})
+
+          _ ->
+            :ok
+        end
+
+        opts[:on_message].(message)
+      end
+
+      {:ok, _} = CiRepairPythonWorkerServer.run_turn(session, prompt, issue, Keyword.put(opts, :on_message, observe))
+      {turn, item} = Process.get(:completed_publication_item)
+
+      native = %{
+        "id" => session.thread_id,
+        "cwd" => session.workspace,
+        "status" => %{"type" => "idle"},
+        "updatedAt" => 1,
+        "turns" => [%{"id" => turn, "status" => "completed", "error" => nil, "items" => [item]}]
+      }
+
+      File.write!(native_path(session.thread_id), Jason.encode!(native))
+      true = Port.command(session.completion_port, "x")
+      port = session.completion_port
+
+      receive do
+        {^port, {:exit_status, 7}} ->
+          Process.put({:completed_publication_exit, port}, 7)
+          {:error, {:port_exit, 7}}
+      after
+        5_000 -> raise "owned synthetic completion process did not exit seven"
+      end
+    end
+
+    def stop_session(session) do
+      7 = Process.delete({:completed_publication_exit, session.completion_port})
+
+      {:ok,
+       %{
+         "transport" => "owned_app_server",
+         "thread_id" => session.thread_id,
+         "pid" => session.metadata.codex_app_server_pid,
+         "invocation_nonce" => session.worker_invocation,
+         "exit_status" => 7,
+         "cwd" => session.workspace
+       }}
+    end
+
+    def read_native_thread(thread, _opts) do
+      native = native_path(thread) |> File.read!() |> Jason.decode!()
+      raw = %{"data" => native["turns"], "nextCursor" => nil}
+      queue = %{"data" => [], "nextCursor" => nil}
+      at = DateTime.utc_now() |> DateTime.to_iso8601()
+      digest = fn value -> :crypto.hash(:sha256, Jason.encode!(value)) |> Base.encode16(case: :lower) end
+
+      latest = %{
+        "mode" => "LATEST_DESC",
+        "parameters" => %{"threadId" => thread, "limit" => 1, "sortDirection" => "desc", "itemsView" => "full"},
+        "sha256" => digest.(raw),
+        "raw_response" => raw,
+        "updated_at" => native["updatedAt"],
+        "observed_at" => at,
+        "confirmation" => %{"sha256" => digest.(raw), "raw_response" => raw, "observed_at" => at}
+      }
+
+      queued = %{"thread_id" => thread, "empty_complete" => true, "count_lower_bound" => 0, "has_more" => false, "sha256" => digest.(queue), "raw_response" => queue, "observed_at" => at}
+      {:ok, native |> Map.put("latest_turn_observation", latest) |> Map.put("queue_observation", queued)}
+    end
+
+    defp native_path(thread), do: Path.join(Application.fetch_env!(:symphony_elixir, :completed_publication_native_root), thread <> ".json")
+  end
+
+  @tag broker_thread_id: "00000000-0000-0000-0000-000000000001", mr_preflight: true
+  @tag ci_repair_fixture: true,
+       ci_repair_native: true,
        verifier_repair_cycle: true,
        ordinary_final_rollover: true,
        ordinary_go_generation: true,
@@ -6365,6 +6498,8 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
         ci_generated_only: ctx[:ci_generated_only]
       )
 
+    options = if ctx[:native_publication_completion], do: Keyword.put(options, :native_reader, NativePublicationCompletionServer), else: options
+
     pipeline = %{
       "id" => "99",
       "project_id" => to_string(fixture_project()),
@@ -6738,6 +6873,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     context |> Map.put(:successor_first, continued) |> Map.put(:ticket_options, options)
   end
 
+  defp ci_fixture_server(%{native_publication_completion: true}), do: NativePublicationCompletionServer
   defp ci_fixture_server(%{capability_recovery_native: true}), do: SymphonyElixir.CapabilityRecoveryFixture
   defp ci_fixture_server(%{ci_generated_only: true}), do: SymphonyElixir.CiRepairOwnedGoWorkerServer
   defp ci_fixture_server(%{ordinary_go_generation: true}), do: SymphonyElixir.CiRepairOwnedGoWorkerServer
@@ -8616,6 +8752,30 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
         except (ValueError,KeyError,TypeError): pass
         else: raise AssertionError('missing nonempty successor projection accepted')
     proof=binding['ordinary_verifier_repair']
+    for prefix in ('writer','verifier'):
+        worker=source.execute('SELECT * FROM worker_evidence WHERE request_key=?',(proof[prefix+'_request_key'],)).fetchone()
+        if json.loads(worker['owner_stop_json'])['exit_status'] == 0: continue
+        event=source.execute("SELECT * FROM events WHERE event_type='TICKET_WORKER_NATIVE_COMPLETION_RECOVERED' AND json_extract(payload_json,'$.request_key')=?",(worker['request_key'],)).fetchone()
+        assert event is not None
+        for kind in ('missing_completion','foreign_completion','altered_completion','after_consumption'):
+            db=sqlite3.connect(':memory:'); source.backup(db); db.row_factory=sqlite3.Row
+            if kind=='missing_completion': db.execute('DELETE FROM events WHERE id=?',(event['id'],))
+            elif kind=='after_consumption': db.execute('UPDATE events SET occurred_at=? WHERE id=?',('2999-01-01T00:00:00Z',event['id']))
+            else:
+                receipt=json.loads(event['payload_json'])
+                receipt['request_key' if kind=='foreign_completion' else 'output_sha256']='foreign' if kind=='foreign_completion' else '0'*64
+                db.execute('UPDATE events SET payload_json=? WHERE id=?',(json.dumps(receipt),event['id']))
+            try: module.ordinary_repair(db,execution,binding,run)
+            except (ValueError,KeyError,TypeError): pass
+            else: raise AssertionError('nonzero '+prefix+' admitted without exact completion: '+kind)
+            db.close()
+        assert json.loads(worker['owner_stop_json'])['exit_status']==7
+    historical=sqlite3.connect(':memory:'); source.backup(historical); historical.row_factory=sqlite3.Row
+    for prefix in ('writer','verifier'):
+        task=source.execute('SELECT task_key FROM worker_evidence WHERE request_key=?',(proof[prefix+'_request_key'],)).fetchone()[0]
+        historical.execute("UPDATE factory_tasks SET turn_id='later-turn',output_json='{}',prompt_sha256=? WHERE task_key=?",('0'*64,task))
+    module.ordinary_repair_proof(historical,execution,binding,run,historical=True)
+    historical.close()
     cases=[
       ("UPDATE factory_tasks SET workspace_sha=? WHERE task_key='run:feature-writer'",('f'*40,)),
       ("UPDATE worker_evidence SET owner_stopped_at=NULL WHERE request_key=?",(proof['writer_request_key'],)),
@@ -10304,10 +10464,12 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
   defp prepared_mr_context(ctx) do
     {context, options} = controller(ctx)
     options = if ctx[:ci_repair_fixture], do: Keyword.put(options, :app_server, ci_fixture_server(ctx)), else: options
+    options = if ctx[:native_publication_completion], do: Keyword.put(options, :native_reader, NativePublicationCompletionServer), else: options
     assert complete_stage(context, options)["state"] == "VERIFYING"
     assert complete_stage(context, options)["state"] == "PUSHING"
     remote = Path.join(ctx.root, "mr-claim-origin.git")
     git(ctx.root, ["init", "--bare", remote])
+    if ctx[:native_publication_completion], do: git(remote, ["config", "core.logAllRefUpdates", "true"])
     fixture_gitlab_origin(ctx, remote)
     {:ok, run} = RunLedger.get(ctx.store, "run")
 
