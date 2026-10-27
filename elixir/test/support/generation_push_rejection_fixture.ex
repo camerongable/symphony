@@ -92,6 +92,24 @@ defmodule SymphonyElixir.TestSupport.GenerationPushRejectionFixture do
     IO.puts("GENERATION_REJECTION_PUBLISHER_B_RESTORED")
   end
 
+  def proof_script do
+    ~S'''
+    import importlib.util,json,sqlite3,sys,pathlib
+    d=json.load(open(sys.argv[1])); s=importlib.util.spec_from_file_location('producer',sys.argv[3]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
+    c=sqlite3.connect('file:'+sys.argv[2]+'?mode=ro',uri=True); c.row_factory=sqlite3.Row; c.execute('PRAGMA query_only=ON')
+    e,b,r=d['execution'],d['binding'],d['run']; p=b['ordinary_verifier_repair']
+    h=pathlib.Path(e['history_program_path']); s=importlib.util.spec_from_file_location('codec',h); v=importlib.util.module_from_spec(s); s.loader.exec_module(v)
+    output=json.loads(c.execute('SELECT output_json FROM worker_evidence WHERE request_key=?',(p['writer_request_key'],)).fetchone()[0])
+    descendants=m.read_git(b['worktree'],['diff','--name-only','--no-renames',p['reviewed_candidate_sha']+'...'+p['source_parent_sha']],e).splitlines()
+    go=sorted({name for name in descendants+output['changed_paths'] if name.endswith('.go')})
+    present=m.read_git(b['worktree'],['ls-tree','-r','--name-only',b['candidate_sha'],'--']+go,e).splitlines() if go else []
+    v.ordinary_generation(c,e,b,r,go,sorted(present))
+    m.retained_history(c,e,b,r)
+    assert c.total_changes==0
+    print('GENERATION_REJECTION_UNWRAPPED_CURRENT_HISTORY_PASS')
+    '''
+  end
+
   def install(ctx, run, intent, raw) do
     fixture = Application.fetch_env!(:symphony_elixir, :ordinary_rejection_private_fixture)
     execution = Jason.decode!(intent["execution_json"])

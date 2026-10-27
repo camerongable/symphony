@@ -7897,6 +7897,8 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
       proof_script =
         "import importlib.util,json,sqlite3,sys; d=json.load(open(sys.argv[1])); s=importlib.util.spec_from_file_location('physical',sys.argv[3]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); c=sqlite3.connect('file:'+sys.argv[2]+'?mode=ro',uri=True); c.row_factory=sqlite3.Row; m.retained_history(c,d['execution'],d['binding'],d['run'])"
 
+      proof_script = if ctx[:generation_push_rejection_child], do: GenerationRejectionFixture.proof_script(), else: proof_script
+
       proof_script =
         "import subprocess,sys; p=subprocess.Popen([sys.executable,'-I','-S','-B','-c'," <>
           inspect(proof_script) <> ",*sys.argv[1:]],stdin=subprocess.PIPE); code=p.wait(timeout=60); p.stdin.close(); sys.exit(code)"
@@ -8225,6 +8227,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
              end)
 
     generated = with_generation_rejection_origin(ctx, fn -> TicketCiGeneration.complete(ctx.store, key, run, original) end)
+    assert_generation_rejection_programs(ctx)
 
     diagnostics =
       if match?({:error, _}, generated) do
@@ -8266,8 +8269,10 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     {committed, restarted}
   end
 
-  defp prepare_generation_rejection_observation(%{generation_push_rejection_child: true}),
-    do: Process.put(:generation_rejection_large_observation, true)
+  defp prepare_generation_rejection_observation(%{generation_push_rejection_child: true}) do
+    Process.put(:generation_rejection_large_observation, true)
+    GenerationRejectionFixture.activate_generation()
+  end
 
   defp prepare_generation_rejection_observation(_ctx), do: :ok
 
@@ -8278,6 +8283,22 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
   end
 
   defp assert_generation_rejection_observation(_ctx), do: :ok
+
+  defp assert_generation_rejection_programs(%{generation_push_rejection_child: true} = ctx) do
+    app = Application.fetch_env!(:symphony_elixir, :generation_rejection_origin)
+    prepared = Store.query!(ctx.store, "SELECT receipt_json FROM ticket_ordinary_generation_events WHERE event_type IN ('EXECUTION_PREPARED','APPLY_PREPARED')").rows
+    assert prepared != []
+
+    for [raw] <- prepared do
+      value = Jason.decode!(raw)
+      assert value["helper_path"] == Path.join(app, "priv/controller_generation_executor_v2.py")
+      assert value["companion_path"] == Path.join(app, "priv/worker_file_companion.py")
+    end
+
+    IO.puts("GENERATION_REJECTION_SAME_A_HELPER_AND_COMPANION")
+  end
+
+  defp assert_generation_rejection_programs(_ctx), do: :ok
 
   defp with_generation_rejection_origin(%{generation_push_rejection_child: true}, operation) do
     GenerationRejectionFixture.activate_generation()
