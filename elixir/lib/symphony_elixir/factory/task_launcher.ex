@@ -3,6 +3,8 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
   Resolves model policy, records it before launch, and starts a visible Codex task.
   """
 
+  alias SymphonyElixir.Codex.ResumeRefusal
+
   alias SymphonyElixir.Factory.{
     DesktopStageRunner,
     ModelRouter,
@@ -1123,7 +1125,7 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
           persist_result(store, key, digest(launch.prompt), result)
 
         {:error, reason} ->
-          TaskLedger.update_if_current(store, key, digest(launch.prompt), @in_flight_states, %{status: "STALE", failure_code: SymphonyElixir.Codex.ResumeRefusal.failure_identity(reason)})
+          TaskLedger.update_if_current(store, key, digest(launch.prompt), @in_flight_states, %{status: "STALE", failure_code: ResumeRefusal.failure_identity(reason)})
       end
 
       send(recipient, {:factory_task_finished, key, result})
@@ -1237,7 +1239,7 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
       result =
         TaskLedger.update_if_current(tx, task_key, prompt_sha256, @in_flight_states, %{
           status: failed_task_status(reason),
-          failure_code: SymphonyElixir.Codex.ResumeRefusal.failure_identity(reason)
+          failure_code: ResumeRefusal.failure_identity(reason)
         })
 
       maybe_record_task_failure(tx, task_key, request_key, reason, result)
@@ -1271,7 +1273,7 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
 
   @doc "Whether Codex refused to resume a task because another writer still owns it."
   @spec retryable_writer_conflict?(term()) :: boolean()
-  def retryable_writer_conflict?(reason), do: match?({:ok, _}, SymphonyElixir.Codex.ResumeRefusal.details(reason))
+  def retryable_writer_conflict?(reason), do: match?({:ok, _}, ResumeRefusal.details(reason))
 
   @doc "Preserves legacy waiting behavior only for controller and non-ticket task paths."
   @spec legacy_controller_writer_conflict?(term()) :: boolean()

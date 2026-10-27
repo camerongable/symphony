@@ -10846,7 +10846,22 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     snapshot = fn -> Map.new(tables, &{&1, Store.query!(ctx.store, "SELECT * FROM #{&1} ORDER BY 1").rows}) end
     original = snapshot.()
 
-    for defect <- [:latest, :queue, :malformed_owner, :wrong_binding, :missing_key, :workflow, :expiry, :port_death, :idle_data, :restart, :kill_restart, :final_physical] do
+    defects = [
+      :latest,
+      :queue,
+      :malformed_owner,
+      :wrong_binding,
+      :missing_key,
+      :workflow,
+      :expiry,
+      :port_death,
+      :idle_data,
+      :restart,
+      :kill_restart,
+      :final_physical
+    ]
+
+    for defect <- defects do
       File.write!(fixture.phase, "prepare")
       server = start_supervised!(Supervisor.child_spec({BrokerRuntime, factory: fixture.factory, store: ctx.store, name: nil}, restart: :temporary))
 

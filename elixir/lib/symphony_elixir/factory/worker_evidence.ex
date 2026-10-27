@@ -1,5 +1,7 @@
 defmodule SymphonyElixir.Factory.WorkerEvidence do
   @moduledoc "Immutable attempt bindings and exact worker receipts; model completion is not adoption."
+  alias SymphonyElixir.Codex.ResumeRefusal
+
   alias SymphonyElixir.Factory.{
     CompletedTurnRecovery,
     ReviewProtocol,
@@ -511,7 +513,7 @@ defmodule SymphonyElixir.Factory.WorkerEvidence do
   defp reconcile_failed_attempt(tx, key, reason, observed) do
     with {:ok, evidence} <- get(tx, key),
          true <- evidence["status"] != "CONSUMED" or {:error, :worker_already_consumed} do
-      {:ok, failed} = update(tx, key, "status = 'RECONCILE_REQUIRED', failure_code = ?", [SymphonyElixir.Codex.ResumeRefusal.failure_identity(reason)])
+      {:ok, failed} = update(tx, key, "status = 'RECONCILE_REQUIRED', failure_code = ?", [ResumeRefusal.failure_identity(reason)])
 
       record_resume_outcome(tx, failed, reason)
 
@@ -525,7 +527,7 @@ defmodule SymphonyElixir.Factory.WorkerEvidence do
 
   defp record_resume_outcome(store, evidence, {kind, _} = reason) when kind in [:native_resume_refused, :response_error] do
     refusal =
-      case SymphonyElixir.Codex.ResumeRefusal.details(reason) do
+      case ResumeRefusal.details(reason) do
         {:ok, observed} -> observed
         :unclassified -> nil
       end
@@ -626,10 +628,10 @@ defmodule SymphonyElixir.Factory.WorkerEvidence do
              true <- observed["kind"] == "NATIVE_RESUME_FAILURE_OBSERVATION_V1",
              true <- Map.take(observed, ~w(request_key task_key run_id binding_sha256)) == Map.take(evidence, ~w(request_key task_key run_id binding_sha256)),
              true <- observed["input_sha256"] == binding["input_sha256"] and observed["reservation_generation"] == binding["reservation_generation"],
-             {:ok, refusal} <- SymphonyElixir.Codex.ResumeRefusal.details({:native_resume_refused, observed["refusal"]}),
+             {:ok, refusal} <- ResumeRefusal.details({:native_resume_refused, observed["refusal"]}),
              true <- observed["refusal_parsed_json_sha256"] == digest(Jason.encode!(refusal)),
              true <- refusal["requested_thread_id"] == task["thread_id"],
-             identity = SymphonyElixir.Codex.ResumeRefusal.failure_identity({:native_resume_refused, refusal}),
+             identity = ResumeRefusal.failure_identity({:native_resume_refused, refusal}),
              true <- observed["failure_code"] == identity,
              true <- is_binary(observed["failure_code"]) and observed["failure_sha256"] == digest(observed["failure_code"]) do
           identity

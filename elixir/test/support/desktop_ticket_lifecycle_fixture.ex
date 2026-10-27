@@ -449,8 +449,10 @@ defmodule SymphonyElixir.DesktopTicketLifecycleFixture do
 
   defmodule RejectedResumeServer do
     @moduledoc false
+    alias SymphonyElixir.Codex.ResumeRefusal
+
     def start_session(_workspace, opts),
-      do: {:error, SymphonyElixir.Codex.ResumeRefusal.classify(%{"code" => -32600, "message" => "thread #{opts[:resume_thread_id]} already has an active writer"}, opts[:resume_thread_id])}
+      do: {:error, ResumeRefusal.classify(%{"code" => -32600, "message" => "thread #{opts[:resume_thread_id]} already has an active writer"}, opts[:resume_thread_id])}
 
     def run_turn(_session, _prompt, _issue, _opts), do: raise("a rejected resume must not start a turn")
     def stop_session(_session), do: raise("a rejected resume has no session")

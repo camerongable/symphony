@@ -5,7 +5,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   require Logger
   alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH}
-  alias SymphonyElixir.Codex.OutputSchema
+  alias SymphonyElixir.Codex.{OutputSchema, ResumeRefusal}
   alias SymphonyElixir.Factory.WorkerFileTools
 
   @initialize_id 1
@@ -630,7 +630,15 @@ defmodule SymphonyElixir.Codex.AppServer do
          true <- File.dir?(cwd) or {:error, :native_reader_cwd_invalid},
          {:ok, port} <- start_port(cwd, nil, DynamicTool.bind()) do
       if not linked?, do: Process.unlink(port)
-      reader = %{owner: self(), port: port, app_server_pid: port_metadata(port, nil)[:codex_app_server_pid], cwd: cwd, identity: make_ref()}
+
+      reader = %{
+        owner: self(),
+        port: port,
+        app_server_pid: port_metadata(port, nil)[:codex_app_server_pid],
+        cwd: cwd,
+        identity: make_ref()
+      }
+
       Process.put({__MODULE__, :native_reader, port}, reader)
 
       try do
@@ -1847,7 +1855,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       {:error, {:response_error, error}} ->
         if thread_options.fork_on_active_writer,
           do: maybe_fork_active_writer(port, workspace, session_policies, thread_options, error),
-          else: {:error, SymphonyElixir.Codex.ResumeRefusal.classify(error, thread_options.resume_thread_id)}
+          else: {:error, ResumeRefusal.classify(error, thread_options.resume_thread_id)}
 
       other ->
         other

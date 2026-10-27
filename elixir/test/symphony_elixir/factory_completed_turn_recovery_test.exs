@@ -1,7 +1,8 @@
 defmodule SymphonyElixir.FactoryCompletedTurnRecoveryTest do
   use SymphonyElixir.TestSupport
   import SymphonyElixir.TicketWorkerFixture
-  alias SymphonyElixir.Factory.{RunLedger, Scheduler, StageSchemas, Store, TaskLedger, TicketWorkerRunner, WorkerEvidence, WorkspaceAccess}
+  alias SymphonyElixir.Factory.{RunLedger, Scheduler, StageSchemas, Store, TaskLedger}
+  alias SymphonyElixir.Factory.{TicketWorkerRunner, WorkerEvidence, WorkspaceAccess}
   setup :setup_fixture
 
   test "a completed native result survives a lost terminal acknowledgement without another execution", ctx do
@@ -314,8 +315,10 @@ defmodule SymphonyElixir.FactoryCompletedTurnRecoveryTest do
   end
 
   defmodule ObservationReader do
+    alias SymphonyElixir.Codex.AppServer
+
     def read_native_thread(thread, opts) do
-      with {:ok, observed} <- SymphonyElixir.Codex.AppServer.read_native_thread(thread, opts),
+      with {:ok, observed} <- AppServer.read_native_thread(thread, opts),
            {:ok, raw} <- File.read(Path.join(opts[:workspace], ".observation-shape")),
            {:ok, %{"path" => path, "value" => value}} <- Jason.decode(raw) do
         {:ok, put_in(observed, path, value)}

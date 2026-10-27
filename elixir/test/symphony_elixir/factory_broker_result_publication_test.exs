@@ -372,7 +372,8 @@ defmodule SymphonyElixir.FactoryBrokerResultPublicationTest do
 
   @tag :uncertainty_residue
   test "startup and polling settle only complete service uncertainty response residues", ctx do
-    cases = for phase <- [:startup, :poll], reason <- [:broker_runtime_outcome_uncertain, :broker_runtime_request_invalid_or_expired], do: {phase, reason}
+    reasons = [:broker_runtime_outcome_uncertain, :broker_runtime_request_invalid_or_expired]
+    cases = for phase <- [:startup, :poll], reason <- reasons, do: {phase, reason}
 
     for {{phase, reason}, index} <- Enum.with_index(cases) do
       id = Integer.to_string(index) |> String.pad_leading(32, "0")
@@ -577,16 +578,18 @@ defmodule SymphonyElixir.FactoryBrokerResultPublicationTest do
   defp digest(body), do: :crypto.hash(:sha256, body) |> Base.encode16(case: :lower)
 
   defp wait_for(path) do
-    Enum.reduce_while(1..500, nil, fn _, _ ->
-      if File.exists?(path),
-        do: {:halt, :ready},
-        else:
-          (
-            Process.sleep(10)
-            {:cont, nil}
-          )
-    end)
+    result =
+      Enum.reduce_while(1..500, :timeout, fn _, _ ->
+        if File.exists?(path),
+          do: {:halt, :ready},
+          else:
+            (
+              Process.sleep(10)
+              {:cont, :timeout}
+            )
+      end)
 
+    assert result == :ready
     assert File.exists?(path)
   end
 end

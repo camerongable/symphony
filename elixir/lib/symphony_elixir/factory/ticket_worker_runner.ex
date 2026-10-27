@@ -3,7 +3,7 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
   Controller-owned role turns in one reserved checkout, separate from the Desktop parent.
   """
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.Factory.{CiCollection, Contract, ControllerCi, ReviewProtocol, RunLedger}
+  alias SymphonyElixir.Factory.{CiCollection, CompletedTurnRecovery, Contract, ControllerCi, ReviewProtocol, RunLedger}
   alias SymphonyElixir.Factory.{SpecialistErrorNotice, StageRunner, Store, TaskLedger}
 
   alias SymphonyElixir.Factory.{
@@ -26,7 +26,7 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
 
   @doc "Recovers only an exact completed native result; never starts another worker."
   @spec reconcile_completed(Store.connection(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
-  def reconcile_completed(store, key, opts \\ []), do: SymphonyElixir.Factory.CompletedTurnRecovery.reconcile(store, key, opts)
+  def reconcile_completed(store, key, opts \\ []), do: CompletedTurnRecovery.reconcile(store, key, opts)
 
   @doc "Admits a writer in the existing pinned checkout; does not launch or allocate source work."
   @spec admit_writer(Store.connection(), map(), map(), keyword()) :: {:ok, map()} | {:error, term()}
@@ -1327,7 +1327,14 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
       end
 
     result = StageRunner.run(policy["cwd"], issue, prompt, schema, runner_opts)
+    complete_execution(store, attempt, key, policy, opts, result)
+  rescue
+    exception ->
+      WorkerEvidence.reconcile_required(store, attempt["request_key"], Exception.message(exception))
+      {:error, :worker_observation_failed}
+  end
 
+  defp complete_execution(store, attempt, key, policy, opts, result) do
     case result do
       {:error, {:worker_failed, reason, observed}} ->
         WorkerEvidence.reconcile_required(store, key, reason, observed)
@@ -1349,10 +1356,6 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
         WorkerEvidence.reconcile_required(store, key, reason)
         error
     end
-  rescue
-    exception ->
-      WorkerEvidence.reconcile_required(store, attempt["request_key"], Exception.message(exception))
-      {:error, :worker_observation_failed}
   end
 
   defp guarded_failed_recovery?(%{"kind" => "INTERRUPTED_TURN_QUIESCENCE"}), do: true

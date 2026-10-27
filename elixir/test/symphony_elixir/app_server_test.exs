@@ -252,7 +252,13 @@ defmodule SymphonyElixir.AppServerTest do
       foreign = Task.async(fn -> {AppServer.read_native_thread(reader, "parent", []), AppServer.close_native_reader(reader)} end)
       assert {{:error, :native_reader_not_owned}, {:error, :native_reader_not_owned}} = Task.await(foreign)
 
-      for changed <- [%{reader | cwd: workspace <> "/foreign"}, %{reader | app_server_pid: "999999999"}, %{reader | identity: make_ref()}] do
+      variants = [
+        %{reader | cwd: workspace <> "/foreign"},
+        %{reader | app_server_pid: "999999999"},
+        %{reader | identity: make_ref()}
+      ]
+
+      for changed <- variants do
         assert {:error, :native_reader_not_owned} = AppServer.read_native_thread(changed, "parent", [])
         assert {:error, :native_reader_not_owned} = AppServer.close_native_reader(changed)
       end

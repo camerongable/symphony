@@ -135,28 +135,14 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
       linked_file?(pending) ->
         state
 
-      present?(stem <> ".finished") or present?(stem <> ".response") or present?(stem <> ".known") or present?(running) ->
+      duplicate_request?(stem, running) ->
         File.rename(pending, stem <> ".duplicate")
         state
 
       File.rename(pending, running) == :ok ->
         request = read_owned(state, running, @max_bytes)
 
-        {result, state} =
-          try do
-            with {:ok, body} <- request,
-                 {:ok, %{"args" => args, "expires_at" => expiry}} <- Jason.decode(body),
-                 true <- is_list(args) and Enum.all?(args, &is_binary/1) and bridged?(args),
-                 true <- is_integer(expiry) and expiry > System.system_time(:millisecond) and expiry <= System.system_time(:millisecond) + 90_000 do
-              dispatch(state, args)
-            else
-              _ -> {{:error, :broker_runtime_request_invalid_or_expired}, state}
-            end
-          rescue
-            _ -> {{:error, :broker_runtime_operation_failed}, state}
-          catch
-            _, _ -> {{:error, :broker_runtime_operation_failed}, state}
-          end
+        {result, state} = dispatch_request(state, request)
 
         case request do
           {:ok, body} -> remember_result(state, running, body, result)
@@ -166,6 +152,30 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
       true ->
         state
     end
+  end
+
+  defp duplicate_request?(stem, running) do
+    present?(stem <> ".finished") or present?(stem <> ".response") or present?(stem <> ".known") or present?(running)
+  end
+
+  defp dispatch_request(state, request) do
+    with {:ok, body} <- request,
+         {:ok, %{"args" => args, "expires_at" => expiry}} <- Jason.decode(body),
+         true <- is_list(args) and Enum.all?(args, &is_binary/1) and bridged?(args),
+         true <- valid_expiry?(expiry) do
+      dispatch(state, args)
+    else
+      _ -> {{:error, :broker_runtime_request_invalid_or_expired}, state}
+    end
+  rescue
+    _ -> {{:error, :broker_runtime_operation_failed}, state}
+  catch
+    _, _ -> {{:error, :broker_runtime_operation_failed}, state}
+  end
+
+  defp valid_expiry?(expiry) do
+    is_integer(expiry) and expiry > System.system_time(:millisecond) and
+      expiry <= System.system_time(:millisecond) + 90_000
   end
 
   defp dispatch(state, [command | _] = args) when command in @owner_operations do
@@ -344,7 +354,7 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
     known = Path.join(state.root, id <> ".known")
 
     settle_publication(state, known, @max_known_bytes, fn raw ->
-      with {:ok, envelope} <- Jason.decode(raw), {:ok, _} <- known_response(state, running, id, envelope), true <- is_nil(state.known_results[id]) or state.known_results[id] == envelope, do: true
+      with {:ok, envelope} <- Jason.decode(raw), {:ok, _} <- known_response(state, running, id, envelope), do: is_nil(state.known_results[id]) or state.known_results[id] == envelope
     end)
 
     cond do
@@ -403,10 +413,7 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
     result =
       case read_owned(state, response, @max_response_bytes) do
         {:ok, body} ->
-          case Jason.decode(body) do
-            {:ok, payload} -> if response_shape?(payload), do: :ok, else: {:error, :broker_runtime_result_invalid}
-            _ -> {:error, :broker_runtime_result_invalid}
-          end
+          validate_existing_response(body)
 
         {:error, :enoent} ->
           publish_response(state, id, Jason.encode!(%{"error" => inspect(reason)}))
@@ -417,6 +424,13 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
 
     if result == :ok, do: finish(state, running, id)
     state
+  end
+
+  defp validate_existing_response(body) do
+    case Jason.decode(body) do
+      {:ok, payload} -> if response_shape?(payload), do: :ok, else: {:error, :broker_runtime_result_invalid}
+      _ -> {:error, :broker_runtime_result_invalid}
+    end
   end
 
   defp own_uncertainty_response?(body),
@@ -505,18 +519,21 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
     # The exclusive final link commits complete bytes without replacing a contender.
     # Readers wait until the temporary link is settled, including after owner death.
     with {:ok, file} <- File.open(temporary, [:write, :exclusive, :binary]) do
-      result =
-        with :ok <- File.chmod(temporary, 0o600),
-             :ok <- IO.binwrite(file, body),
-             :ok <- :file.sync(file),
-             :ok <- File.ln(temporary, Path.join(root, name)) do
-          if is_function(after_link, 0), do: after_link.()
-          unlink_publication_temporary(temporary)
-        end
+      result = commit_publication(file, temporary, root, name, body, after_link)
 
       File.close(file)
       if result != :ok, do: File.rm(temporary)
       result
+    end
+  end
+
+  defp commit_publication(file, temporary, root, name, body, after_link) do
+    with :ok <- File.chmod(temporary, 0o600),
+         :ok <- IO.binwrite(file, body),
+         :ok <- :file.sync(file),
+         :ok <- File.ln(temporary, Path.join(root, name)) do
+      if is_function(after_link, 0), do: after_link.()
+      unlink_publication_temporary(temporary)
     end
   end
 
@@ -552,7 +569,9 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
   defp publication_identity(stat), do: Map.take(stat, ~w(type uid gid links size mode mtime ctime inode major_device minor_device)a)
 
   defp valid_request_record?(raw) do
-    with {:ok, %{"args" => args, "expires_at" => expiry}} <- Jason.decode(raw), true <- is_list(args) and Enum.all?(args, &is_binary/1) and bridged?(args), true <- is_integer(expiry), do: true
+    with {:ok, %{"args" => args, "expires_at" => expiry}} <- Jason.decode(raw),
+         true <- is_list(args) and Enum.all?(args, &is_binary/1) and bridged?(args),
+         do: is_integer(expiry)
   end
 
   defp await(root, id, deadline) do
@@ -591,12 +610,7 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
         with {:ok, raw} <- read_owned(state, known, @max_known_bytes, true),
              {:ok, envelope} <- Jason.decode(raw),
              {:ok, expected} <- known_response(state, running, id, envelope) do
-          case read_owned(state, response, @max_response_bytes) do
-            {:ok, ^expected} -> {:ok, expected}
-            {:error, :enoent} = missing -> missing
-            {:error, :broker_runtime_publication_in_progress} = pending -> pending
-            _ -> {:error, :broker_runtime_response_conflict}
-          end
+          matching_response(state, response, expected)
         else
           {:error, :broker_runtime_publication_in_progress} = pending -> pending
           _ -> {:error, :broker_runtime_response_conflict}
@@ -607,6 +621,15 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
 
       true ->
         {:error, :enoent}
+    end
+  end
+
+  defp matching_response(state, response, expected) do
+    case read_owned(state, response, @max_response_bytes) do
+      {:ok, ^expected} -> {:ok, expected}
+      {:error, :enoent} = missing -> missing
+      {:error, :broker_runtime_publication_in_progress} = pending -> pending
+      _ -> {:error, :broker_runtime_response_conflict}
     end
   end
 

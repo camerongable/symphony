@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.Factory.CompletedTurnRecovery do
   @moduledoc "Reconciles a completed exact native turn after a proven stopped transport failure."
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.Factory.{RunLedger, Store, TaskLedger, WorkerEvidence, WorkspaceAccess}
+  alias SymphonyElixir.Factory.{RunLedger, Store, TaskLedger, TicketWorkerRunner, WorkerEvidence, WorkspaceAccess}
 
   @spec reconcile(Store.connection(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
   def reconcile(store, key, opts \\ []) do
@@ -14,7 +14,9 @@ defmodule SymphonyElixir.Factory.CompletedTurnRecovery do
   defp reconcile_pending(store, key, opts) do
     with {:ok, before} <- snapshot(store, key),
          reader = Keyword.get(opts, :native_reader, AppServer),
-         {:ok, native} <- reader.read_native_thread(before.evidence["thread_id"], workspace: before.binding["policy"]["cwd"], include_turns: false, include_latest_turn: true, include_queue: true),
+         workspace = before.binding["policy"]["cwd"],
+         read_options = [workspace: workspace, include_turns: false, include_latest_turn: true, include_queue: true],
+         {:ok, native} <- reader.read_native_thread(before.evidence["thread_id"], read_options),
          {:ok, result} <- native_result(before, native) do
       recovered = result |> Map.put(:reconciliation_preimage, before) |> Map.put(:native_recovery, provenance(before, native, result))
 
@@ -49,18 +51,11 @@ defmodule SymphonyElixir.Factory.CompletedTurnRecovery do
   end
 
   defp snapshot(store, key) do
-    with {:ok, evidence} <- WorkerEvidence.get(store, key),
-         true <- evidence["status"] == "RECONCILE_REQUIRED" or {:error, :completed_turn_not_pending},
-         true <- transport_failure?(evidence["failure_code"]) or {:error, :completed_turn_transport_unproven},
-         true <- WorkerEvidence.owner_stopped?(store, evidence) or {:error, :completed_turn_stop_unproven},
-         true <- (is_binary(evidence["thread_id"]) and is_binary(evidence["turn_id"])) or {:error, :completed_turn_identity_missing},
-         true <- digest_raw(evidence["binding_json"]) == evidence["binding_sha256"] or {:error, :worker_evidence_corrupt},
-         {:ok, binding} <- Jason.decode(evidence["binding_json"]),
-         true <- is_map(binding) or {:error, :worker_evidence_corrupt},
+    with {:ok, evidence, binding} <- stopped_binding(store, key),
          true <- evidence["policy_json"] == Jason.encode!(binding["policy"]) or {:error, :completed_turn_policy_unproven},
          {:ok, run} <- RunLedger.get(store, evidence["run_id"]),
          {:ok, task} <- TaskLedger.get(store, evidence["task_key"]),
-         :ok <- SymphonyElixir.Factory.TicketWorkerRunner.admitted_stage(run, binding["role"]),
+         :ok <- TicketWorkerRunner.admitted_stage(run, binding["role"]),
          true <- task["status"] in ~w(STARTING RUNNING STALE RETRY_PENDING WAITING_FOR_BROKER WAITING_FOR_WRITER) or {:error, :completed_turn_task_changed},
          true <- (task["stage"] == run["state"] and run["candidate_sha"] in [nil, binding["expected_sha"]]) or {:error, :completed_turn_inputs_changed},
          [pending] <- WorkerEvidence.pending(store, evidence["run_id"]),
@@ -68,6 +63,22 @@ defmodule SymphonyElixir.Factory.CompletedTurnRecovery do
          {:ok, access} <- WorkspaceAccess.validate(store, evidence["reservation_key"], binding["reservation_generation"]),
          {:ok, stop} <- Jason.decode(evidence["owner_stop_json"]) do
       {:ok, %{evidence: evidence, binding: binding, run: run, task: task, access: access, stop: stop}}
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :completed_turn_identity_unproven}
+    end
+  end
+
+  defp stopped_binding(store, key) do
+    with {:ok, evidence} <- WorkerEvidence.get(store, key),
+         true <- evidence["status"] == "RECONCILE_REQUIRED" or {:error, :completed_turn_not_pending},
+         true <- transport_failure?(evidence["failure_code"]) or {:error, :completed_turn_transport_unproven},
+         true <- WorkerEvidence.owner_stopped?(store, evidence) or {:error, :completed_turn_stop_unproven},
+         true <- (is_binary(evidence["thread_id"]) and is_binary(evidence["turn_id"])) or {:error, :completed_turn_identity_missing},
+         true <- digest_raw(evidence["binding_json"]) == evidence["binding_sha256"] or {:error, :worker_evidence_corrupt},
+         {:ok, binding} <- Jason.decode(evidence["binding_json"]),
+         true <- is_map(binding) or {:error, :worker_evidence_corrupt} do
+      {:ok, evidence, binding}
     else
       {:error, _} = error -> error
       _ -> {:error, :completed_turn_identity_unproven}
@@ -102,11 +113,7 @@ defmodule SymphonyElixir.Factory.CompletedTurnRecovery do
          %{"data" => [], "nextCursor" => nil} = queued <- queue["raw_response"],
          true <- queue["sha256"] == digest(queued),
          true <- Enum.all?([latest["observed_at"], confirmed["observed_at"], queue["observed_at"]], &fresh?/1),
-         true <- Enum.all?(items, &is_map/1),
-         [final] <- Enum.filter(items, &(&1["type"] == "agentMessage" and &1["phase"] != "commentary")),
-         true <- final["phase"] == "final_answer" and is_binary(final["id"]) and final["id"] != "",
-         true <- is_binary(final["text"]) and String.trim(final["text"]) != "",
-         {:ok, output} when is_map(output) <- Jason.decode(final["text"]) do
+         {:ok, final, output} <- final_output(items) do
       {:ok, %{thread_id: evidence["thread_id"], turn_id: turn, item_id: final["id"], output: output}}
     else
       _ -> {:error, :completed_turn_native_unproven}
@@ -114,6 +121,18 @@ defmodule SymphonyElixir.Factory.CompletedTurnRecovery do
   end
 
   defp native_result(_before, _native), do: {:error, :completed_turn_native_unproven}
+
+  defp final_output(items) do
+    with true <- Enum.all?(items, &is_map/1),
+         [final] <- Enum.filter(items, &(&1["type"] == "agentMessage" and &1["phase"] != "commentary")),
+         true <- final["phase"] == "final_answer" and is_binary(final["id"]) and final["id"] != "",
+         true <- is_binary(final["text"]) and String.trim(final["text"]) != "",
+         {:ok, output} when is_map(output) <- Jason.decode(final["text"]) do
+      {:ok, final, output}
+    else
+      _ -> {:error, :completed_turn_native_unproven}
+    end
+  end
 
   defp provenance(before, native, result) do
     latest = native["latest_turn_observation"]
