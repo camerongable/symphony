@@ -62,6 +62,29 @@ def validate_artifact_evidence(value, validation):
     assert validation['artifact_test_failures'] == 0
 
 
+def validate_current_publication_evidence(value, manifest, chain, rejection):
+    for result in (chain, rejection):
+        assert result['result'] == 'PASS'
+        assert result['manifest_sha256'] == value['manifest_sha256']
+        assert result['current_candidate_sha'] == CANDIDATE
+        for field in ('live_ledger_writes', 'pushes', 'native_chats', 'native_model_turns'):
+            assert type(result[field]) is int and result[field] == 0
+    for field in ('current_repair_preparation_retirement_import_worker_and_generation_valid',
+                  'exact_parent_committed_paths_and_generated_blob_hashes_valid',
+                  'genuine_owned_stdin_open', 'current_raw_run_unchanged'):
+        assert chain[field] is True
+    assert type(chain['read_only_sqlite_reopens']) is int and chain['read_only_sqlite_reopens'] == 2
+    assert chain['history_sha256'] == manifest['artifact'][
+        'lib/symphony_elixir/priv/ticket_push_history_validator_v25.py']['sha256']
+    assert rejection['source_commit'] == value['source_commit']
+    assert rejection['original_envelope_sha256'] == '5935494d2f4b8b2ec0c3e5778a2e297d64f138c73469140db4c20ae3f549c209'
+    assert rejection['rejection_sha256'] == '44477a82a476e1f83f47b5af4a3182ee4b9962be537e5c542989aa20dea6c40b'
+    assert rejection['audit_sha256'] == 'dfc045f0753fa7d7ddaa3ddd28bbfe0c00031391bef216903a75c0c48314101f'
+    assert rejection['child_pid'] is None and rejection['rejection_bytes'] == 365726
+    assert rejection['exact_audited_closed_authority'] is True
+    assert rejection['original_run_and_three_prior_retirements_unchanged'] is True
+
+
 def bind(evidence_root):
     path = HISTORICAL / 'cutover_guard.py'
     raw = path.read_bytes()
@@ -178,7 +201,8 @@ IO.puts("NATIVE_SOURCE_QUIET")
         assert approval['guardian_sha256'] == THAW_SHA == sha(evidence_root / 'thaw_guardian.py')
         required = {'candidate.json', 'validation.json', 'review-acceptance.json',
                     'service.original.plist', 'audited-protected.json', 'cutover-audit.json',
-                    'cold-boot.json', 'historical-readback-qualification.json'}
+                    'cold-boot.json', 'historical-readback-qualification.json',
+                    'current-publication-chain.json', 'current-rejection-qualification.json'}
         assert required <= approval['evidence'].keys()
         for name, expected in approval['evidence'].items():
             assert sha(evidence_root / name) == expected, name
@@ -191,6 +215,8 @@ IO.puts("NATIVE_SOURCE_QUIET")
         readback = g.load('historical-readback-qualification.json')
         assert readback['result'] == 'PASS' and readback['manifest_sha256'] == value['manifest_sha256']
         assert readback['live_ledger_writes'] == readback['pushes'] == readback['native_chats'] == 0
+        validate_current_publication_evidence(value, manifest,
+            g.load('current-publication-chain.json'), g.load('current-rejection-qualification.json'))
         assert eligible() == g.load('captured.json')['ticket']
         return value, manifest, audit
 

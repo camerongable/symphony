@@ -23,6 +23,39 @@ def module(name, path):
 
 
 class PreparationTests(unittest.TestCase):
+    def test_current_publication_gate_rejects_incomplete_or_other_candidate_evidence(self):
+        cutover = module('current_publication_test', ROOT / 'review_cutover.py')
+        candidate = {'source_commit': 'frozen-commit', 'manifest_sha256': 'candidate-manifest'}
+        manifest = {'artifact': {'lib/symphony_elixir/priv/ticket_push_history_validator_v25.py':
+                                {'sha256': 'frozen-history'}}}
+        common = {'result': 'PASS', 'manifest_sha256': candidate['manifest_sha256'],
+                  'current_candidate_sha': cutover.CANDIDATE, 'live_ledger_writes': 0,
+                  'pushes': 0, 'native_chats': 0, 'native_model_turns': 0}
+        chain = {**common, 'history_sha256': 'frozen-history', 'read_only_sqlite_reopens': 2,
+                 'current_repair_preparation_retirement_import_worker_and_generation_valid': True,
+                 'exact_parent_committed_paths_and_generated_blob_hashes_valid': True,
+                 'genuine_owned_stdin_open': True, 'current_raw_run_unchanged': True}
+        rejection = {**common, 'source_commit': candidate['source_commit'],
+                     'original_envelope_sha256': '5935494d2f4b8b2ec0c3e5778a2e297d64f138c73469140db4c20ae3f549c209',
+                     'rejection_sha256': '44477a82a476e1f83f47b5af4a3182ee4b9962be537e5c542989aa20dea6c40b',
+                     'audit_sha256': 'dfc045f0753fa7d7ddaa3ddd28bbfe0c00031391bef216903a75c0c48314101f',
+                     'child_pid': None, 'rejection_bytes': 365726,
+                     'exact_audited_closed_authority': True,
+                     'original_run_and_three_prior_retirements_unchanged': True}
+        cutover.validate_current_publication_evidence(candidate, manifest, chain, rejection)
+        for target, original in (('chain', chain), ('rejection', rejection)):
+            for field, old in original.items():
+                new = not old if type(old) is bool else 7 if old is None or type(old) is int else 'other'
+                mutated = {**original, field: new}
+                args = (mutated, rejection) if target == 'chain' else (chain, mutated)
+                with self.subTest(target=target, field=field), self.assertRaises(AssertionError):
+                    cutover.validate_current_publication_evidence(candidate, manifest, *args)
+                missing = dict(original)
+                del missing[field]
+                args = (missing, rejection) if target == 'chain' else (chain, missing)
+                with self.subTest(missing=target, field=field), self.assertRaises(KeyError):
+                    cutover.validate_current_publication_evidence(candidate, manifest, *args)
+
     def test_artifact_inventory_excludes_only_bounded_regular_mix_test_metadata(self):
         builder = module('test_metadata_inventory', ROOT / 'build_review_release.py')
         with tempfile.TemporaryDirectory() as temporary:
