@@ -18,19 +18,30 @@ try do
   true = row["output_sha256"] == "42840686cdc6a2a99a4ea7a92910010892f56cbd88dfcecb689b763c026b6350"
   task = Store.one!(store, "SELECT * FROM factory_tasks WHERE task_key=?", [row["task_key"]])
   true = task["status"] == "CONSUMED"
-  intent = Jason.decode!(current["candidate_handoff"])
+  true = Base.encode16(:crypto.hash(:sha256, current["candidate_handoff"]), case: :lower) == "5935494d2f4b8b2ec0c3e5778a2e297d64f138c73469140db4c20ae3f549c209"
+  current_intent = Jason.decode!(current["candidate_handoff"])
+  true = current_intent["phase"] == "PUSH_UNCERTAIN"
+  current_binding = Jason.decode!(current_intent["binding_json"])
+  true = current_binding["ordinary_verifier_repair"]["writer_request_key"] == request
+  generation = Store.one!(store, "SELECT * FROM ticket_ordinary_generation_intents WHERE run_id=? AND request_key=? AND operation='GOFMT_DIFF'", [run_id, request])
+  true = Base.encode16(:crypto.hash(:sha256, generation["binding_json"]), case: :lower) == generation["binding_sha256"]
+  saved = Jason.decode!(generation["binding_json"])
+  historical_run = saved["run_preimage"]
+  true = historical_run["run_id"] == run_id and historical_run["candidate_sha"] == "4e5c48fc2150515c4cb5ce0771f4c204b10c532c"
+  intent = Jason.decode!(historical_run["candidate_handoff"])
   true = intent["kind"] == "TICKET_PUSH" and intent["phase"] == "COMPLETED"
   true = intent["remote_sha"] == "4e5c48fc2150515c4cb5ce0771f4c204b10c532c"
   true = intent["receipt_sha256"] == "743b489bf716d072bb9955f827397588e1c8451974e90c27b64b67e4394b06e1"
   binding = Jason.decode!(intent["binding_json"])
   {:ok, raw} = TicketPushIO.readback(intent)
   true = raw == intent["receipt_json"] and TicketPushIO.receipt_valid?(raw, intent)
-  prior = Map.merge(current, Map.take(binding, ~w(run_id issue_key repo_path worktree branch base_branch candidate_sha contract_sha256 spec_revision verifier_round)))
+  prior = Map.merge(historical_run, Map.take(binding, ~w(run_id issue_key repo_path worktree branch base_branch candidate_sha contract_sha256 spec_revision verifier_round)))
   :ok = TicketPush.validate_historical_completed_preimage(store, prior)
   {:ok, ^raw} = TicketPushIO.readback(intent)
   {:ok, ^current} = RunLedger.get(store, run_id)
   true = row == Store.one!(store, "SELECT * FROM worker_evidence WHERE request_key=?", [request])
   true = task == Store.one!(store, "SELECT * FROM factory_tasks WHERE task_key=?", [row["task_key"]])
+  true = generation == Store.one!(store, "SELECT * FROM ticket_ordinary_generation_intents WHERE run_id=? AND request_key=? AND operation='GOFMT_DIFF'", [run_id, request])
   [[54]] = Store.query!(store, "SELECT MAX(version) FROM factory_schema_migrations").rows
   [[0]] = Store.query!(store, "SELECT total_changes()").rows
   IO.puts(Jason.encode!(%{

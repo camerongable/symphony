@@ -18,7 +18,7 @@ manifest_raw = Path(manifest_path).read_bytes()
 assert sha(manifest_raw) == expected_manifest
 manifest = json.loads(manifest_raw)
 assert manifest['schema_version'] == 54
-assert history_name in ('ticket_push_history_validator_v23.py', 'ticket_push_history_validator_v24.py')
+assert history_name == 'ticket_push_history_validator_v25.py'
 local = Path(manifest['build']) / 'lib/symphony_elixir/priv'
 history_path = local / history_name
 history_raw = history_path.read_bytes()
@@ -39,14 +39,22 @@ for _ in range(2):
         assert current['state'] == 'CI_PUSHING' and current['candidate_sha'] == expected_current
         assert current['verifier_round'] == 5 and current['code_repair_round'] == 13
         assert current['implementation_iteration'] == 27
-        intent = json.loads(current['candidate_handoff'])
+        assert sha(current['candidate_handoff'].encode()) == '5935494d2f4b8b2ec0c3e5778a2e297d64f138c73469140db4c20ae3f549c209'
+        current_intent = json.loads(current['candidate_handoff'])
+        assert current_intent['phase'] == 'PUSH_UNCERTAIN'
+        proof = json.loads(current_intent['binding_json'])['ordinary_verifier_repair']
+        generation = dict(db.execute("SELECT * FROM ticket_ordinary_generation_intents WHERE run_id=? AND request_key=? AND operation='GOFMT_DIFF'", (run_id, proof['writer_request_key'])).fetchone())
+        assert sha(generation['binding_json'].encode()) == generation['binding_sha256']
+        historical_run = json.loads(generation['binding_json'])['run_preimage']
+        assert historical_run['run_id'] == run_id and historical_run['candidate_sha'] == '4e5c48fc2150515c4cb5ce0771f4c204b10c532c'
+        intent = json.loads(historical_run['candidate_handoff'])
         assert intent['kind'] == 'TICKET_PUSH' and intent['phase'] == 'COMPLETED'
         assert intent['receipt_sha256'] == '743b489bf716d072bb9955f827397588e1c8451974e90c27b64b67e4394b06e1'
         binding = json.loads(intent['binding_json'])
         execution = json.loads(intent['execution_json'])
         assert binding['candidate_sha'] == '4e5c48fc2150515c4cb5ce0771f4c204b10c532c'
         assert binding['verifier_round'] == 4 and binding['code_repair_round'] == 12
-        prior = dict(current, **binding)
+        prior = dict(historical_run, **binding)
         codec.validate_archived_ci_authority(db, prior, binding, execution)
         codec.validate_physical_predecessor(db, prior, intent, binding['checkout'], binding['origin'])
         assert db.total_changes == 0
