@@ -10,6 +10,12 @@ Pre-session resume conflicts use correlated typed evidence rather than requiring
 the worker and controller to independently reconstruct an English error. Other
 RPC failures and ambiguous starts remain protected from automatic source retries.
 
+The Desktop broker preserves a serialized known result before publishing its
+response. Publication and bookkeeping can resume after a process restart without
+executing the operation again. Conflicting or invalid files fail closed; saved
+results do not restore expired permissions or in-memory admission handles. This
+does not claim durability across host power loss.
+
 Symphony turns project work into isolated, autonomous implementation runs, allowing teams to manage
 work instead of supervising coding agents.
 

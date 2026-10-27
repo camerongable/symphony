@@ -12,6 +12,9 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
   @operations ~w(claim claim-ticket-followup claim-ticket-mr-owner correct-ticket-mr-owner complete-ticket-mr read-ticket-turn record-ticket-thread complete reconcile-negative-ticket-presentation prepare-ticket-stage authorize-ticket-verifier-repair authorize-ticket-policy-stop-repair prepare-ticket-report-correction apply-ticket-report-correction inspect-ticket-capability-recovery inspect-ticket-capability-runtime authorize-ticket-capability-recovery) ++
                 @owner_operations
   @max_bytes 131_072
+  @max_response_bytes 2_097_152
+  @max_known_bytes 2_800_000
+  @max_unpublished 16
   @max_owner_admissions 16
 
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -54,21 +57,24 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
       store: Keyword.get(opts, :store, Supervisor.store_name()),
       executor: Keyword.get(opts, :executor, &execute/3),
       presend_evidence_reader: Keyword.get(opts, :presend_evidence_reader, SymphonyElixir.Factory.TicketMrPresendEvidence),
-      owner_admissions: %{}
+      owner_admissions: %{},
+      known_results: %{},
+      publication_cursor: nil,
+      uid: File.stat!(root).uid
     }
 
-    Enum.each(paths(root, "running"), &respond(state, &1, {:error, :broker_runtime_outcome_uncertain}))
+    state = Enum.reduce(Enum.take(paths(root, "running"), @max_unpublished), state, &recover_publication(&2, &1))
     send(self(), :poll)
     {:ok, state}
   end
 
   @impl true
   def handle_info(:poll, state) do
-    state = expire_owner_admissions(state)
+    state = state |> expire_owner_admissions() |> retry_publication()
 
     state =
       case paths(state.root, "pending") do
-        [path | _] -> service(state, path)
+        [path | _] -> if map_size(state.known_results) < @max_unpublished and length(paths(state.root, "running")) < @max_unpublished, do: service(state, path), else: state
         [] -> state
       end
 
@@ -107,16 +113,16 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
     stem = String.replace_suffix(pending, ".pending", "")
 
     cond do
-      File.exists?(stem <> ".finished") or File.exists?(stem <> ".response") or File.exists?(running) ->
+      present?(stem <> ".finished") or present?(stem <> ".response") or present?(stem <> ".known") or present?(running) ->
         File.rename(pending, stem <> ".duplicate")
         state
 
       File.rename(pending, running) == :ok ->
+        request = read_owned(state, running, @max_bytes)
+
         {result, state} =
           try do
-            with {:ok, %File.Stat{type: :regular, size: size}} <- File.lstat(running),
-                 true <- size <= @max_bytes,
-                 {:ok, body} <- File.read(running),
+            with {:ok, body} <- request,
                  {:ok, %{"args" => args, "expires_at" => expiry}} <- Jason.decode(body),
                  true <- is_list(args) and Enum.all?(args, &is_binary/1) and bridged?(args),
                  true <- is_integer(expiry) and expiry > System.system_time(:millisecond) and expiry <= System.system_time(:millisecond) + 90_000 do
@@ -130,8 +136,10 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
             _, _ -> {{:error, :broker_runtime_operation_failed}, state}
           end
 
-        respond(state, running, result)
-        state
+        case request do
+          {:ok, body} -> remember_result(state, running, body, result)
+          _ -> publish_uncertain(state, running, :broker_runtime_request_invalid_or_expired)
+        end
 
       true ->
         state
@@ -228,10 +236,24 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
 
   defp execute(args, store, factory), do: Mix.Tasks.Factory.Desktop.runtime_operation(args, store, factory)
 
-  defp respond(state, running, result) do
-    id = running |> Path.basename() |> String.replace_suffix(".running", "")
-    response = Path.join(state.root, id <> ".response")
+  defp remember_result(state, running, request, result) do
+    id = mailbox_id(running)
+    body = serialize_result(result)
 
+    envelope = %{
+      "version" => 1,
+      "mailbox_id" => id,
+      "database_root" => Path.dirname(state.root),
+      "request_sha256" => digest(request),
+      "response_sha256" => digest(body),
+      "response_base64" => Base.encode64(body)
+    }
+
+    state = %{state | known_results: Map.put(state.known_results, id, envelope)}
+    recover_publication(state, running)
+  end
+
+  defp serialize_result(result) do
     payload =
       case result do
         {:ok, value} -> %{"ok" => value}
@@ -239,30 +261,189 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
         _ -> %{"error" => "broker_runtime_result_invalid"}
       end
 
-    publication = if valid_response?(response), do: :ok, else: publish(state.root, id <> ".response", Jason.encode!(payload))
+    case Jason.encode(payload) do
+      {:ok, body} when byte_size(body) <= @max_response_bytes -> body
+      _ -> ~s({"error":"broker_runtime_result_invalid"})
+    end
+  rescue
+    _ -> ~s({"error":"broker_runtime_result_invalid"})
+  end
 
-    case publication do
-      :ok -> File.rename(running, Path.join(state.root, id <> ".finished"))
-      _ -> :ok
+  defp retry_publication(state) do
+    running = paths(state.root, "running")
+    next = Enum.find(running, &(is_nil(state.publication_cursor) or &1 > state.publication_cursor)) || List.first(running)
+
+    if next do
+      %{recover_publication(state, next) | publication_cursor: next}
+    else
+      state
+    end
+  end
+
+  defp recover_publication(state, running) do
+    id = mailbox_id(running)
+    known = Path.join(state.root, id <> ".known")
+
+    cond do
+      present?(known) ->
+        with {:ok, raw} <- read_owned(state, known, @max_known_bytes, true),
+             {:ok, envelope} <- Jason.decode(raw),
+             {:ok, body} <- known_response(state, running, id, envelope),
+             true <- is_nil(state.known_results[id]) or state.known_results[id] == envelope,
+             :ok <- publish_response(state, id, body),
+             :ok <- finish(state, running, id) do
+          %{state | known_results: Map.delete(state.known_results, id)}
+        else
+          _ -> state
+        end
+
+      envelope = state.known_results[id] ->
+        case publish(state.root, id <> ".known", Jason.encode!(envelope)) do
+          :ok -> recover_publication(state, running)
+          _ -> state
+        end
+
+      true ->
+        publish_uncertain(state, running, :broker_runtime_outcome_uncertain)
+    end
+  end
+
+  defp known_response(state, running, id, envelope) when is_map(envelope) do
+    keys = ~w(version mailbox_id database_root request_sha256 response_sha256 response_base64)
+
+    with true <- Enum.sort(Map.keys(envelope)) == Enum.sort(keys),
+         true <- envelope["version"] === 1 and envelope["mailbox_id"] == id and envelope["database_root"] == Path.dirname(state.root),
+         encoded when is_binary(encoded) <- envelope["response_base64"],
+         {:ok, body} <- Base.decode64(encoded),
+         true <- byte_size(body) <= @max_response_bytes and envelope["response_sha256"] == digest(body),
+         {:ok, payload} <- Jason.decode(body),
+         true <- response_shape?(payload),
+         {:ok, request} <- read_request(state, running),
+         true <- envelope["request_sha256"] == digest(request) do
+      {:ok, body}
+    else
+      _ -> {:error, :broker_runtime_known_result_invalid}
+    end
+  end
+
+  defp known_response(_state, _running, _id, _envelope), do: {:error, :broker_runtime_known_result_invalid}
+
+  defp response_shape?(%{"ok" => _} = payload), do: map_size(payload) == 1
+  defp response_shape?(%{"error" => error} = payload), do: map_size(payload) == 1 and is_binary(error)
+  defp response_shape?(_), do: false
+
+  defp publish_uncertain(state, running, reason) do
+    id = mailbox_id(running)
+    response = Path.join(state.root, id <> ".response")
+
+    result =
+      case read_owned(state, response, @max_response_bytes) do
+        {:ok, body} ->
+          case Jason.decode(body) do
+            {:ok, payload} -> if response_shape?(payload), do: :ok, else: {:error, :broker_runtime_result_invalid}
+            _ -> {:error, :broker_runtime_result_invalid}
+          end
+
+        {:error, :enoent} ->
+          publish_response(state, id, Jason.encode!(%{"error" => inspect(reason)}))
+
+        error ->
+          error
+      end
+
+    if result == :ok, do: finish(state, running, id)
+    state
+  end
+
+  defp publish_response(state, id, body) do
+    response = Path.join(state.root, id <> ".response")
+
+    case read_owned(state, response, @max_response_bytes) do
+      {:ok, ^body} -> :ok
+      {:error, :enoent} -> publish(state.root, id <> ".response", body)
+      _ -> {:error, :broker_runtime_response_conflict}
+    end
+  end
+
+  defp finish(state, running, id) do
+    finished = Path.join(state.root, id <> ".finished")
+
+    cond do
+      not present?(finished) ->
+        File.rename(running, finished)
+
+      not present?(running) ->
+        case read_owned(state, finished, @max_bytes) do
+          {:ok, _} -> :ok
+          _ -> {:error, :broker_runtime_finished_conflict}
+        end
+
+      true ->
+        {:error, :broker_runtime_finished_conflict}
+    end
+  end
+
+  defp read_request(state, running) do
+    case read_owned(state, running, @max_bytes) do
+      {:error, :enoent} -> read_owned(state, String.replace_suffix(running, ".running", ".finished"), @max_bytes)
+      result -> result
+    end
+  end
+
+  defp mailbox_id(running), do: running |> Path.basename() |> String.replace_suffix(".running", "")
+  defp present?(path), do: File.lstat(path) != {:error, :enoent}
+  defp digest(body), do: :crypto.hash(:sha256, body) |> Base.encode16(case: :lower)
+
+  defp read_owned(state, path, maximum, private? \\ false) do
+    with {:ok, %File.Stat{type: :regular, uid: uid, links: 1, size: size, mode: mode} = before} <- File.lstat(path),
+         true <- uid == state.uid and size <= maximum and (not private? or Bitwise.band(mode, 0o077) == 0),
+         {:ok, {:ok, body}} <- File.open(path, [:read, :binary], &read_unchanged(&1, path, before, maximum)) do
+      {:ok, body}
+    else
+      {:error, :enoent} -> {:error, :enoent}
+      {:ok, {:error, :enoent}} -> {:error, :enoent}
+      _ -> {:error, :broker_runtime_file_invalid}
+    end
+  end
+
+  defp read_unchanged(file, path, before, maximum) do
+    identity = Map.take(before, ~w(type uid gid links size mode mtime ctime inode major_device minor_device)a)
+
+    with {:ok, opened} <- :file.read_file_info(file, time: :universal),
+         true <- Map.take(File.Stat.from_record(opened), Map.keys(identity)) == identity,
+         body when is_binary(body) <- IO.binread(file, maximum + 1),
+         true <- byte_size(body) <= maximum,
+         {:ok, after_read} <- File.lstat(path),
+         true <- Map.take(after_read, Map.keys(identity)) == identity do
+      {:ok, body}
+    else
+      {:error, :enoent} -> {:error, :enoent}
+      _ -> {:error, :broker_runtime_file_invalid}
     end
   end
 
   defp publish(root, name, body) do
     temporary = Path.join(root, name <> ".writing." <> Base.encode16(:crypto.strong_rand_bytes(8), case: :lower))
-    with :ok <- File.write(temporary, body, [:exclusive]), do: File.rename(temporary, Path.join(root, name))
+
+    with {:ok, file} <- File.open(temporary, [:write, :exclusive, :binary]) do
+      result = with :ok <- File.chmod(temporary, 0o600), :ok <- IO.binwrite(file, body), :ok <- :file.sync(file), do: File.rename(temporary, Path.join(root, name))
+      File.close(file)
+      if result != :ok, do: File.rm(temporary)
+      result
+    end
   end
 
   defp await(root, id, deadline) do
-    response = Path.join(root, id <> ".response")
-    read = if valid_response?(response), do: File.read(response), else: {:error, :enoent}
-
-    case read do
+    case read_response(root, id) do
       {:ok, body} ->
         case Jason.decode(body) do
           {:ok, %{"ok" => value}} -> {:ok, value}
           {:ok, %{"error" => reason}} -> {:error, reason}
           _ -> {:error, :broker_runtime_result_invalid}
         end
+
+      {:error, :broker_runtime_response_conflict} = error ->
+        error
 
       _ ->
         if System.monotonic_time(:millisecond) < deadline do
@@ -276,10 +457,32 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
     end
   end
 
-  defp valid_response?(path) do
-    case File.lstat(path) do
-      {:ok, %File.Stat{type: :regular, size: size}} when size <= 2_097_152 -> true
-      _ -> false
+  defp read_response(root, id) do
+    state = %{root: root, uid: File.stat!(root).uid}
+    running = Path.join(root, id <> ".running")
+    finished = Path.join(root, id <> ".finished")
+    known = Path.join(root, id <> ".known")
+    response = Path.join(root, id <> ".response")
+
+    cond do
+      present?(known) ->
+        with {:ok, raw} <- read_owned(state, known, @max_known_bytes, true),
+             {:ok, envelope} <- Jason.decode(raw),
+             {:ok, expected} <- known_response(state, running, id, envelope) do
+          case read_owned(state, response, @max_response_bytes) do
+            {:ok, ^expected} -> {:ok, expected}
+            {:error, :enoent} = missing -> missing
+            _ -> {:error, :broker_runtime_response_conflict}
+          end
+        else
+          _ -> {:error, :broker_runtime_response_conflict}
+        end
+
+      present?(finished) ->
+        read_owned(state, response, @max_response_bytes)
+
+      true ->
+        {:error, :enoent}
     end
   end
 

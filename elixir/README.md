@@ -25,6 +25,29 @@ or differently scoped marker on the same run fails closed rather than looking
 absent. Already-stored unmixed exact legacy failures remain readable. Explicit
 non-factory controller forking/waiting behavior is unchanged.
 
+The service-owned broker saves one immutable `.known` outcome beside each mailbox
+before `.response` publication. Its versioned envelope binds the mailbox ID,
+canonical database root, original request-byte SHA256, and exact serialized
+response-byte SHA256. The response bytes are base64 encoded, bounded at2MiB after
+JSON escaping; the complete envelope is bounded at2.8MB. Files must be regular,
+single-linked, and owned by the mailbox owner; known records are owner-private.
+Publication uses an exclusive same-directory temporary, file sync, and atomic
+rename. This supports process restart, not host power-loss durability: the existing
+mailbox lifecycle does not synchronize directory entries.
+
+The broker retries publication/bookkeeping only, at most one stopped mailbox per
+250ms poll after a bounded16-mailbox startup pass. It rotates past denied records;
+16 unresolved mailboxes stop new execution, and at most16 unpublished serialized
+results remain in memory if their disk commit is obstructed. Directory enumeration
+still scales with retained mailbox names. A known record fences duplicate IDs even
+when malformed. Missing records after a crash stay uncertain; partial temporaries
+do not permit replay. Existing responses must agree byte-for-byte, including for
+the public caller. The original request can move from `.running` to `.finished`
+during readback without changing its bound bytes. Expired publication remains a
+historical result, and republished preparation handles do not restore in-memory
+MR-owner authority. Linked/nonregular responses now deny publication rather than
+being replaced.
+
 Capability recovery reuses the stopped predecessor's immutable admitted packet and
 shared-instruction bytes. It revalidates all current packet facts except tool
 guidance, which is supplied by the recovery wrapper; it does not admit a replacement

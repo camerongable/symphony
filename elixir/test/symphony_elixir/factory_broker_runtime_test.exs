@@ -120,7 +120,7 @@ defmodule SymphonyElixir.FactoryBrokerRuntimeTest do
     assert Jason.decode!(File.read!(Path.join(root, id <> ".response"))) == %{"ok" => "original receipt"}
   end
 
-  test "restart replaces a linked response without following or modifying its target", ctx do
+  test "restart rejects a linked response without replacing it or modifying its target", ctx do
     {:ok, root} = BrokerRuntime.root(ctx.factory.database)
     File.mkdir_p!(root)
     id = String.duplicate("0", 32)
@@ -129,8 +129,9 @@ defmodule SymphonyElixir.FactoryBrokerRuntimeTest do
     before = File.read!(ctx.workflow)
     start_supervised!({BrokerRuntime, factory: ctx.factory, name: nil})
     assert File.read!(ctx.workflow) == before
-    assert {:ok, %File.Stat{type: :regular}} = File.lstat(Path.join(root, id <> ".response"))
-    assert Jason.decode!(File.read!(Path.join(root, id <> ".response"))) == %{"error" => ":broker_runtime_outcome_uncertain"}
+    assert {:ok, %File.Stat{type: :symlink}} = File.lstat(Path.join(root, id <> ".response"))
+    assert File.exists?(Path.join(root, id <> ".running"))
+    refute File.exists?(Path.join(root, id <> ".finished"))
   end
 
   test "symlink mailbox roots are rejected rather than normalized", ctx do
