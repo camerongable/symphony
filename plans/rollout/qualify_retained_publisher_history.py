@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from contextlib import closing
 from pathlib import Path
 import sqlite3
 import sys
@@ -30,7 +31,7 @@ run_id = 'ab5ab1fe-32cc-48c1-985e-3c3800adcfa2'
 expected_current = 'eb9c67f06a00a38d98dd0d4ba1dd2e83a0883834'
 captured = None
 for _ in range(2):
-    with sqlite3.connect(database.as_uri() + '?mode=ro', uri=True) as db:
+    with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as db:
         db.execute('PRAGMA query_only=ON')
         db.execute('BEGIN')
         db.row_factory = sqlite3.Row
