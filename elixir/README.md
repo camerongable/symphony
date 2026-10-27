@@ -78,8 +78,9 @@ minimum of authorization+60s, runtime+60s, and remote+10s. No initialization or
 model command occurs in finalize. A slow final physical/read still fails closed.
 
 Preparation errors, all finalize outcomes, parse-rejected finalize with a known
-reader handle, expiry, registered idle-port data/death, and broker termination
-close the reader. Wrong-bound finalize now also consumes the associated native
+reader handle (including an omitted positional ticket key), expiry, registered
+idle-port data/death, and broker termination close the reader. Wrong-bound finalize
+now also consumes the associated native
 reader handle rather than retaining a port for a later retry. Unknown messages
 are not suppressed. Close validates ownership; repeat cleanup of an owned dead
 port is effect-free. Restart restores neither reader nor handle. The `:recover`

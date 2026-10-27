@@ -182,15 +182,22 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
     {_, action, _} = OptionParser.parse(args, strict: [workflow: :string, source_thread_id: :string, payload_base64: :string])
 
     case action do
-      [command, _key, handle | _] when command in ~w(finalize-ticket-mr-correction finalize-ticket-mr-claim finalize-ticket-mr-recovery) ->
-        case state.owner_admissions[handle] do
-          %TicketMrOwnerAdmission{native_reader: reader} = context when not is_nil(reader) ->
-            TicketMrOwnerAdmission.close(context)
-            %{state | owner_admissions: Map.delete(state.owner_admissions, handle)}
+      [command, handle] when command in ~w(finalize-ticket-mr-correction finalize-ticket-mr-claim finalize-ticket-mr-recovery) ->
+        discard_reader_handle(state, handle)
 
-          _ ->
-            state
-        end
+      [command, _key, handle | _] when command in ~w(finalize-ticket-mr-correction finalize-ticket-mr-claim finalize-ticket-mr-recovery) ->
+        discard_reader_handle(state, handle)
+
+      _ ->
+        state
+    end
+  end
+
+  defp discard_reader_handle(state, handle) do
+    case state.owner_admissions[handle] do
+      %TicketMrOwnerAdmission{native_reader: reader} = context when not is_nil(reader) ->
+        TicketMrOwnerAdmission.close(context)
+        %{state | owner_admissions: Map.delete(state.owner_admissions, handle)}
 
       _ ->
         state

@@ -100,3 +100,42 @@ Final frozen-source results:
 No lint suppression or baseline cleanup was attempted. Consolidated lint deltas,
 coverage, and Dialyzer remain the separately planned combined gate, not proven by
 this checkpoint. No source acknowledgement is a deployment or ticket-delivery claim.
+
+## Omitted positional key revision
+
+Immediate base: `69c1925d98da2bb99d99b7c11e351ce7b5169101`.
+Independent review found that deleting the positional ticket key left a known warm
+reader and handle live, unlike replacing the key with an unknown value. The
+protected ledger was unchanged, but a corrected replay could still succeed.
+
+The maintained public regression deletes the actual argument with
+`List.delete_at(finalize, 1)`. Before the fix it failed on the live reader Port:
+1/1 in92.3s,161excluded, `_build/mr-reader-omitted-key-red.log`. The change accepts
+only the exact two-positional finalize shape for cleanup, then reuses the existing
+known-handle, warm-reader-only close/drop logic. It does not scan arbitrary
+arguments, change parsing or authorization, or affect reader-free recovery
+contexts. The test checks the actual reader PID/Port closes, admissions are empty,
+the complete protected ledger stays unchanged, and corrected replay is denied.
+
+Frozen revision gates, using the command prefix above:
+
+- `mix test test/symphony_elixir/factory_ticket_worker_lifecycle_test.exs
+  --only mr_reader_omitted_key --only mr_reader_matrix`:2/0 in163.2s,160excluded,
+  `_build/mr-reader-omitted-key-green.log`. This includes the prior full failure,
+  freshness, restart, and physical-observation matrix.
+- `mix test test/symphony_elixir/factory_broker_runtime_test.exs
+  test/symphony_elixir/factory_broker_result_publication_test.exs
+  test/symphony_elixir/factory_ticket_mr_owner_admission_test.exs`:34/0 in7.3s,
+  `_build/mr-reader-omitted-key-broker.log`.
+- `mix test test/symphony_elixir/app_server_test.exs --only native_reader`:2/0
+  in2.3s,82excluded, `_build/mr-reader-omitted-key-api.log`. The deliberately
+  interrupted synthetic shell reply emitted its expected broken-pipe diagnostic.
+  AppServer source remains byte-identical to the preceding full84/0 checkpoint.
+- `mix specs.check` and `mix format --check-formatted`: exit0,
+  `_build/mr-reader-omitted-key-specs.log` and
+  `_build/mr-reader-omitted-key-format.log`. `git diff --check` passed; baseline
+  private/TicketMrOperation/TicketMrPresendRecovery diffs remain empty.
+
+This is the second bounded parse-cleanup revision; a further unresolved instance
+requires a narrowed plan rather than another unreviewed patch. Combined lint,
+coverage, and Dialyzer remain unproven here. No live state was changed.

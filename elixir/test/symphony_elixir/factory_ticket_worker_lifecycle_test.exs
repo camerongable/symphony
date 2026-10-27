@@ -10806,6 +10806,54 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     assert snapshot.() == original
   end
 
+  @tag mr_reader_omitted_key: true
+  @tag mr_preflight: true
+  @tag mr_owner_service: true
+  @tag mr_projectless: true
+  @tag broker_thread_id: "00000000-0000-0000-0000-000000000001"
+  test "omitting the positional ticket key consumes its known reader and denies corrected replay", ctx do
+    fixture = mr_reader_lifetime_fixture(ctx)
+    File.write!(fixture.config["slow_first_initialize"], "covered by the slow-positive case")
+    server = start_supervised!(Supervisor.child_spec({BrokerRuntime, factory: fixture.factory, store: ctx.store, name: nil}, restart: :temporary))
+    tables = ~w(runs control factory_tasks worker_evidence workspace_access ticket_mr_claims desktop_requests ticket_mr_actor_bindings events)
+    snapshot = fn -> Map.new(tables, &{&1, Store.query!(ctx.store, "SELECT * FROM #{&1} ORDER BY 1").rows}) end
+    original = snapshot.()
+
+    prepare = [
+      "prepare-ticket-mr-correction",
+      fixture.request["request_key"],
+      fixture.request["payload_sha256"],
+      "--source-thread-id",
+      fixture.proof["source_thread_id"],
+      "--workflow",
+      fixture.workflow
+    ]
+
+    assert {:ok, prepared} = BrokerRuntime.call(prepare)
+    reader = :sys.get_state(server).owner_admissions[prepared["handle"]].native_reader
+    File.write!(fixture.phase, "finalize")
+    owner = put_in(fixture.frame, ["owner", "observed_at"], DateTime.to_iso8601(DateTime.utc_now()))
+
+    finalize = [
+      "finalize-ticket-mr-correction",
+      fixture.request["request_key"],
+      prepared["handle"],
+      "--source-thread-id",
+      fixture.proof["source_thread_id"],
+      "--payload-base64",
+      owner |> Jason.encode!() |> Base.encode64(),
+      "--workflow",
+      fixture.workflow
+    ]
+
+    assert {:error, _} = BrokerRuntime.call(List.delete_at(finalize, 1))
+    assert_mr_reader_closed(reader)
+    assert :sys.get_state(server).owner_admissions == %{}
+    assert snapshot.() == original
+    assert {:error, ":mr_owner_admission_unavailable"} = BrokerRuntime.call(finalize)
+    assert snapshot.() == original
+  end
+
   defp assert_mr_reader_closed(reader) do
     assert Port.info(reader.port) == nil
     assert_mr_reader_pid_closed(reader.app_server_pid)
