@@ -17,7 +17,7 @@ try do
   true = intent["phase"] == "PUSH_UNCERTAIN" and intent["helper_pid"] == 5776
   true = intent["binding_sha256"] == "c74d7c25ae5f9d452aee999176cd6bc51ef8e8d0d20c30c157f45a0474d922da"
   true = Enum.all?(~w(receipt_json receipt_sha256 remote_sha), &is_nil(intent[&1]))
-  retirement_query = "SELECT * FROM ticket_push_rejection_retirements WHERE run_id=? ORDER BY retirement_key"
+  retirement_query = "SELECT * FROM events WHERE run_id=? AND event_type='TICKET_ORDINARY_PUSH_REJECTION_RETIRED' ORDER BY id"
   prior_retirements = Store.query!(store, retirement_query, [run_id]).rows
   true = length(prior_retirements) == 3
   {:ok, rejection} = TicketPushIO.readback(intent)
@@ -32,7 +32,6 @@ try do
   {:ok, ^before_run} = RunLedger.get(store, run_id)
   ^prior_retirements = Store.query!(store, retirement_query, [run_id]).rows
   [[54]] = Store.query!(store, "SELECT MAX(version) FROM factory_schema_migrations").rows
-  [[3]] = Store.query!(store, "SELECT COUNT(*) FROM ticket_push_rejection_retirements WHERE run_id=?", [run_id]).rows
   [[0]] = Store.query!(store, "SELECT total_changes()").rows
   IO.puts(Jason.encode!(%{
     result: "PASS", manifest_sha256: manifest_sha, source_commit: manifest["source_commit"],
