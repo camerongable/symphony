@@ -7887,6 +7887,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
       assert binding["ordinary_verifier_repair"]["kind"] == "ORDINARY_VERIFIER_REPAIR_PREFLIGHT_V1"
       refute Map.has_key?(binding, "ci_repair")
       assert {:ok, negative_execution} = TicketPushIO.prepare(ctx.store, intent, push_authorization(ctx.store, verified), options)
+      assert_generation_rejection_publisher(ctx, negative_execution)
 
       if ctx[:verifier_plain_cycle] && !ctx[:ordinary_go_generation] && !ctx[:verifier_legacy_packet],
         do: assert_legacy_plain_v9_preflight(ctx, negative_execution, binding, verified)
@@ -8304,6 +8305,11 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     do: GenerationRejectionFixture.proof_script()
 
   defp generation_rejection_proof_script(_ctx, script), do: script
+
+  defp assert_generation_rejection_publisher(%{generation_push_rejection_child: true}, execution),
+    do: GenerationRejectionFixture.assert_current_publisher(execution)
+
+  defp assert_generation_rejection_publisher(_ctx, _execution), do: :ok
 
   defp with_generation_rejection_origin(%{generation_push_rejection_child: true}, operation) do
     GenerationRejectionFixture.activate_generation()

@@ -117,15 +117,40 @@ defmodule SymphonyElixir.TestSupport.GenerationPushRejectionFixture do
     '''
   end
 
+  def assert_current_publisher(execution) do
+    fixture = Application.fetch_env!(:symphony_elixir, :ordinary_rejection_private_fixture)
+    text = File.read!(Path.join(fixture.source, "lib/symphony_elixir/factory/ticket_push_io.ex"))
+    assert text =~ ":large -> \"ticket_push_executor_v35.py\""
+    assert text =~ "defp helper_name(:capability), do: \"ticket_push_executor_v36.py\""
+    assert Path.basename(execution["helper_path"]) == "ticket_push_executor_v36.py"
+    assert Path.basename(execution["history_program_path"]) == "ticket_push_history_validator_v25.py"
+    assert execution["helper_sha256"] == hash(File.read!(execution["helper_path"]))
+    assert execution["history_program_sha256"] == hash(File.read!(execution["history_program_path"]))
+  end
+
   def install(ctx, run, intent, raw) do
     fixture = Application.fetch_env!(:symphony_elixir, :ordinary_rejection_private_fixture)
     execution = Jason.decode!(intent["execution_json"])
     binding = Jason.decode!(intent["binding_json"])
     assert Path.basename(execution["helper_path"]) == "ticket_push_executor_v34.py"
+    assert Path.basename(execution["history_program_path"]) == "ticket_push_history_validator_v24.py"
+    assert execution["helper_sha256"] == hash(File.read!(execution["helper_path"]))
+    assert execution["history_program_sha256"] == hash(File.read!(execution["history_program_path"]))
     assert Jason.decode!(raw)["reason"] == "ordinary_verifier_repair_unproven"
     assert Jason.decode!(raw)["child_pid"] == nil
     assert binding["ordinary_preissuance_retirement"] == nil
     assert retained_programs(fixture) == Application.fetch_env!(:symphony_elixir, :generation_rejection_sealed_programs)
+
+    for [saved] <- Store.query!(ctx.store, "SELECT binding_json FROM ticket_ordinary_generation_intents").rows do
+      prior = Jason.decode!(Jason.decode!(saved)["run_preimage"]["candidate_handoff"])
+      producer = Jason.decode!(prior["execution_json"])
+      assert prior["phase"] == "COMPLETED"
+      assert Path.basename(producer["helper_path"]) == "ticket_push_executor_v33.py"
+      assert Path.basename(producer["history_program_path"]) == "ticket_push_history_validator_v24.py"
+      assert producer["helper_sha256"] == hash(File.read!(producer["helper_path"]))
+      assert producer["history_program_sha256"] == hash(File.read!(producer["history_program_path"]))
+    end
+
     {:ok, remote} = Worktree.read_remote_branch(%{"path" => ctx.repo}, run["branch"])
     prefix = Enum.map(records(ctx.store), &identity/1)
     audit = Map.take(run, ~w(run_id candidate_sha contract_sha256 code_repair_round))
