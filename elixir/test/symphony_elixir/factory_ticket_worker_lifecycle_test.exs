@@ -3,6 +3,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
   Code.require_file("../support/capability_recovery_fixture.ex", __DIR__)
   Code.require_file("../support/ordinary_push_rejection_fixture.ex", __DIR__)
   Code.require_file("../support/forward_push_rejection_fixture.ex", __DIR__)
+  Code.require_file("../support/generation_push_rejection_fixture.ex", __DIR__)
   Code.require_file("../support/schema_confirmation_fixture.ex", __DIR__)
   use ExUnit.Case, async: false
   @moduletag timeout: 180_000
@@ -64,14 +65,20 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
 
   alias SymphonyElixir.SchemaConfirmationFixture
   alias SymphonyElixir.TestSupport.ForwardPushRejectionFixture, as: ForwardRejectionFixture
+  alias SymphonyElixir.TestSupport.GenerationPushRejectionFixture, as: GenerationRejectionFixture
   alias SymphonyElixir.TestSupport.{GenerationOriginRelease, MrPresendFixture}
   alias SymphonyElixir.TestSupport.OrdinaryPushRejectionFixture, as: RejectionFixture
 
   setup :setup_fixture
 
   setup context do
-    if context[:ordinary_push_rejection_child] || context[:forward_push_rejection_child] do
+    if context[:ordinary_push_rejection_child] || context[:forward_push_rejection_child] || context[:generation_push_rejection_child] do
       RejectionFixture.activate()
+    end
+
+    if context[:generation_push_rejection_child] do
+      assert {:ok, run} = RunLedger.get(context.store, "run")
+      GenerationRejectionFixture.seed_closed_prefix(context, run)
     end
 
     if context[:push_origin_recovery_child] || context[:push_origin_fixture] do
@@ -5492,6 +5499,29 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
        verifier_repair_cycle: true,
        ordinary_final_rollover: true,
        ordinary_go_generation: true,
+       operator_verifier_repair: true,
+       capability_recovery_native: true,
+       owned_generation_adoption_tick: true,
+       generation_push_rejection_child: true,
+       timeout: 900_000
+  test "generation from release A survives one audited publisher B rejection and current capability recovery", ctx do
+    Application.put_env(:symphony_elixir, :operator_verifier_repair_fixture, true)
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :operator_verifier_repair_fixture)
+      Application.delete_env(:symphony_elixir, :capability_fixture_block_once)
+    end)
+
+    assert_mr_adoption(ctx)
+    assert Store.one!(ctx.store, "SELECT COUNT(*) AS n FROM events WHERE event_type='TICKET_ORDINARY_PUSH_REJECTION_RETIRED'")["n"] == 4
+  end
+
+  @tag broker_thread_id: "00000000-0000-0000-0000-000000000001", mr_preflight: true
+  @tag ci_repair_fixture: true,
+       ci_repair_native: true,
+       verifier_repair_cycle: true,
+       ordinary_final_rollover: true,
+       ordinary_go_generation: true,
        timeout: 900_000
   test "ordinary Go moves across CONTINUE slices generate missing BUILD before no-edit COMPLETE push", ctx do
     assert_mr_adoption(ctx)
@@ -6877,6 +6907,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     {:ok, task} = TaskLedger.get(store, evidence["task_key"])
     native = %{"id" => task["thread_id"], "cwd" => binding["policy"]["cwd"], "projectId" => task["codex_project_id"], "updatedAt" => 1, "status" => %{"type" => "idle"}}
     turn = %{"id" => task["turn_id"], "status" => "completed", "items" => []}
+    turn = if Process.get(:generation_rejection_large_observation), do: Map.put(turn, "items", [%{"type" => "agentMessage", "text" => String.duplicate("x", 1_060_000)}]), else: turn
 
     cases = """
       *'"method":"thread/read"'*) printf '%s\\n' '#{Jason.encode!(%{"id" => 9, "result" => %{"thread" => native}})}' ;;
@@ -8056,6 +8087,36 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     IO.puts("FORWARD_REJECTION_CANONICAL_FRESH_NONCE_NO_REPLAY")
   end
 
+  defp maybe_retire_ordinary_fixture_rejection(%{generation_push_rejection_child: true} = ctx, context, factory, options, verified) do
+    alias SymphonyElixir.Factory.TicketPushOrdinaryRejection
+    GenerationRejectionFixture.seed_closed_prefix(ctx, verified)
+    authorization = push_authorization(ctx.store, verified)
+    assert {:error, {:ticket_push_rejected_before_issuance, "ordinary_verifier_repair_unproven"}} = TicketPush.step(ctx.store, "run", authorization, options)
+    assert {:ok, rejected} = RunLedger.get(ctx.store, "run")
+    intent = Jason.decode!(rejected["candidate_handoff"])
+    assert {:ok, raw} = TicketPushIO.readback(intent)
+    GenerationRejectionFixture.install(ctx, rejected, intent, raw)
+    RejectionFixture.before_rearm(ctx, rejected)
+    release_generation_fixture_tick(ctx.store, factory)
+    lease_factory = Map.merge(factory, %{enabled: true, lease_seconds: 240})
+    state = push_tick_fixture_state(ctx.store)
+    before = RejectionFixture.protected(ctx.store)
+
+    recover = fn tick ->
+      install_push_tick_fixture_state(state)
+      TicketPushOrdinaryRejection.rearm(ctx.store, "run", fresh_fixture_authorization(ctx, authorization), Keyword.merge(options, ordinary_controller_tick: true, operator_tick: tick))
+    end
+
+    assert {:ran, {:error, :ordinary_rejection_preimage_changed}} = TickLease.run(lease_factory, recover, control_server: context.generation_control)
+    RejectionFixture.assert_rollback(ctx.store, before)
+    assert {:ran, {:ok, %{status: "PUSH_REJECTION_RETIRED"}}} = TickLease.run(lease_factory, recover, control_server: context.generation_control)
+    RejectionFixture.assert_retired(ctx, rejected, 4)
+    saved = RejectionFixture.protected(ctx.store)
+    assert {:ran, {:error, _}} = TickLease.run(lease_factory, recover, control_server: context.generation_control)
+    assert RejectionFixture.protected(ctx.store) == saved
+    IO.puts("GENERATION_REJECTION_CANONICAL_FRESH_NONCE_NO_REPLAY")
+  end
+
   defp maybe_retire_ordinary_fixture_rejection(_ctx, _context, _factory, _options, _verified), do: :ok
 
   defp assert_ordinary_retirement_archive(%{ordinary_push_rejection_child: true} = ctx, run) do
@@ -8125,6 +8186,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
   defp complete_ordinary_go_after_restart(ctx, context, factory, options) do
     alias SymphonyElixir.Factory.TicketCiGeneration
     key = finish_worker(context, options)
+    if ctx[:generation_push_rejection_child], do: Process.put(:generation_rejection_large_observation, true)
     generation_native_reader(ctx.store, ctx.root, key)
     {:ok, run} = RunLedger.get(ctx.store, "run")
     {:ok, worker} = WorkerEvidence.get(ctx.store, key)
@@ -8138,6 +8200,13 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
 
     assert {:ok, %{status: "PREPARED", intents: intents}} = TicketCiGeneration.prepare(ctx.store, key)
     assert length(intents) == 2
+
+    if ctx[:generation_push_rejection_child] do
+      bindings = Store.query!(ctx.store, "SELECT binding_json FROM ticket_ordinary_generation_intents").rows
+      assert Enum.any?(bindings, fn [raw] -> byte_size(raw) > 2_097_152 end)
+      IO.puts("GENERATION_REJECTION_FULL_DUPLICATED_NATIVE_OBSERVATION_RETAINED")
+    end
+
     assert {:error, :controller_generation_pending} = TicketCiGeneration.commit_ready(ctx.store, key)
     assert_raise Exqlite.Error, fn -> Store.query!(ctx.store, "UPDATE workspace_access SET released_at='fixture-release' WHERE reservation_key=?", [worker["reservation_key"]]) end
     [intent | _] = intents
@@ -8158,7 +8227,9 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
                Exqlite.rollback(tx, :ordinary_uncertainty_rollback)
              end)
 
+    if ctx[:generation_push_rejection_child], do: GenerationRejectionFixture.activate_generation()
     generated = TicketCiGeneration.complete(ctx.store, key, run, original)
+    if ctx[:generation_push_rejection_child], do: GenerationRejectionFixture.activate_publisher()
 
     diagnostics =
       if match?({:error, _}, generated) do
@@ -8188,7 +8259,18 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     assert {:ok, %{run: already_committed}} = RunLedger.update(reopened, "run", %{candidate_sha: controller_sha})
     assert {:ok, ^effective} = TicketCiGeneration.complete(reopened, key, already_committed, original)
     assert Store.query!(reopened, "SELECT * FROM ticket_ordinary_generation_events ORDER BY event_key").rows == events
-    assert {:ok, %{status: "ADOPTED", run: committed}} = Scheduler.ticket_step(restarted, "run", options)
+
+    committed =
+      if ctx[:owned_generation_adoption_tick] do
+        {previous, result} = run_generation_fixture_tick(restarted, fn tick -> Scheduler.ticket_step(restarted, "run", Keyword.put(options, :operator_tick, tick)) end)
+        assert {:ran, {:ok, %{status: "ADOPTED", run: adopted}}} = result
+        resume_generation_fixture_tick(reopened, restarted.generation_owner_factory, previous)
+        adopted
+      else
+        assert {:ok, %{status: "ADOPTED", run: adopted}} = Scheduler.ticket_step(restarted, "run", options)
+        adopted
+      end
+
     assert committed["state"] == "CI_PUSHING" and committed["candidate_sha"] == controller_sha and controller_sha != before_sha
     paths = git(ctx.path, ["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"]) |> String.split("\n", trim: true) |> Enum.sort()
     assert paths == Enum.sort(effective["changed_paths"])
