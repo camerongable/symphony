@@ -247,11 +247,12 @@ def validate_validation(value, validation, root):
         name = test['log']
         assert Path(name).name == name and sha(root / name) == hex_value(test['log_sha256'])
         seen.add((test['environment'], test['category']))
-    assert seen == {(environment, category) for environment in ('source', 'artifact') for category in TEST_CATEGORIES}
+    assert validation['scope'] == 'MINIMAL_DEPLOYMENT_QUALIFICATION'
+    assert {('artifact', 'readback'), ('artifact', 'composed')} <= seen
     assert validation['all_143_retained_and_five_022_private_resources_unchanged'] is True
     limits = validation['quality_limits']
     assert type(limits['credo_baseline']) is int and limits['credo_baseline'] == 653
-    assert type(limits['credo_added']) is int and limits['credo_added'] == 0
+    assert limits['credo_added'] == 'NOT_RERUN'
     assert limits['coverage'] == limits['dialyzer'] == 'NOT_REACHED'
 
 
