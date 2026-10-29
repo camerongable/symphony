@@ -8,7 +8,7 @@ true = digest.(File.read!(manifest_path)) == manifest_sha
 manifest = manifest_path |> File.read!() |> Jason.decode!()
 true = manifest["kind"] == "FACTORY_REVIEW_REPORT_RELEASE_V1" and manifest["schema_version"] == 54
 guard = Path.join(manifest["release"], "release_boot_guard.exs")
-true = digest.(File.read!(guard)) == "418b1a40af2c0ae5059fd841b9191ecacc0b8de6b451a4dd499e97bffcb60fb8"
+true = digest.(File.read!(guard)) == manifest["source_hashes"]["plans/rollout/review_release_boot_guard.exs"]
 Code.eval_file(guard)
 :ok = ReviewReportReleaseBootGuard.load(manifest_path, manifest_sha)
 false = Enum.any?(Application.started_applications(), fn {app, _, _} -> app == :symphony_elixir end)
