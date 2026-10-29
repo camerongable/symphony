@@ -463,6 +463,11 @@ defmodule SymphonyElixirWeb.DashboardLive do
           <p><%= @factory.control.handoff_attention[:next_action] %></p>
         </div>
 
+        <div :if={broker_reconciliation_required?(@factory)} class="factory-alert" role="alert" data-broker-attention="true">
+          <strong>Desktop handoff needs attention</strong>
+          <p>A blocking or unclassified handoff needs reconciliation. Inspect Desktop Broker under System health and capacity; do not resend an uncertain request.</p>
+        </div>
+
         <div :if={get_in(@factory.control, [:tick_health, :status]) == "FAILED"} class="factory-alert" role="alert">
           <strong>Last factory tick failed</strong>
           <p>Queued tickets may not advance until recovery. Last error: <%= @factory.control.tick_health.last_error %></p>
@@ -771,10 +776,19 @@ defmodule SymphonyElixirWeb.DashboardLive do
                 <dd class="numeric"><%= @factory.broker.uncertain %></dd>
               </div>
               <div>
-                <dt>Needs reconciliation</dt>
+                <dt>Unresolved reconciliation records (including warnings)</dt>
                 <dd class="numeric"><%= @factory.broker.needs_reconciliation %></dd>
               </div>
+              <div :if={Map.has_key?(@factory.broker, :blocking_attention)}>
+                <dt>Blocking or unclassified handoff attention</dt>
+                <dd class="numeric"><%= @factory.broker.blocking_attention %></dd>
+              </div>
+              <div :if={Map.has_key?(@factory.broker, :communication_warnings)}>
+                <dt>Non-blocking communication warnings</dt>
+                <dd class="numeric"><%= @factory.broker.communication_warnings %></dd>
+              </div>
             </dl>
+            <p :if={(@factory.broker[:communication_warnings] || 0) > 0} class="section-copy">Saved chat-update warnings are retained for reconciliation; they do not block ticket delivery.</p>
             <p class="section-copy broker-last-completed">
               Last completed request:
               <.local_time id="broker-last-completed-at" value={@factory.broker.last_completed_at} />
@@ -1087,13 +1101,17 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp capacity_badge_class("LIMITED"), do: "state-badge state-badge-warning"
   defp capacity_badge_class(_health), do: "state-badge"
 
-  defp broker_request_status(%{needs_reconciliation: count}) when count > 0, do: "Needs attention"
+  defp broker_request_status(%{blocking_attention: count}) when count > 0, do: "Needs attention"
+  defp broker_request_status(%{blocking_attention: 0, communication_warnings: count}) when count > 0, do: "Communication warning"
+  defp broker_request_status(%{needs_reconciliation: count} = broker) when count > 0,
+    do: if(Map.has_key?(broker, :blocking_attention), do: "Unknown", else: "Needs attention")
   defp broker_request_status(%{uncertain: count}) when count > 0, do: "Outcome uncertain"
   defp broker_request_status(%{claimed_unverified: count}) when count > 0, do: "Claimed"
   defp broker_request_status(%{pending: count}) when count > 0, do: "Pending"
   defp broker_request_status(_broker), do: "Unknown"
 
   defp broker_badge_class("Needs attention"), do: "state-badge state-badge-danger"
+  defp broker_badge_class("Communication warning"), do: "state-badge state-badge-warning"
   defp broker_badge_class(_status), do: "state-badge"
 
   defp factory_operability(%{factory: %{available: true} = factory}) do
@@ -1109,6 +1127,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp factory_operability(_payload), do: "unknown"
 
+  defp broker_reconciliation_required?(%{broker: %{blocking_attention: count}}), do: count > 0
   defp broker_reconciliation_required?(%{broker: %{needs_reconciliation: count}}), do: count > 0
   defp broker_reconciliation_required?(_factory), do: false
 
@@ -1223,8 +1242,11 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp ticket_stage(%{run_records: [_ | _]}), do: nil
   defp ticket_stage(%{intake: issue}) when is_map(issue), do: "Intake"
   defp ticket_stage(_ticket), do: nil
+  defp ticket_activity(%{run: %{state: "ADMITTING_WRITER"}}), do: "Preparing the checkout and writer admission; no running worker is implied."
   defp ticket_activity(%{run: run}) when is_map(run), do: worker_execution_label(get_in(run, [:worker_execution, :status]))
   defp ticket_activity(_ticket), do: "No worker activity is established by this intake record."
+
+  defp ticket_activity_summary(%{run: %{state: "ADMITTING_WRITER"}}), do: "Preparing to start"
 
   defp ticket_activity_summary(%{run: run}) when is_map(run) do
     case get_in(run, [:worker_execution, :status]) do
@@ -1305,7 +1327,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
     control = get_in(payload, [:factory, :control]) || %{}
 
     cond do
-      scheduling_attention?(control) -> "Needs attention"
+      scheduling_attention?(control) or broker_reconciliation_required?(payload[:factory] || %{}) -> "Needs attention"
       control[:status] == "PAUSED" -> "Paused — existing work may continue"
       true -> scheduling_observation(control)
     end
@@ -1333,11 +1355,11 @@ defmodule SymphonyElixirWeb.DashboardLive do
        when state in ~w(PLANNING SPECIFYING SPEC_DRAFTING CONTRACT_DISCUSSING SPEC_WRITING AWAITING_JIRA_READBACK SPEC_REVIEW CRITIQUING SPEC_READY_WRITE AWAITING_CONFIRMATION AWAITING_SPEC_INPUT AWAITING_CONTRACT_INPUT),
        do: "Specify"
 
-  defp workflow_stage(state) when state in ~w(WRITING REPAIRING REVIEW_WRITING), do: "Build"
+  defp workflow_stage(state) when state in ~w(ADMITTING_WRITER WRITING REPAIRING REVIEW_WRITING), do: "Build"
   defp workflow_stage("VERIFYING"), do: "Verify"
   defp workflow_stage("READY_FOR_REVIEW"), do: "Review"
-  defp workflow_stage(state) when state in ~w(PUSHING CI_PUSHING MR_CREATING CI_MR_CREATING), do: "Publish"
-  defp workflow_stage(state) when state in ~w(CI_WAITING AWAITING_VALIDATION), do: "Validate"
+  defp workflow_stage(state) when state in ~w(PUSHING CI_PUSHING REVIEW_PUSHING MR_CREATING CI_MR_CREATING), do: "Publish"
+  defp workflow_stage(state) when state in ~w(CI_WAITING AWAITING_VALIDATION TESTING), do: "Validate"
   defp workflow_stage(_state), do: nil
 
   defp worker_execution_label("WAITING"), do: "Waiting for worker; no current native turn recorded."

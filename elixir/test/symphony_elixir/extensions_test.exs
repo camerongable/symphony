@@ -780,6 +780,7 @@ defmodule SymphonyElixir.ExtensionsTest do
   end
 
   @tag unified_tickets: true
+  @tag dashboard_phase_mapping: true
   test "seven fixed phase slots keep condition and navigation separate from phase evidence" do
     name = Module.concat(__MODULE__, :SevenPhaseDashboardOrchestrator)
     {:ok, _pid} = StaticOrchestrator.start_link(name: name, snapshot: static_snapshot(), refresh: :unavailable)
@@ -799,17 +800,23 @@ defmodule SymphonyElixir.ExtensionsTest do
       {"AWAITING_CONFIRMATION", "Specify"},
       {"AWAITING_SPEC_INPUT", "Specify"},
       {"AWAITING_CONTRACT_INPUT", "Specify"},
+      {"ADMITTING_WRITER", "Build"},
       {"WRITING", "Build"},
+      {"REPAIRING", "Build"},
+      {"REVIEW_WRITING", "Build"},
       {"VERIFYING", "Verify"},
       {"PUSHING", "Publish"},
       {"CI_PUSHING", "Publish"},
+      {"REVIEW_PUSHING", "Publish"},
       {"MR_CREATING", "Publish"},
       {"CI_MR_CREATING", "Publish"},
       {"CI_WAITING", "Validate"},
       {"AWAITING_VALIDATION", "Validate"},
+      {"TESTING", "Validate"},
       {"READY_FOR_REVIEW", "Review"},
       {"FAILED", nil},
       {"DELIVERED", nil},
+      {"CANCELLED", nil},
       {"UNRECOGNIZED", nil}
     ]
 
@@ -835,7 +842,13 @@ defmodule SymphonyElixir.ExtensionsTest do
         do: assert(has_element?(view, selector <> " .responsibility", "Human review")),
         else: assert(has_element?(view, selector <> " .responsibility", "Action owner not recorded"))
 
-      assert has_element?(view, selector <> " .ticket-phase", "Stopped / result recorded")
+      if state == "ADMITTING_WRITER" do
+        assert has_element?(view, selector <> " .ticket-phase", "Preparing to start")
+        refute has_element?(view, selector <> " .ticket-phase", "Stopped / result recorded")
+        refute has_element?(view, selector <> " .phase-unavailable")
+      else
+        assert has_element?(view, selector <> " .ticket-phase", "Stopped / result recorded")
+      end
     end
 
     assert has_element?(view, "[data-ticket-record='PPL-2'] .stage-map [aria-current='step']", "Intake")
@@ -1799,7 +1812,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert Floki.text(broker, sep: " ") =~ "Automation heartbeat is not measured here"
     assert Floki.text(broker, sep: " ") =~ "Pending 2"
     assert Floki.text(broker, sep: " ") =~ "Claimed / unverified (not worker activity) 0"
-    assert Floki.text(broker, sep: " ") =~ "Needs reconciliation 0"
+    assert Floki.text(broker, sep: " ") =~ "Unresolved reconciliation records (including warnings) 0"
     assert Floki.find(document, ".control-grid-with-broker .capacity-card") != []
     assert Floki.find(document, ~s(.dashboard-shell[data-factory-operability="ready"])) != []
 
@@ -1903,6 +1916,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert Floki.attribute(history, "open") == []
   end
 
+  @tag broker_attention_classification: true
   test "dashboard flags Desktop requests requiring reconciliation independently of a running scheduler" do
     orchestrator_name = Module.concat(__MODULE__, :ReconcileBrokerFactoryDashboardOrchestrator)
 
@@ -1924,16 +1938,18 @@ defmodule SymphonyElixir.ExtensionsTest do
         last_completed_at: nil
       })
 
+    {:ok, state} = Agent.start_link(fn -> factory_snapshot end)
     start_test_endpoint(
       orchestrator: orchestrator_name,
       snapshot_timeout_ms: 50,
-      factory_observability: fn -> factory_snapshot end
+      factory_observability: fn -> Agent.get(state, & &1) end
     )
 
-    {:ok, _view, html} = live(build_conn(), "/")
+    {:ok, view, html} = live(build_conn(), "/")
     document = Floki.parse_document!(html)
 
-    assert Floki.text(Floki.find(document, ".scheduling-indicator"), sep: " ") =~ "Factory scheduling: Enabled"
+    assert Floki.text(Floki.find(document, ".scheduling-indicator"), sep: " ") =~ "Factory scheduling: Needs attention"
+    assert has_element?(view, "[data-broker-attention]")
 
     assert Floki.text(Floki.find(document, ".broker-card .state-badge-danger")) =~ "Needs attention"
 
@@ -1941,6 +1957,23 @@ defmodule SymphonyElixir.ExtensionsTest do
              "Needs attention"
 
     assert Floki.find(document, ~s(.dashboard-shell[data-factory-operability="stopped"])) != []
+
+    communication = Map.update!(factory_snapshot, :broker, &Map.merge(&1, %{blocking_attention: 0, communication_warnings: 1}))
+    Agent.update(state, fn _ -> communication end)
+    send(view.pid, :observability_updated)
+    render_async(view)
+    assert has_element?(view, ".scheduling-indicator", "Factory scheduling: Enabled")
+    assert has_element?(view, ".broker-card .state-badge-warning", "Communication warning")
+    refute has_element?(view, "[data-broker-attention]")
+    refute has_element?(view, ".dashboard-shell[data-factory-operability='stopped']")
+    assert has_element?(view, ".broker-card", "Non-blocking communication warnings")
+
+    Agent.update(state, fn _ -> put_in(communication, [:broker, :blocking_attention], 1) end)
+    send(view.pid, :observability_updated)
+    render_async(view)
+    assert has_element?(view, ".scheduling-indicator", "Factory scheduling: Needs attention")
+    assert has_element?(view, ".broker-card .state-badge-danger", "Needs attention")
+    assert has_element?(view, "[data-broker-attention]")
   end
 
   test "dashboard summary does not count a queued ticket as active without a running task" do

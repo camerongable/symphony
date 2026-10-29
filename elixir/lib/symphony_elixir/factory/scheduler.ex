@@ -240,23 +240,34 @@ defmodule SymphonyElixir.Factory.Scheduler do
 
     with :ok <- TicketChat.ordinary_delivery_eligibility(run),
          {:ok, _} <- TicketChat.ready_for_run(context.store, run_id) do
-      opts = ticket_runtime_options(context, opts)
+      case ReviewProtocol.pending_status(context.store, run) do
+        %{request_key: key, reason: reason} ->
+          {:ok, %{status: "REPORT_REJECTED", request_key: key, reason: reason, model_invoked: false}}
 
-      result =
-        case current_ticket_attempts(context.store, run) do
-          [] -> ticket_unreserved_step(context, run, opts)
-          [[_key, "RESERVED"]] -> launch_ticket_stage(context, run, opts)
-          [[key, "RECONCILE_REQUIRED"]] -> retry_rejected_ticket_resume(context, run, key, opts)
-          [[key, _]] -> adopt_or_recover_ticket_stage(context, run, key, opts)
-          _ -> {:error, :worker_attempt_reconciliation_required}
-        end
-
-      presentation = publish_ticket_progress(context.store, run_id)
-
-      case result do
-        {:ok, response} -> {:ok, Map.put(response, :presentation, presentation)}
-        error -> error
+        nil ->
+          ticket_admitted_step(context, run, opts)
       end
+    end
+  end
+
+  defp ticket_admitted_step(context, run, opts) do
+    run_id = run["run_id"]
+    opts = ticket_runtime_options(context, opts)
+
+    result =
+      case current_ticket_attempts(context.store, run) do
+        [] -> ticket_unreserved_step(context, run, opts)
+        [[_key, "RESERVED"]] -> launch_ticket_stage(context, run, opts)
+        [[key, "RECONCILE_REQUIRED"]] -> retry_rejected_ticket_resume(context, run, key, opts)
+        [[key, _]] -> adopt_or_recover_ticket_stage(context, run, key, opts)
+        _ -> {:error, :worker_attempt_reconciliation_required}
+      end
+
+    presentation = publish_ticket_progress(context.store, run_id)
+
+    case result do
+      {:ok, response} -> {:ok, Map.put(response, :presentation, presentation)}
+      error -> error
     end
   end
 

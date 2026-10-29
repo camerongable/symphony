@@ -1463,6 +1463,58 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     current["request_key"]
   end
 
+  defmodule PendingExecutionWorkerServer do
+    alias SymphonyElixir.DesktopTicketLifecycleFixture.WorkerServer
+    defdelegate start_session(workspace, options), to: WorkerServer
+    defdelegate stop_session(session), to: WorkerServer
+
+    def run_turn(session, prompt, issue, options) do
+      callback = options[:on_message]
+      packet = Jason.decode!(prompt)
+      role = packet["role"]
+      transform = fn
+        %{payload: %{"method" => "item/completed", "params" => %{"item" => %{"type" => "agentMessage", "text" => raw}}}} = message when role == "feature-writer" ->
+          output = raw |> Jason.decode!() |> Map.put("status", "COMPLETE")
+          output = update_in(output, ["review_report", "criteria"], &Enum.map(&1, fn row -> Map.put(row, "status", "NOT_CHECKED") end))
+          output = put_in(output, ["review_report", "affected_path_checks"], [%{"id" => "executable-validation", "status" => "UNAVAILABLE", "evidence" => ["File-only source worker; controller checks pending"]}])
+          callback.(put_in(message, [:payload, "params", "item", "text"], Jason.encode!(output)))
+
+        message -> callback.(message)
+      end
+
+      WorkerServer.run_turn(session, prompt, issue, Keyword.put(options, :on_message, transform))
+    end
+  end
+
+  @tag structured_review: true
+  @tag writer_adoption_boundary: true
+  test "initial file-only completion adopts once while preserving unavailable checks and durable evidence", ctx do
+    {context, options} = controller(ctx)
+    {:ok, _} = RunLedger.update(ctx.store, "run", %{candidate_sha: nil})
+    options = Keyword.put(options, :app_server, PendingExecutionWorkerServer)
+    request = finish_worker(context, options)
+    {:ok, before} = WorkerEvidence.get(ctx.store, request)
+    assert Jason.decode!(before["output_json"])["status"] == "COMPLETE"
+    assert {:ok, %{status: "ADOPTED", run: adopted}} = Scheduler.ticket_step(context, "run", options)
+    assert adopted["state"] == "VERIFYING"
+    assert is_binary(adopted["candidate_sha"])
+    assert String.trim(git(ctx.path, ["rev-list", "--count", ctx.sha <> "..HEAD"])) == "1"
+    {:ok, reopened} = Store.start_link(database: ctx.database)
+    try do
+      assert {:error, :ticket_role_stage_not_admitted} = TicketWorkerRunner.adoption(reopened, request)
+      assert {:ok, after_adoption} = WorkerEvidence.get(reopened, request)
+      assert after_adoption["status"] == "CONSUMED"
+      assert after_adoption["output_json"] == before["output_json"]
+      assert after_adoption["output_sha256"] == before["output_sha256"]
+      assert {:ok, %{"released_at" => released}} = WorkspaceAccess.get(reopened, before["reservation_key"])
+      assert is_binary(released)
+      assert String.trim(git(ctx.path, ["rev-list", "--count", ctx.sha <> "..HEAD"])) == "1"
+    after
+      GenServer.stop(reopened)
+    end
+    refute_receive {:factory_task_started, _, _}
+  end
+
   test "planner, resumed writer slices and blind verifier share one checkout and adopt exactly once", ctx do
     {context, options} = controller(ctx)
     {:ok, _} = RunLedger.update(ctx.store, "run", %{state: "PLANNING", candidate_sha: nil})

@@ -92,6 +92,36 @@ defmodule SymphonyElixir.FactoryReviewProtocolTest do
     assert get_in(result, ["review_report", "criteria", Access.at(0), "status"]) == "NOT_CHECKED"
   end
 
+  @tag writer_adoption_boundary: true
+  test "file-only writer can leave supplemental execution pending without claiming verifier acceptance" do
+    {writer, binding, result} = focused_writer()
+    policy = %{"mode" => "FILE_SOURCE", "profile" => "symphony_ticket_file_source_v1", "source_access" => "read", "file_tools_sha256" => SymphonyElixir.Factory.WorkerFileTools.tool_contract_sha256()}
+    binding = Map.put(binding, "policy", policy)
+    result = update_in(result, ["review_report", "affected_path_checks"], &(&1 ++ [%{"id" => "executable-validation", "status" => "UNAVAILABLE", "evidence" => ["File-only worker cannot execute commands; controller tests are pending."]}]))
+    assert :ok = ReviewProtocol.validate(writer, binding, result)
+    assert get_in(result, ["review_report", "affected_path_checks", Access.at(1), "status"]) == "UNAVAILABLE"
+
+    for changed <- [Map.delete(binding, "policy"), put_in(binding, ["policy", "mode"], "REVIEW"), put_in(binding, ["policy", "file_tools_sha256"], "foreign")] do
+      assert {:error, :review_report_verdict_contradiction} = ReviewProtocol.validate(writer, changed, result)
+    end
+
+    unchecked_source = put_in(result, ["review_report", "boundary_sweeps", Access.at(1), "status"], "UNAVAILABLE")
+    assert {:error, :review_report_verdict_contradiction} = ReviewProtocol.validate(writer, binding, unchecked_source)
+    verifier = Map.put(writer, "role", "change-verifier")
+    verifier_result = result |> Map.take(~w(checks review_report)) |> Map.merge(%{"status" => "PASS", "candidate_sha" => "candidate"})
+    assert {:error, _} = ReviewProtocol.validate(verifier, binding(verifier), verifier_result)
+  end
+
+  @tag writer_adoption_boundary: true
+  test "verifier still requires every bound affected path to be checked" do
+    verifier = ReviewProtocol.attach(Map.drop(packet(), ["review_protocol"]), [])
+    verifier = put_in(verifier, ["review_protocol", "review_scope", "affected_paths"], ["handler.go"])
+    result = typed_result(verifier, [], "PASS")
+    result = put_in(result, ["review_report", "affected_path_checks"], [%{"id" => "handler.go", "status" => "CHECKED", "evidence" => ["Inspected exact candidate execution path"]}])
+    assert :ok = ReviewProtocol.validate(verifier, binding(verifier), result)
+    assert {:error, :review_report_verdict_contradiction} = ReviewProtocol.validate(verifier, binding(verifier), put_in(result, ["review_report", "affected_path_checks", Access.at(0), "status"], "UNAVAILABLE"))
+  end
+
   test "writer readiness cannot invent current checks, historical passes or acceptance" do
     {writer, binding, result} = focused_writer()
 

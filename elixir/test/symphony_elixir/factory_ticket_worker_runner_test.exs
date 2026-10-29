@@ -313,6 +313,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
   end
 
   @tag structured_writer: true
+  @tag writer_adoption_boundary: true
   test "stopped rejected reports are visible read-only and disappear after consumption or generation drift", ctx do
     {prompt, options} = prepare(ctx)
     packet = Jason.decode!(prompt)
@@ -337,6 +338,20 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
     assert [%{attention: %{source: "WORKER_RESULT", phase: "REPORT_REJECTED", next_action: action}}] = snapshot.current_runs
     assert action =~ "Factory intervention"
     assert action =~ "Do not restart"
+
+    assert {:ok, _} = TicketWorkerRunner.bind_base(ctx.store, "run", ctx.sha)
+    {:ok, _} = RunLedger.update(ctx.store, "run", %{candidate_sha: nil})
+    {:ok, initial} = RunLedger.get(ctx.store, "run")
+    assert %{reason: "review_report_criteria_incomplete"} = ReviewProtocol.pending_status(ctx.store, initial)
+    initial_snapshot = Observability.snapshot(settings: %{factory: factory}, store: ctx.store, control_server: server)
+    assert [%{attention: %{phase: "REPORT_REJECTED"}}] = initial_snapshot.current_runs
+    assert initial_snapshot.overview.needs_attention == 1
+    protected = Map.new(~w(runs factory_tasks worker_evidence controller_checks), &{&1, Store.query!(ctx.store, "SELECT * FROM #{&1} ORDER BY 1").rows})
+    for _ <- 1..2 do
+      assert {:ok, %{status: "REPORT_REJECTED", reason: "review_report_criteria_incomplete", model_invoked: false}} = Scheduler.ticket_step(%{store: ctx.store, factory: %{}}, "run")
+    end
+    for {table, rows} <- protected, do: assert(Store.query!(ctx.store, "SELECT * FROM #{table} ORDER BY 1").rows == rows)
+    assert {:ok, _} = RunLedger.update(ctx.store, "run", %{candidate_sha: ctx.sha})
 
     Store.query!(ctx.store, "UPDATE worker_evidence SET status='CONSUMED' WHERE request_key='reservation:request'")
     assert is_nil(ReviewProtocol.pending_status(ctx.store, run))

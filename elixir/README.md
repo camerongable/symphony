@@ -1612,6 +1612,20 @@ codex:
 Workflow titles fall back to the matching saved Jira snapshot when the ticket is
 absent from intake. Dark surfaces stay neutral; labeled indicators convey health.
 
+Writer admission appears in Build as "Preparing to start", without implying a
+running worker. Review publishing maps to Publish, and manual testing to Validate.
+The broker separates verified non-blocking chat-update warnings from blocking or
+unclassified handoff attention. Only the latter raises the top scheduling indicator
+and handoff alert; all reconciliation records remain visible and unchanged.
+
+A file-only writer's COMPLETE result means its source is ready for controller
+validation. Supplemental checks may honestly remain UNAVAILABLE under the bound
+file-only policy; required source boundaries and independent verifier checks are
+not relaxed. A rejected stopped result appears as REPORT_REJECTED, including
+before the first candidate commit. Scheduling leaves that result and its edits
+intact rather than repeatedly attempting adoption; a compatible validated report
+can then proceed through normal exact-result adoption.
+
 Schema v38 stores controller-owned intake rejection decisions separately from
 the observed Jira snapshot. Missing, ambiguous or unsupported manual-validation
 declarations, disabled/unsupported selected capability, and forbidden admission

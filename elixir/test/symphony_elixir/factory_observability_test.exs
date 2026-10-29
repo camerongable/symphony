@@ -557,6 +557,7 @@ defmodule SymphonyElixir.FactoryObservabilityTest do
     assert Observability.snapshot(options).overview.needs_attention == 0
   end
 
+  @tag broker_attention_classification: true
   test "stale parent synchronization remains separate after proven push recovery completes", context do
     register_run(context.store, "parent-attention", "PPL-123", "CI_PUSHING")
 
@@ -592,7 +593,7 @@ defmodule SymphonyElixir.FactoryObservabilityTest do
       "UPDATE desktop_requests SET status = 'FOLLOWUP_UNCERTAIN', claimed_at = '2026-10-13T20:00:00Z', created_at = '2026-10-13T20:00:00Z', updated_at = '2026-10-13T20:00:00Z' WHERE request_key = 'parent-notice'"
     )
 
-    options = [settings: %{factory: context.factory}, store: context.store, control_server: context.control_server, now: ~U[2026-10-14 00:00:00Z]]
+    options = [settings: %{factory: Map.put(context.factory, :task_transport, "desktop_broker")}, store: context.store, control_server: context.control_server, now: ~U[2026-10-14 00:00:00Z]]
     envelope = %{kind: "TICKET_PUSH_CAS_RECOVERY", phase: "PUSH_UNCERTAIN", old_outcome: "UNKNOWN", original_envelope: "sensitive_nonce_marker"}
     {:ok, _} = RunLedger.update(context.store, "parent-attention", %{candidate_handoff: Jason.encode!(envelope)})
     snapshot = Observability.snapshot(options)
@@ -622,6 +623,17 @@ defmodule SymphonyElixir.FactoryObservabilityTest do
     assert completed.overview.active == 1
     assert completed.overview.delivery_blocked == 0
     assert completed.overview.communication_attention == 1
+    Store.query!(context.store, "UPDATE desktop_requests SET status = 'RECONCILE_REQUIRED' WHERE request_key = 'parent-notice'")
+    communication = Observability.snapshot(options)
+    assert communication.broker.communication_warnings == 1
+    assert communication.broker.blocking_attention == 0
+    assert communication.broker.needs_reconciliation == 1
+    saved_payload_hash = Store.one!(context.store, "SELECT payload_sha256 FROM desktop_requests WHERE request_key = 'parent-notice'")["payload_sha256"]
+    Store.query!(context.store, "UPDATE desktop_requests SET payload_sha256 = 'broken' WHERE request_key = 'parent-notice'")
+    unclassified = Observability.snapshot(options)
+    assert unclassified.broker.communication_warnings == 0
+    assert unclassified.broker.blocking_attention == 1
+    Store.query!(context.store, "UPDATE desktop_requests SET payload_sha256 = ? WHERE request_key = 'parent-notice'", [saved_payload_hash])
     assert hd(completed.current_runs).attention.blocking == false
 
     for changed <- [
@@ -940,6 +952,7 @@ defmodule SymphonyElixir.FactoryObservabilityTest do
     assert Enum.count(snapshot.current_runs, &(&1.run_id == "older-active")) == 1
   end
 
+  @tag broker_attention_classification: true
   test "broker projection distinguishes queued, claimed, and reconciliation requests without claiming liveness", context do
     factory = Map.put(context.factory, :task_transport, "desktop_broker")
 
@@ -956,6 +969,8 @@ defmodule SymphonyElixir.FactoryObservabilityTest do
              uncertain: 0,
              awaiting_result: 0,
              needs_reconciliation: 0,
+             blocking_attention: 0,
+             communication_warnings: 0,
              last_completed_at: nil
            }
 

@@ -127,7 +127,7 @@ defmodule SymphonyElixir.Factory.Observability do
       enabled: true,
       available: true,
       control: control,
-      broker: project_broker(store, factory),
+      broker: project_broker(store, factory, projected_current_runs, control),
       workspace_maintenance: NativeWorkspaceMaintenance.snapshot(store),
       counts: counts(current_runs, tasks, handoffs, enriched_by_id),
       overview: overview(projected_current_runs, projected_tasks, intake, stalled_run_ids),
@@ -1021,7 +1021,7 @@ defmodule SymphonyElixir.Factory.Observability do
     }
   end
 
-  defp project_broker(store, factory) do
+  defp project_broker(store, factory, runs, control) do
     if value(factory, :task_transport) == "desktop_broker" do
       summary =
         Store.one!(
@@ -1038,15 +1038,34 @@ defmodule SymphonyElixir.Factory.Observability do
           """
         )
 
+      unresolved =
+        Store.query!(store, "SELECT request_key FROM desktop_requests WHERE status = 'RECONCILE_REQUIRED'").rows
+        |> Enum.map(&hd/1)
+        |> MapSet.new()
+
+      signals = Enum.flat_map(runs, & &1.attention_signals) ++ List.wrap(control.handoff_attention)
+      nonblocking = broker_signal_keys(signals, false)
+      warnings = MapSet.intersection(unresolved, nonblocking)
+      blocking = unresolved |> MapSet.difference(nonblocking) |> MapSet.union(broker_signal_keys(signals, true))
+
       %{
         pending: summary["pending"],
         claimed_unverified: summary["claimed_unverified"],
         uncertain: summary["uncertain"],
         awaiting_result: summary["awaiting_result"],
         needs_reconciliation: summary["needs_reconciliation"],
+        blocking_attention: MapSet.size(blocking),
+        communication_warnings: MapSet.size(warnings),
         last_completed_at: summary["last_completed_at"]
       }
     end
+  end
+
+  defp broker_signal_keys(signals, blocking) do
+    signals
+    |> Enum.filter(&(&1[:blocking] === blocking and &1[:source] in ~w(PARENT_SYNC TASK CONTROLLER) and is_binary(&1[:request_key])))
+    |> Enum.map(& &1.request_key)
+    |> MapSet.new()
   end
 
   defp project_intake({:ok, nil}, _factory, _runs) do

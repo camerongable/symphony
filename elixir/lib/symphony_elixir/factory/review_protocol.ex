@@ -97,7 +97,7 @@ defmodule SymphonyElixir.Factory.ReviewProtocol do
 
   defp writer_instructions("feature-writer"),
     do:
-      " For a source writer, COMPLETE means the implementation candidate is ready for controller validation, not that tests or independent acceptance passed. Mark criteria NOT_CHECKED when execution is unavailable and explain the inspected source evidence. Use CONTINUE only when source implementation remains unfinished, not solely because formatting, generation, CI or independent verification is pending. Writer classifications are observations, not verifier findings or acceptance."
+      " For a source writer, COMPLETE means the implementation candidate is ready for controller validation, not that tests or independent acceptance passed. Mark criteria NOT_CHECKED when execution is unavailable and explain the inspected source evidence. File-only writers may mark supplemental affected_path_checks UNAVAILABLE with evidence when commands cannot run; mandatory source boundary_sweeps still require CHECKED unless authenticated historical coverage applies. Use CONTINUE only when source implementation remains unfinished, not solely because formatting, generation, CI or independent verification is pending. Writer classifications are observations, not verifier findings or acceptance."
 
   defp writer_instructions(_role), do: ""
 
@@ -118,7 +118,7 @@ defmodule SymphonyElixir.Factory.ReviewProtocol do
          {:ok, output} <- Jason.decode(evidence["output_json"]),
          true <- is_map(binding) and is_map(output),
          task when is_map(task) <- Store.one!(store, "SELECT * FROM factory_tasks WHERE task_key=?", [evidence["task_key"]]),
-         true <- current_pending_report?(run, task, evidence, binding),
+         true <- current_pending_report?(store, run, task, evidence, binding),
          true <- WorkerEvidence.owner_stopped?(store, evidence),
          {:ok, packet} <- context(store, task),
          true <- Map.take(packet, ~w(implementation_iteration verifier_round code_repair_round)) == Map.take(run, ~w(implementation_iteration verifier_round code_repair_round)),
@@ -135,14 +135,23 @@ defmodule SymphonyElixir.Factory.ReviewProtocol do
     end
   end
 
-  defp current_pending_report?(run, task, evidence, binding) do
+  defp current_pending_report?(store, run, task, evidence, binding) do
     task["status"] == "COMPLETE" and task["stage"] == run["state"] and
       Map.take(task, ~w(task_key role)) == Map.take(binding, ~w(task_key role)) and
       Map.take(task, ~w(run_id thread_id turn_id output_json)) == Map.take(evidence, ~w(run_id thread_id turn_id output_json)) and
       Map.take(binding, ~w(run_id spec_revision contract_sha256)) == Map.take(run, ~w(run_id spec_revision contract_sha256)) and
-      binding["stage"] == run["state"] and binding["expected_sha"] == run["candidate_sha"] and
+      binding["stage"] == run["state"] and pending_candidate_matches?(store, run, task, binding) and
       binding["input_sha256"] == task["prompt_sha256"] and current_report_role?(run, task)
   end
+
+  defp pending_candidate_matches?(store, %{"candidate_sha" => nil, "state" => "WRITING", "implementation_iteration" => 0} = run, %{"role" => "feature-writer"}, binding) do
+    case Store.one!(store, "SELECT base_sha FROM ticket_review_bases WHERE run_id=?", [run["run_id"]]) do
+      %{"base_sha" => base} when is_binary(base) -> base == binding["expected_sha"]
+      _ -> false
+    end
+  end
+
+  defp pending_candidate_matches?(_store, run, _task, binding), do: is_binary(run["candidate_sha"]) and binding["expected_sha"] == run["candidate_sha"]
 
   defp current_report_role?(%{"state" => "VERIFYING"} = run, task),
     do: task["role"] == "change-verifier" and task["task_key"] == "#{run["run_id"]}:change-verifier:#{run["verifier_round"]}"
@@ -386,7 +395,7 @@ defmodule SymphonyElixir.Factory.ReviewProtocol do
          true <- row["status"] == "RESULT_RECORDED" and WorkerEvidence.owner_stopped?(store, row),
          {:ok, binding} <- Jason.decode(row["binding_json"]),
          {:ok, output} <- Jason.decode(row["output_json"]),
-         true <- current_pending_report?(run, task, row, binding),
+         true <- current_pending_report?(store, run, task, row, binding),
          {:ok, packet} <- bound_context(store, task, binding),
          :ok <- exact_input(packet, task, binding),
          {:ok, projected} <- correction_projection(packet, binding, output, input["mapping"]) do

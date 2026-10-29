@@ -62,7 +62,7 @@ defmodule SymphonyElixir.Factory.ReviewReport do
              :review_report_evidence_missing
            ),
          :ok <- validate_findings(protocol, report),
-         :ok <- check(verdict?(packet, output, report), :review_report_verdict_contradiction) do
+         :ok <- check(verdict?(packet, binding, output, report), :review_report_verdict_contradiction) do
       :ok
     end
   end
@@ -158,7 +158,7 @@ defmodule SymphonyElixir.Factory.ReviewReport do
   defp basis?(%{"basis" => %{"kind" => "PREFERENCE", "reference" => ref}, "disposition" => "OBSERVATION"}, _protocol, _known), do: text?(ref)
   defp basis?(_, _, _), do: false
 
-  defp verdict?(%{"role" => "change-verifier"}, output, report) do
+  defp verdict?(%{"role" => "change-verifier"}, _binding, output, report) do
     required = findings(output)
     checked = Enum.all?(report["boundary_sweeps"] ++ report["affected_path_checks"], &(&1["status"] == "CHECKED"))
     closed = Enum.all?(report["closures"], &(&1["status"] != "UNRESOLVED"))
@@ -170,13 +170,22 @@ defmodule SymphonyElixir.Factory.ReviewReport do
     end
   end
 
-  defp verdict?(%{"role" => "feature-writer"} = packet, output, report) do
+  defp verdict?(%{"role" => "feature-writer"} = packet, binding, output, report) do
     output["status"] != "COMPLETE" or
       (output["blockers"] == [] and report["block_reason"] == "NONE" and Enum.all?(report["criteria"], &(&1["status"] in ~w(PASS NOT_CHECKED))) and
          Enum.all?(report["closures"], &(&1["status"] != "UNRESOLVED")) and
-         Enum.all?(report["affected_path_checks"], &(&1["status"] == "CHECKED")) and
+         Enum.all?(report["affected_path_checks"], &writer_supplemental_check?(packet, binding, &1)) and
          Enum.all?(report["boundary_sweeps"], &(&1["status"] == "CHECKED" or historical_boundary?(packet, output, report, &1))))
   end
+
+  defp writer_supplemental_check?(_packet, _binding, %{"status" => "CHECKED"}), do: true
+
+  defp writer_supplemental_check?(packet, %{"policy" => %{"mode" => "FILE_SOURCE", "profile" => "symphony_ticket_file_source_v1", "source_access" => "read", "file_tools_sha256" => hash}}, %{"status" => "UNAVAILABLE"}) do
+    not Map.has_key?(packet["review_protocol"]["review_scope"], "affected_paths") and
+      hash == SymphonyElixir.Factory.WorkerFileTools.tool_contract_sha256()
+  end
+
+  defp writer_supplemental_check?(_packet, _binding, _check), do: false
 
   defp exact_ids?(rows, ids), do: Enum.sort(Enum.map(rows, & &1["id"])) == Enum.sort(ids)
   defp text?(value), do: is_binary(value) and String.trim(value) != ""
