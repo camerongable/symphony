@@ -32,6 +32,21 @@ def load(name):
 
 
 class CompatibilityTests(unittest.TestCase):
+    def test_generated_launcher_selects_workflow_before_restoring_configured_origin(self):
+        with generated_launcher() as fixture:
+            root = fixture['root']
+            home, sqlite = root / 'codex', root / 'sqlite'
+            home.mkdir(mode=0o700)
+            sqlite.mkdir(mode=0o700)
+            origin = {'version': 2, 'codex_home': directory_identity(home), 'sqlite_home': directory_identity(sqlite)}
+            default = Path(fixture['manifest']['source_root']) / 'elixir/WORKFLOW.md'
+            default.write_text('---\ntracker:\n  kind: linear\n---\nUnselected default requires unavailable credentials.\n')
+            workflow = root / 'selected-workflow.md'
+            workflow.write_text('---\ntracker:\n  kind: memory\nfactory:\n  enabled: false\n  ticket_supervisor:\n    native_runtime: ' + json.dumps(origin) + '\n---\nSelected workflow.\n')
+            result = fixture['run'](workflow)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue(fixture['sentinel'].exists())
+
     def test_manifest_formats_are_target_specific_and_strictly_typed(self):
         helper = load('native_runtime_compatibility')
         legacy = {'worker_binding_versions': [1], 'completion_receipt_versions': [1]}

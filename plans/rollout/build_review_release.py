@@ -12,9 +12,9 @@ import tarfile
 import tempfile
 
 
-BASE = Path('/Users/cgable/Library/Application Support/ai-factory/releases/symphony-review-report-586b19b')
-BASE_SHA = '65ab6bddc14c1351bb60776c431af0e99a99dd96ce275cca72c0c033d8df08e5'
-BASELINE_COMMIT = '586b19bf40d786840b03ecff0e3759d62c3f46d0'
+BASE = Path('/Users/cgable/Library/Application Support/ai-factory/releases/symphony-review-report-836d8fb')
+BASE_SHA = '614e43219c60a63a51e455b96c99cf343f8b8886bfa8dbe3ba832f5262c36545'
+BASELINE_COMMIT = '836d8fbdc2f34f8468902b664d54bcc0c292ab87'
 ROOT = Path(__file__).resolve().parent
 EXCLUDE = {'.git', '_build', 'deps', 'bin', 'log', 'logs', 'cover', '__pycache__'}
 
@@ -68,7 +68,7 @@ export MIX_BUILD_PATH=@BUILD@
 cd @SOURCE@
 guard_eval=@GUARD@
 case "${SYMPHONY_PUSH_HANDOFF_QUALIFY:-}" in
-  "") guard_eval+=':ok = SymphonyElixir.Factory.NativeRuntimeCompatibility.check_workflow(List.last(System.argv())); SymphonyElixir.CLI.main(System.argv())' ;;
+  "") guard_eval+=':ok = SymphonyElixir.Workflow.set_workflow_file_path(List.last(System.argv())); :ok = SymphonyElixir.Factory.NativeRuntimeCompatibility.check_workflow(List.last(System.argv())); SymphonyElixir.CLI.main(System.argv())' ;;
   1) guard_eval+='IO.puts("FACTORY_REVIEW_REPORT_COLD_BOOT_ATTESTED")' ;;
   *) exit 78 ;;
 esac
