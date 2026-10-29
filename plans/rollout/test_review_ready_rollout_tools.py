@@ -176,6 +176,58 @@ INSERT INTO control VALUES('timer');
             with self.assertRaises(AssertionError):
                 tools.mailbox_quiet(root)
 
+    def test_completed_known_result_requires_exact_unchanged_owned_pair(self):
+        import base64
+
+        tools = load_tools()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            root.chmod(0o700)
+            key = 'c' * 32
+            finished, response, known = (root / (key + '.' + phase) for phase in ('finished', 'response', 'known'))
+            finished.write_bytes(b'exact request')
+            response.write_bytes(b'exact response')
+            finished.chmod(0o600)
+            response.chmod(0o600)
+            envelope = {'version': 1, 'mailbox_id': key, 'database_root': str(root.parent),
+                        'request_sha256': tools.sha(finished), 'response_sha256': tools.sha(response),
+                        'response_base64': base64.b64encode(response.read_bytes()).decode('ascii')}
+            known.write_text(json.dumps(envelope))
+            known.chmod(0o600)
+            before = tools.mailbox_quiet(root)
+            self.assertEqual(before['completed_known_hashes'][key]['known_sha256'], tools.sha(known))
+            mutations = [('version', True), ('mailbox_id', 'd' * 32), ('database_root', str(root)),
+                         ('request_sha256', '0' * 64), ('response_sha256', '0' * 64),
+                         ('response_base64', envelope['response_base64'] + '\n'), ('unknown', 1)]
+            for field, value in mutations:
+                with self.subTest(field=field):
+                    known.write_text(json.dumps({**envelope, field: value}))
+                    with self.assertRaises(AssertionError):
+                        tools.mailbox_quiet(root)
+            for raw in (b'not JSON', b' ' * 2_800_001, json.dumps(envelope).replace('"version": 1', '"version": 1, "version": 1').encode()):
+                with self.subTest(malformed_size=len(raw)):
+                    known.write_bytes(raw)
+                    with self.assertRaises(AssertionError):
+                        tools.mailbox_quiet(root)
+            known.write_text(json.dumps(envelope, indent=2))
+            self.assertNotEqual(before, tools.mailbox_quiet(root))
+            for mode in (0o644,):
+                known.chmod(mode)
+                with self.assertRaises(AssertionError):
+                    tools.mailbox_quiet(root)
+            known.chmod(0o600)
+            response.unlink()
+            with self.assertRaises(AssertionError):
+                tools.mailbox_quiet(root)
+            response.write_bytes(b'changed response')
+            with self.assertRaises(AssertionError):
+                tools.mailbox_quiet(root)
+            response.write_bytes(b'exact response')
+            known.unlink()
+            known.symlink_to(finished)
+            with self.assertRaises(AssertionError):
+                tools.mailbox_quiet(root)
+
     def fixture_artifact(self, tools, root):
         release = root / 'symphony-review-report-fixture'
         source, build = root / 'source', release / 'dev'

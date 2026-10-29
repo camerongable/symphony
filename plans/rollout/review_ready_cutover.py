@@ -341,18 +341,66 @@ def import_pinned(path, expected, name):
 
 
 def mailbox_quiet(path):
+    import base64
+
     metadata = path.lstat()
     assert stat.S_ISDIR(metadata.st_mode) and metadata.st_uid == os.getuid() and metadata.st_mode & 0o777 == 0o700
-    phases = {'finished': set(), 'response': set()}
+    phases = {'finished': set(), 'response': set(), 'known': set()}
     for entry in path.iterdir():
-        found = re.fullmatch(r'([0-9a-f]{32})\.(finished|response)', entry.name)
+        found = re.fullmatch(r'([0-9a-f]{32})\.(finished|response|known)', entry.name)
         assert found is not None, 'unresolved or unknown broker mailbox entry'
         item = entry.lstat()
         assert stat.S_ISREG(item.st_mode) and item.st_uid == os.getuid(), entry.name
+        if found[2] == 'known':
+            assert stat.S_IMODE(item.st_mode) == 0o600 and item.st_size <= 2_800_000
         phases[found[2]].add(found[1])
     assert phases['finished'] == phases['response'] and phases['finished']
+    assert phases['known'] <= phases['finished']
+
+    def unique_object(pairs):
+        result = dict(pairs)
+        assert len(result) == len(pairs)
+        return result
+
+    def owned_bytes(entry, limit=None):
+        descriptor = os.open(entry, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            before = os.fstat(descriptor)
+            assert stat.S_ISREG(before.st_mode) and before.st_uid == os.getuid()
+            if limit is not None:
+                assert stat.S_IMODE(before.st_mode) == 0o600 and before.st_size <= limit
+            with os.fdopen(descriptor, 'rb', closefd=False) as stream:
+                raw = stream.read() if limit is None else stream.read(limit + 1)
+            after = os.fstat(descriptor)
+            assert (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) == (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+            assert len(raw) == before.st_size and (limit is None or len(raw) <= limit)
+            current = entry.lstat()
+            assert (current.st_dev, current.st_ino, current.st_mode, current.st_uid) == (before.st_dev, before.st_ino, before.st_mode, before.st_uid)
+            return raw
+        finally:
+            os.close(descriptor)
+
+    known_hashes = {}
+    for key in sorted(phases['known']):
+        try:
+            raw = owned_bytes(path / (key + '.known'), 2_800_000)
+            envelope = json.loads(raw.decode('utf-8'), object_pairs_hook=unique_object)
+            assert type(envelope) is dict and set(envelope) == {'version', 'mailbox_id', 'database_root', 'request_sha256', 'response_sha256', 'response_base64'}
+            assert type(envelope['version']) is int and envelope['version'] == 1
+            assert envelope['mailbox_id'] == key and envelope['database_root'] == str(path.parent)
+            request = owned_bytes(path / (key + '.finished'), 131_072)
+            response = owned_bytes(path / (key + '.response'), 2_097_152)
+            assert envelope['request_sha256'] == digest(request) and envelope['response_sha256'] == digest(response)
+            encoded = envelope['response_base64']
+            assert type(encoded) is str
+            decoded = base64.b64decode(encoded, validate=True)
+            assert base64.b64encode(decoded).decode('ascii') == encoded and decoded == response
+            known_hashes[key] = {'known_sha256': digest(raw), 'request_sha256': digest(request), 'response_sha256': digest(response)}
+        except (OSError, ValueError, TypeError, UnicodeError) as error:
+            raise AssertionError('invalid completed broker known-result record') from error
+    assert sorted(item.name for item in path.iterdir()) == sorted(key + '.' + phase for phase, keys in phases.items() for key in keys)
     return {'finished_count': len(phases['finished']), 'response_count': len(phases['response']),
-            'names_sha256': digest(encode(sorted(item.name for item in path.iterdir())))}
+            'names_sha256': digest(encode(sorted(item.name for item in path.iterdir()))), 'completed_known_hashes': known_hashes}
 
 
 def validate_replacement_absent(process_listing, audit):
