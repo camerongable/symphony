@@ -65,8 +65,12 @@ defmodule SymphonyElixir.FactoryInitialWriterReworkTest do
     assert Store.one!(ctx.store, "SELECT COUNT(*) AS count FROM events WHERE event_type LIKE 'TICKET_CAPABILITY_RECOVERY_%'")["count"] == 0
   end
 
-  for scenario <- [:idle, :completed_tick_during_jira, :active_tick_during_jira] do
+  for scenario <- [:idle, :completed_tick_during_jira, :active_tick_during_jira, :recorded_origin] do
     @tag :capability_recovery
+    if scenario == :recorded_origin do
+      @tag :native_worker_binding
+    end
+
     @tag timeout: 120_000
     @tag capability_scenario: scenario
     test "operator capability approval preserves repeated writes with #{scenario}", ctx do
@@ -74,6 +78,7 @@ defmodule SymphonyElixir.FactoryInitialWriterReworkTest do
       git(ctx.path, ["add", "second.txt", "third.txt"])
       git(ctx.path, ["commit", "--no-verify", "-m", "fixture base files"])
       ctx = ctx |> Map.put(:base_sha, ctx.sha) |> Map.put(:sha, git(ctx.path, ["rev-parse", "HEAD"]) |> String.trim())
+      ctx = if ctx.capability_scenario == :recorded_origin, do: Map.put(ctx, :native_runtime, capability_route(ctx)), else: ctx
       {:ok, _} = TaskLedger.update(ctx.store, "writer", %{workspace_sha: ctx.sha})
       blocked = blocked_initial_writer(ctx, :capability)
       {:ok, run} = RunLedger.get(ctx.store, "run")
@@ -122,14 +127,30 @@ defmodule SymphonyElixir.FactoryInitialWriterReworkTest do
       }
 
       {native, options} = capability_observation(ctx, blocked)
+      if ctx.capability_scenario == :recorded_origin, do: configure_capability_reader(ctx, native)
       Process.put(:capability_native, native)
-      options = Keyword.merge(options, jira_reader: CapabilityJiraReader, native_reader: CapabilityNativeReader, workspace: ctx.root, free_bytes: 40_000_000_000)
+
+      options =
+        Keyword.merge(options,
+          jira_reader: CapabilityJiraReader,
+          native_reader: CapabilityNativeReader,
+          workspace: if(ctx.capability_scenario == :recorded_origin, do: ctx.path, else: ctx.root),
+          free_bytes: 40_000_000_000
+        )
+
       rows = Store.query!(ctx.store, "SELECT rowid,* FROM worker_file_operations ORDER BY rowid")
       assert length(rows.rows) == 4
 
       assert {:error, :capability_recovery_authorization_invalid} = TicketCapabilityRecovery.stage(ctx.store, input, factory, options)
       assert {:ok, description} = TicketCapabilityRecovery.describe(ctx.store, input, factory, options)
       assert description["runtime"]["pid"] == System.pid()
+
+      if ctx.capability_scenario == :recorded_origin do
+        methods = Path.join(ctx.root, "capability-native.trace") |> File.read!() |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!(&1)["method"])
+        assert "thread/read" in methods
+        assert "config/read" in methods
+        refute Enum.any?(methods, &(&1 in ~w(thread/start thread/resume turn/start)))
+      end
 
       expected_modules = [
         SymphonyElixir.Factory.TicketCapabilityRecovery,
@@ -239,6 +260,23 @@ defmodule SymphonyElixir.FactoryInitialWriterReworkTest do
       assert File.read!(Path.join(ctx.path, "fixture.txt")) == "partial implementation\n"
       assert Store.one!(ctx.store, "SELECT COUNT(*) AS count FROM worker_evidence")["count"] == 2
       assert {:ok, application} = TicketCapabilityRecovery.applied(ctx.store, receipt.recovery_key)
+
+      if ctx.capability_scenario == :recorded_origin do
+        {:ok, destination} = WorkerEvidence.get(ctx.store, application["request_key"])
+        successor = Jason.decode!(destination["binding_json"])
+        assert successor["native_runtime"] === binding["native_runtime"]
+        assert successor["binding_version"] === 2
+        raw = successor |> Map.delete("native_runtime") |> Map.delete("binding_version") |> Jason.encode!()
+        Store.query!(ctx.store, "UPDATE worker_evidence SET binding_json=?,binding_sha256=? WHERE request_key=?", [raw, capability_hash(raw), destination["request_key"]])
+        assert {:error, :capability_recovery_application_unproven} = TicketCapabilityRecovery.applied(ctx.store, receipt.recovery_key)
+
+        Store.query!(ctx.store, "UPDATE worker_evidence SET binding_json=?,binding_sha256=? WHERE request_key=?", [
+          destination["binding_json"],
+          destination["binding_sha256"],
+          destination["request_key"]
+        ])
+      end
+
       assert WorkerEvidence.superseded_blocked_attempt?(ctx.store, blocked.evidence)
       assert {:ok, retained} = WorkerEvidence.get(ctx.store, "reservation:request")
       assert retained == blocked.evidence
@@ -268,6 +306,16 @@ defmodule SymphonyElixir.FactoryInitialWriterReworkTest do
       assert Store.one!(ctx.store, "SELECT COUNT(*) AS count FROM events WHERE event_type='TICKET_CAPABILITY_RECOVERY_APPLIED'")["count"] == 1
       assert Store.one!(ctx.store, "SELECT COUNT(*) AS count FROM workspace_access")["count"] == 2
       if ctx.capability_scenario == :idle, do: assert_archived_capability_codec(ctx, blocked, application)
+
+      if ctx.capability_scenario == :recorded_origin do
+        trace = Path.join(ctx.root, "capability-native.trace")
+        requests = File.read!(trace)
+        File.rename!(ctx.native_runtime.codex_home.path, ctx.native_runtime.codex_home.path <> "-unavailable")
+        File.rename!(ctx.native_runtime.sqlite_home.path, ctx.native_runtime.sqlite_home.path <> "-unavailable")
+        assert {:ok, ^application} = TicketCapabilityRecovery.applied(ctx.store, receipt.recovery_key)
+        assert WorkerEvidence.superseded_blocked_attempt?(ctx.store, blocked.evidence)
+        assert File.read!(trace) == requests
+      end
     end
   end
 
@@ -499,7 +547,7 @@ defmodule SymphonyElixir.FactoryInitialWriterReworkTest do
     end)
   end
 
-  defp install_capability_tick_hook(%{capability_scenario: :idle}, _, _), do: :ok
+  defp install_capability_tick_hook(%{capability_scenario: scenario}, _, _) when scenario in [:idle, :recorded_origin], do: :ok
 
   defp install_capability_tick_hook(ctx, factory, control) do
     Process.put(:capability_jira_hook, fn ->
@@ -695,6 +743,69 @@ defmodule SymphonyElixir.FactoryInitialWriterReworkTest do
     end
   end
 
+  @tag :native_worker_binding
+  test "infrastructure supersession cannot hide a predecessor behind a different valid native origin", ctx do
+    alias SymphonyElixir.Factory.{NativeRuntimeRoute, TicketInfrastructureRecovery}
+    root = ctx.root <> "-origins"
+    File.mkdir!(root)
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    routes =
+      for name <- ~w(a b) do
+        descriptor = %{"version" => 1, "codex_home" => Path.join(root, name <> "-codex"), "sqlite_home" => Path.join(root, name <> "-sqlite")}
+
+        for path <- [descriptor["codex_home"], descriptor["sqlite_home"]] do
+          File.mkdir!(path)
+          File.chmod!(path, 0o700)
+        end
+
+        {:ok, route} = NativeRuntimeRoute.validate(descriptor)
+        route
+      end
+
+    [old_route, other_route] = routes
+    blocked = blocked_initial_writer(Map.put(ctx, :native_runtime, old_route), :io)
+    {:ok, proof} = TicketInfrastructureRecovery.authorize(ctx.store, "reservation:request")
+    {:ok, resume} = TicketInfrastructureRecovery.resume(ctx.store, "reservation:request")
+    prompt_hash = capability_hash("recovery packet")
+    transfer_proof = Map.merge(blocked.proof, resume) |> Map.put("new_prompt_sha256", prompt_hash) |> Map.put("checkout_head_sha", ctx.sha)
+    {:ok, access} = WorkspaceAccess.transfer_blocked_source(ctx.store, "reservation", blocked.access["generation"], blocked.attrs, transfer_proof)
+    {:ok, _} = TaskLedger.update(ctx.store, "writer", %{status: "STARTING", prompt_sha256: prompt_hash, output_json: nil})
+
+    attributes = %{
+      "request_key" => "resumed:request",
+      "task_key" => "writer",
+      "reservation_key" => "resumed",
+      "input_sha256" => prompt_hash,
+      "owner_id" => "new-owner",
+      "schema" => StageSchemas.for_stage(:native_feature_writer),
+      "policy" => TicketWorkerRunner.policy("SOURCE", ctx.path),
+      "native_runtime" => other_route
+    }
+
+    {:ok, destination} = WorkerEvidence.reserve(ctx.store, attributes)
+
+    transfer =
+      Store.one!(ctx.store, "SELECT release_receipt_json FROM workspace_access WHERE reservation_key='reservation'")["release_receipt_json"]
+      |> Jason.decode!()
+      |> Map.put("new_generation", access["generation"])
+
+    assert {:ok, _} = TicketInfrastructureRecovery.record_transfer(ctx.store, proof["recovery_key"], transfer)
+    refute WorkerEvidence.superseded_blocked_attempt?(ctx.store, blocked.evidence)
+    assert Enum.any?(WorkerEvidence.pending(ctx.store, "run"), &(&1["request_key"] == blocked.evidence["request_key"]))
+    assert {:error, :infrastructure_recovery_replay_unproven} = TicketInfrastructureRecovery.applied(ctx.store, proof["recovery_key"])
+    binding = Jason.decode!(destination["binding_json"]) |> Map.put("native_runtime", Jason.decode!(blocked.evidence["binding_json"])["native_runtime"])
+    raw = Jason.encode!(binding)
+    Store.query!(ctx.store, "UPDATE worker_evidence SET binding_json=?,binding_sha256=? WHERE request_key=?", [raw, capability_hash(raw), destination["request_key"]])
+    assert WorkerEvidence.superseded_blocked_attempt?(ctx.store, blocked.evidence)
+    File.rename!(old_route.codex_home.path, old_route.codex_home.path <> "-unavailable")
+    File.rename!(old_route.sqlite_home.path, old_route.sqlite_home.path <> "-unavailable")
+    assert WorkerEvidence.superseded_blocked_attempt?(ctx.store, blocked.evidence)
+    assert {:ok, _} = TicketInfrastructureRecovery.applied(ctx.store, proof["recovery_key"])
+    Store.query!(ctx.store, "UPDATE worker_evidence SET binding_sha256=? WHERE request_key=?", [String.duplicate("0", 64), destination["request_key"]])
+    refute WorkerEvidence.superseded_blocked_attempt?(ctx.store, blocked.evidence)
+  end
+
   test "accepted native rework transfers a stopped first writer at its exact initial base", ctx do
     blocked = blocked_initial_writer(ctx)
     assert {:ok, transferred} = transfer(ctx, blocked)
@@ -815,16 +926,18 @@ defmodule SymphonyElixir.FactoryInitialWriterReworkTest do
     policy = TicketWorkerRunner.policy("SOURCE", ctx.path)
     {:ok, task} = TaskLedger.get(ctx.store, "writer")
 
-    {:ok, _} =
-      WorkerEvidence.reserve(ctx.store, %{
-        "request_key" => "reservation:request",
-        "task_key" => "writer",
-        "reservation_key" => "reservation",
-        "input_sha256" => task["prompt_sha256"],
-        "owner_id" => "owned-invocation",
-        "schema" => StageSchemas.for_stage(:native_feature_writer),
-        "policy" => policy
-      })
+    attributes = %{
+      "request_key" => "reservation:request",
+      "task_key" => "writer",
+      "reservation_key" => "reservation",
+      "input_sha256" => task["prompt_sha256"],
+      "owner_id" => "owned-invocation",
+      "schema" => StageSchemas.for_stage(:native_feature_writer),
+      "policy" => policy
+    }
+
+    attributes = if ctx[:native_runtime], do: Map.put(attributes, "native_runtime", ctx.native_runtime), else: attributes
+    {:ok, _} = WorkerEvidence.reserve(ctx.store, attributes)
 
     {:ok, _} = WorkerEvidence.mark_start_sent(ctx.store, "reservation:request")
     {:ok, _} = WorkerEvidence.bind_thread(ctx.store, "reservation:request", "worker", policy)
@@ -933,7 +1046,7 @@ defmodule SymphonyElixir.FactoryInitialWriterReworkTest do
       }
     }
 
-    database = Path.join(ctx.root, "queue.sqlite")
+    database = if ctx[:native_runtime], do: Path.join(ctx.native_runtime.sqlite_home.path, "queue_1.sqlite"), else: Path.join(ctx.root, "queue.sqlite")
 
     schema =
       "CREATE TABLE queued_items (id TEXT PRIMARY KEY NOT NULL, thread_id TEXT NOT NULL, payload_json TEXT NOT NULL, queue_order INTEGER NOT NULL, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL);CREATE TABLE queued_thread_revisions (revision INTEGER PRIMARY KEY AUTOINCREMENT, thread_id TEXT NOT NULL UNIQUE);"
@@ -944,9 +1057,48 @@ defmodule SymphonyElixir.FactoryInitialWriterReworkTest do
       end)
 
     {_, 0} = System.cmd("/usr/bin/sqlite3", [database, schema <> triggers])
-    home = Path.join(ctx.root, "native-home")
+    home = if ctx[:native_runtime], do: ctx.native_runtime.codex_home.path, else: Path.join(ctx.root, "native-home")
     File.mkdir_p!(Path.join(home, "thread-writer-locks"))
     {native, [native_queue_database: database, native_home: home]}
+  end
+
+  defp capability_route(ctx) do
+    root = ctx.root <> "-capability-origin"
+    File.mkdir!(root)
+    on_exit(fn -> File.rm_rf!(root) end)
+    descriptor = %{"version" => 1, "codex_home" => Path.join(root, "codex"), "sqlite_home" => Path.join(root, "sqlite")}
+
+    for path <- [descriptor["codex_home"], descriptor["sqlite_home"]] do
+      File.mkdir!(path)
+      File.chmod!(path, 0o700)
+    end
+
+    {:ok, route} = SymphonyElixir.Factory.NativeRuntimeRoute.validate(descriptor)
+    route
+  end
+
+  defp configure_capability_reader(ctx, native) do
+    trace = Path.join(ctx.root, "capability-native.trace")
+    state = Map.take(native, ~w(id cwd status updatedAt)) |> Map.put("turns", native["latest_turn_observation"]["raw_response"]["data"])
+    File.write!(Path.join(ctx.native_runtime.sqlite_home.path, "completed-state.json"), Jason.encode!(state))
+    default = put_in(state, ["turns", Access.at(0), "items", Access.at(1), "text"], Jason.encode!(%{"status" => "BLOCKED", "blockers" => ["wrong-default-origin"]}))
+    File.write!(trace <> ".state", Jason.encode!(default))
+
+    File.write!(
+      trace <> ".initialize",
+      Jason.encode!(%{"codexHome" => "unused-default", "platformFamily" => "unix", "platformOs" => "macos", "userAgent" => "symphony-orchestrator/0.160.0 (fixture)"})
+    )
+
+    File.write!(trace <> ".config", Jason.encode!(%{"config" => %{}}))
+    binary = Path.join(ctx.root, "capability-native-reader")
+    server = Path.expand("../support/completed_turn_server.py", __DIR__)
+    File.write!(binary, "#!/bin/sh\nexec /usr/bin/python3 -I -S -B '#{server}' '#{trace}' \"$@\"\n")
+    File.chmod!(binary, 0o755)
+    previous = SymphonyElixir.Workflow.workflow_file_path()
+    workflow = Path.join(ctx.root, "capability-reader-WORKFLOW.md")
+    File.write!(workflow, "---\ntracker:\n  kind: memory\nfactory:\n  enabled: false\ncodex:\n  command: #{binary} app-server\n  read_timeout_ms: 5000\n---\nSynthetic recorded-origin reader.\n")
+    SymphonyElixir.Workflow.set_workflow_file_path(workflow)
+    on_exit(fn -> SymphonyElixir.Workflow.set_workflow_file_path(previous) end)
   end
 
   defp denied_native_preparation(ctx, chat) do

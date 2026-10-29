@@ -4,6 +4,7 @@ defmodule SymphonyElixir.FactorySpecialistErrorNoticeTest do
 
   alias SymphonyElixir.Factory.{
     DesktopRequest,
+    DesktopToolArgs,
     SpecialistErrorNotice,
     Store,
     TaskLedger,
@@ -15,6 +16,68 @@ defmodule SymphonyElixir.FactorySpecialistErrorNoticeTest do
   @broker "019fa5b7-27fa-7660-ab47-7c3abb867c91"
 
   setup :setup_fixture
+
+  test "metadata splitting is lossless, shape-only and leaves unknown keys visible" do
+    base = %{"generation" => 1, "unknown" => "must not disappear"}
+    notice = %{"specialist_notice_ids" => ["opaque legacy id"], "specialist_notice_text" => " exact\ntext "}
+    assert {:ok, ^base, %{}} = SpecialistErrorNotice.split_metadata(base)
+    assert {:ok, ^base, ^notice} = SpecialistErrorNotice.split_metadata(Map.merge(base, notice))
+
+    for invalid <- [
+          nil,
+          [],
+          "scalar",
+          %{"specialist_notice_ids" => ["id"]},
+          %{"specialist_notice_text" => "text"},
+          %{"specialist_notice_ids" => nil, "specialist_notice_text" => "text"},
+          %{"specialist_notice_ids" => "id", "specialist_notice_text" => "text"},
+          %{"specialist_notice_ids" => [], "specialist_notice_text" => "text"},
+          %{"specialist_notice_ids" => ["id", "other"], "specialist_notice_text" => "text"},
+          %{"specialist_notice_ids" => [""], "specialist_notice_text" => "text"},
+          %{"specialist_notice_ids" => [<<255>>], "specialist_notice_text" => "text"},
+          %{"specialist_notice_ids" => ["id"], "specialist_notice_text" => <<255>>},
+          %{"specialist_notice_ids" => ["id"], "specialist_notice_text" => ""},
+          %{"specialist_notice_ids" => ["id"], "specialist_notice_text" => nil}
+        ] do
+      assert {:error, :invalid_specialist_notice_metadata} = SpecialistErrorNotice.split_metadata(invalid)
+    end
+  end
+
+  test "formatting shape does not authorize forged notice IDs, text or generation", ctx do
+    seed_notice(ctx)
+    assert {:ok, %{request_key: key}} = TicketChatOutbox.publish(ctx.store, "run")
+    {:ok, request} = DesktopRequest.get(ctx.store, key)
+    metadata = Jason.decode!(request["metadata_json"])
+    assert :ok = TicketChat.validate_request(ctx.store, request)
+    assert {:ok, _} = DesktopToolArgs.followup(request)
+    policy = %{"enabled" => true, "pilot_issue_keys" => ["PPL-123"]}
+
+    for changes <- [
+          %{"specialist_notice_ids" => ["forged-but-shape-valid"]},
+          %{"specialist_notice_text" => metadata["specialist_notice_text"] <> " altered"},
+          %{"generation" => metadata["generation"] + 1}
+        ] do
+      forged = Map.put(request, "metadata_json", Jason.encode!(Map.merge(metadata, changes)))
+      assert {:ok, _} = DesktopToolArgs.followup(forged)
+      assert {:error, :ticket_chat_binding_mismatch} = TicketChat.validate_request(ctx.store, forged)
+      assert {:error, _} = TicketChat.authorize_issuance(ctx.store, forged, policy)
+
+      attrs =
+        forged
+        |> Map.take(~w(request_key target_kind target_key action codex_project_id model reasoning_effort title prompt cwd existing_thread_id branch base_branch))
+        |> Map.put("metadata", Jason.decode!(forged["metadata_json"]))
+        |> Map.put("schema", Jason.decode!(forged["schema_json"]))
+
+      assert {:error, :request_key_conflict} = DesktopRequest.enqueue(ctx.store, attrs)
+      assert {:error, :ticket_chat_binding_mismatch} = DesktopRequest.enqueue(ctx.store, Map.put(attrs, "request_key", key <> ":forged"))
+      assert {:ok, ^request} = DesktopRequest.get(ctx.store, key)
+    end
+
+    Store.query!(ctx.store, "UPDATE desktop_requests SET prompt = prompt || ' changed' WHERE request_key = ?", [key])
+    {:ok, corrupted} = DesktopRequest.get(ctx.store, key)
+    refute DesktopRequest.payload_intact?(corrupted)
+    assert {:error, _} = DesktopToolArgs.followup(ctx.store, key, ticket_policy: policy)
+  end
 
   test "durable errors require visible final notices and survive uncertain parent presentations", ctx do
     payload = %{
@@ -100,6 +163,8 @@ defmodule SymphonyElixir.FactorySpecialistErrorNoticeTest do
     assert :ok = SpecialistErrorNotice.validate_render(Jason.decode!(request["metadata_json"]), completion["output"], receipt["readback_sha256"])
     ack_only = notice_native(ctx, request, "{\"acknowledged\":true}")
     assert {:error, :specialist_notice_render_unproven} = TicketParentEvidence.observe(request, @broker, ack_only)
+    assert {:error, :specialist_notice_render_unproven} = TicketParentEvidence.observe(request, @broker, notice_native(ctx, request, text <> " tampered"))
+    assert {:error, :specialist_notice_render_unproven} = TicketParentEvidence.observe(request, @broker, notice_native(ctx, request, String.replace(text, "specialist", "different")))
 
     assert {:error, :specialist_notice_render_unproven} =
              SpecialistErrorNotice.validate_render(Jason.decode!(request["metadata_json"]), %{"result" => %{"acknowledged" => true}}, receipt["readback_sha256"])

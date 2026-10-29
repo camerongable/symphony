@@ -58,6 +58,26 @@ def clean_env(build=None):
     return env
 
 
+def render_launcher(build, source, guard_eval):
+    launcher = '''#!/bin/zsh
+set -euo pipefail
+export PATH='/Applications/ChatGPT.localized/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS:/Applications/ChatGPT.localized/ChatGPT.app/Contents/Resources:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'
+unset ELIXIR_ERL_OPTIONS ERL_AFLAGS ERL_ZFLAGS ERL_LIBS MIX_TARGET ERL_FLAGS
+export MIX_ENV=dev
+export MIX_BUILD_PATH=@BUILD@
+cd @SOURCE@
+guard_eval=@GUARD@
+case "${SYMPHONY_PUSH_HANDOFF_QUALIFY:-}" in
+  "") guard_eval+=':ok = SymphonyElixir.Factory.NativeRuntimeCompatibility.check_workflow(List.last(System.argv())); SymphonyElixir.CLI.main(System.argv())' ;;
+  1) guard_eval+='IO.puts("FACTORY_REVIEW_REPORT_COLD_BOOT_ATTESTED")' ;;
+  *) exit 78 ;;
+esac
+exec /opt/homebrew/bin/mise exec -- mix run --no-compile --no-deps-check --no-start -e "${guard_eval}" -- --i-understand-that-this-will-be-running-without-the-usual-guardrails --logs-root "${SYMPHONY_FACTORY_LOGS_ROOT:-/Users/cgable/Library/Logs/ai-factory}" "${1:-/Users/cgable/Repos/symphony/elixir/WORKFLOW.local.md}"
+'''
+    quote = lambda value: "'" + value.replace("'", "'\\''") + "'"
+    return launcher.replace('@BUILD@', quote(str(build))).replace('@SOURCE@', quote(str(source / 'elixir'))).replace('@GUARD@', quote(guard_eval))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--worktree', type=Path, required=True)
@@ -136,11 +156,15 @@ origins = for path <- Path.wildcard(Path.join(build, "lib/symphony_elixir/ebin/*
 end
 {:ok, [{:application, :symphony_elixir, properties}]} = :file.consult(String.to_charlist(Path.join(build, "lib/symphony_elixir/ebin/symphony_elixir.app")))
 true = Enum.sort(Enum.map(origins, & &1.module)) == Enum.sort(Enum.map(properties[:modules], &to_string/1))
-IO.puts(Jason.encode!(origins))
+compatibility = SymphonyElixir.Factory.NativeRuntimeCompatibility
+{:module, ^compatibility} = Code.ensure_loaded(compatibility)
+true = to_string(:code.which(compatibility)) == Path.join(build, "lib/symphony_elixir/ebin/Elixir.SymphonyElixir.Factory.NativeRuntimeCompatibility.beam")
+IO.puts(Jason.encode!(%{origins: origins, native_runtime_formats: compatibility.supported_formats()}))
 '''
-    origins = json.loads(command(['/opt/homebrew/bin/mise', 'exec', '--', 'elixir',
-                                  '-pa', str(release / 'dev/lib/jason/ebin'), '-e', origin_script,
+    compiled_metadata = json.loads(command(['/opt/homebrew/bin/mise', 'exec', '--', 'elixir',
+                                  '-pa', str(release / 'dev/lib/jason/ebin'), '-pa', str(release / 'dev/lib/symphony_elixir/ebin'), '-e', origin_script,
                                   '--', str(source), str(release / 'dev')], source / 'elixir', env))
+    origins = compiled_metadata['origins']
     assert all(item['source'] in source_map for item in origins)
     artifact = artifact_inventory(release / 'dev')
     factories = {item['module']: artifact[item['path']]['sha256'] for item in origins
@@ -155,6 +179,7 @@ IO.puts(Base.encode16(:crypto.hash(:sha256, :erlang.term_to_binary(digests)), ca
                                  cwd=source / 'elixir', env=env, input=json.dumps(factories),
                                  capture_output=True, text=True, check=True, timeout=30).stdout.strip()
     manifest = {'kind': 'FACTORY_REVIEW_REPORT_RELEASE_V1', 'schema_version': 54,
+                'native_runtime_formats': compiled_metadata['native_runtime_formats'],
                 'build': str(release / 'dev'), 'source_root': str(source), 'release': str(release),
                 'source': source_map, 'source_hashes': {name: item['sha256'] for name, item in source_map.items()},
                 'factory_modules': factories, 'factory_beam_fingerprint': fingerprint,
@@ -170,23 +195,7 @@ IO.puts(Base.encode16(:crypto.hash(:sha256, :erlang.term_to_binary(digests)), ca
                   f'true = Base.encode16(:crypto.hash(:sha256, raw), case: :lower) == "{sha(guard_path)}"; '
                   'Code.eval_string(raw, [], file: path); '
                   f':ok = ReviewReportReleaseBootGuard.load({json.dumps(str(manifest_path))}, "{sha(manifest_path)}"); ')
-    launcher = '''#!/bin/zsh
-set -euo pipefail
-export PATH='/Applications/ChatGPT.localized/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS:/Applications/ChatGPT.localized/ChatGPT.app/Contents/Resources:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'
-unset ELIXIR_ERL_OPTIONS ERL_AFLAGS ERL_ZFLAGS ERL_LIBS MIX_TARGET ERL_FLAGS
-export MIX_ENV=dev
-export MIX_BUILD_PATH=@BUILD@
-cd @SOURCE@
-guard_eval=@GUARD@
-case "${SYMPHONY_PUSH_HANDOFF_QUALIFY:-}" in
-  "") guard_eval+='SymphonyElixir.CLI.main(System.argv())' ;;
-  1) guard_eval+='IO.puts("FACTORY_REVIEW_REPORT_COLD_BOOT_ATTESTED")' ;;
-  *) exit 78 ;;
-esac
-exec /opt/homebrew/bin/mise exec -- mix run --no-compile --no-deps-check --no-start -e "${guard_eval}" -- --i-understand-that-this-will-be-running-without-the-usual-guardrails --logs-root "${SYMPHONY_FACTORY_LOGS_ROOT:-/Users/cgable/Library/Logs/ai-factory}" "${1:-/Users/cgable/Repos/symphony/elixir/WORKFLOW.local.md}"
-'''
-    quote = lambda value: "'" + value.replace("'", "'\\''") + "'"
-    launcher = launcher.replace('@BUILD@', quote(str(release / 'dev'))).replace('@SOURCE@', quote(str(source / 'elixir'))).replace('@GUARD@', quote(guard_eval))
+    launcher = render_launcher(release / 'dev', source, guard_eval)
     launcher_path = release / 'run-local-factory'
     launcher_path.write_text(launcher)
     launcher_path.chmod(0o755)

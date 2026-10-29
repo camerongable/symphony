@@ -21,6 +21,9 @@ import urllib.error
 
 
 TOOLS = Path(__file__).resolve().parent
+_compat_spec = importlib.util.spec_from_file_location('ready_native_runtime_compatibility', TOOLS / 'native_runtime_compatibility.py')
+native_compatibility = importlib.util.module_from_spec(_compat_spec)
+_compat_spec.loader.exec_module(native_compatibility)
 HISTORICAL = Path('/private/tmp/symphony-push-handoff.cnRVdUfY/review-cutover-r19f2')
 GUARD_SHA = '41c26ac2067bdba97ecbf92238e11f813e0e45c8068283b75565677abfe53482'
 THAW_SHA = 'cec22fd5003117f496bbe369baaf935f8c9f4797ae519ae0ca90578fb12b4534'
@@ -224,6 +227,7 @@ def validate_candidate(value, release_parent=OLD_RELEASE.parent):
     source = inventory(Path(value['source']), True)
     assert source == manifest['source']
     assert {name: entry['sha256'] for name, entry in source.items()} == manifest['source_hashes']
+    native_compatibility.validate_manifest(manifest)
     return manifest
 
 
@@ -412,7 +416,9 @@ def bind(evidence_root):
         assert original['source_commit'] == OLD_SOURCE and original['schema_version'] == 54
         assert inventory(Path(original['build']), artifact_source=Path(original['source_root'])) == original['artifact']
         assert {name: entry['sha256'] for name, entry in inventory(Path(original['source_root']), True).items()} == original['source_hashes']
+        native_compatibility.validate_manifest(original)
         return {'build': original['build'], 'source': original['source_root'],
+                'native_runtime_formats': native_compatibility.validate_manifest(original),
                 'phoenix_placeholder': phoenix_placeholder(Path(original['build']), Path(original['source_root']))}
 
     def eligible():
@@ -441,26 +447,23 @@ def bind(evidence_root):
         return result
 
     def native_quiet_for(value):
+        manifest = {'native_runtime_formats': value['native_runtime_formats']}
+        native_compatibility.check_database(g.DB, manifest)
         with g.readonly() as db:
-            threads = [row[0] for row in db.execute('SELECT DISTINCT thread_id FROM worker_evidence WHERE thread_id IS NOT NULL')]
-        assert 1 <= len(threads) <= 1000
-        script = '''
-for thread <- System.argv() do
-  {:ok, queue} = SymphonyElixir.Factory.NativeQueueReadback.read("/Users/cgable/.codex/queue_1.sqlite", thread)
-  {:ok, lock} = SymphonyElixir.Factory.NativeQueueReadback.writer_unlocked("/Users/cgable/.codex", thread)
-  true = queue["thread_id"] == thread and queue["item_count"] == 0
-  true = lock["status"] in ["absent", "unlocked"]
-end
-IO.puts("NATIVE_SOURCE_QUIET")
-'''
+            workers = db.execute('SELECT DISTINCT thread_id,binding_json,binding_sha256 FROM worker_evidence WHERE thread_id IS NOT NULL').fetchall()
+        payload, pairs = native_compatibility.quietness_payload(workers, g.WORKFLOW, manifest)
+        assert 1 <= pairs <= 1000
         result = subprocess.run(['/opt/homebrew/bin/mise', 'exec', '--', 'elixir', '-pa',
-                                 str(Path(value['build']) / 'lib/*/ebin'), '-e', script, '--', *threads],
+                                 str(Path(value['build']) / 'lib/*/ebin'), '-e', native_compatibility.NATIVE_QUIET_SCRIPT, '--', payload],
                                 cwd=Path(value['source']) / 'elixir', env=clean_env(),
                                 capture_output=True, text=True, timeout=30)
         assert result.returncode == 0 and result.stdout.strip() == 'NATIVE_SOURCE_QUIET'
+        native_compatibility.check_database(g.DB, manifest)
 
     def native_quiet():
-        native_quiet_for(candidate()[0])
+        value, manifest, _audit = candidate()
+        native_quiet_for({**value, 'native_runtime_formats': native_compatibility.validate_manifest(manifest)})
+        g.native_runtime_admit('stop')
 
     def qualified():
         value, manifest, audit = candidate()
@@ -566,9 +569,11 @@ IO.puts("NATIVE_SOURCE_QUIET")
         protected(audit)
         saved = evidence_root / 'service.original.plist'
         assert sha(saved) == g.load('captured.json')['plist_sha256'] == sha(g.PLIST) == OLD_PLIST
+        g.native_runtime_admit('start')
         replace_plist(g.PLIST, sha(saved), replacement_plist(saved.read_bytes(), audit['replacement_launcher'], audit['replacement_build']))
         protected(audit)
         g.save('start-intent.json', {'manifest_sha256': value['manifest_sha256'], 'plist_sha256': sha(g.PLIST), 'attempts': 1})
+        g.native_runtime_admit('start')
         g.command(['/bin/launchctl', 'bootstrap', 'gui/505', str(g.PLIST)], timeout=15)
         finish_start()
 
@@ -587,12 +592,14 @@ IO.puts("NATIVE_SOURCE_QUIET")
         validate_restore_plist(saved.read_bytes(), g.PLIST.read_bytes(), audit, str(g.WORKFLOW), runtime['build'])
         g.quiet()
         native_quiet_for(runtime)
+        g.native_runtime_admit('restore-check')
         print('ORIGINAL_216_ONLY_RESTORE_ALLOWED')
 
     retained_restore = g.restore_original
 
     def restore_original():
         restore_check()
+        g.native_runtime_admit('restore-original')
         saved = evidence_root / 'service.original.plist'
         if g.PLIST.read_bytes() != saved.read_bytes():
             replace_plist(g.PLIST, sha(g.PLIST), saved.read_bytes())
@@ -603,7 +610,25 @@ IO.puts("NATIVE_SOURCE_QUIET")
                     'native_quiet_for', 'native_quiet', 'qualified', 'finish_start', 'start',
                     'restore_check', 'restore_original'}:
             setattr(g, name, function)
-    return g, capture
+
+    def native_runtime_admit(operation):
+        if operation.startswith('restore-'):
+            original = g.original_pins()
+            native_compatibility.check_database(g.DB, {'native_runtime_formats': original['native_runtime_formats']})
+        else:
+            _value, manifest, _audit = g.candidate()
+            native_compatibility.check_database(g.DB, manifest)
+
+    def guarded(operation, action):
+        def checked():
+            native_runtime_admit(operation)
+            return action()
+        return checked
+
+    g.native_runtime_admit = native_runtime_admit
+    for name in ('stop', 'finish_stop', 'start', 'finish_start', 'restore_check', 'restore_original'):
+        setattr(g, name, guarded(name.replace('_', '-'), getattr(g, name)))
+    return g, guarded('capture', capture)
 
 
 def clean_env():
@@ -640,6 +665,7 @@ def main():
     assert evidence.is_dir()
     assert operation in ('capture', 'stop', 'finish-stop', 'start', 'finish-start', 'restore-check', 'restore-original')
     g, capture = bind(evidence)
+    g.native_runtime_admit(operation)
     {'capture': capture, 'stop': g.stop, 'finish-stop': g.finish_stop, 'start': g.start,
      'finish-start': g.finish_start, 'restore-check': g.restore_check, 'restore-original': g.restore_original}[operation]()
 

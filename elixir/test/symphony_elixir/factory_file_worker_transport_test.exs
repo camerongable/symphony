@@ -5,6 +5,54 @@ defmodule SymphonyElixir.FactoryFileWorkerTransportTest do
   setup :setup_fixture
 
   for entry <- ~w(start resume) do
+    @tag :native_worker_origin
+    test "explicit FILE_SOURCE native #{entry} retains its seven tools and exact routed storage", ctx do
+      files = starting_files(ctx)
+      descriptor = %{"version" => 1, "codex_home" => Path.join(ctx.root, "codex-B"), "sqlite_home" => Path.join(ctx.root, "sqlite-B")}
+      default = Path.join(ctx.root, "sqlite-A")
+
+      for path <- [default, descriptor["codex_home"], descriptor["sqlite_home"]] do
+        File.mkdir!(path)
+        File.chmod!(path, 0o700)
+      end
+
+      File.write!(Path.join(default, "marker"), "A")
+      File.write!(Path.join(descriptor["sqlite_home"], "marker"), "B")
+      script = Path.expand("test/support/native_origin_worker_server.py")
+      trace = Path.join(ctx.root, "origin.trace")
+      control = Path.join(ctx.root, "origin-control.json")
+      File.write!(control, "{}")
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: Path.join(ctx.root, "workspaces"),
+        codex_command: "/usr/bin/python3 -I -S -B #{script} #{trace} #{default} #{control} app-server"
+      )
+
+      assert {:ok, route} = SymphonyElixir.Factory.NativeRuntimeRoute.validate(descriptor)
+      bind = fn thread -> WorkerEvidence.bind_thread(ctx.store, files.key, thread, TicketWorkerRunner.policy("SOURCE", ctx.path)) end
+      resume = if unquote(entry) == "resume", do: "worker-B"
+      options = [worker_access: "FILE_SOURCE", worker_files: files, native_runtime: route, model: "gpt-6-luna", reasoning_effort: "medium", resume_thread_id: resume, on_thread_created: bind]
+      assert {:ok, session} = AppServer.start_session(ctx.path, options)
+
+      try do
+        assert session.native_runtime === route
+        requests = trace |> File.read!() |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!/1)
+        request = Enum.find(requests, &(&1["method"] == "thread/" <> unquote(entry)))
+        assert request["params"]["permissions"] == "symphony_ticket_file_source_v1"
+        if unquote(entry) == "start", do: assert(request["params"]["dynamicTools"] == WorkerFileTools.tool_specs()), else: refute(Map.has_key?(request["params"], "dynamicTools"))
+        assert session.dynamic_tool_binding.tool_specs == WorkerFileTools.tool_specs()
+
+        for actor <- Enum.filter(requests, &(&1["method"] == "actor")) do
+          assert actor["codex_home"] == descriptor["codex_home"]
+          assert actor["sqlite_home"] == descriptor["sqlite_home"]
+        end
+      after
+        assert {:ok, _stop} = AppServer.stop_session(session)
+      end
+    end
+  end
+
+  for entry <- ~w(start resume) do
     @tag :file_revision
     @revision_entry entry
     test "restricted native #{@revision_entry} keeps seven tools and restores exact base bytes using current-file CAS", ctx do

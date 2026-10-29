@@ -6,7 +6,7 @@ defmodule SymphonyElixir.FactoryWorkerEvidenceTest do
   alias SymphonyElixir.Tracker.Issue
   setup :setup_fixture
 
-  defp reserve(ctx, mode \\ "SOURCE") do
+  defp reserve(ctx, mode \\ "SOURCE", extra \\ %{}) do
     if mode == "REVIEW", do: TaskLedger.update(ctx.store, "writer", %{role: "change-verifier"})
     {:ok, _} = WorkspaceAccess.acquire(ctx.store, attrs(ctx, mode), opts(ctx))
 
@@ -20,8 +20,113 @@ defmodule SymphonyElixir.FactoryWorkerEvidenceTest do
       "policy" => TicketWorkerRunner.policy(mode, ctx.path)
     }
 
+    attrs = Map.merge(attrs, extra)
     {:ok, evidence} = WorkerEvidence.reserve(ctx.store, attrs)
     {attrs, evidence}
+  end
+
+  @tag :native_worker_binding
+  test "routed reservation persists its origin once and an existing destination replays exact bytes", ctx do
+    route = private_origin_route(ctx, "first")
+    {:ok, origin} = SymphonyElixir.Factory.NativeRuntimeRoute.origin(route)
+    {attrs, evidence} = reserve(ctx, "SOURCE", %{"native_runtime" => route})
+    binding = Jason.decode!(evidence["binding_json"])
+    assert binding["binding_version"] === 2
+    assert binding["native_runtime"] === origin
+    assert {:ok, ^evidence} = WorkerEvidence.reserve(ctx.store, attrs)
+    assert {:ok, ^evidence} = WorkerEvidence.reserve(ctx.store, Map.delete(attrs, "native_runtime"))
+    conflict = private_origin_route(ctx, "other")
+    assert {:error, :worker_native_runtime_conflict} = WorkerEvidence.reserve(ctx.store, Map.put(attrs, "native_runtime", conflict))
+    assert {:ok, ^evidence} = WorkerEvidence.get(ctx.store, evidence["request_key"])
+    File.rename!(route.sqlite_home.path, route.sqlite_home.path <> "-original")
+    File.mkdir!(route.sqlite_home.path)
+    File.chmod!(route.sqlite_home.path, 0o700)
+    assert {:error, :native_runtime_storage_changed} = WorkerEvidence.mark_start_sent(ctx.store, evidence["request_key"])
+    assert {:ok, ^evidence} = WorkerEvidence.get(ctx.store, evidence["request_key"])
+  end
+
+  @tag :native_worker_binding
+  test "ordinary successful V2 work records its result without a native recovery receipt or event", ctx do
+    route = private_origin_route(ctx, "ordinary")
+    {attrs, evidence} = reserve(ctx, "SOURCE", %{"native_runtime" => route})
+    key = evidence["request_key"]
+    assert {:ok, _} = WorkerEvidence.mark_start_sent(ctx.store, key)
+    assert {:ok, _} = WorkerEvidence.bind_thread(ctx.store, key, "worker", attrs["policy"])
+    assert {:ok, _} = WorkerEvidence.bind_owner_process(ctx.store, key, process_receipt())
+    assert {:ok, _} = WorkerEvidence.bind_turn(ctx.store, key, "worker", "turn")
+    assert {:ok, recorded} = WorkerEvidence.record_result(ctx.store, key, %{thread_id: "worker", turn_id: "turn", item_id: "final", output: %{"status" => "PASS"}})
+    assert recorded["status"] == "RESULT_RECORDED"
+    assert Store.one!(ctx.store, "SELECT COUNT(*) AS n FROM events WHERE event_type='TICKET_WORKER_NATIVE_COMPLETION_RECOVERED'")["n"] == 0
+  end
+
+  @tag :native_worker_binding
+  test "one binding resolver owns history queue locks and workspace without accepting independent overrides", ctx do
+    route = private_origin_route(ctx, "namespace")
+    {_attrs, evidence} = reserve(ctx, "SOURCE", %{"native_runtime" => route})
+    binding = Jason.decode!(evidence["binding_json"])
+    assert {:ok, options} = WorkerEvidence.runtime_options(binding)
+    assert options[:native_runtime] === route
+    assert options[:native_home] == route.codex_home.path
+    assert options[:native_queue_database] == Path.join(route.sqlite_home.path, "queue_1.sqlite")
+    assert options[:native_history] == Path.join(route.sqlite_home.path, "thread_history_1.sqlite")
+    assert options[:workspace] == ctx.path
+
+    for key <- [:native_home, :native_queue_database, :native_history, :workspace] do
+      assert {:error, :worker_native_runtime_conflict} = WorkerEvidence.runtime_options(binding, [{key, ctx.repo}])
+    end
+
+    assert {:ok, %{}} = WorkerEvidence.inherit_runtime(%{}, %{})
+    assert {:error, :worker_native_runtime_conflict} = WorkerEvidence.inherit_runtime(%{"native_runtime" => route}, %{})
+    assert {:ok, %{"native_runtime" => ^route}} = WorkerEvidence.inherit_runtime(%{}, binding)
+
+    for malformed <- [
+          %{"binding_version" => 2},
+          %{"native_runtime" => binding["native_runtime"]},
+          %{binding | "binding_version" => 1},
+          %{binding | "binding_version" => 3},
+          %{binding | "binding_version" => true},
+          %{binding | "binding_version" => "2"},
+          %{binding | "binding_version" => 2.0},
+          %{binding | "native_runtime" => nil}
+        ] do
+      assert {:error, :worker_native_runtime_unproven} = WorkerEvidence.runtime_options(malformed)
+    end
+  end
+
+  @tag :native_worker_binding
+  test "legacy absence remains byte-stable and caller versions null or serialized routes cannot create authority", ctx do
+    {attrs, original} = reserve(ctx)
+    original_rows = Store.query!(ctx.store, "SELECT * FROM worker_evidence ORDER BY request_key").rows
+    binding = Jason.decode!(original["binding_json"])
+    refute Map.has_key?(binding, "binding_version")
+    refute Map.has_key?(binding, "native_runtime")
+    assert {:ok, ^original} = WorkerEvidence.reserve(ctx.store, attrs)
+    assert {:ok, ^attrs} = WorkerEvidence.inherit_runtime(attrs, binding)
+    assert WorkerEvidence.runtime_matches?(binding, %{})
+
+    for extra <- [%{"binding_version" => 2}, %{"unknown" => true}] do
+      assert {:error, :invalid_worker_attempt} = WorkerEvidence.reserve(ctx.store, Map.merge(attrs, extra))
+    end
+
+    for value <- [nil, false, %{"version" => 1, "codex_home" => ctx.root, "sqlite_home" => ctx.root}] do
+      assert {:error, :worker_native_runtime_conflict} = WorkerEvidence.reserve(ctx.store, Map.put(attrs, "native_runtime", value))
+      fresh = attrs |> Map.put("request_key", "fresh:request") |> Map.put("native_runtime", value)
+      assert {:error, :native_runtime_route_invalid} = WorkerEvidence.reserve(ctx.store, fresh)
+    end
+
+    assert Store.query!(ctx.store, "SELECT * FROM worker_evidence ORDER BY request_key").rows == original_rows
+  end
+
+  defp private_origin_route(ctx, name) do
+    descriptor = %{"version" => 1, "codex_home" => Path.join(ctx.root, name <> "-codex"), "sqlite_home" => Path.join(ctx.root, name <> "-sqlite")}
+
+    for path <- [descriptor["codex_home"], descriptor["sqlite_home"]] do
+      File.mkdir!(path)
+      File.chmod!(path, 0o700)
+    end
+
+    {:ok, route} = SymphonyElixir.Factory.NativeRuntimeRoute.validate(descriptor)
+    route
   end
 
   defp result(ctx, mode \\ "SOURCE") do

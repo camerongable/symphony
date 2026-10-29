@@ -13,20 +13,152 @@ defmodule SymphonyElixir.Factory.CompletedTurnRecovery do
 
   defp reconcile_pending(store, key, opts) do
     with {:ok, before} <- snapshot(store, key),
-         reader = Keyword.get(opts, :native_reader, AppServer),
-         workspace = before.binding["policy"]["cwd"],
-         read_options = [workspace: workspace, include_turns: false, include_latest_turn: true, include_queue: true],
-         {:ok, native} <- reader.read_native_thread(before.evidence["thread_id"], read_options),
-         {:ok, result} <- native_result(before, native) do
-      recovered = result |> Map.put(:reconciliation_preimage, before) |> Map.put(:native_recovery, provenance(before, native, result))
+         {:ok, native, result, origin} <- read_observation(before, opts) do
+      proof = provenance(before, native, result)
+      proof = if is_nil(origin), do: proof, else: Map.merge(proof, %{"kind" => "NATIVE_COMPLETION_RECEIPT_V2", "version" => 2, "native_runtime" => origin, "native_runtime_sha256" => digest(origin)})
+      recovered = result |> Map.put(:reconciliation_preimage, before) |> Map.put(:native_recovery, proof)
 
-      with {:ok, _evidence} <- WorkerEvidence.reconcile_completed(store, key, before.evidence["owner_id"], recovered, before.stop) do
-        {:ok, result |> Map.put(:policy, before.binding["policy"]) |> Map.put(:owner_stop, before.stop) |> Map.put(:worker_request_key, key)}
+      recover_observation(store, key, before, recovered, origin, fn recovered ->
+        with {:ok, _evidence} <- WorkerEvidence.reconcile_completed(store, key, before.evidence["owner_id"], recovered, before.stop) do
+          {:ok, result |> Map.put(:policy, before.binding["policy"]) |> Map.put(:owner_stop, before.stop) |> Map.put(:worker_request_key, key)}
+        end
+      end)
+    end
+  end
+
+  defp read_observation(before, opts) do
+    with {:ok, options} <- WorkerEvidence.runtime_options(before.binding, opts) do
+      read_options = Keyword.merge(Keyword.take(options, [:native_runtime]), workspace: before.binding["policy"]["cwd"], include_turns: false, include_latest_turn: true, include_queue: true)
+
+      if Keyword.has_key?(options, :native_runtime) do
+        with {:ok, reader} <- AppServer.open_native_reader(before.binding["policy"]["cwd"], native_runtime: options[:native_runtime]) do
+          try do
+            with {:ok, native} <- AppServer.read_native_thread(reader, before.evidence["thread_id"], read_options),
+                 {:ok, origin} <- AppServer.native_reader_origin(reader),
+                 true <- origin === before.binding["native_runtime"] or {:error, :completed_turn_origin_unproven},
+                 {:ok, result} <- native_result(before, native),
+                 do: {:ok, native, result, origin}
+          after
+            AppServer.close_native_reader(reader)
+          end
+        end
+      else
+        reader = Keyword.get(opts, :native_reader, AppServer)
+        with {:ok, native} <- reader.read_native_thread(before.evidence["thread_id"], read_options), {:ok, result} <- native_result(before, native), do: {:ok, native, result, nil}
       end
     end
   end
 
+  defp recover_observation(_store, _key, _before, recovered, nil, callback), do: callback.(recovered)
+
+  defp recover_observation(store, key, before, recovered, _origin, callback) do
+    token = make_ref()
+
+    Process.put({__MODULE__, :observation, token}, %{
+      store: store,
+      key: key,
+      owner: before.evidence["owner_id"],
+      result: recovered,
+      stop: before.stop,
+      expires: System.monotonic_time(:millisecond) + 10_000
+    })
+
+    try do
+      callback.(Map.put(recovered, :native_observation_authority, token))
+    after
+      Process.delete({__MODULE__, :observation, token})
+    end
+  end
+
+  @doc false
+  @spec validate_observation_authority(Store.connection(), String.t(), String.t(), map(), map()) :: :ok | {:error, atom()}
+  def validate_observation_authority(store, key, owner, result, stop) do
+    with token when is_reference(token) <- result[:native_observation_authority],
+         %{store: ^store, key: ^key, owner: ^owner, stop: ^stop, result: expected, expires: expires} <- Process.get({__MODULE__, :observation, token}),
+         true <- expected === Map.delete(result, :native_observation_authority) and expires >= System.monotonic_time(:millisecond) do
+      :ok
+    else
+      _ -> {:error, :completed_turn_receipt_unproven}
+    end
+  end
+
   defp committed(store, key) do
+    case WorkerEvidence.get(store, key) do
+      {:ok, %{"status" => "RESULT_RECORDED"} = evidence} ->
+        case Jason.decode(evidence["binding_json"]) do
+          {:ok, binding} when is_map(binding) ->
+            if Map.has_key?(binding, "binding_version") or Map.has_key?(binding, "native_runtime"), do: committed_routed(store, key, evidence, binding), else: committed_legacy(store, key)
+
+          _ ->
+            committed_legacy(store, key)
+        end
+
+      _ ->
+        :none
+    end
+  end
+
+  defp committed_routed(store, key, evidence, binding) do
+    with true <- digest_raw(evidence["binding_json"]) == evidence["binding_sha256"],
+         {:ok, proof, occurred_at} <- committed_event(store, evidence),
+         {:ok, completed} <- WorkerEvidence.completed_result(store, key),
+         {:ok, stop} <- Jason.decode(evidence["owner_stop_json"]),
+         result = %{thread_id: evidence["thread_id"], turn_id: evidence["turn_id"], item_id: evidence["item_id"], output: completed.output},
+         original = %{evidence | "status" => "RECONCILE_REQUIRED", "failure_code" => proof["failure_code"]},
+         before = %{evidence: original, binding: binding, access: completed.access},
+         :ok <- validate_receipt(proof, before, result, occurred_at),
+         true <- original_failure_recorded?(store, original, binding, occurred_at) do
+      {:ok, result |> Map.put(:policy, binding["policy"]) |> Map.put(:owner_stop, stop) |> Map.put(:worker_request_key, key)}
+    else
+      _ -> {:error, :completed_turn_receipt_unproven}
+    end
+  end
+
+  defp committed_event(store, evidence) do
+    Store.query!(store, "SELECT payload_json,occurred_at FROM events WHERE event_type='TICKET_WORKER_NATIVE_COMPLETION_RECOVERED' AND run_id=?", [evidence["run_id"]]).rows
+    |> Enum.reduce_while({:ok, []}, fn [raw, at], {:ok, found} ->
+      case Jason.decode(raw) do
+        {:ok, %{"request_key" => request} = proof} when is_binary(request) -> {:cont, {:ok, if(request == evidence["request_key"], do: [{proof, at} | found], else: found)}}
+        _ -> {:halt, {:error, :completed_turn_receipt_unproven}}
+      end
+    end)
+    |> case do
+      {:ok, [{proof, at}]} -> {:ok, proof, at}
+      _ -> {:error, :completed_turn_receipt_unproven}
+    end
+  end
+
+  defp original_failure_recorded?(store, evidence, binding, occurred_at) do
+    with {:ok, reason} <- transport_reason(evidence["failure_code"]), {:ok, at} <- utc(occurred_at) do
+      identity =
+        Map.take(evidence, ~w(run_id request_key task_key thread_id turn_id binding_sha256))
+        |> Map.merge(Map.take(binding, ~w(role stage)))
+        |> Map.put("error_sha256", digest_raw(:erlang.term_to_binary(reason, [:deterministic])))
+
+      Store.query!(store, "SELECT payload_json,occurred_at FROM events WHERE event_type='SPECIALIST_ERROR_RECORDED' AND run_id=?", [evidence["run_id"]]).rows
+      |> Enum.any?(fn [raw, recorded] ->
+        with {:ok, notice} when is_map(notice) <- Jason.decode(raw),
+             {:ok, recorded} <- utc(recorded),
+             do: Map.take(notice, Map.keys(identity)) === identity and DateTime.compare(recorded, at) != :gt,
+             else: (_ -> false)
+      end)
+    else
+      _ -> false
+    end
+  end
+
+  defp transport_reason(":turn_timeout"), do: {:ok, :turn_timeout}
+
+  defp transport_reason(reason) when is_binary(reason) do
+    case Regex.run(~r/\A\{:port_exit, (-?\d+)\}\z/, reason) do
+      [_, status] -> {:ok, {:port_exit, String.to_integer(status)}}
+      _ -> {:error, :completed_turn_transport_unproven}
+    end
+  end
+
+  defp transport_reason(_), do: {:error, :completed_turn_transport_unproven}
+
+  defp committed_legacy(store, key) do
     with {:ok, evidence} <- WorkerEvidence.get(store, key),
          true <- evidence["status"] == "RESULT_RECORDED",
          %{"payload_json" => raw} <-
@@ -34,7 +166,8 @@ defmodule SymphonyElixir.Factory.CompletedTurnRecovery do
          {:ok, provenance} <- Jason.decode(raw),
          true <-
            provenance["output_sha256"] == evidence["output_sha256"] and provenance["binding_sha256"] == evidence["binding_sha256"] and provenance["owner_stop_json"] == evidence["owner_stop_json"],
-         {:ok, completed} <- WorkerEvidence.completed_result(store, key) do
+         {:ok, completed} <- WorkerEvidence.completed_result(store, key),
+         true <- receipt_format?(provenance, completed.binding) or {:error, :completed_turn_receipt_unproven} do
       {:ok,
        %{
          thread_id: evidence["thread_id"],
@@ -46,6 +179,7 @@ defmodule SymphonyElixir.Factory.CompletedTurnRecovery do
          worker_request_key: key
        }}
     else
+      {:error, :completed_turn_receipt_unproven} = error -> error
       _ -> :none
     end
   end
@@ -173,8 +307,10 @@ defmodule SymphonyElixir.Factory.CompletedTurnRecovery do
 
     identity = ~w(request_key task_key run_id reservation_key owner_id owner_stopped_at binding_sha256 failure_code owner_stop_json thread_id turn_id)
 
+    keys = if Map.has_key?(binding, "binding_version"), do: keys ++ ~w(native_runtime native_runtime_sha256), else: keys
+
     with true <- exact_keys?(proof, keys),
-         true <- proof["kind"] == "NATIVE_COMPLETION_RECEIPT_V1" and proof["version"] === 1,
+         true <- receipt_format?(proof, binding),
          true <- Map.take(proof, identity) == Map.take(evidence, identity),
          true <- Map.take(evidence, ~w(run_id task_key request_key reservation_key)) == Map.take(access, ~w(run_id task_key request_key reservation_key)),
          true <- Map.take(evidence, ~w(run_id task_key reservation_key)) == Map.take(binding, ~w(run_id task_key reservation_key)),
@@ -199,6 +335,16 @@ defmodule SymphonyElixir.Factory.CompletedTurnRecovery do
   end
 
   def validate_receipt(_proof, _before, _result, _occurred_at), do: {:error, :completed_turn_receipt_unproven}
+
+  defp receipt_format?(proof, binding) do
+    if Map.has_key?(binding, "binding_version") or Map.has_key?(binding, "native_runtime") do
+      binding["binding_version"] === 2 and SymphonyElixir.Factory.NativeRuntimeRoute.validate_origin_format(binding["native_runtime"]) == :ok and
+        proof["kind"] == "NATIVE_COMPLETION_RECEIPT_V2" and proof["version"] === 2 and proof["native_runtime"] === binding["native_runtime"] and
+        proof["native_runtime_sha256"] == digest(binding["native_runtime"])
+    else
+      proof["kind"] == "NATIVE_COMPLETION_RECEIPT_V1" and proof["version"] === 1
+    end
+  end
 
   defp valid_receipt_identity?(proof) do
     limits = [{~w(request_key task_key reservation_key), 4096}, {~w(run_id owner_id), 256}, {~w(thread_id turn_id item_id), 1024}, {~w(failure_code), 128}]

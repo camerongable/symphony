@@ -15,11 +15,19 @@ defmodule SymphonyElixir.Factory.WorkerEvidence do
 
   alias SymphonyElixir.Factory.SpecialistErrorNotice
   alias SymphonyElixir.Factory.TicketCapabilityRecovery
+  alias SymphonyElixir.Factory.NativeRuntimeRoute
 
-  @fields ~w(request_key task_key reservation_key input_sha256 owner_id schema policy)
+  @fields ~w(request_key task_key reservation_key input_sha256 owner_id schema policy native_runtime)
 
   @spec reserve(Store.connection(), map()) :: {:ok, map()} | {:error, term()}
   def reserve(store, attrs) do
+    with :ok <- valid_attrs(attrs),
+         {:ok, runtime} <- reservation_runtime(store, attrs) do
+      reserve_with_runtime(store, attrs, runtime)
+    end
+  end
+
+  defp reserve_with_runtime(store, attrs, runtime) do
     transaction(store, fn tx ->
       with :ok <- valid_attrs(attrs),
            {:ok, task} <- TaskLedger.get(tx, attrs["task_key"]),
@@ -40,11 +48,126 @@ defmodule SymphonyElixir.Factory.WorkerEvidence do
           })
 
         pin = Store.one!(tx, "SELECT base_sha FROM ticket_review_bases WHERE run_id = ?", [run["run_id"]])
-        binding = Map.put(binding, "base_sha", (pin || %{})["base_sha"])
+        binding = binding |> Map.put("base_sha", (pin || %{})["base_sha"]) |> Map.merge(runtime)
 
         reserve_binding(tx, attrs, binding)
       end
     end)
+  end
+
+  @doc "Restores a recorded origin without overriding it with caller defaults or options."
+  def runtime_options(binding, opts \\ [])
+
+  @spec runtime_options(map() | nil, keyword()) :: {:ok, keyword()} | {:error, term()}
+  def runtime_options(nil, opts) do
+    if Keyword.has_key?(opts, :native_runtime) do
+      with true <- match?(%NativeRuntimeRoute{}, opts[:native_runtime]) or {:error, :native_runtime_route_invalid},
+           {:ok, route} <- NativeRuntimeRoute.validate(opts[:native_runtime]) do
+        runtime_paths(Keyword.put(opts, :native_runtime, route), route, nil)
+      end
+    else
+      {:ok, opts}
+    end
+  end
+
+  def runtime_options(binding, opts) when is_map(binding) do
+    with {:ok, origin} <- binding_runtime_origin(binding) do
+      case origin do
+        nil ->
+          if Keyword.has_key?(opts, :native_runtime), do: {:error, :worker_native_runtime_conflict}, else: {:ok, opts}
+
+        origin ->
+          with {:ok, route} <- NativeRuntimeRoute.restore_origin(origin),
+               :ok <- matching_runtime_option(origin, opts) do
+            runtime_paths(Keyword.put(opts, :native_runtime, route), route, get_in(binding, ["policy", "cwd"]))
+          end
+      end
+    end
+  end
+
+  def runtime_options(_binding, _opts), do: {:error, :worker_native_runtime_unproven}
+
+  @doc "Carries validated predecessor storage into a successor reservation, including legacy absence."
+  @spec inherit_runtime(map(), map()) :: {:ok, map()} | {:error, term()}
+  def inherit_runtime(attrs, binding) do
+    with {:ok, options} <- runtime_options(binding, runtime_attribute_options(attrs)) do
+      if Keyword.has_key?(options, :native_runtime),
+        do: {:ok, Map.put(attrs, "native_runtime", options[:native_runtime])},
+        else: {:ok, Map.delete(attrs, "native_runtime")}
+    end
+  end
+
+  @doc "Compares recorded storage lineage without consulting present-day filesystem state."
+  @spec runtime_matches?(map(), map()) :: boolean()
+  def runtime_matches?(left, right) when is_map(left) and is_map(right) do
+    with {:ok, origin} <- binding_runtime_origin(left), {:ok, ^origin} <- binding_runtime_origin(right), do: true, else: (_ -> false)
+  end
+
+  def runtime_matches?(_left, _right), do: false
+
+  defp matching_runtime_option(origin, opts) do
+    if Keyword.has_key?(opts, :native_runtime) do
+      with {:ok, options} <- runtime_options(nil, opts),
+           {:ok, requested} <- NativeRuntimeRoute.origin(options[:native_runtime]),
+           true <- requested === origin or {:error, :worker_native_runtime_conflict},
+           do: :ok
+    else
+      :ok
+    end
+  end
+
+  defp runtime_attribute_options(attrs), do: if(Map.has_key?(attrs, "native_runtime"), do: [native_runtime: attrs["native_runtime"]], else: [])
+
+  defp runtime_paths(options, route, workspace) do
+    paths = [
+      native_home: route.codex_home.path,
+      native_queue_database: Path.join(route.sqlite_home.path, "queue_1.sqlite"),
+      native_history: Path.join(route.sqlite_home.path, "thread_history_1.sqlite")
+    ]
+
+    paths = if is_binary(workspace), do: [{:workspace, workspace} | paths], else: paths
+
+    Enum.reduce_while(paths, {:ok, options}, fn {key, expected}, {:ok, current} ->
+      if not is_nil(current[key]) and current[key] != expected,
+        do: {:halt, {:error, :worker_native_runtime_conflict}},
+        else: {:cont, {:ok, Keyword.put(current, key, expected)}}
+    end)
+  end
+
+  defp reservation_runtime(store, attrs) do
+    with {:ok, binding} <- reserved_runtime_binding(row(store, attrs["request_key"])),
+         {:ok, options} <- runtime_options(binding, runtime_attribute_options(attrs)) do
+      captured_runtime_fields(options)
+    end
+  end
+
+  defp reserved_runtime_binding(nil), do: {:ok, nil}
+
+  defp reserved_runtime_binding(evidence) do
+    with :ok <- intact(evidence), do: decode_binding(evidence["binding_json"])
+  end
+
+  defp captured_runtime_fields(options) do
+    if Keyword.has_key?(options, :native_runtime) do
+      with {:ok, origin} <- NativeRuntimeRoute.origin(options[:native_runtime]), do: {:ok, %{"binding_version" => 2, "native_runtime" => origin}}
+    else
+      {:ok, %{}}
+    end
+  end
+
+  defp binding_runtime_origin(binding) do
+    case {Map.has_key?(binding, "binding_version"), Map.has_key?(binding, "native_runtime")} do
+      {false, false} ->
+        {:ok, nil}
+
+      {true, true} ->
+        if binding["binding_version"] === 2 and NativeRuntimeRoute.validate_origin_format(binding["native_runtime"]) == :ok,
+          do: {:ok, binding["native_runtime"]},
+          else: {:error, :worker_native_runtime_unproven}
+
+      _ ->
+        {:error, :worker_native_runtime_unproven}
+    end
   end
 
   @doc "Reserves only a dedicated CI successor whose physical SOURCE was observed before its current transaction."
@@ -68,7 +191,9 @@ defmodule SymphonyElixir.Factory.WorkerEvidence do
              transfer["new_reservation_key"] == access["reservation_key"] and transfer["new_generation"] == access["generation"],
          true <- Map.take(access, ~w(run_id task_key canonical_path git_dir common_dir)) == Map.take(entry.proof["prior_access"], ~w(run_id task_key canonical_path git_dir common_dir)),
          {:ok, original} <- decode_binding(entry.proof["prior_evidence"]["binding_json"]),
-         true <- attrs["policy"] == original["policy"] and attrs["schema"] == original["schema"] do
+         true <- attrs["policy"] == original["policy"] and attrs["schema"] == original["schema"],
+         {:ok, attrs} <- inherit_runtime(attrs, original),
+         {:ok, runtime} <- captured_runtime_fields(runtime_attribute_options(attrs)) do
       binding =
         Map.take(task, ~w(task_key run_id role stage model reasoning_effort prompt_sha256))
         |> Map.merge(Map.take(run, ~w(spec_revision contract_sha256)))
@@ -80,6 +205,7 @@ defmodule SymphonyElixir.Factory.WorkerEvidence do
           "mode" => "SOURCE",
           "base_sha" => original["base_sha"]
         })
+        |> Map.merge(runtime)
 
       reserve_binding(tx, attrs, binding)
     else
@@ -99,7 +225,9 @@ defmodule SymphonyElixir.Factory.WorkerEvidence do
          true <-
            {attrs["request_key"], attrs["reservation_key"], attrs["task_key"], attrs["input_sha256"]} ==
              {target["request_key"], target["reservation_key"], verified.task["task_key"], target["prompt_sha256"]},
-         true <- attrs["schema"] == verified.binding["schema"] and attrs["policy"] == verified.binding["policy"] do
+         true <- attrs["schema"] == verified.binding["schema"] and attrs["policy"] == verified.binding["policy"],
+         {:ok, attrs} <- inherit_runtime(attrs, verified.binding),
+         {:ok, runtime} <- captured_runtime_fields(runtime_attribute_options(attrs)) do
       binding =
         Map.take(verified.task, ~w(task_key run_id role stage model reasoning_effort prompt_sha256))
         |> Map.merge(Map.take(verified.run, ~w(spec_revision contract_sha256)))
@@ -111,6 +239,7 @@ defmodule SymphonyElixir.Factory.WorkerEvidence do
           "base_sha" => verified.binding["base_sha"],
           "mode" => "SOURCE"
         })
+        |> Map.merge(runtime)
 
       reserve_binding(tx, attrs, binding)
     else
@@ -160,10 +289,20 @@ defmodule SymphonyElixir.Factory.WorkerEvidence do
   @spec superseded_blocked_attempt?(Store.connection(), map()) :: boolean()
   def superseded_blocked_attempt?(store, evidence) do
     SymphonyElixir.Factory.FailedTurnRecovery.superseded?(store, evidence) or
-      SymphonyElixir.Factory.TicketInfrastructureRecovery.superseded?(store, evidence) or
+      superseded_infrastructure?(store, evidence) or
       TicketCapabilityRecovery.superseded?(store, evidence) or
       superseded_human_rework?(store, evidence) or
       SymphonyElixir.Factory.TicketCiRepairSuccessor.superseded?(store, evidence)
+  end
+
+  defp superseded_infrastructure?(store, evidence) do
+    with true <- SymphonyElixir.Factory.TicketInfrastructureRecovery.superseded?(store, evidence),
+         {:ok, access} <- WorkspaceAccess.get(store, evidence["reservation_key"]),
+         {:ok, %{"new_request_key" => request}} <- Jason.decode(access["release_receipt_json"] || "null"),
+         {:ok, destination} <- get(store, request),
+         true <- matching_evidence_runtime?(evidence, destination),
+         do: true,
+         else: (_ -> false)
   end
 
   defp superseded_human_rework?(store, evidence) do
@@ -196,7 +335,17 @@ defmodule SymphonyElixir.Factory.WorkerEvidence do
   defp resumed_evidence_matches?(new_evidence, evidence, application) do
     application["request_key"] == new_evidence["request_key"] and
       application["reservation_key"] == new_evidence["reservation_key"] and
-      new_evidence["task_key"] == evidence["task_key"] and new_evidence["run_id"] == evidence["run_id"]
+      new_evidence["task_key"] == evidence["task_key"] and new_evidence["run_id"] == evidence["run_id"] and
+      matching_evidence_runtime?(new_evidence, evidence)
+  end
+
+  defp matching_evidence_runtime?(left, right) do
+    with :ok <- intact(left),
+         :ok <- intact(right),
+         {:ok, left_binding} <- decode_binding(left["binding_json"]),
+         {:ok, right_binding} <- decode_binding(right["binding_json"]),
+         do: runtime_matches?(left_binding, right_binding),
+         else: (_ -> false)
   end
 
   @spec pending(Store.connection(), String.t()) :: [map()]
@@ -372,8 +521,10 @@ defmodule SymphonyElixir.Factory.WorkerEvidence do
 
   @spec mark_start_sent(Store.connection(), String.t()) :: {:ok, map()} | {:error, term()}
   def mark_start_sent(store, key) do
-    transition(store, key, fn tx, evidence, _binding ->
-      if evidence["status"] == "RESERVED", do: update(tx, key, "status = 'START_SENT'", []), else: {:error, :worker_start_already_sent}
+    transition(store, key, fn tx, evidence, binding ->
+      with {:ok, _options} <- runtime_options(binding) do
+        if evidence["status"] == "RESERVED", do: update(tx, key, "status = 'START_SENT'", []), else: {:error, :worker_start_already_sent}
+      end
     end)
   end
 
@@ -657,6 +808,22 @@ defmodule SymphonyElixir.Factory.WorkerEvidence do
   @doc "Recover the same known turn and owned process; never restart creation to repair an uncertain result."
   @spec reconcile_completed(Store.connection(), String.t(), String.t(), map(), map()) :: {:ok, map()} | {:error, term()}
   def reconcile_completed(store, key, owner, result, stop) do
+    try do
+      with {:ok, evidence} <- get(store, key),
+           :ok <- intact(evidence),
+           {:ok, binding} <- decode_binding(evidence["binding_json"]),
+           :ok <- recovery_authority(store, key, owner, binding, result, stop) do
+        reconcile_completed_owned(store, key, owner, result, stop)
+      end
+    after
+      if is_reference(result[:native_observation_authority]), do: Process.delete({CompletedTurnRecovery, :observation, result[:native_observation_authority]})
+    end
+  end
+
+  defp recovery_authority(store, key, owner, %{"binding_version" => 2}, result, stop), do: CompletedTurnRecovery.validate_observation_authority(store, key, owner, result, stop)
+  defp recovery_authority(_store, _key, _owner, _binding, _result, _stop), do: :ok
+
+  defp reconcile_completed_owned(store, key, owner, result, stop) do
     transition(store, key, fn tx, evidence, binding ->
       with true <- evidence["status"] == "RECONCILE_REQUIRED" or {:error, :worker_reconciliation_not_pending},
            true <- evidence["owner_id"] == owner or {:error, :worker_owner_mismatch},
@@ -670,6 +837,7 @@ defmodule SymphonyElixir.Factory.WorkerEvidence do
            :ok <- recovered_output(evidence, raw, result[:item_id]),
            true <- valid_stop(tx, evidence, stop) or {:error, :worker_stop_receipt_invalid},
            true <- is_nil(evidence["owner_stop_json"]) or evidence["owner_stop_json"] == Jason.encode!(stop) or {:error, :worker_stop_receipt_conflict},
+           :ok <- recovery_authority(store, key, owner, binding, result, stop),
            :ok <- record_native_completion(tx, evidence, binding, result, occurred_at) do
         update(
           tx,
@@ -703,6 +871,7 @@ defmodule SymphonyElixir.Factory.WorkerEvidence do
     end
   end
 
+  defp record_native_completion(_store, _evidence, %{"binding_version" => 2}, _result, _occurred_at), do: {:error, :completed_turn_receipt_unproven}
   defp record_native_completion(_store, _evidence, _binding, _result, _occurred_at), do: :ok
 
   defp native_completion_unrecorded?(store, evidence) do
@@ -718,6 +887,7 @@ defmodule SymphonyElixir.Factory.WorkerEvidence do
     end)
   end
 
+  defp recovered_preimage(_store, _evidence, %{"binding_version" => 2}, nil), do: {:error, :completed_turn_receipt_unproven}
   defp recovered_preimage(_store, _evidence, _binding, nil), do: :ok
 
   defp recovered_preimage(store, evidence, binding, before) when is_map(before) do
@@ -980,8 +1150,14 @@ defmodule SymphonyElixir.Factory.WorkerEvidence do
 
   defp decode_binding(raw) do
     case Jason.decode(raw) do
-      {:ok, binding} when is_map(binding) -> {:ok, binding}
-      _ -> {:error, :worker_evidence_corrupt}
+      {:ok, binding} when is_map(binding) ->
+        case binding_runtime_origin(binding) do
+          {:ok, _origin} -> {:ok, binding}
+          _ -> {:error, :worker_evidence_corrupt}
+        end
+
+      _ ->
+        {:error, :worker_evidence_corrupt}
     end
   end
 

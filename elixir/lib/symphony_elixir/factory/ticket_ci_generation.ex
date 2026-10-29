@@ -388,7 +388,8 @@ defmodule SymphonyElixir.Factory.TicketCiGeneration do
     all_paths = context.actions |> Enum.flat_map(&elem(&1, 1)) |> Enum.uniq() |> Enum.sort()
     route = context.policy["route"]
 
-    with {:ok, tree} <- Worktree.generation_inputs(route, run["worktree"], run["branch"], context.binding["expected_sha"], paths),
+    with {:ok, native_options} <- WorkerEvidence.runtime_options(context.binding, workspace: context.binding["policy"]["cwd"]),
+         {:ok, tree} <- Worktree.generation_inputs(route, run["worktree"], run["branch"], context.binding["expected_sha"], paths),
          {:ok, committed} <- Worktree.generation_candidate_paths(route, run["worktree"], run["branch"], context.base["base_sha"], context.binding["expected_sha"], paths),
          true <- Enum.all?(all_paths -- generated_paths(context.scope), &(&1 in (paths ++ committed))) or {:error, :controller_generation_package_unproven},
          packages = Enum.filter(committed, &String.ends_with?(&1, ".go")) |> Enum.map(&Path.dirname/1) |> Enum.uniq(),
@@ -398,8 +399,9 @@ defmodule SymphonyElixir.Factory.TicketCiGeneration do
              {:error, :controller_generation_package_unproven},
          {:ok, spool} <- WorkerFileIO.controller_spool(store, run["worktree"]),
          {:ok, files} <- observe_files(store, run["worktree"], all_paths, generation_version(context)),
-         {:ok, native} <- AppServer.read_native_thread(context.task["thread_id"], workspace: context.binding["policy"]["cwd"], include_turns: false, include_latest_turn: true, include_queue: true),
+         {:ok, native} <- AppServer.read_native_thread(context.task["thread_id"], Keyword.merge(native_options, include_turns: false, include_latest_turn: true, include_queue: true)),
          :ok <- TicketMrGuard.native_receipt(context.native_request, native, DateTime.utc_now()),
+         {:ok, _} <- WorkerEvidence.runtime_options(context.binding, native_options),
          {:ok, ^tree} <- Worktree.generation_inputs(route, run["worktree"], run["branch"], context.binding["expected_sha"], paths),
          {:ok, ^files} <- observe_files(store, run["worktree"], all_paths, generation_version(context)) do
       {:ok, %{tree: tree, files: files, native: native, spool: spool}}

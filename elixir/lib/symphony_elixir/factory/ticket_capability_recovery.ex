@@ -258,6 +258,9 @@ defmodule SymphonyElixir.Factory.TicketCapabilityRecovery do
            },
          true <- digest(next["binding_json"]) == next["binding_sha256"],
          {:ok, next_binding} <- Jason.decode(next["binding_json"]),
+         true <- digest(old["binding_json"]) == old["binding_sha256"],
+         {:ok, old_binding} <- Jason.decode(old["binding_json"]),
+         true <- WorkerEvidence.runtime_matches?(old_binding, next_binding),
          true <-
            next_binding["reservation_generation"] == next_access["generation"] and next_binding["input_sha256"] == initial["destination"]["prompt_sha256"] and
              next_binding["base_sha"] == record.proof["authorization"]["base_sha"] do
@@ -348,6 +351,7 @@ defmodule SymphonyElixir.Factory.TicketCapabilityRecovery do
   def owned_session_preflight(store, resume, session, opts) do
     with {:ok, record} <- authorization_for_request(store, resume["request_key"]),
          {:ok, before} <- Store.transaction!(store, &continuation_facts(&1, record, ~w(THREAD_BOUND)), mode: :deferred),
+         {:ok, opts} <- WorkerEvidence.runtime_options(before.binding, opts),
          true <- before.application["recovery_key"] == resume["operational_recovery_key"],
          true <- before.next["thread_id"] == session.thread_id and session.thread_id == before.evidence["thread_id"],
          {:ok, owner} <- Jason.decode(before.next["owner_process_json"] || "null"),
@@ -358,12 +362,14 @@ defmodule SymphonyElixir.Factory.TicketCapabilityRecovery do
          true <- observed.files == record.proof["files"] and observed.base_blobs == record.proof["base_blobs"],
          {:ok, native} <- owned_reader(opts).read_owned_native_thread(session),
          :ok <- validate_native(before, native),
+         {:ok, _} <- WorkerEvidence.runtime_options(before.binding, opts),
          {:ok, queue} <- NativeQueueReadback.read(queue_database(opts), session.thread_id),
          {:ok, checked} <- checked_record_historical(store, resume),
          true <- queue == checked["native"]["queue"],
          {:ok, ^before} <- Store.transaction!(store, &continuation_facts(&1, record, ~w(THREAD_BOUND)), mode: :deferred),
          true <- TaskLauncher.active_owner(before.next["task_key"]) == self(),
          true <- source_fresh?(observed.source_observed_at),
+         {:ok, _} <- WorkerEvidence.runtime_options(before.binding, opts),
          :ok <- fresh_native_observations(native) do
       :ok
     else
@@ -401,6 +407,7 @@ defmodule SymphonyElixir.Factory.TicketCapabilityRecovery do
          {:ok, task} <- TaskLedger.get(store, old["task_key"]),
          true <- task["status"] in ~w(STARTING RUNNING) and task["prompt_sha256"] == attempt_input(next) and task["thread_id"] == old["thread_id"] and task["turn_id"] == old["turn_id"],
          {:ok, next_binding} <- Jason.decode(next["binding_json"]),
+         true <- digest(old["binding_json"]) == old["binding_sha256"] and digest(next["binding_json"]) == next["binding_sha256"] and WorkerEvidence.runtime_matches?(binding, next_binding),
          true <- Map.take(task, ~w(task_key run_id role stage model reasoning_effort prompt_sha256)) == Map.take(next_binding, ~w(task_key run_id role stage model reasoning_effort prompt_sha256)),
          operations = rows(store, "SELECT rowid AS journal_rowid,* FROM worker_file_operations WHERE request_key=? ORDER BY rowid", [old["request_key"]]),
          true <- json_hash(operations) == record.proof["ledger"]["operations"],
@@ -983,12 +990,16 @@ defmodule SymphonyElixir.Factory.TicketCapabilityRecovery do
 
   defp native_observation(facts, opts) do
     thread = facts.evidence["thread_id"]
-    options = [workspace: opts[:workspace], include_turns: false, include_latest_turn: true, include_queue: true]
 
-    with {:ok, native} <- native_reader(opts).read_native_thread(thread, options),
+    with {:ok, opts} <- WorkerEvidence.runtime_options(facts.binding, opts),
+         options = Keyword.merge(Keyword.take(opts, [:native_runtime, :workspace]), include_turns: false, include_latest_turn: true, include_queue: true),
+         {:ok, native} <- native_reader(opts).read_native_thread(thread, options),
          :ok <- validate_native(facts, native),
+         {:ok, _} <- WorkerEvidence.runtime_options(facts.binding, opts),
          {:ok, queue} <- NativeQueueReadback.read(queue_database(opts), thread),
-         {:ok, lock} <- NativeQueueReadback.writer_unlocked(native_home(opts), thread) do
+         {:ok, _} <- WorkerEvidence.runtime_options(facts.binding, opts),
+         {:ok, lock} <- NativeQueueReadback.writer_unlocked(native_home(opts), thread),
+         {:ok, _} <- WorkerEvidence.runtime_options(facts.binding, opts) do
       dates = [native["latest_turn_observation"]["observed_at"], native["latest_turn_observation"]["confirmation"]["observed_at"], native["queue_observation"]["observed_at"]]
       expiry = dates |> Enum.map(&(DateTime.from_iso8601(&1) |> elem(1))) |> Enum.min_by(&DateTime.to_unix(&1, :microsecond)) |> DateTime.add(10, :second) |> DateTime.to_iso8601()
       {:ok, %{"observed_at" => now(), "expires_at" => expiry, "readback_sha256" => json_hash(native), "queue" => queue, "writer_lock" => lock}}
@@ -1187,19 +1198,24 @@ defmodule SymphonyElixir.Factory.TicketCapabilityRecovery do
     }
   end
 
+  defp native_reader(opts), do: if(Keyword.has_key?(opts, :native_runtime), do: AppServer, else: legacy_native_reader(opts))
+  defp owned_reader(opts), do: if(Keyword.has_key?(opts, :native_runtime), do: AppServer, else: legacy_owned_reader(opts))
+  defp queue_database(opts), do: if(Keyword.has_key?(opts, :native_runtime), do: opts[:native_queue_database], else: legacy_queue_database(opts))
+  defp native_home(opts), do: if(Keyword.has_key?(opts, :native_runtime), do: opts[:native_home], else: legacy_native_home(opts))
+
   if Mix.env() == :test do
     defp jira_reader(opts), do: opts[:jira_reader] || JiraMcpReader
-    defp native_reader(opts), do: opts[:native_reader] || AppServer
-    defp owned_reader(opts), do: opts[:app_server] || AppServer
-    defp queue_database(opts), do: opts[:native_queue_database] || Path.join(System.user_home!(), ".codex/queue_1.sqlite")
-    defp native_home(opts), do: opts[:native_home] || Path.join(System.user_home!(), ".codex")
+    defp legacy_native_reader(opts), do: opts[:native_reader] || AppServer
+    defp legacy_owned_reader(opts), do: opts[:app_server] || AppServer
+    defp legacy_queue_database(opts), do: opts[:native_queue_database] || Path.join(System.user_home!(), ".codex/queue_1.sqlite")
+    defp legacy_native_home(opts), do: opts[:native_home] || Path.join(System.user_home!(), ".codex")
     defp grant_root(opts), do: opts[:grant_root] || Path.join(System.user_home!(), "Library/Application Support/ai-factory/operator-grants")
   else
     defp jira_reader(_opts), do: JiraMcpReader
-    defp native_reader(_opts), do: AppServer
-    defp owned_reader(_opts), do: AppServer
-    defp queue_database(_opts), do: Path.join(System.user_home!(), ".codex/queue_1.sqlite")
-    defp native_home(_opts), do: Path.join(System.user_home!(), ".codex")
+    defp legacy_native_reader(_opts), do: AppServer
+    defp legacy_owned_reader(_opts), do: AppServer
+    defp legacy_queue_database(_opts), do: Path.join(System.user_home!(), ".codex/queue_1.sqlite")
+    defp legacy_native_home(_opts), do: Path.join(System.user_home!(), ".codex")
     defp grant_root(_opts), do: Path.join(System.user_home!(), "Library/Application Support/ai-factory/operator-grants")
   end
 

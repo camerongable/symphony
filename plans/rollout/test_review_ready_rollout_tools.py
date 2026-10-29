@@ -432,6 +432,7 @@ CREATE TABLE worker_evidence(owner_process_json TEXT,owner_stopped_at TEXT);
             (root / 'cutover-audit.json').write_bytes(tools.encode(audit))
             guard, _ = tools.bind(root)
             guard.DB = root / 'must-not-open.sqlite'
+            guard.original_pins = lambda: {'build': 'owned fixture', 'source': 'owned fixture', 'native_runtime_formats': {'worker_binding_versions': [1], 'completion_receipt_versions': [1]}}
             commands = []
 
             def os_boundary(args, **_options):

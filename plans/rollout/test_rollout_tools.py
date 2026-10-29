@@ -131,7 +131,7 @@ class PreparationTests(unittest.TestCase):
             with patch.multiple(cutover, OLD_RELEASE=release, OLD_MANIFEST_SHA=cutover.sha(manifest),
                                 OLD_LAUNCHER_SHA=cutover.sha(launcher), OLD_BOOT_SHA=cutover.sha(guard)):
                 g, _capture = cutover.bind(root)
-                self.assertEqual(g.original_pins(), {'build': str(release / 'dev'), 'source': str(source)})
+                self.assertEqual(g.original_pins(), {'build': str(release / 'dev'), 'source': str(source), 'native_runtime_formats': {'worker_binding_versions': [1], 'completion_receipt_versions': [1]}})
                 artifact.write_bytes(b'changed artifact')
                 with self.assertRaises(AssertionError):
                     g.original_pins()
@@ -339,7 +339,7 @@ INSERT INTO desktop_requests VALUES('old-uncertain','RECONCILE_REQUIRED');
             g.BROKER.write_text('status="PAUSED"\nrrule="FREQ=MINUTELY;INTERVAL=1"\n')
             g.MONITOR.write_text('status="PAUSED"\n')
             g.WORKFLOW.write_text('fixture')
-            original_runtime = {'build': '/original/build', 'source': '/original/source'}
+            original_runtime = {'build': '/original/build', 'source': '/original/source', 'native_runtime_formats': {'worker_binding_versions': [1], 'completion_receipt_versions': [1]}}
             original = {'ProgramArguments': [str(cutover.OLD_RELEASE / 'run-local-factory'), str(g.WORKFLOW)],
                         'EnvironmentVariables': {'MIX_BUILD_PATH': original_runtime['build']}}
             saved = root / 'service.original.plist'

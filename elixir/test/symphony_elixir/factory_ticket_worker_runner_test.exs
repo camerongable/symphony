@@ -32,12 +32,24 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
         do: {:error, :connector_catalog_not_empty},
         else:
           {:ok,
-           %{
-             thread_id: thread,
-             worker_policy: Process.get(:observed_policy, TicketWorkerRunner.policy(opts[:worker_access], workspace)),
-             worker_invocation: Base.encode16(:crypto.strong_rand_bytes(32), case: :lower),
-             metadata: %{codex_app_server_pid: Process.get(:worker_pid, "fixture")}
-           }}
+           routed_session(
+             %{
+               thread_id: thread,
+               worker_policy: Process.get(:observed_policy, TicketWorkerRunner.policy(opts[:worker_access], workspace)),
+               worker_invocation: Base.encode16(:crypto.strong_rand_bytes(32), case: :lower),
+               metadata: %{codex_app_server_pid: Process.get(:worker_pid, "fixture")}
+             },
+             opts
+           )}
+    end
+
+    defp routed_session(session, opts) do
+      if Keyword.has_key?(opts, :native_runtime) do
+        {:ok, origin} = SymphonyElixir.Factory.NativeRuntimeRoute.origin(opts[:native_runtime])
+        Map.merge(session, %{native_runtime: opts[:native_runtime], native_runtime_origin: origin})
+      else
+        session
+      end
     end
 
     def run_turn(session, prompt, _issue, opts) do
@@ -127,6 +139,68 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
     ]
 
     {prompt, options}
+  end
+
+  @tag :native_worker_binding
+  test "public runner reserves and forwards one exact opaque native origin", ctx do
+    {prompt, options} = prepare(ctx)
+    descriptor = %{"version" => 1, "codex_home" => Path.join(ctx.root, "runner-codex"), "sqlite_home" => Path.join(ctx.root, "runner-sqlite")}
+
+    for path <- [descriptor["codex_home"], descriptor["sqlite_home"]] do
+      File.mkdir!(path)
+      File.chmod!(path, 0o700)
+    end
+
+    {:ok, route} = SymphonyElixir.Factory.NativeRuntimeRoute.validate(descriptor)
+    {:ok, origin} = SymphonyElixir.Factory.NativeRuntimeRoute.origin(route)
+    schema = %{"type" => "object", "required" => ["status"], "properties" => %{"status" => %{"type" => "string"}}}
+    assert {:ok, _} = TicketWorkerRunner.run(ctx.path, issue(), prompt, schema, Keyword.put(options, :native_runtime, route))
+    assert_received {:worker_options, observed}
+    assert observed[:native_runtime] === route
+    assert {:ok, evidence} = WorkerEvidence.get(ctx.store, options[:request_key])
+    binding = Jason.decode!(evidence["binding_json"])
+    assert binding["binding_version"] === 2
+    assert binding["native_runtime"] === origin
+  end
+
+  @tag :native_worker_binding
+  test "same-thread continuation inherits its origin with no caller route and refuses a conflicting route before reservation", ctx do
+    {prompt, options} = prepare(ctx)
+
+    routes =
+      for name <- ~w(original other) do
+        descriptor = %{"version" => 1, "codex_home" => Path.join(ctx.root, name <> "-codex"), "sqlite_home" => Path.join(ctx.root, name <> "-sqlite")}
+
+        for path <- [descriptor["codex_home"], descriptor["sqlite_home"]] do
+          File.mkdir!(path)
+          File.chmod!(path, 0o700)
+        end
+
+        {:ok, route} = SymphonyElixir.Factory.NativeRuntimeRoute.validate(descriptor)
+        route
+      end
+
+    [original, other] = routes
+    assert {:ok, observed} = TicketWorkerRunner.run(ctx.path, issue(), prompt, schema(), Keyword.put(options, :native_runtime, original))
+    assert_received {:worker_options, first}
+    assert first[:native_runtime] === original
+    {:ok, prior} = WorkerEvidence.get(ctx.store, observed.worker_request_key)
+    {:ok, _} = TaskLedger.update(ctx.store, "writer", %{status: "CONSUMED", thread_id: observed.thread_id, turn_id: observed.turn_id, output_json: Jason.encode!(observed.output)})
+    assert {:ok, _} = WorkerEvidence.consume(ctx.store, observed.worker_request_key)
+    {:ok, _} = TaskLedger.update(ctx.store, "writer", %{status: "STARTING"})
+    {:ok, _} = WorkspaceAccess.acquire(ctx.store, attrs(ctx, "SOURCE", "second"), opts(ctx))
+    continuation = Keyword.merge(options, request_key: "second:request", reservation_key: "second")
+    assert {:error, :worker_native_runtime_conflict} = TicketWorkerRunner.run(ctx.path, issue(), prompt, schema(), Keyword.put(continuation, :native_runtime, other))
+    assert {:error, :unknown_worker_attempt} = WorkerEvidence.get(ctx.store, "second:request")
+    refute_received {:worker_options, _}
+    Process.put(:worker_turn, "next-turn")
+    assert {:ok, result} = TicketWorkerRunner.run(ctx.path, issue(), prompt, schema(), continuation)
+    assert result.turn_id == "next-turn"
+    assert_received {:worker_options, resumed}
+    assert resumed[:resume_thread_id] == observed.thread_id
+    assert resumed[:native_runtime] === original
+    {:ok, destination} = WorkerEvidence.get(ctx.store, result.worker_request_key)
+    assert Jason.decode!(destination["binding_json"])["native_runtime"] === Jason.decode!(prior["binding_json"])["native_runtime"]
   end
 
   @tag structured_writer: true

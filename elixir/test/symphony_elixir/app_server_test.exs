@@ -2,6 +2,490 @@ defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
   alias SymphonyElixir.Factory.TicketChatCommands
   alias SymphonyElixir.TicketChatFixture
+  alias SymphonyElixir.Factory.NativeRuntimeRoute
+
+  @tag :native_worker_origin
+  test "a foreign caller cannot strip route fields to operate on a routed actor" do
+    with_worker_origin_server(fn ctx ->
+      assert {:ok, session} = AppServer.start_session(ctx.workspace, worker_access: "REVIEW", native_runtime: ctx.route, model: "gpt-6-luna", reasoning_effort: "medium")
+
+      try do
+        trace = File.read!(ctx.trace)
+        stripped = Map.drop(session, [:native_runtime, :native_runtime_origin])
+
+        results =
+          Task.async(fn ->
+            [AppServer.run_turn(stripped, "Do not run", %Issue{}), AppServer.read_owned_native_thread(stripped), AppServer.stop_session(stripped)]
+          end)
+          |> Task.await()
+
+        assert results == List.duplicate({:error, :file_worker_session_not_owned}, 3)
+        assert File.read!(ctx.trace) == trace
+      after
+        assert {:ok, _stop} = AppServer.stop_session(session)
+      end
+    end)
+  end
+
+  @tag :native_worker_origin
+  test "the exact routed owner can collect an already-exited actor stop after storage becomes unsafe" do
+    with_worker_origin_server(fn ctx ->
+      File.write!(ctx.control, Jason.encode!(%{"actual" => %{"exit_on_read" => 7}}))
+      assert {:ok, session} = AppServer.start_session(ctx.workspace, worker_access: "REVIEW", native_runtime: ctx.route, model: "gpt-6-luna", reasoning_effort: "medium")
+      assert {:error, {:port_exit, 7}} = AppServer.read_owned_native_thread(session)
+      assert Port.info(session.port) == nil
+      File.chmod!(ctx.descriptor["sqlite_home"], 0o755)
+      assert {:ok, stop} = AppServer.stop_session(session)
+      assert stop["exit_status"] == 7
+      assert stop["thread_id"] == session.thread_id
+      assert stop["pid"] == session.metadata.codex_app_server_pid
+      assert stop["invocation_nonce"] == session.worker_invocation
+      assert {:error, :native_runtime_session_not_owned} = AppServer.stop_session(session)
+    end)
+  end
+
+  @tag :native_worker_origin
+  test "a recovery preflight cannot replace routed storage immediately before turn issuance" do
+    with_worker_origin_server(fn ctx ->
+      preflight = fn _session ->
+        path = ctx.descriptor["sqlite_home"]
+        File.rename!(path, path <> "-original")
+        File.mkdir!(path)
+        File.chmod!(path, 0o700)
+        :ok
+      end
+
+      assert {:ok, session} =
+               AppServer.start_session(ctx.workspace,
+                 worker_access: "REVIEW",
+                 native_runtime: ctx.route,
+                 model: "gpt-6-luna",
+                 reasoning_effort: "medium",
+                 native_recovery: %{},
+                 recovery_preflight: preflight
+               )
+
+      try do
+        assert {:error, :native_runtime_storage_changed} = AppServer.run_turn(session, "Do not run", %Issue{})
+        refute Enum.any?(worker_origin_trace(ctx), &(&1["method"] == "turn/start"))
+      after
+        assert {:ok, _stop} = AppServer.stop_session(session)
+      end
+    end)
+  end
+
+  @tag :native_worker_origin
+  test "StageRunner carries the same explicit route through its real external worker session" do
+    with_worker_origin_server(fn ctx ->
+      schema = SymphonyElixir.Factory.StageSchemas.for_stage(:specification_critic)
+
+      assert {:ok, %{thread_id: "worker-B", output: %{"status" => "PASS"}}} =
+               SymphonyElixir.Factory.StageRunner.run(ctx.workspace, %Issue{}, "Synthetic review", schema,
+                 worker_access: "REVIEW",
+                 native_runtime: ctx.route,
+                 model: "gpt-6-luna",
+                 reasoning_effort: "medium"
+               )
+
+      assert Enum.count(worker_origin_trace(ctx), &(&1["method"] == "turn/start")) == 1
+      for actor <- Enum.filter(worker_origin_trace(ctx), &(&1["method"] == "actor")), do: assert(actor["sqlite_home"] == ctx.descriptor["sqlite_home"])
+    end)
+  end
+
+  @tag :native_worker_origin
+  test "explicit REVIEW resume keeps its origin and active-writer refusal never forks or starts a turn" do
+    for active? <- [false, true] do
+      with_worker_origin_server(fn ctx ->
+        File.write!(ctx.control, Jason.encode!(%{"actual" => %{"active_writer" => active?}}))
+        options = [worker_access: "REVIEW", native_runtime: ctx.route, model: "gpt-6-luna", reasoning_effort: "medium", resume_thread_id: "worker-B"]
+
+        case AppServer.start_session(ctx.workspace, options) do
+          {:ok, session} ->
+            refute active?
+            assert session.thread_id == "worker-B"
+            assert session.native_runtime === ctx.route
+            assert {:ok, _stop} = AppServer.stop_session(session)
+
+          {:error, {:native_resume_refused, refusal}} ->
+            assert active?
+            assert refusal["requested_thread_id"] == "worker-B"
+        end
+
+        requests = worker_origin_trace(ctx)
+        assert Enum.count(requests, &(&1["method"] == "thread/resume")) == 1
+        refute Enum.any?(requests, &(&1["method"] in ["thread/start", "thread/fork", "turn/start"]))
+      end)
+    end
+  end
+
+  @tag :native_worker_origin
+  test "explicit storage refuses nonworker remote malformed and stale routes before spawn" do
+    with_worker_origin_server(fn ctx ->
+      options = [native_runtime: ctx.route, model: "gpt-6-luna", reasoning_effort: "medium"]
+
+      for worker <- [nil, "SOURCE", "CONTROLLER"] do
+        assert {:error, :native_runtime_worker_required} = AppServer.start_session(ctx.workspace, Keyword.put(options, :worker_access, worker))
+      end
+
+      assert {:error, :native_runtime_remote_unsupported} = AppServer.start_session(ctx.workspace, options ++ [worker_access: "REVIEW", worker_host: "remote"])
+      assert {:error, :native_runtime_route_invalid} = AppServer.start_session(ctx.workspace, Keyword.put(options, :native_runtime, nil) ++ [worker_access: "REVIEW"])
+
+      case AppServer.start_session(ctx.workspace, Keyword.put(options, :native_runtime, ctx.descriptor) ++ [worker_access: "REVIEW"]) do
+        {:ok, unexpected} ->
+          AppServer.stop_session(unexpected)
+          flunk("a path-only worker descriptor must not repin the expected storage identity")
+
+        refused ->
+          assert refused == {:error, :native_runtime_route_invalid}
+      end
+
+      File.chmod!(ctx.descriptor["sqlite_home"], 0o755)
+      assert {:error, :native_runtime_storage_unsafe} = AppServer.start_session(ctx.workspace, options ++ [worker_access: "REVIEW"])
+      refute File.exists?(ctx.trace)
+    end)
+  end
+
+  @tag :native_worker_origin
+  test "owned native read rejects an otherwise valid observation if storage changes during collection" do
+    with_worker_origin_server(fn ctx ->
+      File.write!(ctx.control, Jason.encode!(%{"actual" => %{"replace_on_read" => ctx.descriptor["sqlite_home"]}}))
+      assert {:ok, session} = AppServer.start_session(ctx.workspace, worker_access: "REVIEW", native_runtime: ctx.route, model: "gpt-6-luna", reasoning_effort: "medium")
+
+      try do
+        assert {:error, :native_runtime_storage_changed} = AppServer.read_owned_native_thread(session)
+        assert Enum.any?(worker_origin_trace(ctx), &(&1["method"] == "thread/read"))
+      after
+        assert {:ok, _stop} = AppServer.stop_session(session)
+      end
+    end)
+  end
+
+  @tag :native_worker_origin
+  test "either actor must attest the routed home and SQLite before any worker thread" do
+    for phase <- ["preflight", "actual"], behavior <- ["home", "sqlite", "missing_sqlite", "missing_config_response"] do
+      with_worker_origin_server(fn ctx ->
+        value = if behavior in ["home", "sqlite"], do: ctx.default, else: true
+        File.write!(ctx.control, Jason.encode!(%{phase => %{behavior => value}}))
+        result = AppServer.start_session(ctx.workspace, worker_access: "REVIEW", native_runtime: ctx.route, model: "gpt-6-luna", reasoning_effort: "medium")
+
+        expected =
+          cond do
+            behavior == "home" -> :worker_runtime_home_mismatch
+            phase == "preflight" and behavior == "missing_config_response" -> :worker_configuration_unavailable
+            true -> :native_runtime_sqlite_mismatch
+          end
+
+        assert result == {:error, expected}
+        requests = worker_origin_trace(ctx)
+        refute Enum.any?(requests, &(&1["method"] in ["thread/start", "thread/resume", "turn/start"]))
+
+        for spawn <- Enum.filter(requests, &(&1["method"] == "spawn")) do
+          assert {_output, status} = System.cmd("/bin/kill", ["-0", to_string(spawn["pid"])], stderr_to_stdout: true)
+          refute status == 0
+        end
+      end)
+    end
+  end
+
+  @tag :native_worker_origin
+  test "storage replacement between preflight and actual actor refuses before the second spawn" do
+    with_worker_origin_server(fn ctx ->
+      File.write!(ctx.control, Jason.encode!(%{"preflight" => %{"replace" => ctx.descriptor["sqlite_home"]}}))
+      assert {:error, :native_runtime_storage_changed} = AppServer.start_session(ctx.workspace, worker_access: "REVIEW", native_runtime: ctx.route, model: "gpt-6-luna", reasoning_effort: "medium")
+      assert Enum.count(worker_origin_trace(ctx), &(&1["method"] == "spawn")) == 1
+      refute Enum.any?(worker_origin_trace(ctx), &(&1["method"] in ["thread/start", "thread/resume", "turn/start"]))
+    end)
+  end
+
+  @tag :native_worker_origin
+  test "routed session rechecks storage before turns and owned reads but can still be stopped" do
+    with_worker_origin_server(fn ctx ->
+      assert {:ok, session} = AppServer.start_session(ctx.workspace, worker_access: "REVIEW", native_runtime: ctx.route, model: "gpt-6-luna", reasoning_effort: "medium")
+      assert {:ok, %{turn_id: "turn-B"}} = AppServer.run_turn(session, "Synthetic no-op", %Issue{})
+      trace = File.read!(ctx.trace)
+      File.chmod!(ctx.descriptor["sqlite_home"], 0o755)
+      assert {:error, :native_runtime_storage_unsafe} = AppServer.run_turn(session, "Do not run", %Issue{})
+      assert {:error, :native_runtime_storage_unsafe} = AppServer.read_owned_native_thread(session)
+      assert File.read!(ctx.trace) == trace
+      File.chmod!(ctx.descriptor["sqlite_home"], 0o700)
+      File.rename!(ctx.descriptor["sqlite_home"], ctx.descriptor["sqlite_home"] <> "-original")
+      File.mkdir!(ctx.descriptor["sqlite_home"])
+      File.chmod!(ctx.descriptor["sqlite_home"], 0o700)
+      assert {:error, :native_runtime_storage_changed} = AppServer.run_turn(session, "Do not run", %Issue{})
+      assert {:error, :native_runtime_storage_changed} = AppServer.read_owned_native_thread(session)
+      assert File.read!(ctx.trace) == trace
+      assert {:ok, _stop} = AppServer.stop_session(session)
+    end)
+  end
+
+  @tag :native_worker_origin
+  test "routed worker session records origin and refuses forged foreign and stripped-session operations" do
+    with_worker_origin_server(fn ctx ->
+      assert {:ok, expected} = NativeRuntimeRoute.origin(ctx.route)
+      assert {:ok, session} = AppServer.start_session(ctx.workspace, worker_access: "REVIEW", native_runtime: ctx.route, model: "gpt-6-luna", reasoning_effort: "medium")
+
+      try do
+        assert session[:native_runtime] === ctx.route
+        assert session[:native_runtime_origin] === expected
+        trace = File.read!(ctx.trace)
+
+        for forged <- [Map.delete(session, :native_runtime), Map.put(session, :native_runtime, nil), Map.put(session, :native_runtime_origin, %{}), Map.put(session, :worker_invocation, "forged")] do
+          assert {:error, :native_runtime_session_not_owned} = AppServer.run_turn(forged, "Do not run", %Issue{})
+          assert {:error, :native_runtime_session_not_owned} = AppServer.read_owned_native_thread(forged)
+          assert {:error, :native_runtime_session_not_owned} = AppServer.stop_session(forged)
+        end
+
+        assert {:error, :native_runtime_session_not_owned} = Task.async(fn -> AppServer.run_turn(session, "Do not run", %Issue{}) end) |> Task.await()
+        assert File.read!(ctx.trace) == trace
+      after
+        assert {:ok, _stop} = AppServer.stop_session(session)
+      end
+
+      assert {:error, :native_runtime_session_not_owned} = AppServer.run_turn(session, "Do not run", %Issue{})
+    end)
+  end
+
+  @tag :native_worker_origin
+  test "explicit worker storage reaches both preflight and actual actor without changing parent environment" do
+    with_worker_origin_server(fn ctx ->
+      before = Map.take(System.get_env(), ~w(HOME CODEX_HOME CODEX_SQLITE_HOME))
+      assert {:ok, session} = AppServer.start_session(ctx.workspace, worker_access: "REVIEW", native_runtime: ctx.route, model: "gpt-6-luna", reasoning_effort: "medium")
+      assert session.thread_id == "worker-B"
+      assert {:ok, _stop} = AppServer.stop_session(session)
+      actors = ctx.trace |> File.read!() |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!/1) |> Enum.filter(&(&1["method"] == "actor"))
+      assert Enum.map(actors, & &1["phase"]) == ["preflight", "actual"]
+
+      for actor <- actors do
+        assert actor["codex_home"] == ctx.descriptor["codex_home"]
+        assert actor["sqlite_home"] == ctx.descriptor["sqlite_home"]
+        assert actor["sqlite_env"] == ctx.descriptor["sqlite_home"]
+      end
+
+      assert Map.take(System.get_env(), ~w(HOME CODEX_HOME CODEX_SQLITE_HOME)) == before
+    end)
+  end
+
+  @tag :native_route_transport
+  test "restored readers publish same-actor attested origins for matching histories across separate stores" do
+    with_storage_reader_server(fn ctx ->
+      for marker <- ["A", "B"] do
+        descriptor = storage_route(ctx.root, "durable-" <> marker)
+        File.write!(Path.join(descriptor["sqlite_home"], "threads.json"), Jason.encode!(%{"parent" => %{"id" => "parent", "turns" => [], "origin" => marker}}))
+        assert {:ok, route} = NativeRuntimeRoute.validate(descriptor)
+        assert {:ok, envelope} = NativeRuntimeRoute.origin(route)
+        assert {:ok, restored} = NativeRuntimeRoute.restore_origin(envelope |> Jason.encode!() |> Jason.decode!())
+        assert {:ok, reader} = AppServer.open_native_reader(ctx.workspace, native_runtime: restored)
+
+        try do
+          assert {:ok, %{"origin" => ^marker}} = AppServer.read_native_thread(reader, "parent", native_runtime: restored)
+          assert {:ok, ^envelope} = apply(AppServer, :native_reader_origin, [reader])
+          launch = Path.join(descriptor["codex_home"], "launch.json") |> File.read!() |> Jason.decode!()
+          assert launch["codex_home"] == envelope["codex_home"]["path"]
+          assert launch["sqlite_cli"] == envelope["sqlite_home"]["path"]
+          trace = File.read!(Path.join(descriptor["codex_home"], "trace.jsonl"))
+          conflict = storage_route(ctx.root, "conflict-" <> marker)
+          assert {:ok, conflict} = NativeRuntimeRoute.validate(conflict)
+          assert {:error, :native_runtime_route_conflict} = AppServer.read_native_thread(reader, "parent", native_runtime: conflict)
+          assert {:error, :native_runtime_remote_unsupported} = AppServer.read_native_thread(reader, "parent", worker_host: "remote")
+          assert File.read!(Path.join(descriptor["codex_home"], "trace.jsonl")) == trace
+          assert {:error, :native_reader_not_owned} = Task.async(fn -> apply(AppServer, :native_reader_origin, [reader]) end) |> Task.await()
+          assert {:error, :native_reader_not_owned} = apply(AppServer, :native_reader_origin, [Map.put(reader, :native_runtime_origin, %{})])
+        after
+          assert :ok = AppServer.close_native_reader(reader)
+        end
+
+        assert {:error, :native_reader_not_owned} = apply(AppServer, :native_reader_origin, [reader])
+      end
+    end)
+  end
+
+  @tag :native_route_transport
+  test "a stale restored route refuses before spawning after either directory is replaced at the same path" do
+    with_storage_reader_server(fn ctx ->
+      for key <- ["codex_home", "sqlite_home"] do
+        descriptor = storage_route(ctx.root, "pre-spawn-" <> key)
+        assert {:ok, route} = NativeRuntimeRoute.validate(descriptor)
+        assert {:ok, envelope} = NativeRuntimeRoute.origin(route)
+        assert {:ok, restored} = NativeRuntimeRoute.restore_origin(envelope |> Jason.encode!() |> Jason.decode!())
+        spawn_trace = File.read(Path.join(ctx.root, "spawn.trace"))
+        assert {:error, :native_runtime_remote_unsupported} = AppServer.open_native_reader(ctx.workspace, native_runtime: restored, worker_host: "remote")
+        assert File.read(Path.join(ctx.root, "spawn.trace")) == spawn_trace
+        path = descriptor[key]
+        File.rename!(path, path <> "-original")
+        File.mkdir!(path)
+        File.chmod!(path, 0o700)
+        spawn_trace = File.read(Path.join(ctx.root, "spawn.trace"))
+        assert {:error, :native_runtime_storage_changed} = AppServer.open_native_reader(ctx.workspace, native_runtime: restored)
+        assert File.read(Path.join(ctx.root, "spawn.trace")) == spawn_trace
+        assert {:error, :native_runtime_storage_changed} = NativeRuntimeRoute.restore_origin(envelope)
+        assert {:ok, _fresh_replacement} = NativeRuntimeRoute.validate(descriptor)
+      end
+    end)
+  end
+
+  @tag :native_route_transport
+  test "restored reader provenance and reads refuse changed storage while owned cleanup remains possible" do
+    with_storage_reader_server(fn ctx ->
+      for key <- ["codex_home", "sqlite_home"] do
+        descriptor = storage_route(ctx.root, "after-open-" <> key)
+        assert {:ok, route} = NativeRuntimeRoute.validate(descriptor)
+        assert {:ok, envelope} = NativeRuntimeRoute.origin(route)
+        assert {:ok, restored} = NativeRuntimeRoute.restore_origin(envelope |> Jason.encode!() |> Jason.decode!())
+        assert {:ok, reader} = AppServer.open_native_reader(ctx.workspace, native_runtime: restored)
+        path = descriptor[key]
+        trace = File.read!(Path.join(descriptor["codex_home"], "trace.jsonl"))
+        File.chmod!(path, 0o755)
+        assert {:error, :native_runtime_storage_unsafe} = AppServer.native_reader_origin(reader)
+        assert {:error, :native_runtime_storage_unsafe} = AppServer.read_native_thread(reader, "parent", [])
+        assert File.read!(Path.join(descriptor["codex_home"], "trace.jsonl")) == trace
+        File.chmod!(path, 0o700)
+        File.rename!(path, path <> "-original")
+        File.mkdir!(path)
+        File.chmod!(path, 0o700)
+        assert {:error, :native_runtime_storage_changed} = AppServer.native_reader_origin(reader)
+        assert {:error, :native_runtime_storage_changed} = AppServer.read_native_thread(reader, "parent", [])
+        home = if key == "codex_home", do: path <> "-original", else: descriptor["codex_home"]
+        assert File.read!(Path.join(home, "trace.jsonl")) == trace
+        if key == "codex_home", do: refute(File.exists?(Path.join(path, "trace.jsonl")))
+        assert :ok = AppServer.close_native_reader(reader)
+        assert :ok = AppServer.close_native_reader(reader)
+        assert {:error, :native_reader_not_owned} = AppServer.native_reader_origin(reader)
+      end
+    end)
+  end
+
+  @tag :native_route_transport
+  test "explicit readers pin actual child homes and reject cross-origin reuse" do
+    with_storage_reader_server(fn ctx ->
+      before = Map.take(System.get_env(), ~w(HOME CODEX_HOME CODEX_SQLITE_HOME))
+      route_a = storage_route(ctx.root, "a")
+      route_b = storage_route(ctx.root, "b")
+      File.write!(Path.join(route_b["sqlite_home"], "threads.json"), Jason.encode!(%{"parent" => %{"id" => "parent", "turns" => [], "origin" => "B"}}))
+
+      assert {:ok, reader_a} = apply(AppServer, :open_native_reader, [ctx.workspace, [native_runtime: route_a]])
+      assert {:ok, reader_b} = apply(AppServer, :open_native_reader, [ctx.workspace, [native_runtime: route_b]])
+
+      try do
+        assert {:error, _} = AppServer.read_native_thread(reader_a, "parent", [])
+        assert {:ok, %{"origin" => "B"} = observed} = AppServer.read_native_thread(reader_b, "parent", [])
+        assert {:ok, ^observed} = AppServer.read_native_thread(reader_b, "parent", [])
+        trace = File.read!(Path.join(route_b["codex_home"], "trace.jsonl"))
+        assert {:error, :native_runtime_remote_unsupported} = AppServer.read_native_thread(reader_b, "parent", worker_host: "remote")
+        assert {:error, :native_runtime_route_conflict} = AppServer.read_native_thread(reader_b, "parent", native_runtime: route_a)
+        assert File.read!(Path.join(route_b["codex_home"], "trace.jsonl")) == trace
+        assert {:error, :native_reader_not_owned} = AppServer.read_native_thread(Map.put(reader_b, :native_runtime, nil), "parent", [])
+      after
+        assert :ok = AppServer.close_native_reader(reader_a)
+        assert :ok = AppServer.close_native_reader(reader_b)
+      end
+
+      assert Map.take(System.get_env(), ~w(HOME CODEX_HOME CODEX_SQLITE_HOME)) == before
+
+      for route <- [route_a, route_b] do
+        launch = Path.join(route["codex_home"], "launch.json") |> File.read!() |> Jason.decode!()
+        assert launch["codex_home"] == route["codex_home"]
+        assert launch["sqlite_env"] == route["sqlite_home"]
+        assert launch["sqlite_cli"] == route["sqlite_home"]
+      end
+    end)
+  end
+
+  @tag :native_route_transport
+  test "reader attestation refusals issue no thread method and close only the owned actor" do
+    with_storage_reader_server(fn ctx ->
+      for {name, behavior, expected, methods} <- [
+            {"home", %{"initialize_home" => ctx.root}, :native_runtime_home_mismatch, ["initialize"]},
+            {"malformed", %{"initialize_result" => 42}, :native_runtime_home_mismatch, ["initialize"]},
+            {"missing", %{"config_mode" => "missing"}, :native_runtime_sqlite_mismatch, ["initialize", "initialized", "config/read"]},
+            {"wrong", %{"sqlite_reply" => ctx.root}, :native_runtime_sqlite_mismatch, ["initialize", "initialized", "config/read"]},
+            {"scalar", %{"sqlite_reply" => 42}, :native_runtime_sqlite_mismatch, ["initialize", "initialized", "config/read"]}
+          ] do
+        route = storage_route(ctx.root, name)
+        File.write!(Path.join(route["codex_home"], "behavior.json"), Jason.encode!(behavior))
+        assert {:error, ^expected} = AppServer.open_native_reader(ctx.workspace, native_runtime: route)
+        assert storage_methods(route) == methods
+        launch = Path.join(route["codex_home"], "launch.json") |> File.read!() |> Jason.decode!()
+        assert {_output, status} = System.cmd("/bin/kill", ["-0", to_string(launch["pid"])], stderr_to_stdout: true)
+        refute status == 0
+      end
+    end)
+  end
+
+  @tag :native_route_transport
+  @tag :route_policy_regression
+  test "malformed remote and workspace routes refuse before spawn and changed roots still permit close" do
+    with_storage_reader_server(fn ctx ->
+      route = storage_route(ctx.root, "safe")
+
+      for opts <- [[native_runtime: %{}], [native_runtime: route, worker_host: "remote"], [native_runtime: Map.put(route, "codex_home", ctx.workspace)]] do
+        assert {:error, _} = AppServer.open_native_reader(ctx.workspace, opts)
+        refute File.exists?(Path.join(ctx.root, "spawn.trace"))
+        refute File.exists?(Path.join(route["codex_home"], "launch.json"))
+      end
+
+      case AppServer.open_native_reader("/", native_runtime: route) do
+        {:ok, unexpected} ->
+          AppServer.close_native_reader(unexpected)
+          flunk("filesystem-root workspace spawned an explicit reader")
+
+        error ->
+          assert error == {:error, :native_runtime_storage_unsafe}
+      end
+
+      refute File.exists?(Path.join(ctx.root, "spawn.trace"))
+
+      assert {:ok, reader} = AppServer.open_native_reader(ctx.workspace, native_runtime: route)
+      trace = File.read!(Path.join(route["codex_home"], "trace.jsonl"))
+      File.chmod!(route["sqlite_home"], 0o755)
+      assert {:error, :native_runtime_storage_unsafe} = AppServer.read_native_thread(reader, "parent", [])
+      assert File.read!(Path.join(route["codex_home"], "trace.jsonl")) == trace
+      File.chmod!(route["sqlite_home"], 0o700)
+      File.rename!(route["sqlite_home"], route["sqlite_home"] <> "-old")
+      File.mkdir!(route["sqlite_home"])
+      File.chmod!(route["sqlite_home"], 0o700)
+      assert {:error, :native_runtime_storage_changed} = AppServer.read_native_thread(reader, "parent", [])
+      assert File.read!(Path.join(route["codex_home"], "trace.jsonl")) == trace
+      assert :ok = AppServer.close_native_reader(reader)
+      assert :ok = AppServer.close_native_reader(reader)
+    end)
+  end
+
+  @tag :native_route_transport
+  test "explicit CLI SQLite root wins conflicting private config and child environment with safely escaped paths" do
+    with_storage_reader_server(fn ctx ->
+      route = storage_route(ctx.root, "spaces and 'apostrophes; $(touch NEVER_EXECUTED)")
+      wrong = storage_route(ctx.root, "wrong")
+      File.write!(Path.join(route["codex_home"], "config.toml"), "sqlite_home=" <> Jason.encode!(wrong["sqlite_home"]))
+      File.write!(Path.join(route["sqlite_home"], "threads.json"), Jason.encode!(%{"parent" => %{"id" => "parent", "turns" => [], "origin" => "CLI"}}))
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: Path.join(ctx.root, "workspaces"),
+        codex_command: "/usr/bin/env CODEX_SQLITE_HOME=#{wrong["codex_home"]} /usr/bin/python3 -I -S -B #{ctx.script} app-server"
+      )
+
+      assert {:ok, %{"origin" => "CLI"}} = AppServer.read_native_thread("parent", workspace: ctx.workspace, native_runtime: route)
+      launch = Path.join(route["codex_home"], "launch.json") |> File.read!() |> Jason.decode!()
+      assert launch["sqlite_env"] == wrong["codex_home"]
+      assert launch["sqlite_cli"] == route["sqlite_home"]
+      refute File.exists?(Path.join(ctx.workspace, "NEVER_EXECUTED"))
+      assert storage_methods(route) == ["initialize", "initialized", "config/read", "thread/read"]
+    end)
+  end
+
+  @tag :native_route_transport
+  test "a legacy reader cannot acquire a route after initialization" do
+    with_thread_listing_server("legacy-route-retrofit", "", fn workspace, trace ->
+      route = storage_route(Path.dirname(Path.dirname(workspace)), "private")
+      assert {:ok, reader} = AppServer.open_native_reader(workspace)
+      assert {:error, :native_runtime_origin_unavailable} = AppServer.native_reader_origin(reader)
+      assert {:error, :native_reader_not_owned} = AppServer.native_reader_origin(Map.put(reader, :native_runtime_origin, %{"version" => 2}))
+      assert {:error, :native_runtime_route_conflict} = AppServer.read_native_thread(reader, "parent", native_runtime: route)
+      assert :ok = AppServer.close_native_reader(reader)
+      methods = File.read!(trace) |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!(String.trim_leading(&1, "JSON:"))["method"])
+      assert Enum.count(methods, &(&1 == "initialize")) == 1
+      assert Enum.all?(methods, &(&1 in ~w(initialize initialized)))
+    end)
+  end
 
   @tag :provider_schema
   test "internal review workers use named scoped profiles, explicit turns and no controller connectors" do
@@ -4190,6 +4674,112 @@ defmodule SymphonyElixir.AppServerTest do
       "platformOs" => "macos",
       "userAgent" => "symphony-orchestrator/0.160.0 (fixture)"
     }
+  end
+
+  defp worker_origin_trace(ctx), do: ctx.trace |> File.read!() |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!/1)
+
+  defp with_worker_origin_server(callback) do
+    root = Path.join(System.tmp_dir!(), "worker-origin-#{System.unique_integer([:positive])}")
+    workspace = Path.join(root, "workspaces/reader")
+    File.mkdir_p!(workspace)
+    {:ok, root} = SymphonyElixir.PathSafety.canonicalize(root)
+    descriptor = %{"version" => 1, "codex_home" => Path.join(root, "codex-B"), "sqlite_home" => Path.join(root, "sqlite-B")}
+    default = Path.join(root, "sqlite-A")
+
+    for path <- [default, descriptor["codex_home"], descriptor["sqlite_home"]] do
+      File.mkdir!(path)
+      File.chmod!(path, 0o700)
+    end
+
+    File.write!(Path.join(default, "marker"), "A")
+    File.write!(Path.join(descriptor["sqlite_home"], "marker"), "B")
+    script = Path.expand("test/support/native_origin_worker_server.py")
+    trace = Path.join(root, "trace.jsonl")
+    control = Path.join(root, "control.json")
+    File.write!(control, "{}")
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: Path.join(root, "workspaces"), codex_command: "/usr/bin/python3 -I -S -B #{script} #{trace} #{default} #{control} app-server")
+    assert {:ok, route} = NativeRuntimeRoute.validate(descriptor)
+
+    try do
+      callback.(%{root: root, workspace: workspace, descriptor: descriptor, route: route, trace: trace, control: control, default: default})
+    after
+      File.rm_rf!(root)
+    end
+  end
+
+  defp with_storage_reader_server(callback) do
+    root = Path.join(System.tmp_dir!(), "reader-storage-#{System.unique_integer([:positive])}")
+    workspace = Path.join(root, "workspaces/reader")
+    script = Path.join(root, "fake.py")
+    File.mkdir_p!(workspace)
+
+    File.write!(script, """
+    import json, os, pathlib, sys
+    with (pathlib.Path(__file__).parent / 'spawn.trace').open('a') as spawned: spawned.write(json.dumps(sys.argv) + '\\n')
+    home = pathlib.Path(os.environ['CODEX_HOME'])
+    env_sqlite = os.environ.get('CODEX_SQLITE_HOME')
+    overrides = {}
+    for index, value in enumerate(sys.argv[:-1]):
+        if value in ('--config', '-c'):
+            key, separator, encoded = sys.argv[index + 1].partition('=')
+            if separator:
+                try: overrides[key] = json.loads(encoded)
+                except ValueError: pass
+    configured = None
+    config_file = home / 'config.toml'
+    if config_file.exists():
+        for line in config_file.read_text().splitlines():
+            key, separator, encoded = line.partition('=')
+            if key.strip() == 'sqlite_home': configured = json.loads(encoded.strip())
+    effective = overrides.get('sqlite_home', configured or env_sqlite)
+    (home / 'launch.json').write_text(json.dumps({'pid': os.getpid(), 'codex_home': str(home), 'sqlite_env': env_sqlite, 'sqlite_cli': overrides.get('sqlite_home')}))
+    behavior_file = home / 'behavior.json'
+    behavior = json.loads(behavior_file.read_text()) if behavior_file.exists() else {}
+    for line in sys.stdin:
+        request = json.loads(line)
+        with (home / 'trace.jsonl').open('a') as trace: trace.write(line)
+        method = request['method']
+        if method == 'initialize':
+            result = behavior.get('initialize_result', {'codexHome': behavior.get('initialize_home', str(home))})
+        elif method == 'config/read':
+            config = {} if behavior.get('config_mode') == 'missing' else {'sqlite_home': behavior.get('sqlite_reply', effective)}
+            result = {'config': config}
+        elif method == 'thread/read':
+            path = pathlib.Path(effective) / 'threads.json'
+            rows = json.loads(path.read_text()) if path.exists() else {}
+            thread = rows.get(request['params']['threadId'])
+            if thread is None:
+                print(json.dumps({'id': request['id'], 'error': {'message': 'missing in this store'}}), flush=True)
+                continue
+            result = {'thread': thread}
+        else: continue
+        print(json.dumps({'id': request['id'], 'result': result}), flush=True)
+    """)
+
+    write_workflow_file!(Workflow.workflow_file_path(), workspace_root: Path.join(root, "workspaces"), codex_command: "/usr/bin/python3 -I -S -B #{script} app-server")
+
+    try do
+      {:ok, canonical} = SymphonyElixir.PathSafety.canonicalize(root)
+      callback.(%{root: canonical, workspace: workspace, script: script})
+    after
+      File.rm_rf!(root)
+    end
+  end
+
+  defp storage_route(root, name) do
+    codex = Path.join(root, name <> "-codex")
+    sqlite = Path.join(root, name <> "-sqlite")
+
+    for path <- [codex, sqlite] do
+      File.mkdir_p!(path)
+      File.chmod!(path, 0o700)
+    end
+
+    %{"version" => 1, "codex_home" => codex, "sqlite_home" => sqlite}
+  end
+
+  defp storage_methods(route) do
+    Path.join(route["codex_home"], "trace.jsonl") |> File.read!() |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!(&1)["method"])
   end
 
   defp with_thread_listing_server(test_name, list_handler, callback, runtime \\ fixture_runtime()) do

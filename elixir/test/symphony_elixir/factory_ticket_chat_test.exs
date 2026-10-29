@@ -247,12 +247,14 @@ defmodule SymphonyElixir.FactoryTicketChatTest do
     assert args["target"]["type"] == "projectless"
     assert {:ok, claimed} = DesktopRequest.claim(ctx.store, key, opts)
     trace = Path.join(ctx.root, "runtime-fixture.trace")
-    assert length(File.read!(trace) |> String.split("\n", trim: true)) == 1
+    handshake = File.read!(trace)
+    methods = handshake |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!(&1)["method"])
+    assert methods == ["initialize", "initialized"]
     assert claimed["status"] == "CREATE_UNCERTAIN"
     assert {:error, :ticket_chat_request_already_issued} = DesktopRequest.claim(ctx.store, key, opts)
     assert {:error, :ticket_chat_runtime_not_integrated} = DesktopToolArgs.create_thread(ctx.store, key)
     assert DesktopRequest.list_reconciliation(ctx.store) == [claimed]
-    assert length(File.read!(trace) |> String.split("\n", trim: true)) == 1
+    assert File.read!(trace) == handshake
     File.mkdir_p!(claimed["cwd"])
     assert {:ok, _} = DesktopRequest.record_ticket_thread(ctx.store, key, proof(claimed))
     assert {:ok, _} = DesktopRequest.complete(ctx.store, key, completion("parent-bootstrap"))

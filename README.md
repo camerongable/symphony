@@ -27,6 +27,11 @@ work instead of supervising coding agents.
 The local Jira factory keeps source-writing and exact-commit review in isolated
 worktrees; contract-only conversations can stay in their repository Project
 without allocating a worktree.
+An experimental opt-in native reader can pin private local Codex and SQLite roots.
+Worker selection and default routing remain unchanged; explicit recorded origins
+can also follow worker execution/recovery without activating isolated workers.
+Its durable origin preserves directory identity across restart and exports provenance
+only from the same initialized reader; it does not attest database contents.
 
 Ticket-local manual-validation admission denials remain visible without blocking
 unrelated queued or active work. Global configuration, provider, runtime and ledger
@@ -44,6 +49,8 @@ read-backed commands; staging alone never starts work or changes Jira.
 Controller updates display an immutable as-of snapshot; direct human commands
 still refresh their binding before staging. Presentation ACKs are not delivery
 or source-authorization evidence.
+Specialist notices share one metadata shape across formatting and parent binding;
+only an exact linked-run ledger notice and visible final readback authorize completion.
 Explicit contract revisions and candidate rework can use a read-only native-input
 payload preparer, avoiding model transcription while retaining exact completed-turn
 and staging-receipt checks. Preparation is not acceptance or permission to work.
@@ -183,6 +190,12 @@ exact task/prompt links. It preserves independent verification and controller-on
 Git/MR actions. Deployment and actual runtime packet readback remain separate
 gates; the old shared `autopilot` compatibility copy stays until those pass. See
 [the implementation contract](elixir/README.md#shared-role-instruction-admission).
+
+Factory startup, ledger openings and updated local release tools refuse unsupported
+native-history formats before mutation. This binary supports legacy unversioned
+bindings/V1 completion receipts and explicitly bound V2 worker origins/receipts;
+the configuration selector and hidden-worker routing remain off. See
+[the admission boundary](elixir/README.md#native-history-upgrade-admission).
 
 ## License
 

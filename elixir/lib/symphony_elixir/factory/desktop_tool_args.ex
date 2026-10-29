@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.Factory.DesktopToolArgs do
   @moduledoc "Builds exact Codex Desktop tool arguments from durable requests."
 
-  alias SymphonyElixir.Factory.{DesktopRequest, Store, TicketMrOperation}
+  alias SymphonyElixir.Factory.{DesktopRequest, SpecialistErrorNotice, Store, TicketMrOperation}
 
   @model_efforts %{
     "gpt-6.1-sol" => ~w(low medium high xhigh max ultra),
@@ -114,7 +114,7 @@ defmodule SymphonyElixir.Factory.DesktopToolArgs do
   defp validate_projectless_metadata(request) do
     with {:ok, metadata} <- decode_metadata(request["metadata_json"]),
          :ok <- projectless_fields(request),
-         :ok <- ticket_metadata(metadata),
+         :ok <- ticket_metadata(metadata, request["action"]),
          true <- valid_directory?(request["cwd"], metadata["directory_name"]) or {:error, :ticket_chat_directory_mismatch} do
       :ok
     end
@@ -128,7 +128,16 @@ defmodule SymphonyElixir.Factory.DesktopToolArgs do
     end
   end
 
-  defp ticket_metadata(metadata) do
+  defp ticket_metadata(metadata, action) do
+    with {:ok, base, notice} <- SpecialistErrorNotice.split_metadata(metadata),
+         true <- action == "FOLLOWUP" or notice == %{} do
+      ticket_base_metadata(base)
+    else
+      _ -> {:error, :invalid_ticket_chat_metadata}
+    end
+  end
+
+  defp ticket_base_metadata(metadata) do
     cond do
       Enum.sort(Map.keys(Map.delete(metadata, "broker_thread_id"))) != ~w(chat_key directory_name generation route) -> {:error, :invalid_ticket_chat_metadata}
       not valid_metadata_broker?(metadata) -> {:error, :parent_broker_identity_invalid}

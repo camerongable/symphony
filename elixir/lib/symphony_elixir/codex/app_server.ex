@@ -7,6 +7,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH}
   alias SymphonyElixir.Codex.{OutputSchema, ResumeRefusal}
   alias SymphonyElixir.Factory.WorkerFileTools
+  alias SymphonyElixir.Factory.NativeRuntimeRoute
 
   @initialize_id 1
   @thread_start_id 2
@@ -40,7 +41,15 @@ defmodule SymphonyElixir.Codex.AppServer do
   @mcp_startup_statuses_key {__MODULE__, :mcp_startup_statuses}
   @mcp_approval_state_key {__MODULE__, :mcp_approval_state}
   @turn_event_state_key {__MODULE__, :turn_event_state}
-  @type native_reader :: %{owner: pid(), port: port(), app_server_pid: String.t(), cwd: Path.t(), identity: reference()}
+  @type native_reader :: %{
+          required(:owner) => pid(),
+          required(:port) => port(),
+          required(:app_server_pid) => String.t(),
+          required(:cwd) => Path.t(),
+          required(:identity) => reference(),
+          required(:native_runtime) => NativeRuntimeRoute.t() | nil,
+          optional(:native_runtime_origin) => map()
+        }
   @type session :: %{
           port: port(),
           metadata: map(),
@@ -230,6 +239,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       worker_files: Keyword.get(opts, :worker_files),
       native_recovery: Keyword.get(opts, :native_recovery),
       recovery_preflight: Keyword.get(opts, :recovery_preflight),
+      native_runtime: nil,
       worker_policy: nil,
       worker_overrides: []
     }
@@ -241,15 +251,18 @@ defmodule SymphonyElixir.Codex.AppServer do
 
       with {:ok, connector_overrides} <- factory_connector_overrides(opts, worker_host),
            {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
+           {:ok, thread_options} <- worker_runtime_route(expanded_workspace, worker_host, opts, thread_options),
            {:ok, thread_options, binding} <- prepare_worker(expanded_workspace, worker_host, thread_options, binding),
+           {:ok, storage} <- worker_storage(expanded_workspace, thread_options),
            {:ok, port} <-
              start_port(
                expanded_workspace,
                worker_host,
                binding,
                thread_options.gitlab_mcp_startup_timeout_sec,
-               thread_options.worker_overrides,
-               connector_overrides
+               thread_options.worker_overrides ++ storage.overrides,
+               connector_overrides,
+               storage.env
              ) do
         metadata = port_metadata(port, worker_host)
 
@@ -264,31 +277,32 @@ defmodule SymphonyElixir.Codex.AppServer do
                    binding,
                    thread_options
                  ) do
-            {:ok,
-             %{
-               port: port,
-               metadata: metadata,
-               approval_policy: session_policies.approval_policy,
-               auto_approve_requests: false,
-               allowed_mcp_tool_approvals: thread_options.allowed_mcp_tool_approvals,
-               thread_sandbox: session_policies.thread_sandbox,
-               turn_sandbox_policy: session_policies.turn_sandbox_policy,
-               thread_id: thread_ref.thread_id,
-               forked_from_thread_id: thread_ref.forked_from_thread_id,
-               thread_name: thread_options.name,
-               project_id: thread_ref.project_id,
-               section_id: thread_options.section_id,
-               model: thread_options.model,
-               reasoning_effort: thread_options.reasoning_effort,
-               worker_policy: thread_options.worker_policy,
-               worker_files: thread_options.worker_files,
-               native_recovery: thread_options.native_recovery,
-               recovery_preflight: thread_options.recovery_preflight,
-               worker_invocation: worker_invocation(thread_options.worker_policy),
-               workspace: expanded_workspace,
-               worker_host: worker_host,
-               dynamic_tool_binding: binding
-             }}
+            session = %{
+              port: port,
+              metadata: metadata,
+              approval_policy: session_policies.approval_policy,
+              auto_approve_requests: false,
+              allowed_mcp_tool_approvals: thread_options.allowed_mcp_tool_approvals,
+              thread_sandbox: session_policies.thread_sandbox,
+              turn_sandbox_policy: session_policies.turn_sandbox_policy,
+              thread_id: thread_ref.thread_id,
+              forked_from_thread_id: thread_ref.forked_from_thread_id,
+              thread_name: thread_options.name,
+              project_id: thread_ref.project_id,
+              section_id: thread_options.section_id,
+              model: thread_options.model,
+              reasoning_effort: thread_options.reasoning_effort,
+              worker_policy: thread_options.worker_policy,
+              worker_files: thread_options.worker_files,
+              native_recovery: thread_options.native_recovery,
+              recovery_preflight: thread_options.recovery_preflight,
+              worker_invocation: worker_invocation(thread_options.worker_policy),
+              workspace: expanded_workspace,
+              worker_host: worker_host,
+              dynamic_tool_binding: binding
+            }
+
+            finish_worker_session(session, thread_options)
           else
             {:error, reason} ->
               stop_port(port)
@@ -308,6 +322,75 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp worker_invocation(nil), do: nil
   defp worker_invocation(_policy), do: Base.encode16(:crypto.strong_rand_bytes(32), case: :lower)
 
+  defp worker_runtime_route(workspace, host, opts, options) do
+    if Keyword.has_key?(opts, :native_runtime) do
+      with true <- is_nil(host) or {:error, :native_runtime_remote_unsupported},
+           true <- options.worker_access in ~w(FILE_SOURCE REVIEW) or {:error, :native_runtime_worker_required},
+           true <- match?(%NativeRuntimeRoute{}, opts[:native_runtime]) or {:error, :native_runtime_route_invalid},
+           {:ok, route} <- NativeRuntimeRoute.validate(opts[:native_runtime]),
+           {:ok, _storage} <- reader_storage(route, workspace) do
+        {:ok, %{options | native_runtime: route}}
+      end
+    else
+      {:ok, options}
+    end
+  end
+
+  defp worker_storage(_workspace, %{native_runtime: nil}), do: {:ok, %{env: [], overrides: []}}
+  defp worker_storage(workspace, %{native_runtime: route}), do: reader_storage(route, workspace)
+
+  defp finish_worker_session(session, %{native_runtime: nil}), do: {:ok, session}
+
+  defp finish_worker_session(session, %{native_runtime: route}) do
+    with {:ok, origin} <- NativeRuntimeRoute.origin(route) do
+      session = Map.merge(session, %{native_runtime: route, native_runtime_origin: origin})
+      Process.put({__MODULE__, :routed_session, session.port}, session)
+      {:ok, session}
+    else
+      error ->
+        stop_port(session.port)
+        error
+    end
+  end
+
+  defp routed_session_access(session, current? \\ true)
+
+  defp routed_session_access(%{port: port} = session, current?) when is_port(port) do
+    binding = Process.get({__MODULE__, :routed_session, port})
+    connected = Port.info(port, :connected)
+
+    cond do
+      is_map(binding) ->
+        with true <- binding === session or {:error, :native_runtime_session_not_owned},
+             true <- connected == {:connected, self()} or (not current? and is_nil(connected)) or {:error, :native_runtime_session_not_owned},
+             true <- is_nil(connected) or port_metadata(port, nil)[:codex_app_server_pid] == session.metadata[:codex_app_server_pid] or {:error, :native_runtime_session_not_owned} do
+          if current? do
+            case reader_storage(binding.native_runtime, binding.workspace) do
+              {:ok, _storage} -> :ok
+              error -> error
+            end
+          else
+            :ok
+          end
+        end
+
+      Map.has_key?(session, :native_runtime) or Map.has_key?(session, :native_runtime_origin) ->
+        {:error, :native_runtime_session_not_owned}
+
+      match?({:connected, owner} when owner != self(), connected) ->
+        {:error, :file_worker_session_not_owned}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp routed_session_access(session, _current?) do
+    if is_map(session) and (Map.has_key?(session, :native_runtime) or Map.has_key?(session, :native_runtime_origin)),
+      do: {:error, :native_runtime_session_not_owned},
+      else: :ok
+  end
+
   def run_turn(session, prompt, issue, opts \\ [])
 
   @spec run_turn(session(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
@@ -316,16 +399,18 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   def run_turn(%{worker_policy: %{"mode" => "FILE_SOURCE"}} = session, prompt, issue, opts) do
     with :ok <- WorkerFileTools.turn_preflight(session[:worker_files], session),
+         :ok <- routed_session_access(session),
          :ok <- file_worker_session_owned(session),
          :ok <- file_worker_runtime(session.port, session.workspace),
          :ok <- worker_catalog_empty(session.port, session),
-         :ok <- recovery_turn_preflight(session) do
+         :ok <- recovery_turn_preflight(session),
+         :ok <- routed_session_access(session) do
       run_allowed_turn(session, prompt, issue, opts)
     end
   end
 
   def run_turn(session, prompt, issue, opts) do
-    with :ok <- recovery_turn_preflight(session), do: run_allowed_turn(session, prompt, issue, opts)
+    with :ok <- routed_session_access(session), :ok <- recovery_turn_preflight(session), :ok <- routed_session_access(session), do: run_allowed_turn(session, prompt, issue, opts)
   end
 
   defp recovery_turn_preflight(%{native_recovery: proof, recovery_preflight: callback} = session) when is_map(proof) and is_function(callback, 1), do: callback.(session)
@@ -468,7 +553,18 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp turn_start_request_id(:legacy), do: @turn_start_id
 
   @spec stop_session(session()) :: :ok | {:ok, map()} | {:error, term()}
-  def stop_session(%{worker_policy: %{} = policy, port: port, thread_id: thread, metadata: metadata} = session) do
+  def stop_session(session) do
+    with :ok <- routed_session_access(session, false) do
+      try do
+        stop_valid_session(session)
+      after
+        if is_map(session) and is_port(session[:port]) and Process.get({__MODULE__, :routed_session, session.port}) === session,
+          do: Process.delete({__MODULE__, :routed_session, session.port})
+      end
+    end
+  end
+
+  defp stop_valid_session(%{worker_policy: %{} = policy, port: port, thread_id: thread, metadata: metadata} = session) do
     Process.unlink(port)
 
     try do
@@ -490,7 +586,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  def stop_session(%{port: port, thread_id: thread_id}) when is_port(port) do
+  defp stop_valid_session(%{port: port, thread_id: thread_id}) when is_port(port) do
     Process.unlink(port)
 
     try do
@@ -609,7 +705,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     workspace = Keyword.get(opts, :workspace, File.cwd!())
 
     native_read_scope(20_000, fn ->
-      with {:ok, reader} <- open_native_reader(workspace, false) do
+      with {:ok, reader} <- open_native_reader_actor(workspace, false, opts) do
         try do
           read_native_thread(reader, thread_id, opts)
         after
@@ -623,12 +719,16 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   @doc "Initializes a linked read-only actor; owner exit closes it without changing the caller's exit flags."
   @spec open_native_reader(Path.t()) :: {:ok, native_reader()} | {:error, term()}
-  def open_native_reader(workspace), do: open_native_reader(workspace, true)
+  def open_native_reader(workspace), do: open_native_reader_actor(workspace, true, [])
 
-  defp open_native_reader(workspace, linked?) when is_binary(workspace) do
+  @spec open_native_reader(Path.t(), keyword()) :: {:ok, native_reader()} | {:error, term()}
+  def open_native_reader(workspace, opts) when is_list(opts), do: open_native_reader_actor(workspace, true, opts)
+
+  defp open_native_reader_actor(workspace, linked?, opts) when is_binary(workspace) do
     with {:ok, cwd} <- PathSafety.canonicalize(Path.expand(workspace)),
          true <- File.dir?(cwd) or {:error, :native_reader_cwd_invalid},
-         {:ok, port} <- start_port(cwd, nil, DynamicTool.bind()) do
+         {:ok, route, storage} <- native_reader_route(cwd, opts),
+         {:ok, port} <- start_port(cwd, nil, DynamicTool.bind(), nil, [], storage.overrides, storage.env) do
       if not linked?, do: Process.unlink(port)
 
       reader = %{
@@ -636,16 +736,18 @@ defmodule SymphonyElixir.Codex.AppServer do
         port: port,
         app_server_pid: port_metadata(port, nil)[:codex_app_server_pid],
         cwd: cwd,
-        identity: make_ref()
+        identity: make_ref(),
+        native_runtime: route
       }
 
       Process.put({__MODULE__, :native_reader, port}, reader)
 
       try do
-        case native_read_scope(20_000, fn -> send_initialize(port) end) do
-          :ok ->
-            {:ok, reader}
-
+        with :ok <- native_read_scope(20_000, fn -> initialize_native_reader(port, storage) end),
+             {:ok, attested_reader} <- attest_native_reader(reader) do
+          Process.put({__MODULE__, :native_reader, port}, attested_reader)
+          {:ok, attested_reader}
+        else
           error ->
             close_native_reader(reader)
             error
@@ -662,7 +764,87 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp open_native_reader(_workspace, _linked?), do: {:error, :native_reader_cwd_invalid}
+  defp open_native_reader_actor(_workspace, _linked?, _opts), do: {:error, :native_reader_cwd_invalid}
+
+  defp native_reader_route(cwd, opts) do
+    if Keyword.has_key?(opts, :native_runtime) do
+      with true <- is_nil(opts[:worker_host]) or {:error, :native_runtime_remote_unsupported},
+           {:ok, route} <- NativeRuntimeRoute.validate(opts[:native_runtime]),
+           {:ok, storage} <- reader_storage(route, cwd) do
+        {:ok, route, storage}
+      end
+    else
+      {:ok, nil, %{env: [], overrides: []}}
+    end
+  end
+
+  defp reader_storage(route, cwd) do
+    with {:ok, storage} <- NativeRuntimeRoute.storage(route),
+         false <- Enum.any?([storage.codex_home, storage.sqlite_home], &reader_path_overlap?(&1, cwd)) do
+      {:ok, storage}
+    else
+      true -> {:error, :native_runtime_storage_unsafe}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp reader_path_overlap?(left, right), do: left == right or left == "/" or right == "/" or String.starts_with?(left, right <> "/") or String.starts_with?(right, left <> "/")
+
+  defp initialize_native_reader(port, %{codex_home: home, sqlite_home: sqlite}) do
+    with {:ok, response} <- initialization_response(port),
+         true <- (is_map(response) and response["codexHome"] == home) or {:error, :native_runtime_home_mismatch} do
+      send_message(port, %{"method" => "initialized", "params" => %{}})
+      send_message(port, %{"method" => "config/read", "id" => @worker_config_id, "params" => %{"includeLayers" => false}})
+
+      case await_response(port, @worker_config_id) do
+        {:ok, %{"config" => %{"sqlite_home" => ^sqlite}}} -> :ok
+        {:ok, _} -> {:error, :native_runtime_sqlite_mismatch}
+        error -> error
+      end
+    end
+  end
+
+  defp initialize_native_reader(port, _storage), do: send_initialize(port)
+
+  defp attest_native_reader(%{native_runtime: nil} = reader), do: {:ok, reader}
+
+  defp attest_native_reader(reader) do
+    with {:ok, origin} <- NativeRuntimeRoute.origin(reader.native_runtime) do
+      {:ok, Map.put(reader, :native_runtime_origin, origin)}
+    end
+  end
+
+  defp native_reader_route_current(reader, opts) do
+    route = reader.native_runtime
+
+    with :ok <- matching_reader_route(route, opts) do
+      if is_nil(route) do
+        :ok
+      else
+        case reader_storage(route, reader.cwd) do
+          {:ok, _storage} -> :ok
+          error -> error
+        end
+      end
+    end
+  end
+
+  defp matching_reader_route(route, opts) do
+    cond do
+      not is_nil(route) and not is_nil(opts[:worker_host]) ->
+        {:error, :native_runtime_remote_unsupported}
+
+      Keyword.has_key?(opts, :native_runtime) ->
+        with true <- not is_nil(route) or {:error, :native_runtime_route_conflict},
+             {:ok, supplied} <- NativeRuntimeRoute.validate(opts[:native_runtime]),
+             true <- supplied === route or {:error, :native_runtime_route_conflict} do
+          :ok
+        end
+
+      true ->
+        :ok
+    end
+  end
 
   @doc "Collects fresh persisted history on the same initialized owned reader."
   @spec read_native_thread(native_reader(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
@@ -670,12 +852,28 @@ defmodule SymphonyElixir.Codex.AppServer do
     timeout = Keyword.get(opts, :timeout_ms, 20_000)
 
     with :ok <- native_reader_owned(reader),
+         :ok <- native_reader_route_current(reader, opts),
          true <- (is_integer(timeout) and timeout > 0) or {:error, :native_read_deadline_expired} do
       native_read_scope(min(timeout, 20_000), fn -> collect_native_thread(reader.port, thread_id, opts) end)
     end
   end
 
   def read_native_thread(_reader, _thread_id, _opts), do: {:error, :invalid_native_thread_id}
+
+  @doc "Exports storage provenance only from the same successfully attested owned reader."
+  @spec native_reader_origin(native_reader()) :: {:ok, map()} | {:error, term()}
+  def native_reader_origin(reader) do
+    with :ok <- native_reader_owned(reader),
+         {:ok, origin} <- Map.fetch(reader, :native_runtime_origin),
+         :ok <- native_reader_route_current(reader, []),
+         {:ok, current} <- NativeRuntimeRoute.origin(reader.native_runtime),
+         true <- current === origin or {:error, :native_runtime_origin_mismatch} do
+      {:ok, origin}
+    else
+      :error -> {:error, :native_runtime_origin_unavailable}
+      {:error, _} = error -> error
+    end
+  end
 
   @doc "Closes only this process's native reader; repeated owned dead-reader cleanup is harmless."
   @spec close_native_reader(native_reader()) :: :ok | {:error, term()}
@@ -760,7 +958,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   @doc "Reads latest-turn and queue evidence using the worker's existing owned native actor."
   @spec read_owned_native_thread(session()) :: {:ok, map()} | {:error, term()}
   def read_owned_native_thread(%{port: port, thread_id: thread} = session) do
-    with :ok <- file_worker_session_owned(session),
+    with :ok <- routed_session_access(session),
+         :ok <- file_worker_session_owned(session),
          true <- is_nil(Process.get(@turn_event_state_key)) or {:error, :native_recovery_session_busy} do
       Process.put(@native_read_deadline_key, System.monotonic_time(:millisecond) + 20_000)
 
@@ -771,7 +970,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         with {:ok, %{"thread" => %{"id" => ^thread} = observed}} <- await_response(port, @thread_read_id),
              {:ok, observed} <- maybe_read_latest_turn(port, observed, opts),
              {:ok, observed} <- maybe_read_native_queue(port, observed, opts) do
-          recheck_latest_queue_version(port, observed, opts)
+          with {:ok, observed} <- recheck_latest_queue_version(port, observed, opts), :ok <- routed_session_access(session), do: {:ok, observed}
         else
           {:error, _} = error -> error
           _ -> {:error, :native_read_identity_or_history_mismatch}
@@ -1199,6 +1398,16 @@ defmodule SymphonyElixir.Codex.AppServer do
     do: {:error, :factory_connector_remote_unsupported}
 
   defp start_port(workspace, nil, dynamic_tool_binding, gitlab_mcp_startup_timeout_sec, overrides, connector_overrides) do
+    start_port(workspace, nil, dynamic_tool_binding, gitlab_mcp_startup_timeout_sec, overrides, connector_overrides, [])
+  end
+
+  defp start_port(workspace, host, binding, timeout, overrides, connector_overrides, []) when is_binary(host),
+    do: start_port(workspace, host, binding, timeout, overrides, connector_overrides)
+
+  defp start_port(_workspace, host, _binding, _timeout, _overrides, _connector_overrides, [_ | _]) when is_binary(host),
+    do: {:error, :native_runtime_remote_unsupported}
+
+  defp start_port(workspace, nil, dynamic_tool_binding, gitlab_mcp_startup_timeout_sec, overrides, connector_overrides, child_env) do
     executable = System.find_executable("bash")
 
     if is_nil(executable) do
@@ -1213,7 +1422,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           :exit_status,
           args: [~c"-lc", String.to_charlist(command)],
           cd: String.to_charlist(workspace),
-          env: worker_port_env(dynamic_tool_binding, overrides),
+          env: worker_port_env(dynamic_tool_binding, overrides) ++ child_env,
           line: @port_line_bytes
         ])
 
@@ -1347,6 +1556,14 @@ defmodule SymphonyElixir.Codex.AppServer do
     await_response(port, @initialize_id)
   end
 
+  defp qualify_worker_initialization(response, %{worker_access: mode, native_runtime: %NativeRuntimeRoute{} = route}) when mode in ~w(FILE_SOURCE REVIEW) do
+    with {:ok, home, family, os, agent} <- worker_runtime_fields(response),
+         :ok <- worker_runtime_supported(family, os, agent),
+         true <- home == route.codex_home.path or {:error, :worker_runtime_home_mismatch} do
+      :ok
+    end
+  end
+
   defp qualify_worker_initialization(response, %{worker_access: mode}) when mode in ~w(FILE_SOURCE REVIEW) do
     qualify_ticket_runtime_identity(response)
   end
@@ -1446,7 +1663,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp prepare_worker(workspace, nil, %{worker_access: "FILE_SOURCE"} = options, binding) do
     with :ok <- WorkerFileTools.preflight(options.worker_files, workspace),
          :ok <- restricted_worker_options(options),
-         {:ok, inventory} <- read_worker_configuration(workspace, binding),
+         {:ok, inventory} <- read_worker_configuration(workspace, binding, options),
          policy = worker_policy("FILE_SOURCE", workspace),
          {:ok, overrides} <- worker_overrides(inventory, policy) do
       overrides = overrides ++ worker_allocation_overrides(options)
@@ -1456,7 +1673,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp prepare_worker(workspace, nil, %{worker_access: "REVIEW"} = options, binding) do
     with :ok <- restricted_worker_options(options),
-         {:ok, inventory} <- read_worker_configuration(workspace, binding),
+         {:ok, inventory} <- read_worker_configuration(workspace, binding, options),
          policy = worker_policy("REVIEW", workspace),
          {:ok, overrides} <- worker_overrides(inventory, policy) do
       overrides = overrides ++ worker_allocation_overrides(options)
@@ -1478,14 +1695,16 @@ defmodule SymphonyElixir.Codex.AppServer do
     if valid, do: :ok, else: {:error, :worker_capability_configuration_rejected}
   end
 
-  defp read_worker_configuration(workspace, binding) do
-    with {:ok, port} <- start_port(workspace, nil, binding) do
+  defp read_worker_configuration(workspace, binding, options) do
+    with {:ok, storage} <- worker_storage(workspace, options),
+         {:ok, port} <- start_port(workspace, nil, binding, nil, storage.overrides, [], storage.env) do
       Process.put(@native_read_deadline_key, System.monotonic_time(:millisecond) + 20_000)
 
       try do
-        with :ok <- send_initialize(port),
+        with :ok <- send_initialize(port, if(is_nil(options.native_runtime), do: nil, else: options)),
              true <- send_message(port, %{"method" => "config/read", "id" => @worker_config_id, "params" => %{"cwd" => workspace, "includeLayers" => false}}),
-             {:ok, %{"config" => config}} <- await_response(port, @worker_config_id) do
+             {:ok, %{"config" => config}} <- await_response(port, @worker_config_id),
+             :ok <- worker_sqlite_config(config, options) do
           {:ok, config}
         else
           {:error, _} = error -> error
@@ -1648,9 +1867,11 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp do_start_session(port, workspace, session_policies, dynamic_tool_binding, thread_options) do
     with :ok <- send_initialize(port, thread_options),
+         :ok <- worker_sqlite_runtime(port, thread_options),
          :ok <- file_worker_runtime(port, workspace, thread_options),
          :ok <- worker_account(port, thread_options),
          {:ok, project_id} <- resolve_project_id(port, thread_options.project_id, thread_options.project_root),
+         {:ok, _storage} <- worker_storage(workspace, thread_options),
          {:ok, thread_ref} <-
            open_thread(
              port,
@@ -1662,6 +1883,22 @@ defmodule SymphonyElixir.Codex.AppServer do
       {:ok, Map.put(thread_ref, :project_id, project_id)}
     end
   end
+
+  defp worker_sqlite_runtime(_port, %{native_runtime: nil}), do: :ok
+
+  defp worker_sqlite_runtime(port, options) do
+    send_message(port, %{"method" => "config/read", "id" => @worker_config_id, "params" => %{"includeLayers" => false}})
+
+    case await_response(port, @worker_config_id) do
+      {:ok, %{"config" => config}} -> worker_sqlite_config(config, options)
+      {:error, _} = error -> error
+      _ -> {:error, :native_runtime_sqlite_mismatch}
+    end
+  end
+
+  defp worker_sqlite_config(_config, %{native_runtime: nil}), do: :ok
+  defp worker_sqlite_config(%{"sqlite_home" => sqlite}, %{native_runtime: route}) when sqlite == route.sqlite_home.path, do: :ok
+  defp worker_sqlite_config(_config, _options), do: {:error, :native_runtime_sqlite_mismatch}
 
   defp file_worker_runtime(port, workspace, %{worker_access: "FILE_SOURCE"}), do: file_worker_runtime(port, workspace)
   defp file_worker_runtime(_port, _workspace, _options), do: :ok

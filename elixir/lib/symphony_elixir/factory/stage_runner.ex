@@ -42,6 +42,7 @@ defmodule SymphonyElixir.Factory.StageRunner do
         :worker_access,
         :worker_files,
         :native_recovery,
+        :native_runtime,
         :recovery_preflight,
         :fork_on_active_writer,
         :model,

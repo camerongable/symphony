@@ -416,10 +416,16 @@ defmodule SymphonyElixir.Factory.TicketChat do
   defp metadata_matches?(store, chat, request, metadata) do
     linked = Store.query!(store, "SELECT run_id FROM ticket_chat_runs WHERE chat_key = ?", [chat["chat_key"]])
 
-    metadata == request_metadata(chat) or
-      (request["action"] == "FOLLOWUP" and
-         Map.drop(metadata, ~w(specialist_notice_ids specialist_notice_text)) == request_metadata(chat) and
-         Enum.any?(linked.rows, fn [run_id] -> SpecialistErrorNotice.valid_metadata?(store, run_id, metadata) end))
+    case SpecialistErrorNotice.split_metadata(metadata) do
+      {:ok, base, notice} ->
+        base == request_metadata(chat) and
+          (notice == %{} or
+             (request["action"] == "FOLLOWUP" and
+                Enum.any?(linked.rows, fn [run_id] -> SpecialistErrorNotice.valid_metadata?(store, run_id, metadata) end)))
+
+      {:error, _} ->
+        false
+    end
   end
 
   defp valid_schema?(json) when is_binary(json), do: Jason.decode(json) == {:ok, @schema}

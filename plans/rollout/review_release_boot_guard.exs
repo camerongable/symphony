@@ -63,6 +63,7 @@ defmodule ReviewReportReleaseBootGuard do
       |> Enum.sort()
     true = loaded_factories == Enum.sort(Map.keys(manifest["factory_modules"]))
     true = sha(:erlang.term_to_binary(digests)) == manifest["factory_beam_fingerprint"]
+    :ok = SymphonyElixir.Factory.NativeRuntimeCompatibility.check_manifest(manifest)
     nil = Process.whereis(SymphonyElixir.Factory.ControlServer)
     :ok
   end

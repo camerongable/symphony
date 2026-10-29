@@ -1063,20 +1063,27 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
          {:ok, _} <- WorkspaceAccess.validate(store, access["reservation_key"], access["generation"]),
          true <- access["mode"] == if(task["role"] == "feature-writer", do: "SOURCE", else: "REVIEW") or {:error, :ticket_worker_access_mismatch},
          {:ok, resume} <- resume_writer(store, task, opts),
+         {:ok, runtime_opts} <- selected_runtime_options(store, key, resume.binding, opts),
          policy = policy(access["mode"], access["canonical_path"]),
          :ok <- SymphonyElixir.Factory.TicketCiRepairSuccessor.issuance_check(store, run, opts),
          {:ok, attempt} <-
-           WorkerEvidence.reserve(store, %{
-             "request_key" => key,
-             "task_key" => task_key,
-             "reservation_key" => access["reservation_key"],
-             "input_sha256" => digest(prompt),
-             "owner_id" => Keyword.fetch!(opts, :owner_id),
-             "schema" => schema,
-             "policy" => policy
-           }),
+           WorkerEvidence.reserve(
+             store,
+             runtime_attempt_attrs(
+               %{
+                 "request_key" => key,
+                 "task_key" => task_key,
+                 "reservation_key" => access["reservation_key"],
+                 "input_sha256" => digest(prompt),
+                 "owner_id" => Keyword.fetch!(opts, :owner_id),
+                 "schema" => schema,
+                 "policy" => policy
+               },
+               runtime_opts
+             )
+           ),
          {:ok, _} <- WorkerEvidence.mark_start_sent(store, key) do
-      execute(store, attempt, policy, issue, prompt, schema, Keyword.put(opts, :resume_thread_id, resume))
+      execute(store, attempt, policy, issue, prompt, schema, Keyword.put(runtime_opts, :resume_thread_id, resume.thread_id))
     end
   end
 
@@ -1166,7 +1173,30 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
     end
   end
 
-  defp resume_writer(_store, %{"thread_id" => nil}, _opts), do: {:ok, nil}
+  defp runtime_attempt_attrs(attrs, opts) do
+    if Keyword.has_key?(opts, :native_runtime), do: Map.put(attrs, "native_runtime", opts[:native_runtime]), else: attrs
+  end
+
+  defp selected_runtime_options(store, key, predecessor, opts) do
+    case WorkerEvidence.get(store, key) do
+      {:error, :unknown_worker_attempt} ->
+        WorkerEvidence.runtime_options(predecessor, opts)
+
+      {:ok, evidence} ->
+        with true <- digest(evidence["binding_json"]) == evidence["binding_sha256"] or {:error, :worker_evidence_corrupt},
+             {:ok, binding} <- Jason.decode(evidence["binding_json"]),
+             {:ok, selected} <- WorkerEvidence.runtime_options(binding, opts),
+             {:ok, prior} <- if(is_nil(predecessor), do: {:ok, selected}, else: WorkerEvidence.runtime_options(predecessor, opts)),
+             true <- Keyword.fetch(selected, :native_runtime) === Keyword.fetch(prior, :native_runtime) or {:error, :worker_native_runtime_conflict} do
+          {:ok, selected}
+        end
+
+      error ->
+        error
+    end
+  end
+
+  defp resume_writer(_store, %{"thread_id" => nil}, _opts), do: {:ok, %{thread_id: nil, binding: nil}}
 
   defp resume_writer(store, task, opts) do
     if is_map(opts[:failed_turn_recovery]), do: resume_failed_writer(store, task, opts), else: resume_completed_writer(store, task, opts)
@@ -1176,8 +1206,11 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
     receipt = opts[:failed_turn_recovery]
 
     with :ok <- SymphonyElixir.Factory.FailedTurnRecovery.start_preflight(store, receipt, opts),
-         true <- (receipt["new_request_key"] == opts[:request_key] and receipt["thread_id"] == task["thread_id"]) or {:error, :failed_retry_binding_changed} do
-      {:ok, task["thread_id"]}
+         true <- (receipt["new_request_key"] == opts[:request_key] and receipt["thread_id"] == task["thread_id"]) or {:error, :failed_retry_binding_changed},
+         {:ok, previous} <- WorkerEvidence.get(store, receipt["old_request_key"]),
+         true <- digest(previous["binding_json"]) == previous["binding_sha256"] or {:error, :worker_evidence_corrupt},
+         {:ok, binding} <- Jason.decode(previous["binding_json"]) do
+      {:ok, %{thread_id: task["thread_id"], binding: binding}}
     end
   end
 
@@ -1198,7 +1231,7 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
         (previous["status"] == "CONSUMED" or blocked_transfer_matches?(store, previous, opts) or SymphonyElixir.Factory.TicketCiRepairSuccessor.resume_matches?(store, previous, opts))
 
     if valid,
-      do: {:ok, previous["thread_id"]},
+      do: {:ok, %{thread_id: previous["thread_id"], binding: Jason.decode!(previous["binding_json"])}},
       else: {:error, :ticket_worker_resume_unproven}
   end
 
@@ -1283,6 +1316,12 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
 
     on_ready = fn session ->
       true = session.worker_policy == policy
+
+      if Keyword.has_key?(opts, :native_runtime) do
+        true = session[:native_runtime] === opts[:native_runtime]
+        true = session[:native_runtime_origin] === Jason.decode!(attempt["binding_json"])["native_runtime"]
+      end
+
       require_resumed_thread!(session.thread_id, opts[:resume_thread_id])
       process = %{"pid" => session.metadata.codex_app_server_pid, "invocation_nonce" => session.worker_invocation}
       {:ok, _} = WorkerEvidence.bind_owner_process(store, key, process)
@@ -1305,6 +1344,8 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
       blocked_resume_prompt: opts[:blocked_resume_prompt],
       ready_rework: opts[:ready_rework]
     ]
+
+    runner_opts = if Keyword.has_key?(opts, :native_runtime), do: Keyword.put(runner_opts, :native_runtime, opts[:native_runtime]), else: runner_opts
 
     runner_opts =
       if guarded_failed_recovery?(opts[:failed_turn_recovery]) do

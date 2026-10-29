@@ -745,6 +745,20 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
 
   alias SymphonyElixir.DesktopTicketLifecycleFixture.WorkerServer
 
+  defmodule OriginLineageWorkerServer do
+    alias SymphonyElixir.DesktopTicketLifecycleFixture.WorkerServer
+
+    def start_session(workspace, opts) do
+      with {:ok, session} <- WorkerServer.start_session(workspace, opts),
+           {:ok, origin} <- SymphonyElixir.Factory.NativeRuntimeRoute.origin(opts[:native_runtime]) do
+        {:ok, Map.merge(session, %{native_runtime: opts[:native_runtime], native_runtime_origin: origin})}
+      end
+    end
+
+    defdelegate run_turn(session, prompt, issue, opts), to: WorkerServer
+    defdelegate stop_session(session), to: WorkerServer
+  end
+
   defmodule CompletionServer do
     alias SymphonyElixir.DesktopTicketLifecycleFixture.WorkerServer
     alias SymphonyElixir.Factory.WorkerFileTools
@@ -1317,7 +1331,87 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
 
     jira_scope = fn _workspace, callback -> callback.(%{thread_id: "jira-fixture"}) end
     options = Keyword.merge(opts(ctx), workspace_root: Path.join(ctx.root, "workspaces"), app_server: WorkerServer, jira_reader: JiraReader, jira_session: jira_scope)
+    options = if ctx[:native_ready_origin], do: Keyword.merge(options, native_runtime: ctx.native_runtime, app_server: OriginLineageWorkerServer), else: options
     {context, options}
+  end
+
+  @tag :native_ready_origin
+  @tag broker_thread_id: "00000000-0000-0000-0000-000000000001", finalize_jira: true, timeout: 450_000
+  test "READY rework and prepared replay retain the originally reserved native origin", ctx do
+    alias SymphonyElixir.Factory.NativeRuntimeRoute
+    root = ctx.root <> "-ready-origins"
+    File.mkdir!(root)
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    [origin, conflict] =
+      for name <- ~w(original other) do
+        descriptor = %{"version" => 1, "codex_home" => Path.join(root, name <> "-codex"), "sqlite_home" => Path.join(root, name <> "-sqlite")}
+
+        for path <- [descriptor["codex_home"], descriptor["sqlite_home"]] do
+          File.mkdir!(path)
+          File.chmod!(path, 0o700)
+        end
+
+        {:ok, route} = NativeRuntimeRoute.validate(descriptor)
+        route
+      end
+
+    ctx = Map.put(ctx, :native_runtime, origin)
+    {launch_context, options} = assert_mr_adoption(ctx, true)
+    {:ok, ready} = RunLedger.get(ctx.store, "run")
+    assert ready["state"] == "READY_FOR_REVIEW"
+    {:ok, chat} = TicketChat.ready_for_run(ctx.store, "run")
+    body = "Please rework the current candidate"
+    assert TicketChatCommands.rework_body?(body)
+    operations = [%{"operation" => "request_rework"}]
+    {:ok, command} = SymphonyElixir.TicketChatFixture.stage(%{store: ctx.store}, "origin-ready-rework", body, operations)
+    assert Jason.decode!(command["payload_json"]) == operations
+
+    readback =
+      SymphonyElixir.TicketChatFixture.native(Map.merge(ctx, %{cwd: chat["cwd"], chat: chat}), [body], command["command_key"])
+      |> put_in(["turns", Access.at(0), "id"], "origin-ready-turn")
+      |> put_in(["turns", Access.at(0), "items", Access.at(0), "id"], "origin-ready-item")
+      |> put_in(["turns", Access.at(0), "items", Access.at(0), "clientId"], "origin-ready-client")
+
+    assert {:ok, %{receipts: [%{"status" => "ACCEPTED"}]}} = TicketChatCommands.admit_readback(ctx.store, "run", readback)
+    {:ok, parent_options} = parent_reader_options(chat, readback)
+    {context, tick_options} = tick_controller(launch_context, Keyword.merge(Keyword.delete(options, :native_runtime), parent_options))
+    tick_options = Keyword.put(tick_options, :jira_reader, FinalJiraReader)
+    context = %{context | task_supervisor: nil}
+    handoff_rows = fn -> Map.new(~w(runs factory_tasks worker_evidence workspace_access ticket_chat_commands), &{&1, Store.query!(ctx.store, "SELECT rowid,* FROM #{&1} ORDER BY rowid").rows}) end
+    before = handoff_rows.()
+    conflicting = put_in(context, [:ticket_options], Keyword.put(context.ticket_options, :native_runtime, conflict))
+    assert {:ok, %{launches: [], events: events}} = Scheduler.tick(conflicting, tick_options)
+    assert Enum.any?(events, &(&1.event == "TICKET_DEFERRED" and String.contains?(&1.detail, "worker_native_runtime_conflict")))
+    assert handoff_rows.() == before
+    refute_received {:factory_task_started, _, _}
+
+    interrupt = fn selected ->
+      try do
+        Scheduler.tick(selected, tick_options)
+      catch
+        :exit, reason -> {:interrupted, reason}
+      end
+    end
+
+    _ = interrupt.(context)
+    {:ok, applied} = TicketChatCommands.get(ctx.store, command["command_key"])
+    assert applied["status"] == "APPLIED"
+    receipt = Jason.decode!(applied["application_receipt_json"])
+    {:ok, destination} = WorkerEvidence.get(ctx.store, receipt["request_key"])
+    {:ok, expected} = NativeRuntimeRoute.origin(origin)
+    assert destination["status"] == "RESERVED"
+    assert Jason.decode!(destination["binding_json"])["native_runtime"] === expected
+    assert {:ok, _} = TicketChatCommands.validate_ready_rework_replay(ctx.store, command["command_key"])
+    prepared_rows = handoff_rows.()
+    conflicting = put_in(context, [:ticket_options], Keyword.put(context.ticket_options, :native_runtime, conflict))
+    assert {:ok, %{launches: [], events: replay_events}} = Scheduler.tick(conflicting, tick_options)
+    assert Enum.any?(replay_events, &(&1.event == "TICKET_DEFERRED" and String.contains?(&1.detail, "worker_native_runtime_conflict")))
+    assert handoff_rows.() == prepared_rows
+    _ = interrupt.(context)
+    assert handoff_rows.() == prepared_rows
+    assert Store.one!(ctx.store, "SELECT COUNT(*) AS n FROM events WHERE event_type='TICKET_COMMAND_APPLIED' AND json_extract(payload_json,'$.command_key')=?", [command["command_key"]])["n"] == 1
+    refute_received {:factory_task_started, _, _}
   end
 
   defp parent_reader_options(chat, readback) do
@@ -9403,10 +9497,29 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
 
   defp maybe_finalize_jira(ctx, factory, options, run, mr) do
     cond do
+      ctx[:native_ready_origin] -> finalize_ready_origin(ctx, factory, options, run, mr)
       ctx[:finalize_jira] -> assert_jira_finalization(ctx, factory, options, run, mr)
       ctx[:finalize_race] -> assert_jira_finalization_race(ctx, factory, options, run, mr)
       true -> :ok
     end
+  end
+
+  defp finalize_ready_origin(ctx, factory, options, run, mr) do
+    assert {:ok, _} = Control.activate(ctx.store, factory, factory.dispatcher_id)
+    {:ok, snapshot} = JiraReader.issue(run["issue_key"], store: ctx.store)
+    snapshot = Map.update!(snapshot, "comments", fn comments -> Enum.with_index(comments, fn entry, index -> Map.put(entry, "id", "origin-history-#{index}") end) end)
+    Process.put(:final_jira_snapshot, snapshot)
+    Process.put(:final_jira_calls, [])
+    Process.put(:final_jira_mode, :applied)
+    Process.put(:mr_reads, List.duplicate(mr, 100))
+    request = Store.one!(ctx.store, "SELECT cwd FROM desktop_requests WHERE target_kind='CONTROLLER' AND status='SUCCEEDED'")
+    scope = fn _cwd, operation -> operation.(%{thread_id: "final-jira"}) end
+    options = Keyword.merge(options, workspace: request["cwd"], jira_reader: FinalJiraReader, jira_connector: FinalJiraConnector, jira_session: scope)
+    assert {:ok, %{status: "REVIEW_READY", run: ready}} = TicketJiraFinalization.finish(ctx.store, "run", factory, options)
+    assert ready["state"] == "READY_FOR_REVIEW"
+    reopened = start_supervised!({Store, database: ctx.database}, id: :ready_origin_reopen)
+    assert {:ok, ^ready} = RunLedger.get(reopened, "run")
+    assert_jira_finalization_ready_run(ready, run)
   end
 
   defp assert_jira_finalization_race(ctx, factory, options, run, mr) do

@@ -1101,11 +1101,26 @@ direct specialist input remains prohibited. A Desktop-held exclusive lock or
 unexplained source-cwd holder still denies recovery. Never delete native locks
 or fabricate shutdown receipts to bypass those guards.
 
+The experimental owned-reader API accepts an explicit private local storage route,
+attesting both native home and effective SQLite root before history reads. It does
+not change the default route. Explicit worker routes use the same restored origin
+for preflight, startup/resume and every owned turn/read.
+`NativeRuntimeRoute.origin/1` and `restore_origin/1` preserve canonical paths and
+directory device/inode/UID across JSON storage. Replaced directories refuse rather
+than becoming a new trusted origin. `AppServer.native_reader_origin/1` requires the
+same owned reader's successful home and effective-SQLite attestation. This is not
+in-place database integrity or issuance authority. Versioned attempts and recovery
+receipts retain that origin; the workflow selector and isolated-worker activation
+remain disabled.
+
 Every captured specialist error has a durable deduplicated parent notice. The
 notice requires independently read-back final text, not an acknowledgment-only
 result. An uncertain parent presentation remains a delivery obstruction and is
 never blindly resent. These changes do not authorize deployment or prove visible
 delivery in the live ticket chat.
+Notice metadata is an optional complete ID/text pair on parent follow-ups only.
+Formatting accepts opaque notice IDs but grants no authority: the linked-run ledger,
+immutable request payload and exact visible final readback remain required.
 
 When a writer returns `BLOCKED` on a failing contract check with partial
 source edits, the controller does not discard them or silently reinterpret the
@@ -2038,6 +2053,33 @@ claim or receipt. After the same issuer shutdown and replacement checks, they
 archive both original records verbatim and rearm the unchanged reservation once.
 The recorded outcome is `GIT_NOT_ISSUED`: helper input arrived, but Git did not run.
 Neither command retries a helper or changes the earlier unattached operation.
+
+### Native-history upgrade admission
+
+Factory startup and both explicit ledger openings scan all retained worker bindings
+and native completion events in one read-only SQLite snapshot before initialization,
+migration or worker probes. Unversioned bindings and V1 completion receipts remain
+byte-compatible. Explicit V2 bindings retain the recorded host-directory origin
+through reservation, launch/resume, successors and recovery. V2 recovery receipts
+require the same owned reader's attested origin; ordinary successful results do not
+invent a recovery receipt. Unknown formats and unreadable history refuse.
+Database inputs are filesystem paths, not SQLite `file:` URIs. Disabled factory
+startup leaves its unused ledger untouched; an explicit reserved
+`ticket_supervisor.native_runtime` setting still refuses, even when false or null.
+
+Updated release launchers and supported rollout/restore entrypoints also compare
+the target's compiled supported formats with its attested manifest and the current
+ledger. SQLite may update its own lock metadata, but admission does not write ledger
+rows, schema or WAL payloads. Artifact-only cold qualification does not read the
+workflow/ledger and is not admission proof. This does not protect manually invoked
+immutable older binaries or enable native-storage routing. Missing manifest declarations
+always mean legacy-only, so a V2-capable binary requires its explicit matching declaration.
+Rollout quietness checks every recorded origin/thread pair; an older rollback target
+refuses V2 history before service effects. V2 origin digests use sorted string keys,
+compact JSON and raw UTF-8 (not ASCII escapes); V1 encoding is unchanged. Directory
+identity does not attest in-place database contents or authorize worker issuance.
+The workflow selector remains disabled; activation and authoritative minimum rollback
+admission require separate qualification and authorization.
 
 This project is licensed under the [Apache License 2.0](../LICENSE).
 

@@ -26,23 +26,32 @@ defmodule SymphonyElixir.Factory.FailedTurnRecovery do
   @event "TICKET_FAILED_TURN_RECOVERY_APPLIED"
   @closed_connection inspect("connection is closed because of an error, disconnect or timeout")
   @run_fields ~w(run_id state worktree branch candidate_sha spec_revision contract_sha256 implementation_iteration plan_markdown)
+
+  defp native_history(opts), do: if(Keyword.has_key?(opts, :native_runtime), do: {:ok, opts[:native_history]}, else: legacy_native_history(opts))
+  defp queue_reader(opts), do: if(Keyword.has_key?(opts, :native_runtime), do: AppServer, else: legacy_queue_reader(opts))
+  defp owned_reader(opts), do: if(Keyword.has_key?(opts, :native_runtime), do: AppServer, else: legacy_owned_reader(opts))
+  defp native_home(opts), do: if(Keyword.has_key?(opts, :native_runtime), do: opts[:native_home], else: legacy_native_home(opts))
+  defp queue_database(opts), do: if(Keyword.has_key?(opts, :native_runtime), do: opts[:native_queue_database], else: legacy_queue_database(opts))
+
   if Mix.env() == :test do
-    defp native_history(opts) do
+    defp legacy_native_history(opts) do
       if is_binary(opts[:native_history]), do: {:ok, opts[:native_history]}, else: {:error, :native_history_missing}
     end
 
     defp recovery_now(opts), do: Keyword.get(opts, :now, DateTime.utc_now())
-    defp queue_reader(opts), do: Keyword.get(opts, :native_reader, AppServer)
-    defp owned_reader(opts), do: Keyword.get(opts, :app_server, AppServer)
-    defp native_home(opts), do: opts[:native_home] || get_in(opts[:native_queue] || %{}, ["writer_lock", "home"]) || Path.join(System.user_home!(), ".codex")
-    defp queue_database(opts), do: opts[:native_queue_database] || get_in(opts[:native_queue] || %{}, ["persisted_queue", "database_path"]) || Path.join(System.user_home!(), ".codex/queue_1.sqlite")
+    defp legacy_queue_reader(opts), do: Keyword.get(opts, :native_reader, AppServer)
+    defp legacy_owned_reader(opts), do: Keyword.get(opts, :app_server, AppServer)
+    defp legacy_native_home(opts), do: opts[:native_home] || get_in(opts[:native_queue] || %{}, ["writer_lock", "home"]) || Path.join(System.user_home!(), ".codex")
+
+    defp legacy_queue_database(opts),
+      do: opts[:native_queue_database] || get_in(opts[:native_queue] || %{}, ["persisted_queue", "database_path"]) || Path.join(System.user_home!(), ".codex/queue_1.sqlite")
   else
-    defp native_history(_opts), do: {:ok, Path.join(System.user_home!(), ".codex/thread_history_1.sqlite")}
+    defp legacy_native_history(_opts), do: {:ok, Path.join(System.user_home!(), ".codex/thread_history_1.sqlite")}
     defp recovery_now(_opts), do: DateTime.utc_now()
-    defp queue_reader(_opts), do: AppServer
-    defp owned_reader(_opts), do: AppServer
-    defp native_home(_opts), do: Path.join(System.user_home!(), ".codex")
-    defp queue_database(_opts), do: Path.join(System.user_home!(), ".codex/queue_1.sqlite")
+    defp legacy_queue_reader(_opts), do: AppServer
+    defp legacy_owned_reader(_opts), do: AppServer
+    defp legacy_native_home(_opts), do: Path.join(System.user_home!(), ".codex")
+    defp legacy_queue_database(_opts), do: Path.join(System.user_home!(), ".codex/queue_1.sqlite")
   end
 
   @spec prepare_automatic(Store.connection(), String.t(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
@@ -196,16 +205,20 @@ defmodule SymphonyElixir.Factory.FailedTurnRecovery do
            {:ok, transferred} <- WorkspaceAccess.transfer_failed_source(store, access["reservation_key"], proof),
            {:ok, _} <- TaskLedger.update(store, task["task_key"], %{status: "STARTING", prompt_sha256: hash(prompt), output_json: nil, failure_code: nil}),
            :ok <- WorkerInstructions.bind_task(store, task["task_key"], hash(prompt), Jason.decode!(base)["instruction_binding_sha256"]),
-           {:ok, attempt} <-
-             WorkerEvidence.reserve(store, %{
-               "request_key" => new_request,
-               "task_key" => task["task_key"],
-               "reservation_key" => transferred["reservation_key"],
-               "input_sha256" => hash(prompt),
-               "owner_id" => "owner:" <> new_request,
-               "schema" => binding["schema"],
-               "policy" => binding["policy"]
-             }) do
+           {:ok, attempt_attrs} <-
+             WorkerEvidence.inherit_runtime(
+               %{
+                 "request_key" => new_request,
+                 "task_key" => task["task_key"],
+                 "reservation_key" => transferred["reservation_key"],
+                 "input_sha256" => hash(prompt),
+                 "owner_id" => "owner:" <> new_request,
+                 "schema" => binding["schema"],
+                 "policy" => binding["policy"]
+               },
+               binding
+             ),
+           {:ok, attempt} <- WorkerEvidence.reserve(store, attempt_attrs) do
         result = Map.merge(proof, %{"new_generation" => transferred["generation"], "new_binding_sha256" => attempt["binding_sha256"]})
         persist(store, run["run_id"], @event, result)
         {:ok, result}
@@ -223,13 +236,28 @@ defmodule SymphonyElixir.Factory.FailedTurnRecovery do
   end
 
   defp read_interrupted_queue(old, opts) do
+    with {:ok, opts} <- runtime_options(old, opts), do: read_interrupted_queue_resolved(old, opts)
+  end
+
+  defp read_interrupted_queue_resolved(old, opts) do
     reader = queue_reader(opts)
-    read_opts = [workspace: File.cwd!(), include_turns: false, include_latest_turn: true, include_queue: true, native_history: opts[:native_history]]
+
+    read_opts =
+      Keyword.merge(Keyword.take(opts, [:native_runtime]),
+        workspace: opts[:workspace] || File.cwd!(),
+        include_turns: false,
+        include_latest_turn: true,
+        include_queue: true,
+        native_history: opts[:native_history]
+      )
 
     with {:ok, native} <- reader.read_native_thread(old["thread_id"], read_opts),
          :ok <- queue_valid?(old, native, opts),
+         {:ok, _} <- runtime_options(old, opts),
          {:ok, persisted} <- NativeQueueReadback.read(queue_database(opts), old["thread_id"]),
-         {:ok, lock} <- NativeQueueReadback.writer_unlocked(native_home(opts), old["thread_id"]) do
+         {:ok, _} <- runtime_options(old, opts),
+         {:ok, lock} <- NativeQueueReadback.writer_unlocked(native_home(opts), old["thread_id"]),
+         {:ok, _} <- runtime_options(old, opts) do
       {:ok, native |> Map.put("persisted_queue", persisted) |> Map.put("writer_lock", Map.put(lock, "home", native_home(opts)))}
     else
       {:error, _} = error -> error
@@ -237,10 +265,15 @@ defmodule SymphonyElixir.Factory.FailedTurnRecovery do
   end
 
   defp interrupted_queue_current(old, opts) do
+    with {:ok, opts} <- runtime_options(old, opts), do: interrupted_queue_current_resolved(old, opts)
+  end
+
+  defp interrupted_queue_current_resolved(old, opts) do
     if guarded_mode?(opts) do
       with :ok <- queue_valid?(old, opts[:native_queue], opts),
            {:ok, current} <- NativeQueueReadback.read(queue_database(opts), old["thread_id"]),
-           true <- current == opts[:native_queue]["persisted_queue"] do
+           true <- current == opts[:native_queue]["persisted_queue"],
+           {:ok, _} <- runtime_options(old, opts) do
         :ok
       else
         _ -> {:error, :interrupted_persisted_queue_unproven}
@@ -251,10 +284,12 @@ defmodule SymphonyElixir.Factory.FailedTurnRecovery do
   end
 
   defp interrupted_transfer_current(old, opts) do
-    with :ok <- interrupted_queue_current(old, opts) do
+    with {:ok, opts} <- runtime_options(old, opts), :ok <- interrupted_queue_current(old, opts) do
       if guarded_mode?(opts) do
-        with {:ok, lock} <- NativeQueueReadback.writer_unlocked(native_home(opts), old["thread_id"]),
-             true <- Map.put(lock, "home", native_home(opts)) == opts[:native_queue]["writer_lock"] do
+        with {:ok, _} <- runtime_options(old, opts),
+             {:ok, lock} <- NativeQueueReadback.writer_unlocked(native_home(opts), old["thread_id"]),
+             true <- Map.put(lock, "home", native_home(opts)) == opts[:native_queue]["writer_lock"],
+             {:ok, _} <- runtime_options(old, opts) do
           :ok
         else
           _ -> {:error, :interrupted_native_writer_lock_unproven}
@@ -445,7 +480,16 @@ defmodule SymphonyElixir.Factory.FailedTurnRecovery do
   end
 
   defp native_failed(old, opts) do
-    if schema_mode?(opts), do: native_schema_failed(old, opts), else: native_failed_standard(old, opts)
+    with {:ok, opts} <- runtime_options(old, opts),
+         {:ok, native} <- if(schema_mode?(opts), do: native_schema_failed(old, opts), else: native_failed_standard(old, opts)),
+         {:ok, _} <- runtime_options(old, opts),
+         do: {:ok, native}
+  end
+
+  defp runtime_options(old, opts) do
+    with true <- hash(old["binding_json"]) == old["binding_sha256"] or {:error, :worker_evidence_corrupt},
+         {:ok, binding} <- Jason.decode(old["binding_json"]),
+         do: WorkerEvidence.runtime_options(binding, opts)
   end
 
   defp native_failed_standard(old, opts) do
@@ -666,6 +710,7 @@ defmodule SymphonyElixir.Factory.FailedTurnRecovery do
          true <- transfer == Map.take(proof, ~w(kind recovery_key old_request_key new_request_key new_reservation_key)),
          {:ok, new} <- WorkerEvidence.get(store, proof["new_request_key"]),
          true <- new["binding_sha256"] == proof["new_binding_sha256"] and hash(new["binding_json"]) == proof["new_binding_sha256"],
+         true <- hash(old["binding_json"]) == old["binding_sha256"] and WorkerEvidence.runtime_matches?(Jason.decode!(old["binding_json"]), Jason.decode!(new["binding_json"])),
          {:ok, new_access} <- WorkspaceAccess.get(store, proof["new_reservation_key"]),
          true <- new_access["generation"] == proof["new_generation"] and new_access["request_key"] == new["request_key"] do
       new["run_id"] == old["run_id"] and new["task_key"] == old["task_key"] and new["reservation_key"] == proof["new_reservation_key"]
@@ -704,6 +749,7 @@ defmodule SymphonyElixir.Factory.FailedTurnRecovery do
     opts = recovery_options(proof, opts)
 
     with {:ok, old} <- WorkerEvidence.get(store, proof["old_request_key"]),
+         {:ok, opts} <- runtime_options(old, opts),
          {:ok, opts} <- fresh_interrupted_start(old, opts),
          :ok <- frozen_queue_matches(proof, opts) do
       {:ok, opts}
@@ -727,11 +773,12 @@ defmodule SymphonyElixir.Factory.FailedTurnRecovery do
   @spec owned_session_preflight(Store.connection(), map(), map(), keyword()) :: :ok | {:error, term()}
   def owned_session_preflight(store, proof, session, opts) do
     opts = recovery_options(proof, opts)
-    reader = owned_reader(opts)
 
     with true <- guarded_mode?(opts),
          true <- receipt(store, "new_request_key", proof["new_request_key"]) == proof,
          {:ok, old} <- WorkerEvidence.get(store, proof["old_request_key"]),
+         {:ok, opts} <- runtime_options(old, opts),
+         reader = owned_reader(opts),
          :ok <- schema_scope_current(store, old, opts),
          true <- superseded?(store, old),
          {:ok, current} <- WorkerEvidence.get(store, proof["new_request_key"]),

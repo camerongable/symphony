@@ -3,7 +3,255 @@ defmodule SymphonyElixir.FactoryCompletedTurnRecoveryTest do
   import SymphonyElixir.TicketWorkerFixture
   alias SymphonyElixir.Factory.{RunLedger, Scheduler, StageSchemas, Store, TaskLedger}
   alias SymphonyElixir.Factory.{TicketWorkerRunner, WorkerEvidence, WorkspaceAccess}
+  alias SymphonyElixir.Factory.{DesktopRequest, DesktopToolArgs, TicketChat, TicketChatOutbox}
   setup :setup_fixture
+
+  defmodule UntrustedRecoveryReader do
+    def read_native_thread(_thread, _opts), do: raise("routed recovery must not call an injected reader")
+  end
+
+  @tag :native_worker_recovery
+  test "a routed pending result refuses copied proof without genuine observation authority", ctx do
+    route = recovery_route(ctx)
+    {_trace, failed} = failed_attempt(Map.put(ctx, :native_runtime, route))
+    observed = %{thread_id: failed["thread_id"], turn_id: failed["turn_id"], item_id: "completed-final", output: output()}
+    before = Store.query!(ctx.store, "SELECT * FROM events ORDER BY id").rows
+    assert {:error, :completed_turn_receipt_unproven} = WorkerEvidence.reconcile_completed(ctx.store, failed["request_key"], failed["owner_id"], observed, Jason.decode!(failed["owner_stop_json"]))
+    assert {:ok, ^failed} = WorkerEvidence.get(ctx.store, failed["request_key"])
+    assert Store.query!(ctx.store, "SELECT * FROM events ORDER BY id").rows == before
+  end
+
+  @tag :native_worker_recovery
+  @tag :native_notice_scalar
+  test "routed completion reads the bound store and committed readback needs neither roots nor another read", ctx do
+    for raw <- ["null", "[]", "1", "\"scalar\""] do
+      Store.query!(ctx.store, "INSERT INTO events(event_type,run_id,payload_json,occurred_at) VALUES ('SPECIALIST_ERROR_RECORDED','run',?,?)", [raw, DateTime.to_iso8601(DateTime.utc_now())])
+    end
+
+    route = recovery_route(ctx)
+    {trace, failed} = failed_attempt(Map.put(ctx, :native_runtime, route))
+    assert File.regular?(Path.join(route.sqlite_home.path, "completed-state.json"))
+    refute File.exists?(trace <> ".state")
+    default_state = Path.join(route.sqlite_home.path, "completed-state.json") |> File.read!() |> Jason.decode!()
+    default_state = put_in(default_state, ["turns", Access.at(0), "items", Access.at(0), "text"], Jason.encode!(Map.put(output(), "checks", ["wrong-default-store-A"])))
+    File.write!(trace <> ".state", Jason.encode!(default_state))
+    default_bytes = File.read!(trace <> ".state")
+    assert {:ok, observed} = TicketWorkerRunner.reconcile_completed(ctx.store, failed["request_key"], native_reader: UntrustedRecoveryReader)
+    assert observed.output == output()
+    [proof] = recovery_events(ctx.store)
+    assert proof["kind"] == "NATIVE_COMPLETION_RECEIPT_V2"
+    assert proof["version"] === 2
+    assert proof["native_runtime"] === Jason.decode!(failed["binding_json"])["native_runtime"]
+    assert proof["native_runtime_sha256"] == hash_json(proof["native_runtime"])
+    requests = File.read!(trace)
+    File.rename!(route.codex_home.path, route.codex_home.path <> "-unavailable")
+    File.rename!(route.sqlite_home.path, route.sqlite_home.path <> "-unavailable")
+    assert {:ok, ^observed} = TicketWorkerRunner.reconcile_completed(ctx.store, failed["request_key"])
+    assert File.read!(trace) == requests
+    assert length(recovery_events(ctx.store)) == 1
+    assert execution_count(trace) == 1
+    assert File.read!(trace <> ".state") == default_bytes
+  end
+
+  @tag :native_worker_recovery
+  test "pending routed recovery refuses unavailable or unsafe roots before any native read", ctx do
+    route = recovery_route(ctx)
+    {trace, failed} = failed_attempt(Map.put(ctx, :native_runtime, route))
+    requests = File.read!(trace)
+    File.chmod!(route.sqlite_home.path, 0o755)
+    assert {:error, :native_runtime_storage_unsafe} = TicketWorkerRunner.reconcile_completed(ctx.store, failed["request_key"])
+    assert File.read!(trace) == requests
+    File.chmod!(route.sqlite_home.path, 0o700)
+    File.rename!(route.sqlite_home.path, route.sqlite_home.path <> "-original")
+    File.mkdir!(route.sqlite_home.path)
+    File.chmod!(route.sqlite_home.path, 0o700)
+    assert {:error, :native_runtime_storage_changed} = TicketWorkerRunner.reconcile_completed(ctx.store, failed["request_key"])
+    assert File.read!(trace) == requests
+    assert {:ok, ^failed} = WorkerEvidence.get(ctx.store, failed["request_key"])
+    assert recovery_events(ctx.store) == []
+  end
+
+  @tag :native_worker_recovery
+  test "a valid copied V2 receipt cannot replace process-private observation authority", ctx do
+    route = recovery_route(ctx)
+    {trace, failed} = failed_attempt(Map.put(ctx, :native_runtime, route))
+    binding = Jason.decode!(failed["binding_json"])
+    {:ok, run} = RunLedger.get(ctx.store, failed["run_id"])
+    {:ok, task} = TaskLedger.get(ctx.store, failed["task_key"])
+    {:ok, access} = WorkspaceAccess.get(ctx.store, failed["reservation_key"])
+    stop = Jason.decode!(failed["owner_stop_json"])
+    before = %{evidence: failed, binding: binding, run: run, task: task, access: access, stop: stop}
+    assert {:ok, observed} = TicketWorkerRunner.reconcile_completed(ctx.store, failed["request_key"])
+    [proof] = recovery_events(ctx.store)
+    reset_receipt_fixture(ctx.store, failed)
+    recovered = Map.take(observed, [:thread_id, :turn_id, :item_id, :output]) |> Map.merge(%{reconciliation_preimage: before, native_recovery: proof})
+    assert :ok = SymphonyElixir.Factory.CompletedTurnRecovery.validate_receipt(proof, before, recovered, DateTime.to_iso8601(DateTime.utc_now()))
+    events = Store.query!(ctx.store, "SELECT * FROM events ORDER BY id").rows
+    requests = File.read!(trace)
+
+    for result <- [recovered, Map.put(recovered, :native_observation_authority, make_ref()), Map.put(recovered, :native_observation_authority, %{"native_runtime" => binding["native_runtime"]})] do
+      assert {:error, :completed_turn_receipt_unproven} = WorkerEvidence.reconcile_completed(ctx.store, failed["request_key"], failed["owner_id"], result, stop)
+      assert {:ok, ^failed} = WorkerEvidence.get(ctx.store, failed["request_key"])
+      assert Store.query!(ctx.store, "SELECT * FROM events ORDER BY id").rows == events
+    end
+
+    refute Enum.any?(Process.get_keys(), &match?({SymphonyElixir.Factory.CompletedTurnRecovery, :observation, _}, &1))
+    assert File.read!(trace) == requests
+  end
+
+  @tag :native_worker_recovery
+  test "committed V2 receipt tampering refuses without replaying native observation", ctx do
+    route = recovery_route(ctx)
+    {trace, failed} = failed_attempt(Map.put(ctx, :native_runtime, route))
+    assert {:ok, observed} = TicketWorkerRunner.reconcile_completed(ctx.store, failed["request_key"])
+    [proof] = recovery_events(ctx.store)
+    [[id, raw, occurred_at]] = Store.query!(ctx.store, "SELECT id,payload_json,occurred_at FROM events WHERE event_type='TICKET_WORKER_NATIVE_COMPLETION_RECOVERED'").rows
+    requests = File.read!(trace)
+    altered_origin = put_in(proof["native_runtime"], ["sqlite_home", "inode"], proof["native_runtime"]["sqlite_home"]["inode"] + 1)
+
+    changes = [
+      Map.put(proof, "version", 2.0),
+      Map.put(proof, "version", true),
+      Map.put(proof, "kind", "NATIVE_COMPLETION_RECEIPT_V1"),
+      Map.put(proof, "native_runtime_sha256", String.duplicate("f", 64)),
+      Map.merge(proof, %{"native_runtime" => altered_origin, "native_runtime_sha256" => hash_json(altered_origin)}),
+      Map.put(proof, "output_sha256", String.duplicate("f", 64)),
+      Map.put(proof, "owner_stop_json", "{}"),
+      Map.put(proof, "failure_code", ":turn_timeout"),
+      put_in(proof, ["native_observation", "latest", "observed_at"], "2999-01-01T00:00:00Z"),
+      Map.delete(proof, "native_runtime"),
+      Map.put(proof, "unknown", true)
+    ]
+
+    for changed <- Enum.map(changes, &Jason.encode!/1) ++ ["{", "null"] do
+      Store.query!(ctx.store, "UPDATE events SET payload_json=? WHERE id=?", [changed, id])
+      assert {:error, :completed_turn_receipt_unproven} = TicketWorkerRunner.reconcile_completed(ctx.store, failed["request_key"])
+      assert File.read!(trace) == requests
+    end
+
+    Store.query!(ctx.store, "UPDATE events SET payload_json=?,occurred_at=? WHERE id=?", [raw, "2020-01-01T00:00:00Z", id])
+    assert {:error, :completed_turn_receipt_unproven} = TicketWorkerRunner.reconcile_completed(ctx.store, failed["request_key"])
+    Store.query!(ctx.store, "UPDATE events SET occurred_at=? WHERE id=?", [occurred_at, id])
+    Store.query!(ctx.store, "INSERT INTO events(event_type,run_id,payload_json,occurred_at) VALUES ('TICKET_WORKER_NATIVE_COMPLETION_RECOVERED',?,?,?)", [failed["run_id"], raw, occurred_at])
+    assert {:error, :completed_turn_receipt_unproven} = TicketWorkerRunner.reconcile_completed(ctx.store, failed["request_key"])
+    Store.query!(ctx.store, "DELETE FROM events WHERE event_type='TICKET_WORKER_NATIVE_COMPLETION_RECOVERED' AND id<>?", [id])
+    Process.sleep(11_000)
+    assert {:ok, ^observed} = TicketWorkerRunner.reconcile_completed(ctx.store, failed["request_key"])
+    assert File.read!(trace) == requests
+    assert execution_count(trace) == 1
+  end
+
+  defp recovery_route(ctx) do
+    runtime_root = ctx.root <> "-runtime"
+    File.mkdir!(runtime_root)
+    on_exit(fn -> File.rm_rf!(runtime_root) end)
+    descriptor = %{"version" => 1, "codex_home" => Path.join(runtime_root, "codex"), "sqlite_home" => Path.join(runtime_root, "sqlite")}
+
+    for path <- [descriptor["codex_home"], descriptor["sqlite_home"]] do
+      File.mkdir!(path)
+      File.chmod!(path, 0o700)
+    end
+
+    {:ok, route} = SymphonyElixir.Factory.NativeRuntimeRoute.validate(descriptor)
+    route
+  end
+
+  @tag :native_worker_recovery
+  test "routed result rollback closes its observation authority and leaves the failed preimage intact", ctx do
+    route = recovery_route(ctx)
+    {trace, failed} = failed_attempt(Map.put(ctx, :native_runtime, route))
+    Store.query!(ctx.store, "CREATE TRIGGER reject_routed_result BEFORE UPDATE OF status ON worker_evidence WHEN NEW.status='RESULT_RECORDED' BEGIN SELECT RAISE(ABORT,'routed rollback fixture'); END")
+    assert_raise Exqlite.Error, ~r/routed rollback fixture/, fn -> TicketWorkerRunner.reconcile_completed(ctx.store, failed["request_key"]) end
+    assert {:ok, ^failed} = WorkerEvidence.get(ctx.store, failed["request_key"])
+    assert recovery_events(ctx.store) == []
+    refute Enum.any?(Process.get_keys(), &match?({SymphonyElixir.Factory.CompletedTurnRecovery, :observation, _}, &1))
+    Store.query!(ctx.store, "DROP TRIGGER reject_routed_result")
+    assert {:ok, _} = TicketWorkerRunner.reconcile_completed(ctx.store, failed["request_key"])
+    assert length(recovery_events(ctx.store)) == 1
+    assert execution_count(trace) == 1
+  end
+
+  defp hash_json(value), do: :crypto.hash(:sha256, Jason.encode!(value)) |> Base.encode16(case: :lower)
+
+  @tag :notice_metadata_regression
+  test "reopened completed result reaches its original parent once with the recorded error notice", ctx do
+    {trace, failed} = failed_attempt(ctx)
+    assert WorkerEvidence.owner_stopped?(ctx.store, failed)
+    assert {:ok, original_parent} = TicketChat.for_run(ctx.store, "run")
+    reopened = start_supervised!({Store, database: ctx.database}, id: :notice_recovery_reopen)
+
+    assert {:ok, recovered} = TicketWorkerRunner.reconcile_completed(reopened, "reservation:request")
+    assert recovered.output == output()
+    assert recovered.owner_stop == Jason.decode!(failed["owner_stop_json"])
+    assert {:ok, _task} = WorkerEvidence.adopt_completed(reopened, "reservation:request")
+    assert {:ok, %{request_key: key, status: "PENDING"}} = TicketChatOutbox.publish(reopened, "run")
+    assert {:ok, request} = DesktopRequest.get(reopened, key)
+    assert request["existing_thread_id"] == original_parent["thread_id"]
+    assert Map.has_key?(Jason.decode!(request["metadata_json"]), "specialist_notice_ids")
+    assert DesktopRequest.payload_intact?(request)
+    assert :ok = TicketChat.validate_request(reopened, request)
+    assert {:ok, arguments} = DesktopToolArgs.followup(request)
+    assert arguments["threadId"] == original_parent["thread_id"]
+
+    native_requests = File.read!(trace)
+    assert {:ok, ^recovered} = TicketWorkerRunner.reconcile_completed(reopened, "reservation:request")
+
+    for _ <- 1..2 do
+      assert {:ok, %{status: "SYNC_LAG", request_key: ^key, model_invoked: false}} = TicketChatOutbox.publish(reopened, "run")
+      assert {:ok, ^request} = DesktopRequest.get(reopened, key)
+    end
+
+    assert File.read!(trace) == native_requests
+    assert execution_count(trace) == 1
+    assert length(recovery_events(reopened)) == 1
+    assert Store.one!(reopened, "SELECT COUNT(*) AS count FROM events WHERE event_type='SPECIALIST_ERROR_QUEUED'")["count"] == 1
+    assert Store.one!(reopened, "SELECT COUNT(*) AS count FROM desktop_requests WHERE target_kind='TICKET_CHAT' AND action='FOLLOWUP'")["count"] == 1
+    assert {:ok, final} = WorkerEvidence.get(reopened, "reservation:request")
+    assert final["owner_stop_json"] == failed["owner_stop_json"]
+    assert final["owner_stopped_at"] == failed["owner_stopped_at"]
+    assert final["output_json"] == Jason.encode!(output())
+  end
+
+  @tag :native_worker_recovery
+  test "reopened V2 completion is read back before adoption and reaches its original master exactly once", ctx do
+    route = recovery_route(ctx)
+    {trace, failed} = failed_attempt(Map.put(ctx, :native_runtime, route))
+    assert {:ok, parent} = TicketChat.for_run(ctx.store, "run")
+    assert {:ok, recovered} = TicketWorkerRunner.reconcile_completed(ctx.store, failed["request_key"])
+    requests = File.read!(trace)
+    [proof] = recovery_events(ctx.store)
+    assert proof["kind"] == "NATIVE_COMPLETION_RECEIPT_V2"
+    File.rename!(route.codex_home.path, route.codex_home.path <> "-retained")
+    File.rename!(route.sqlite_home.path, route.sqlite_home.path <> "-retained")
+    reopened = start_supervised!({Store, database: ctx.database}, id: :routed_recovery_reopen)
+    Process.sleep(1100)
+    assert {:ok, ^recovered} = TicketWorkerRunner.reconcile_completed(reopened, failed["request_key"])
+    assert recovery_events(reopened) == [proof]
+    assert File.read!(trace) == requests
+    assert {:ok, task} = WorkerEvidence.adopt_completed(reopened, failed["request_key"])
+    assert {:ok, ^task} = WorkerEvidence.adopt_completed(reopened, failed["request_key"])
+    assert {:ok, %{request_key: key, status: "PENDING"}} = TicketChatOutbox.publish(reopened, "run")
+    assert {:ok, request} = DesktopRequest.get(reopened, key)
+    assert request["existing_thread_id"] == parent["thread_id"]
+    assert DesktopRequest.payload_intact?(request)
+    assert :ok = TicketChat.validate_request(reopened, request)
+    assert {:ok, arguments} = DesktopToolArgs.followup(request)
+    assert arguments["threadId"] == parent["thread_id"]
+
+    for _ <- 1..2 do
+      assert {:ok, %{status: "SYNC_LAG", request_key: ^key, model_invoked: false}} = TicketChatOutbox.publish(reopened, "run")
+      assert {:ok, ^request} = DesktopRequest.get(reopened, key)
+    end
+
+    assert Store.one!(reopened, "SELECT COUNT(*) AS n FROM desktop_requests WHERE target_kind='TICKET_CHAT' AND action='FOLLOWUP'")["n"] == 1
+    assert Store.one!(reopened, "SELECT COUNT(*) AS n FROM events WHERE event_type='SPECIALIST_ERROR_QUEUED'")["n"] == 1
+    assert recovery_events(reopened) == [proof]
+    assert File.read!(trace) == requests
+    assert execution_count(trace) == 1
+    assert {:ok, final} = WorkerEvidence.get(reopened, failed["request_key"])
+    assert final["owner_stop_json"] == failed["owner_stop_json"]
+    assert final["output_json"] == Jason.encode!(output())
+  end
 
   test "a completed native result survives a lost terminal acknowledgement without another execution", ctx do
     {prompt, options} = prepare(ctx)
@@ -66,7 +314,8 @@ defmodule SymphonyElixir.FactoryCompletedTurnRecoveryTest do
     end
   end
 
-  test "committed recovery is an exact readback without another native read or stop rewrite", ctx do
+  @tag :native_worker_recovery
+  test "committed legacy recovery refuses a V2 receipt without another native read or stop rewrite", ctx do
     {trace, failed} = failed_attempt(ctx)
     assert {:ok, observed} = TicketWorkerRunner.reconcile_completed(ctx.store, "reservation:request")
     {:ok, recorded} = WorkerEvidence.get(ctx.store, "reservation:request")
@@ -79,6 +328,20 @@ defmodule SymphonyElixir.FactoryCompletedTurnRecoveryTest do
     assert recorded["owner_stopped_at"] == failed["owner_stopped_at"]
     assert recovery_events(ctx.store) == events
     assert length(events) == 1
+    assert File.read!(trace) == requests
+    [proof] = events
+    route = recovery_route(ctx)
+    assert {:ok, origin} = SymphonyElixir.Factory.NativeRuntimeRoute.origin(route)
+    v2 = Map.merge(proof, %{"kind" => "NATIVE_COMPLETION_RECEIPT_V2", "version" => 2, "native_runtime" => origin, "native_runtime_sha256" => hash_json(origin)})
+    Store.query!(ctx.store, "UPDATE events SET payload_json=? WHERE event_type='TICKET_WORKER_NATIVE_COMPLETION_RECOVERED'", [Jason.encode!(v2)])
+    altered = Store.query!(ctx.store, "SELECT * FROM events ORDER BY id").rows
+    assert {:error, :completed_turn_receipt_unproven} = TicketWorkerRunner.reconcile_completed(ctx.store, "reservation:request")
+    assert {:ok, ^recorded} = WorkerEvidence.get(ctx.store, "reservation:request")
+    assert Store.query!(ctx.store, "SELECT * FROM events ORDER BY id").rows == altered
+    assert File.read!(trace) == requests
+    Store.query!(ctx.store, "UPDATE events SET payload_json=? WHERE event_type='TICKET_WORKER_NATIVE_COMPLETION_RECOVERED'", [Jason.encode!(proof)])
+    assert {:ok, ^observed} = TicketWorkerRunner.reconcile_completed(ctx.store, "reservation:request")
+    assert recovery_events(ctx.store) == events
     assert File.read!(trace) == requests
   end
 
@@ -434,6 +697,7 @@ defmodule SymphonyElixir.FactoryCompletedTurnRecoveryTest do
       review_base_sha: ctx.sha
     ]
 
+    options = if ctx[:native_runtime], do: Keyword.put(options, :native_runtime, ctx.native_runtime), else: options
     {prompt, options}
   end
 
@@ -443,7 +707,7 @@ defmodule SymphonyElixir.FactoryCompletedTurnRecoveryTest do
     if Map.has_key?(ctx, :native_status), do: File.write!(trace <> ".native-status", Jason.encode!(ctx.native_status))
     binary = Path.join(ctx.root, "completed-server")
     server = Path.expand("../support/completed_turn_server.py", __DIR__)
-    File.write!(binary, "#!/bin/sh\nexec /usr/bin/python3 -I -S -B '#{server}' '#{trace}'\n")
+    File.write!(binary, "#!/bin/sh\nexec /usr/bin/python3 -I -S -B '#{server}' '#{trace}' \"$@\"\n")
     File.chmod!(binary, 0o755)
 
     flags =

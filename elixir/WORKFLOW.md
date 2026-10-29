@@ -468,6 +468,17 @@ Controller write and credentialed remote operations are unchanged.
 Schema version 17 also reserves Desktop-owned, projectless parent identities
 under route `desktop_owned_ticket_chat_v1`. Identity is scoped by dispatcher,
 immutable Jira issue ID and repository key, with separate run links.
+Parent follow-ups may carry one complete specialist-notice ID/text pair; creation
+may not. Shared shape validation does not replace linked-run ledger authentication,
+immutable payload checks or exact visible-final notice readback.
+Experimental owned native readers may explicitly pin private local storage roots;
+they recheck directory identity and effective SQLite configuration before reading.
+This has no workflow selector or worker activation; all default routes are unchanged.
+JSON origin restoration preserves the original directory identities; it never
+repins replacement storage. Same-reader provenance requires successful native-home
+and effective-SQLite readback. Origin V2 is a storage envelope referenced by V2
+worker bindings and recovery receipts, not an issuance authority or a database-content
+integrity guarantee.
 
 Set `factory.ticket_supervisor.all_eligible_tickets: true` and `enabled: true`
 to select the new route for all new deliveries in the existing assignee/repository
@@ -676,3 +687,10 @@ counters plus `maximum_additional_iterations:1`. Its applied authority derives
 only that exact run's next-iteration ceiling; configured WORKFLOW limits remain
 unchanged. Honest CONTINUE advances the iteration and then stops, without an
 automatic extra source iteration.
+
+Native-history admission supports legacy/V1 and explicit V2 recorded worker origins;
+no workflow selector or hidden-worker routing is enabled by this support.
+Do not add `factory.ticket_supervisor.native_runtime`; explicit values, including
+false/null, are unsupported. Updated startup, ledger-opening and rollout entrypoints
+refuse unsupported retained native history before mutation. Artifact-only release
+qualification is not workflow/ledger admission or deployment evidence.

@@ -672,6 +672,8 @@ defmodule SymphonyElixir.Factory.TicketCiRepairSuccessor do
 
   def admit(store, context, opts) do
     with :ok <- WorkspaceAccess.source_capacity(store, context.run, opts),
+         {:ok, binding} <- object(context.prior["binding_json"], context.prior["binding_sha256"]),
+         {:ok, _} <- WorkerEvidence.runtime_options(binding, opts),
          {:ok, source} <- WorkspaceAccess.prepare_ci_successor_source(store, context.run, context.access, context.source.root),
          true <- source == context.source or {:error, :ci_successor_source_changed},
          {:ok, policy} <- policy_receipt(store, context.run),
@@ -836,10 +838,16 @@ defmodule SymphonyElixir.Factory.TicketCiRepairSuccessor do
 
   defp native_observation(task, binding, opts) do
     request = native_request(task, binding)
-    reader = opts[:app_server] || AppServer
 
-    with {:ok, native} <- reader.read_native_thread(task["thread_id"], workspace: opts[:workspace], include_turns: false, include_latest_turn: true, include_queue: true),
-         :ok <- TicketMrGuard.native_receipt(request, native, DateTime.utc_now()) do
+    with {:ok, native_options} <- WorkerEvidence.runtime_options(binding, opts),
+         reader = if(Keyword.has_key?(native_options, :native_runtime), do: AppServer, else: opts[:app_server] || AppServer),
+         {:ok, native} <-
+           reader.read_native_thread(
+             task["thread_id"],
+             Keyword.merge(Keyword.take(native_options, [:native_runtime, :workspace]), include_turns: false, include_latest_turn: true, include_queue: true)
+           ),
+         :ok <- TicketMrGuard.native_receipt(request, native, DateTime.utc_now()),
+         {:ok, _} <- WorkerEvidence.runtime_options(binding, native_options) do
       {:ok, %{request: request, receipt: native}}
     end
   end
@@ -894,6 +902,7 @@ defmodule SymphonyElixir.Factory.TicketCiRepairSuccessor do
          {:ok, new_binding} <- object(destination["binding_json"], destination["binding_sha256"]),
          fields = ~w(run_id task_key role stage mode model reasoning_effort schema policy contract_sha256 spec_revision expected_sha base_sha),
          true <- Map.take(old_binding, fields) == Map.take(new_binding, fields),
+         true <- WorkerEvidence.runtime_matches?(old_binding, new_binding),
          true <- new_binding["reservation_key"] == new_access["reservation_key"] and new_binding["reservation_generation"] == new_access["generation"],
          true <- destination_owner?(destination, old),
          [event] <-

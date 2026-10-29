@@ -390,9 +390,15 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
          validation = WorkspaceAccess.validate(store, reservation, access["generation"], clean: true, candidate_adopted: true),
          {:ok, _} <- validation,
          {:ok, %{"status" => "RESERVED", "task_key" => ^key, "reservation_key" => ^reservation} = attempt} <- WorkerEvidence.get(store, request),
-         true <- attempt["binding_sha256"] == digest(attempt["binding_json"]) or {:error, :ready_rework_attempt_changed} do
+         true <- attempt["binding_sha256"] == digest(attempt["binding_json"]) or {:error, :ready_rework_attempt_changed},
+         {:ok, binding} <- Jason.decode(attempt["binding_json"]),
+         {:ok, prior} <- WorkerEvidence.get(store, receipt["prior_request_key"]),
+         true <- prior["binding_sha256"] == digest(prior["binding_json"]) or {:error, :ready_rework_attempt_changed},
+         {:ok, prior_binding} <- Jason.decode(prior["binding_json"]),
+         true <- WorkerEvidence.runtime_matches?(binding, prior_binding) or {:error, :worker_native_runtime_conflict},
+         {:ok, runtime_opts} <- WorkerEvidence.runtime_options(binding, launch.opts) do
       worker_opts =
-        Keyword.merge(launch.opts,
+        Keyword.merge(runtime_opts,
           project_id: assignment.project_id,
           section_id: assignment.section_id,
           request_key: request,
@@ -423,6 +429,8 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
          {:ok, task} <- TaskLedger.get(store, key),
          {:ok, assignment} <- ready_rework_assignment(task, launch.opts),
          {:ok, prior} <- ready_rework_predecessor(store, task, current),
+         true <- digest(prior.evidence["binding_json"]) == prior.evidence["binding_sha256"] or {:error, :worker_evidence_corrupt},
+         {:ok, prior_binding} <- Jason.decode(prior.evidence["binding_json"]),
          {:ok, %{run: changed_run}} <- RunLedger.update(store, current["run_id"], %{state: "REVIEW_WRITING"}),
          route = %{launch.route | resolved_role: launch.route.requested_role},
          {:ok, refreshed, resume} <- prepare_task(store, changed_run, key, "REVIEW_WRITING", launch.prompt, route, assignment, Keyword.put(launch.opts, :resume_terminal, true)),
@@ -446,15 +454,20 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
            {access["canonical_path"], access["git_dir"], access["common_dir"]} == {prior.access["canonical_path"], prior.access["git_dir"], prior.access["common_dir"]} or
              {:error, :ready_rework_checkout_changed},
          {:ok, _attempt} <-
-           WorkerEvidence.reserve(store, %{
-             "request_key" => request,
-             "task_key" => key,
-             "reservation_key" => reservation,
-             "input_sha256" => digest(launch.prompt),
-             "owner_id" => "owner:" <> request,
-             "schema" => launch.output_schema,
-             "policy" => TicketWorkerRunner.policy("SOURCE", access["canonical_path"])
-           }),
+           reserve_ready_attempt(
+             store,
+             %{
+               "request_key" => request,
+               "task_key" => key,
+               "reservation_key" => reservation,
+               "input_sha256" => digest(launch.prompt),
+               "owner_id" => "owner:" <> request,
+               "schema" => launch.output_schema,
+               "policy" => TicketWorkerRunner.policy("SOURCE", access["canonical_path"])
+             },
+             prior_binding,
+             launch.opts
+           ),
          {:ok, _application} <-
            TicketChatCommands.record_ready_rework(store, ready.command_key, %{
              "command_key" => ready.command_key,
@@ -548,6 +561,14 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
 
   defp complete_candidate_output?(output, run) do
     output["status"] == "COMPLETE" and (is_nil(output["commit_sha"]) or output["commit_sha"] == run["candidate_sha"])
+  end
+
+  defp runtime_attempt_attrs(attrs, opts) do
+    if Keyword.has_key?(opts, :native_runtime), do: Map.put(attrs, "native_runtime", opts[:native_runtime]), else: attrs
+  end
+
+  defp reserve_ready_attempt(store, attrs, binding, opts) do
+    with {:ok, attrs} <- WorkerEvidence.inherit_runtime(runtime_attempt_attrs(attrs, opts), binding), do: WorkerEvidence.reserve(store, attrs)
   end
 
   defp ready_rework_verifier_predecessor(store, run) do
@@ -663,7 +684,9 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
                "schema" => launch.output_schema,
                "policy" => policy
              },
-             resume
+             resume,
+             completed.binding,
+             launch.opts
            ),
          transfer = %{
            "kind" => "BLOCKED_SOURCE_TRANSFER",
@@ -705,10 +728,14 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
   defp transfer_blocked_access(store, evidence, proof, attrs),
     do: WorkspaceAccess.transfer_blocked_source(store, evidence["reservation_key"], proof["reservation_generation"], attrs, proof)
 
-  defp reserve_blocked_attempt(store, attrs, %{"operational_recovery_key" => "TCAP-" <> _} = resume),
-    do: WorkerEvidence.reserve_capability(store, attrs, resume)
-
-  defp reserve_blocked_attempt(store, attrs, _resume), do: WorkerEvidence.reserve(store, attrs)
+  defp reserve_blocked_attempt(store, attrs, resume, binding, opts) do
+    with {:ok, attrs} <- WorkerEvidence.inherit_runtime(runtime_attempt_attrs(attrs, opts), binding) do
+      case resume do
+        %{"operational_recovery_key" => "TCAP-" <> _} -> WorkerEvidence.reserve_capability(store, attrs, resume)
+        _ -> WorkerEvidence.reserve(store, attrs)
+      end
+    end
+  end
 
   defp blocked_capacity(store, run, opts) do
     case opts[:blocked_resume] do
@@ -860,15 +887,18 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
          {:ok, attempt} <-
            reserve_prepared_blocked_attempt(
              store,
-             %{
-               "request_key" => request,
-               "task_key" => key,
-               "reservation_key" => reservation,
-               "input_sha256" => digest(launch.prompt),
-               "owner_id" => "owner:" <> request,
-               "schema" => launch.output_schema,
-               "policy" => policy
-             },
+             runtime_attempt_attrs(
+               %{
+                 "request_key" => request,
+                 "task_key" => key,
+                 "reservation_key" => reservation,
+                 "input_sha256" => digest(launch.prompt),
+                 "owner_id" => "owner:" <> request,
+                 "schema" => launch.output_schema,
+                 "policy" => policy
+               },
+               launch.opts
+             ),
              resume
            ),
          true <-
@@ -903,7 +933,9 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
 
   defp reserve_prepared_blocked_attempt(store, attrs, %{"operational_recovery_key" => "TCAP-" <> _} = resume) do
     with {:ok, attempt} <- WorkerEvidence.get(store, attrs["request_key"]),
+         true <- digest(attempt["binding_json"]) == attempt["binding_sha256"] or {:error, :worker_evidence_corrupt},
          {:ok, binding} <- Jason.decode(attempt["binding_json"]),
+         {:ok, _runtime} <- WorkerEvidence.runtime_options(binding, if(Map.has_key?(attrs, "native_runtime"), do: [native_runtime: attrs["native_runtime"]], else: [])),
          true <- Map.take(binding, ~w(input_sha256 schema policy)) == Map.take(attrs, ~w(input_sha256 schema policy)) do
       TicketCapabilityRecovery.admit_prepared(store, resume)
     else

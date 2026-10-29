@@ -20,6 +20,33 @@ defmodule SymphonyElixir.FactoryFailedTurnRecoveryTest do
 
   setup :setup_fixture
 
+  @tag :native_worker_binding
+  test "failed retry inherits the recorded history origin and refuses a changed origin before transfer", ctx do
+    descriptor = %{"version" => 1, "codex_home" => Path.join(ctx.root, "failed-codex"), "sqlite_home" => Path.join(ctx.root, "failed-sqlite")}
+
+    for path <- [descriptor["codex_home"], descriptor["sqlite_home"]] do
+      File.mkdir!(path)
+      File.chmod!(path, 0o700)
+    end
+
+    {:ok, route} = SymphonyElixir.Factory.NativeRuntimeRoute.validate(descriptor)
+    {old, _, options} = failed(Map.put(ctx, :native_runtime, route))
+    original = Jason.decode!(old["binding_json"])
+    assert {:ok, proof} = FailedTurnRecovery.prepare(ctx.store, old["request_key"], "failed-turn", Keyword.delete(options, :native_history))
+    assert {:ok, successor} = WorkerEvidence.get(ctx.store, proof["new_request_key"])
+    binding = Jason.decode!(successor["binding_json"])
+    assert binding["binding_version"] === 2
+    assert binding["native_runtime"] === original["native_runtime"]
+    assert FailedTurnRecovery.superseded?(ctx.store, old)
+    assert :ok = FailedTurnRecovery.start_preflight(ctx.store, proof, Keyword.delete(options, :native_history))
+    File.rename!(route.sqlite_home.path, route.sqlite_home.path <> "-original")
+    File.mkdir!(route.sqlite_home.path)
+    File.chmod!(route.sqlite_home.path, 0o700)
+    assert {:error, _} = FailedTurnRecovery.start_preflight(ctx.store, proof, Keyword.delete(options, :native_history))
+    assert FailedTurnRecovery.superseded?(ctx.store, old)
+    assert {:ok, ^successor} = WorkerEvidence.get(ctx.store, proof["new_request_key"])
+  end
+
   test "preflight diagnostics identify only the failed guard without exposing proof or changing state", ctx do
     {old, _, options} = failed(ctx)
     {:ok, proof} = FailedTurnRecovery.prepare(ctx.store, old["request_key"], "failed-turn", options)
@@ -181,16 +208,18 @@ defmodule SymphonyElixir.FactoryFailedTurnRecoveryTest do
     {:ok, access} = WorkspaceAccess.acquire(ctx.store, Map.put(attrs(ctx), "task_key", task_key), opts(ctx))
     {:ok, task} = TaskLedger.get(ctx.store, task_key)
 
-    {:ok, evidence} =
-      WorkerEvidence.reserve(ctx.store, %{
-        "request_key" => "reservation:request",
-        "task_key" => task_key,
-        "reservation_key" => "reservation",
-        "input_sha256" => task["prompt_sha256"],
-        "owner_id" => "owned",
-        "schema" => StageSchemas.for_stage(:native_feature_writer),
-        "policy" => TicketWorkerRunner.policy("SOURCE", ctx.path)
-      })
+    attributes = %{
+      "request_key" => "reservation:request",
+      "task_key" => task_key,
+      "reservation_key" => "reservation",
+      "input_sha256" => task["prompt_sha256"],
+      "owner_id" => "owned",
+      "schema" => StageSchemas.for_stage(:native_feature_writer),
+      "policy" => TicketWorkerRunner.policy("SOURCE", ctx.path)
+    }
+
+    attributes = if ctx[:native_runtime], do: Map.put(attributes, "native_runtime", ctx.native_runtime), else: attributes
+    {:ok, evidence} = WorkerEvidence.reserve(ctx.store, attributes)
 
     {:ok, _} = WorkerEvidence.mark_start_sent(ctx.store, evidence["request_key"])
     {:ok, _} = WorkerEvidence.bind_thread(ctx.store, evidence["request_key"], "worker", Jason.decode!(evidence["binding_json"])["policy"])
@@ -211,7 +240,7 @@ defmodule SymphonyElixir.FactoryFailedTurnRecoveryTest do
     error = %{"codexErrorInfo" => "serverOverloaded", "message" => "Selected model is at capacity. Please try a different model.", "additionalDetails" => nil, "misalignment" => nil}
     {:ok, _} = WorkerEvidence.reconcile_required(ctx.store, evidence["request_key"], {:worker_turn_error, error})
     {:ok, _} = TaskLedger.update(ctx.store, task_key, %{status: "STALE", thread_id: "worker", turn_id: "prior-turn", failure_code: inspect({:worker_turn_error, error})})
-    history = Path.join(ctx.root, "history.sqlite")
+    history = if ctx[:native_runtime], do: Path.join(ctx.native_runtime.sqlite_home.path, "thread_history_1.sqlite"), else: Path.join(ctx.root, "history.sqlite")
 
     {_, 0} =
       System.cmd("sqlite3", [

@@ -92,8 +92,13 @@ defmodule SymphonyElixir.FactoryCiRepairSuccessorTest do
     atomic_successor_case(true)
   end
 
-  defp atomic_successor_case(scoped) do
-    fixture = journal_fixture(scoped)
+  @tag :native_worker_binding
+  test "CI evidence successor preserves the exact recorded native origin in reservation and readback" do
+    atomic_successor_case(false, true)
+  end
+
+  defp atomic_successor_case(scoped, routed \\ false) do
+    fixture = journal_fixture(scoped, routed)
     ctx = fixture.ctx
     extension = if scoped, do: extension_fixture(fixture)
     {owner, tick, policy} = current_policy_fixture(fixture, 5, extension)
@@ -301,6 +306,19 @@ defmodule SymphonyElixir.FactoryCiRepairSuccessorTest do
     assert {:error, :ci_repair_discussions_unproven} = TicketCiRepairSuccessor.admit(ctx.store, put_in(context, [:review, "mr_iid"], 10), options)
     assert protected.() == before
 
+    if Map.has_key?(Jason.decode!(fixture.evidence["binding_json"]), "native_runtime") do
+      descriptor = %{"version" => 1, "codex_home" => Path.join(ctx.root, "conflicting-codex"), "sqlite_home" => Path.join(ctx.root, "conflicting-sqlite")}
+
+      for path <- [descriptor["codex_home"], descriptor["sqlite_home"]] do
+        File.mkdir!(path)
+        File.chmod!(path, 0o700)
+      end
+
+      {:ok, other} = SymphonyElixir.Factory.NativeRuntimeRoute.validate(descriptor)
+      assert {:error, :worker_native_runtime_conflict} = TicketCiRepairSuccessor.admit(ctx.store, context, Keyword.put(options, :native_runtime, other))
+      assert protected.() == before
+    end
+
     Store.query!(
       ctx.store,
       "CREATE TRIGGER fixture_bind_failure BEFORE INSERT ON worker_instruction_task_bindings WHEN NEW.prompt_sha256 != ? BEGIN SELECT RAISE(ABORT,'fixture after-transfer failure'); END"
@@ -316,6 +334,26 @@ defmodule SymphonyElixir.FactoryCiRepairSuccessorTest do
     assert applied.destination["status"] == "RESERVED" and applied.destination["thread_id"] == nil
     assert applied.destination["request_key"] == request
     assert applied.access["generation"] == fixture.access["generation"] + 1
+    original_binding = Jason.decode!(fixture.evidence["binding_json"])
+    destination_binding = Jason.decode!(applied.destination["binding_json"])
+    assert WorkerEvidence.runtime_matches?(original_binding, destination_binding)
+
+    if Map.has_key?(original_binding, "native_runtime") do
+      assert destination_binding["native_runtime"] === original_binding["native_runtime"]
+      assert destination_binding["binding_version"] === 2
+      raw = destination_binding |> Map.delete("native_runtime") |> Map.delete("binding_version") |> Jason.encode!()
+      Store.query!(ctx.store, "UPDATE worker_evidence SET binding_json=?,binding_sha256=? WHERE request_key=?", [raw, hash(raw), applied.destination["request_key"]])
+      assert {:error, :ci_successor_applied_unproven} = TicketCiRepairSuccessor.applied(ctx.store, fixture.key)
+
+      Store.query!(ctx.store, "UPDATE worker_evidence SET binding_json=?,binding_sha256=? WHERE request_key=?", [
+        applied.destination["binding_json"],
+        applied.destination["binding_sha256"],
+        applied.destination["request_key"]
+      ])
+
+      assert {:ok, _} = TicketCiRepairSuccessor.applied(ctx.store, fixture.key)
+    end
+
     assert Store.one!(ctx.store, "SELECT * FROM worker_evidence WHERE request_key=?", [fixture.request]) == fixture.evidence
     assert TicketCiRepairSuccessor.attempts_used(ctx.store, "run") == 2
     assert {:error, _} = TicketCiRepairSuccessor.admit(ctx.store, context, options)
@@ -363,8 +401,25 @@ defmodule SymphonyElixir.FactoryCiRepairSuccessorTest do
     %{request: request, receipt: native}
   end
 
-  defp journal_fixture(exhausted \\ false) do
+  defp journal_fixture(exhausted \\ false, routed \\ false) do
     ctx = SymphonyElixir.TicketWorkerFixture.setup_fixture(%{})
+
+    route =
+      if routed do
+        root = ctx.root <> "-native"
+        File.mkdir!(root)
+        on_exit(fn -> File.rm_rf!(root) end)
+        descriptor = %{"version" => 1, "codex_home" => Path.join(root, "codex"), "sqlite_home" => Path.join(root, "sqlite")}
+
+        for path <- [descriptor["codex_home"], descriptor["sqlite_home"]] do
+          File.mkdir!(path)
+          File.chmod!(path, 0o700)
+        end
+
+        {:ok, route} = SymphonyElixir.Factory.NativeRuntimeRoute.validate(descriptor)
+        route
+      end
+
     SymphonyElixir.TicketWorkerFixture.bind_parent(ctx)
     snapshot = Store.one!(ctx.store, "SELECT snapshot_json FROM runs WHERE run_id='run'")["snapshot_json"] |> Jason.decode!() |> Map.merge(%{"labels" => ["ai-running"], "status" => "In Progress"})
     {:ok, %{run: prior}} = RunLedger.update(ctx.store, "run", %{state: "CI_WAITING", ci_pipeline_id: 99, mr_iid: 9, mr_url: "https://example/mr/9", snapshot_json: Jason.encode!(snapshot)})
@@ -414,16 +469,18 @@ defmodule SymphonyElixir.FactoryCiRepairSuccessorTest do
     policy = %{"cwd" => ctx.path, "sandbox" => "read-only"}
     request = attrs["request_key"]
 
-    assert {:ok, _} =
-             WorkerEvidence.reserve(ctx.store, %{
-               "request_key" => request,
-               "task_key" => "writer",
-               "reservation_key" => attrs["reservation_key"],
-               "input_sha256" => prompt_sha,
-               "owner_id" => "fixture",
-               "schema" => StageSchemas.for_stage(:native_feature_writer),
-               "policy" => policy
-             })
+    attributes = %{
+      "request_key" => request,
+      "task_key" => "writer",
+      "reservation_key" => attrs["reservation_key"],
+      "input_sha256" => prompt_sha,
+      "owner_id" => "fixture",
+      "schema" => StageSchemas.for_stage(:native_feature_writer),
+      "policy" => policy
+    }
+
+    attributes = if route, do: Map.put(attributes, "native_runtime", route), else: attributes
+    assert {:ok, _} = WorkerEvidence.reserve(ctx.store, attributes)
 
     assert {:ok, _} = WorkerEvidence.mark_start_sent(ctx.store, request)
     assert {:ok, _} = WorkerEvidence.bind_thread(ctx.store, request, "worker", policy)

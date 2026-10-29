@@ -840,6 +840,13 @@ defmodule SymphonyElixir.Factory.Store do
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
     database = Keyword.fetch!(opts, :database)
+
+    with :ok <- SymphonyElixir.Factory.NativeRuntimeCompatibility.check_database(database) do
+      start_compatible_store(opts, database)
+    end
+  end
+
+  defp start_compatible_store(opts, database) do
     ensure_database_parent(database)
 
     connection_opts = [
@@ -874,9 +881,11 @@ defmodule SymphonyElixir.Factory.Store do
     with true <- is_binary(database) and Path.type(database) == :absolute,
          {:ok, %File.Stat{type: :regular}} <- File.lstat(database),
          {:ok, %File.Stat{type: :directory}} <- File.stat(Path.dirname(database)),
+         :ok <- SymphonyElixir.Factory.NativeRuntimeCompatibility.check_database(database),
          {:ok, connection} <- Exqlite.start_link(connection_opts) do
       validate_reader(connection)
     else
+      {:error, reason} = error when reason in [:unsupported_native_runtime_history, :native_runtime_history_unreadable] -> error
       _ -> {:error, :existing_factory_ledger_required}
     end
   end

@@ -19,6 +19,9 @@ import urllib.error
 
 
 TOOLS = Path(__file__).resolve().parent
+_compat_spec = importlib.util.spec_from_file_location('review_native_runtime_compatibility', TOOLS / 'native_runtime_compatibility.py')
+native_compatibility = importlib.util.module_from_spec(_compat_spec)
+_compat_spec.loader.exec_module(native_compatibility)
 HISTORICAL = Path('/private/tmp/symphony-push-handoff.cnRVdUfY/review-cutover-r19f2')
 GUARD_SHA = '41c26ac2067bdba97ecbf92238e11f813e0e45c8068283b75565677abfe53482'
 THAW_SHA = 'cec22fd5003117f496bbe369baaf935f8c9f4797ae519ae0ca90578fb12b4534'
@@ -138,6 +141,7 @@ def bind(evidence_root):
             assert sha(Path(manifest['build']) / name) == entry['sha256'], name
         for name, digest in manifest['source_hashes'].items():
             assert sha(Path(manifest['source_root']) / name) == digest, name
+        native_compatibility.validate_manifest(manifest)
         audit = g.load('cutover-audit.json') if (evidence_root / 'cutover-audit.json').exists() else None
         if audit:
             assert audit['kind'] == 'OWNED_REVIEW_REPORT_SERVICE_REPLACEMENT'
@@ -147,31 +151,27 @@ def bind(evidence_root):
         return value, manifest, audit
 
     def native_quiet_for(value):
+        manifest = {'native_runtime_formats': value['native_runtime_formats']}
+        native_compatibility.check_database(g.DB, manifest)
         with g.readonly() as db:
-            threads = [row[0] for row in db.execute('SELECT DISTINCT thread_id FROM worker_evidence WHERE run_id=? AND thread_id IS NOT NULL', (RUN,))]
-        assert threads and len(threads) <= 100
-        script = '''
-for thread <- System.argv() do
-  {:ok, queue} = SymphonyElixir.Factory.NativeQueueReadback.read("/Users/cgable/.codex/queue_1.sqlite", thread)
-  {:ok, lock} = SymphonyElixir.Factory.NativeQueueReadback.writer_unlocked("/Users/cgable/.codex", thread)
-  true = queue["thread_id"] == thread and queue["item_count"] == 0
-  true = lock["status"] in ["absent", "unlocked"]
-end
-IO.puts("NATIVE_SOURCE_QUIET")
-'''
+            workers = db.execute('SELECT DISTINCT thread_id,binding_json,binding_sha256 FROM worker_evidence WHERE run_id=? AND thread_id IS NOT NULL', (RUN,)).fetchall()
+        payload, pairs = native_compatibility.quietness_payload(workers, g.WORKFLOW, manifest)
+        assert 1 <= pairs <= 100
         env = {key: value for key, value in os.environ.items() if key not in
                ('ELIXIR_ERL_OPTIONS', 'ERL_AFLAGS', 'ERL_ZFLAGS', 'ERL_LIBS',
                 'MIX_BUILD_PATH', 'MIX_ENV', 'MIX_TARGET', 'ERL_FLAGS')}
         env.update(ERL_FLAGS='+S 4:4')
         result = subprocess.run(['/opt/homebrew/bin/mise', 'exec', '--', 'elixir',
-                                 '-pa', str(Path(value['build']) / 'lib/*/ebin'), '-e', script, '--', *threads],
+                                 '-pa', str(Path(value['build']) / 'lib/*/ebin'), '-e', native_compatibility.NATIVE_QUIET_SCRIPT, '--', payload],
                                 cwd=Path(value['source']) / 'elixir', env=env,
                                 capture_output=True, text=True, timeout=20)
         assert result.returncode == 0 and result.stdout.strip() == 'NATIVE_SOURCE_QUIET'
+        native_compatibility.check_database(g.DB, manifest)
 
     def native_quiet():
-        value, _manifest, _audit = candidate()
-        native_quiet_for(value)
+        value, manifest, _audit = candidate()
+        native_quiet_for({**value, 'native_runtime_formats': native_compatibility.validate_manifest(manifest)})
+        g.native_runtime_admit('stop')
 
     def original_pins():
         path = OLD_RELEASE / 'evidence/release-manifest.json'
@@ -183,7 +183,8 @@ IO.puts("NATIVE_SOURCE_QUIET")
             assert sha(Path(old['source_root']) / name) == digest, name
         for name, entry in old['artifact'].items():
             assert sha(Path(old['build']) / name) == entry['sha256'], name
-        return {'build': old['build'], 'source': old['source_root']}
+        native_compatibility.validate_manifest(old)
+        return {'build': old['build'], 'source': old['source_root'], 'native_runtime_formats': native_compatibility.validate_manifest(old)}
 
     def eligible():
         with g.readonly() as db:
@@ -364,11 +365,13 @@ IO.puts("NATIVE_SOURCE_QUIET")
         expected = plistlib.loads(saved.read_bytes())
         expected['ProgramArguments'][0] = audit['replacement_launcher']
         expected['EnvironmentVariables']['MIX_BUILD_PATH'] = audit['replacement_build']
+        g.native_runtime_admit('start')
         replace_plist(g.PLIST, sha(saved), plistlib.dumps(expected))
         g.protected(audit)
         g.save('prebootstrap-preservation.json', {'manifest_sha256': value['manifest_sha256'],
                'protected_sha256': audit['protected_snapshot']['sha256'], 'guard_ledger_row_writes': 0})
         g.save('start-intent.json', {'manifest_sha256': value['manifest_sha256'], 'plist_sha256': sha(g.PLIST), 'attempts': 1})
+        g.native_runtime_admit('start')
         g.command(['/bin/launchctl', 'bootstrap', 'gui/505', str(g.PLIST)], timeout=15)
         g.finish_start()
 
@@ -398,10 +401,12 @@ IO.puts("NATIVE_SOURCE_QUIET")
         assert current == original or current == replacement
         g.quiet()
         g.native_quiet_for(original_runtime)
+        g.native_runtime_admit('restore-check')
         print('ORIGINAL_C66_RESTORE_ALLOWED_AFTER_EXACT_PLIST_RESTORATION')
 
     def restore_original():
         g.restore_check()
+        g.native_runtime_admit('restore-original')
         saved = evidence_root / 'service.original.plist'
         if g.PLIST.read_bytes() != saved.read_bytes():
             replace_plist(g.PLIST, sha(g.PLIST), saved.read_bytes())
@@ -419,7 +424,25 @@ IO.puts("NATIVE_SOURCE_QUIET")
     g.restore_check = restore_check
     original_restore = g.restore_original
     g.restore_original = restore_original
-    return g, capture
+
+    def native_runtime_admit(operation):
+        if operation.startswith('restore-'):
+            original = g.original_pins()
+            native_compatibility.check_database(g.DB, {'native_runtime_formats': original['native_runtime_formats']})
+        else:
+            _value, manifest, _audit = g.candidate()
+            native_compatibility.check_database(g.DB, manifest)
+
+    def guarded(operation, action):
+        def checked():
+            native_runtime_admit(operation)
+            return action()
+        return checked
+
+    g.native_runtime_admit = native_runtime_admit
+    for name in ('stop', 'finish_stop', 'start', 'finish_start', 'restore_check', 'restore_original'):
+        setattr(g, name, guarded(name.replace('_', '-'), getattr(g, name)))
+    return g, guarded('capture', capture)
 
 
 def main():
@@ -428,6 +451,7 @@ def main():
     assert evidence.is_dir()
     assert operation in ('capture', 'stop', 'finish-stop', 'start', 'finish-start', 'restore-check', 'restore-original')
     g, capture = bind(evidence)
+    g.native_runtime_admit(operation)
     {'capture': capture, 'stop': g.stop, 'finish-stop': g.finish_stop,
      'start': g.start, 'finish-start': g.finish_start,
      'restore-check': g.restore_check, 'restore-original': g.restore_original}[operation]()

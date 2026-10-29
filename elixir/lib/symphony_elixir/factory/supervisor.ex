@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Factory.Supervisor do
 
   alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.Config
-  alias SymphonyElixir.Factory.{Controller, ControlServer, Policy, Store}
+  alias SymphonyElixir.Factory.{Controller, ControlServer, NativeRuntimeCompatibility, Policy, Store}
 
   @store_name SymphonyElixir.Factory.Store
   @read_store_name SymphonyElixir.Factory.ReadStore
@@ -25,7 +25,10 @@ defmodule SymphonyElixir.Factory.Supervisor do
       name = Keyword.get(opts, :name, __MODULE__)
       Supervisor.start_link(__MODULE__, settings, name: name)
     else
-      :ignore
+      case NativeRuntimeCompatibility.check_factory(settings.factory) do
+        :ok -> :ignore
+        {:error, reason} -> {:error, {:invalid_factory_policy, reason}}
+      end
     end
   end
 
@@ -73,7 +76,8 @@ defmodule SymphonyElixir.Factory.Supervisor do
   end
 
   defp validate_startup(factory) do
-    with :ok <- Policy.validate(factory) do
+    with :ok <- NativeRuntimeCompatibility.check_factory(factory),
+         :ok <- Policy.validate(factory) do
       policy = Map.get(factory, "ticket_supervisor", Map.get(factory, :ticket_supervisor, %{}))
       enabled = Map.get(policy, "enabled", Map.get(policy, :enabled, false))
 

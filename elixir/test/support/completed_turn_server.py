@@ -7,6 +7,14 @@ import time
 trace = sys.argv[1]
 read_count = 0
 turn_list_count = 0
+storage = None
+if 'CODEX_SQLITE_HOME' in os.environ:
+    for index, argument in enumerate(sys.argv[:-1]):
+        if argument in ('--config', '-c') and sys.argv[index + 1].startswith('sqlite_home='):
+            storage = json.loads(sys.argv[index + 1].split('=', 1)[1])
+    if storage is None:
+        raise RuntimeError('explicit worker SQLite override missing')
+state_path = os.path.join(storage, 'completed-state.json') if storage else trace + '.state'
 
 
 def send(value):
@@ -20,9 +28,15 @@ for line in sys.stdin:
     method = request.get("method")
     identifier = request.get("id")
     if method == "initialize":
-        send({"id": identifier, "result": json.load(open(trace + ".initialize"))})
+        initialized = json.load(open(trace + ".initialize"))
+        if storage:
+            initialized['codexHome'] = os.environ['CODEX_HOME']
+        send({"id": identifier, "result": initialized})
     elif method == "config/read":
-        send({"id": identifier, "result": json.load(open(trace + ".config"))})
+        configuration = json.load(open(trace + ".config"))
+        if storage:
+            configuration['config']['sqlite_home'] = storage
+        send({"id": identifier, "result": configuration})
     elif method == "account/read":
         send({"id": identifier, "result": {"account": {"type": "chatgpt"}}})
     elif method == "mcpServerStatus/list":
@@ -35,7 +49,7 @@ for line in sys.stdin:
         state = {"id": "completed-worker", "cwd": os.getcwd(), "status": {"type": "idle"}, "updatedAt": 1, "turns": [{"id": "completed-turn", "status": "completed", "error": None, "items": [item]}]}
         if os.path.exists(trace + ".native-status"):
             state["status"] = json.load(open(trace + ".native-status"))
-        with open(trace + ".state", "w") as output:
+        with open(state_path, "w") as output:
             json.dump(state, output)
         send({"id": identifier, "result": {"turn": {"id": "completed-turn"}}})
         send({"method": "item/completed", "params": {"threadId": "completed-worker", "turnId": "completed-turn", "item": item}})
@@ -45,13 +59,13 @@ for line in sys.stdin:
         if os.path.exists(trace + ".deny-read"):
             send({"id": identifier, "error": {"code": -32600, "message": "native read unavailable"}})
         else:
-            state = json.load(open(trace + ".state"))
+            state = json.load(open(state_path))
             if os.path.exists(trace + ".version-drift") and read_count > 1:
                 state["updatedAt"] += 1
             send({"id": identifier, "result": {"thread": state}})
     elif method == "thread/turns/list":
         turn_list_count += 1
-        state = json.load(open(trace + ".state"))
+        state = json.load(open(state_path))
         if os.path.exists(trace + ".barrier"):
             with open(trace + ".ready", "w") as output:
                 output.write("native read reached")

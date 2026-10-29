@@ -177,6 +177,29 @@ defmodule SymphonyElixir.Factory.SpecialistErrorNotice do
     %{"specialist_notice_ids" => [notice["notice_id"]], "specialist_notice_text" => text}
   end
 
+  @doc "Separates an optional complete notice pair without granting ledger authority."
+  @spec split_metadata(map()) :: {:ok, map(), map()} | {:error, atom()}
+  def split_metadata(metadata) when is_map(metadata) do
+    keys = ~w(specialist_notice_ids specialist_notice_text)
+    notice = Map.take(metadata, keys)
+
+    case notice do
+      empty when map_size(empty) == 0 ->
+        {:ok, metadata, %{}}
+
+      %{"specialist_notice_ids" => [id], "specialist_notice_text" => text}
+      when is_binary(id) and byte_size(id) > 0 and is_binary(text) and byte_size(text) > 0 ->
+        if String.valid?(id) and String.valid?(text),
+          do: {:ok, Map.drop(metadata, keys), notice},
+          else: {:error, :invalid_specialist_notice_metadata}
+
+      _ ->
+        {:error, :invalid_specialist_notice_metadata}
+    end
+  end
+
+  def split_metadata(_metadata), do: {:error, :invalid_specialist_notice_metadata}
+
   @spec valid_metadata?(Store.connection(), String.t(), map()) :: boolean()
   def valid_metadata?(store, run_id, metadata) do
     case metadata["specialist_notice_ids"] do
