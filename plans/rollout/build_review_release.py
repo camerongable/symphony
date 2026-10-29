@@ -12,9 +12,9 @@ import tarfile
 import tempfile
 
 
-BASE = Path('/Users/cgable/Library/Application Support/ai-factory/releases/symphony-review-report-836d8fb')
-BASE_SHA = '614e43219c60a63a51e455b96c99cf343f8b8886bfa8dbe3ba832f5262c36545'
-BASELINE_COMMIT = '836d8fbdc2f34f8468902b664d54bcc0c292ab87'
+BASE = Path('/Users/cgable/Library/Application Support/ai-factory/releases/symphony-review-report-781b7b4')
+BASE_SHA = 'fd87785dfd9bfd935c90767547a6f574c10b04ee0631e93c78991aa1394ed3db'
+BASELINE_COMMIT = '781b7b4cc5ffbcfa993eb2880ce42ab5872ed57b'
 ROOT = Path(__file__).resolve().parent
 EXCLUDE = {'.git', '_build', 'deps', 'bin', 'log', 'logs', 'cover', '__pycache__'}
 

@@ -560,6 +560,7 @@ defmodule SymphonyElixir.AppServerTest do
   end
 
   @tag installed_runtime_112: true
+  @tag :runtime_165_qualification
   test "V1 workers reject unqualified runtime identity before thread creation", _ctx do
     supported = Map.put(fixture_runtime(), "userAgent", "symphony-orchestrator/0.163.0-alpha.10.2 (fixture)")
     agent164 = "symphony-orchestrator/0.164.0-alpha.11.1"
@@ -588,6 +589,9 @@ defmodule SymphonyElixir.AppServerTest do
           {"updated-runtime-suffix", suffix164, :worker_runtime_unsupported},
           {"updated-runtime-lookalike", lookalike164, :worker_runtime_unsupported},
           {"updated-runtime-unqualified-patch", next164, :worker_runtime_unsupported},
+          {"new-runtime-suffix", Map.put(supported, "userAgent", "symphony-orchestrator/0.165.0-alpha.1.2suffix (fixture)"), :worker_runtime_unsupported},
+          {"new-runtime-lookalike", Map.put(supported, "userAgent", "symphony-orchestrator/0.165.0-alpha.1.20 (fixture)"), :worker_runtime_unsupported},
+          {"new-runtime-unqualified-patch", Map.put(supported, "userAgent", "symphony-orchestrator/0.165.0-alpha.1.3 (fixture)"), :worker_runtime_unsupported},
           {"agent", Map.put(supported, "userAgent", "other/0.160.0 (fixture)"), :worker_runtime_unsupported},
           {"platform", Map.put(supported, "platformOs", "linux"), :worker_runtime_unsupported},
           {"home", Map.put(supported, "codexHome", System.tmp_dir!()), :worker_runtime_home_mismatch}
@@ -620,6 +624,7 @@ defmodule SymphonyElixir.AppServerTest do
   end
 
   @tag installed_runtime_112: true
+  @tag :runtime_165_qualification
   test "ticket runtime probes finish only qualified handshakes and observe process exit" do
     candidate_runtime = Map.put(fixture_runtime(), "userAgent", "symphony-orchestrator/0.162.0-alpha.2 (fixture)")
     updated_runtime = Map.put(fixture_runtime(), "userAgent", "symphony-orchestrator/0.162.0-alpha.17.2 (fixture)")
@@ -636,6 +641,7 @@ defmodule SymphonyElixir.AppServerTest do
           {"installed-candidate-version", candidate_runtime, :ok},
           {"updated-installed-version", updated_runtime, :ok},
           {"updated-minor-installed-version", updated_minor_runtime, :ok},
+          {"new-installed-version", Map.put(fixture_runtime(), "userAgent", "symphony-orchestrator/0.165.0-alpha.1.2 (fixture)"), :ok},
           {"current-installed-version", current_runtime, :ok},
           {"latest-installed-version", latest_runtime, :ok},
           {"patch-installed-version", patch_runtime, :ok},

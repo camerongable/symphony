@@ -36,7 +36,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @thread_list_source_kinds ~w(cli vscode exec appServer subAgent subAgentReview subAgentCompact subAgentThreadSpawn subAgentOther unknown)
   @thread_unsubscribe_timeout_ms 1_000
   @port_line_bytes 1_048_576
-  @ticket_worker_runtime_versions ~w(0.160.0 0.162.0-alpha.2 0.162.0-alpha.17.2 0.163.0-alpha.10.2 0.163.0-alpha.11 0.163.0-alpha.11.1 0.163.0-alpha.11.2 0.164.0-alpha.11.1)
+  @ticket_worker_runtime_versions ~w(0.160.0 0.162.0-alpha.2 0.162.0-alpha.17.2 0.163.0-alpha.10.2 0.163.0-alpha.11 0.163.0-alpha.11.1 0.163.0-alpha.11.2 0.164.0-alpha.11.1 0.165.0-alpha.1.2)
   @max_stream_log_bytes 1_000
   @mcp_startup_statuses_key {__MODULE__, :mcp_startup_statuses}
   @mcp_approval_state_key {__MODULE__, :mcp_approval_state}
