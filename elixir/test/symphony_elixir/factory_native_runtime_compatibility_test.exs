@@ -11,6 +11,36 @@ defmodule SymphonyElixir.FactoryNativeRuntimeCompatibilityTest do
     %{root: root}
   end
 
+  @tag :native_runtime_activation
+  test "workflow admits only the exact pinned runtime and refuses replacement before ledger creation", ctx do
+    alias SymphonyElixir.Factory.NativeRuntimeRoute
+    descriptor = %{"version" => 1, "codex_home" => Path.join(ctx.root, "configured-codex"), "sqlite_home" => Path.join(ctx.root, "configured-sqlite")}
+
+    for path <- [descriptor["codex_home"], descriptor["sqlite_home"]] do
+      File.mkdir!(path)
+      File.chmod!(path, 0o700)
+    end
+
+    {:ok, route} = NativeRuntimeRoute.validate(descriptor)
+    {:ok, origin} = NativeRuntimeRoute.origin(route)
+    workflow = Path.join(ctx.root, "runtime-workflow.md")
+    database = Path.join(ctx.root, "absent/ledger.sqlite")
+
+    File.write!(
+      workflow,
+      "---\ntracker:\n  kind: memory\nfactory:\n  enabled: false\n  database: #{Jason.encode!(database)}\n  ticket_supervisor:\n    native_runtime: #{Jason.encode!(origin)}\n---\nSynthetic\n"
+    )
+
+    assert :ok = Compatibility.check_workflow(workflow)
+    refute File.exists?(Path.dirname(database))
+
+    File.rename!(descriptor["sqlite_home"], descriptor["sqlite_home"] <> "-original")
+    File.mkdir!(descriptor["sqlite_home"])
+    File.chmod!(descriptor["sqlite_home"], 0o700)
+    assert {:error, :unsupported_native_runtime_configuration} = Compatibility.check_workflow(workflow)
+    refute File.exists?(Path.dirname(database))
+  end
+
   @tag :native_v2_admission
   test "supported mixed history opens through both ledger boundaries without restoring historical roots", ctx do
     origin = %{
@@ -270,8 +300,9 @@ defmodule SymphonyElixir.FactoryNativeRuntimeCompatibilityTest do
     end
   end
 
-  test "reserved runtime configuration refuses false null and malformed values before any factory effect", ctx do
-    for reserved <- [false, nil, true, %{}, [], "future"] do
+  @tag :native_runtime_activation
+  test "runtime configuration refuses false null and malformed values before any factory effect", ctx do
+    for reserved <- [false, nil, true, %{}, [], "future", %{"version" => 1, "codex_home" => ctx.root, "sqlite_home" => ctx.root}] do
       policy = %{"enabled" => true, "native_runtime" => reserved, "parent_output_root" => Path.join(ctx.root, "dated/{date}")}
       factory = %{enabled: false, database: Path.join(ctx.root, "absent/ledger.sqlite"), ticket_supervisor: policy}
       assert {:error, {:invalid_factory_policy, :unsupported_native_runtime_configuration}} = SymphonyElixir.Factory.Supervisor.start_link(settings: %{factory: factory})

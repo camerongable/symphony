@@ -32,20 +32,27 @@ defmodule SymphonyElixir.Factory.NativeRuntimeCompatibility do
     policy = Map.get(factory, :ticket_supervisor, Map.get(factory, "ticket_supervisor", %{}))
     database = Map.get(factory, :database, Map.get(factory, "database"))
 
-    cond do
-      is_map(policy) and (Map.has_key?(policy, "native_runtime") or Map.has_key?(policy, :native_runtime)) ->
-        {:error, :unsupported_native_runtime_configuration}
-
-      Map.get(factory, :enabled, Map.get(factory, "enabled")) === false ->
-        :ok
-
-      is_nil(database) ->
-        :ok
-
-      true ->
-        check_database(database)
+    with :ok <- check_configured_runtime(policy) do
+      cond do
+        Map.get(factory, :enabled, Map.get(factory, "enabled")) === false -> :ok
+        is_nil(database) -> :ok
+        true -> check_database(database)
+      end
     end
   end
+
+  defp check_configured_runtime(policy) when is_map(policy) do
+    if Map.has_key?(policy, "native_runtime") or Map.has_key?(policy, :native_runtime) do
+      case NativeRuntimeRoute.restore_origin(Map.get(policy, "native_runtime", Map.get(policy, :native_runtime))) do
+        {:ok, _route} -> :ok
+        {:error, _reason} -> {:error, :unsupported_native_runtime_configuration}
+      end
+    else
+      :ok
+    end
+  end
+
+  defp check_configured_runtime(_policy), do: :ok
 
   @spec check_database(term()) :: :ok | {:error, atom()}
   def check_database(database) when database in [:memory, ":memory:"], do: :ok

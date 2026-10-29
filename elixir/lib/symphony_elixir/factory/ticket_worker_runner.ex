@@ -1178,9 +1178,19 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
   end
 
   defp selected_runtime_options(store, key, predecessor, opts) do
+    default = Keyword.fetch(opts, :native_runtime_default)
+    opts = Keyword.delete(opts, :native_runtime_default)
+
     case WorkerEvidence.get(store, key) do
       {:error, :unknown_worker_attempt} ->
-        WorkerEvidence.runtime_options(predecessor, opts)
+        if is_nil(predecessor) and not Keyword.has_key?(opts, :native_runtime) and default != :error do
+          {:ok, origin} = default
+
+          with {:ok, route} <- SymphonyElixir.Factory.NativeRuntimeRoute.restore_origin(origin),
+               do: WorkerEvidence.runtime_options(nil, Keyword.put(opts, :native_runtime, route))
+        else
+          WorkerEvidence.runtime_options(predecessor, opts)
+        end
 
       {:ok, evidence} ->
         with true <- digest(evidence["binding_json"]) == evidence["binding_sha256"] or {:error, :worker_evidence_corrupt},

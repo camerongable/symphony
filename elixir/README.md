@@ -2064,22 +2064,35 @@ through reservation, launch/resume, successors and recovery. V2 recovery receipt
 require the same owned reader's attested origin; ordinary successful results do not
 invent a recovery receipt. Unknown formats and unreadable history refuse.
 Database inputs are filesystem paths, not SQLite `file:` URIs. Disabled factory
-startup leaves its unused ledger untouched; an explicit reserved
-`ticket_supervisor.native_runtime` setting still refuses, even when false or null.
+startup leaves its unused ledger untouched, but still refuses an invalid explicit
+`ticket_supervisor.native_runtime` setting.
 
 Updated release launchers and supported rollout/restore entrypoints also compare
 the target's compiled supported formats with its attested manifest and the current
 ledger. SQLite may update its own lock metadata, but admission does not write ledger
 rows, schema or WAL payloads. Artifact-only cold qualification does not read the
 workflow/ledger and is not admission proof. This does not protect manually invoked
-immutable older binaries or enable native-storage routing. Missing manifest declarations
+immutable older binaries. Missing manifest declarations
 always mean legacy-only, so a V2-capable binary requires its explicit matching declaration.
 Rollout quietness checks every recorded origin/thread pair; an older rollback target
 refuses V2 history before service effects. V2 origin digests use sorted string keys,
 compact JSON and raw UTF-8 (not ASCII escapes); V1 encoding is unchanged. Directory
 identity does not attest in-place database contents or authorize worker issuance.
-The workflow selector remains disabled; activation and authoritative minimum rollback
-admission require separate qualification and authorization.
+The optional `factory.ticket_supervisor.native_runtime` setting selects isolated
+storage only for fresh ticket-supervisor specialists. Supply the exact V2 envelope returned
+by `NativeRuntimeRoute.origin/1` after preparing private, authenticated Codex and
+SQLite directories; the factory does not create roots, copy credentials, or repin
+replaced directories. Booleans, null, and V1 path descriptors are not selectors.
+Omit the setting to retain normal storage. The controller reads it at startup,
+so changing it requires a restart.
+
+Existing reservations and same-thread continuations keep their recorded storage,
+including legacy normal-store bindings, even if the configured default changes.
+An explicit trusted per-worker route takes precedence for genuinely fresh work.
+Ticket masters, the Desktop broker, and controller operations remain on their
+existing routes. Activation requires storage/authentication readiness and a
+rollback target supporting retained V2 history; restoring an older configuration
+must not reroute workers already bound to isolated storage.
 
 This project is licensed under the [Apache License 2.0](../LICENSE).
 

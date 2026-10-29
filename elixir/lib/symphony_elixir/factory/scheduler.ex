@@ -462,6 +462,14 @@ defmodule SymphonyElixir.Factory.Scheduler do
   end
 
   defp ticket_runtime_options(context, opts) do
+    policy = Map.get(context.factory, :ticket_supervisor, %{})
+
+    opts =
+      case Map.fetch(policy, "native_runtime") do
+        {:ok, origin} -> Keyword.put_new(opts, :native_runtime_default, origin)
+        :error -> opts
+      end
+
     opts
     |> Keyword.put_new(:workspace_root, context.workspace_root)
     |> Keyword.put_new_lazy(:capacity_policy, fn -> factory_policy(context) end)

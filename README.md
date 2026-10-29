@@ -28,8 +28,8 @@ The local Jira factory keeps source-writing and exact-commit review in isolated
 worktrees; contract-only conversations can stay in their repository Project
 without allocating a worktree.
 An experimental opt-in native reader can pin private local Codex and SQLite roots.
-Worker selection and default routing remain unchanged; explicit recorded origins
-can also follow worker execution/recovery without activating isolated workers.
+An optional pinned-origin workflow setting routes fresh ticket-supervisor specialists into
+that storage; existing workers keep their recorded execution/recovery routes.
 Its durable origin preserves directory identity across restart and exports provenance
 only from the same initialized reader; it does not attest database contents.
 
@@ -194,7 +194,9 @@ gates; the old shared `autopilot` compatibility copy stays until those pass. See
 Factory startup, ledger openings and updated local release tools refuse unsupported
 native-history formats before mutation. This binary supports legacy unversioned
 bindings/V1 completion receipts and explicitly bound V2 worker origins/receipts;
-the configuration selector and hidden-worker routing remain off. See
+an optional pinned-storage selector applies only to fresh ticket-supervisor specialists.
+Existing workers retain their recorded routes, while ticket masters and controller
+operations stay unchanged. See
 [the admission boundary](elixir/README.md#native-history-upgrade-admission).
 
 ## License

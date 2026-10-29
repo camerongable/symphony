@@ -473,7 +473,10 @@ may not. Shared shape validation does not replace linked-run ledger authenticati
 immutable payload checks or exact visible-final notice readback.
 Experimental owned native readers may explicitly pin private local storage roots;
 they recheck directory identity and effective SQLite configuration before reading.
-This has no workflow selector or worker activation; all default routes are unchanged.
+`factory.ticket_supervisor.native_runtime` optionally selects isolated storage for
+fresh ticket-supervisor specialists. Its value must be an exact V2 origin captured with
+`NativeRuntimeRoute.origin/1`, not a V1 path descriptor or a boolean. Omitting it
+keeps the normal native store. Restart the factory after changing this setting.
 JSON origin restoration preserves the original directory identities; it never
 repins replacement storage. Same-reader provenance requires successful native-home
 and effective-SQLite readback. Origin V2 is a storage envelope referenced by V2
@@ -688,9 +691,13 @@ only that exact run's next-iteration ceiling; configured WORKFLOW limits remain
 unchanged. Honest CONTINUE advances the iteration and then stops, without an
 automatic extra source iteration.
 
-Native-history admission supports legacy/V1 and explicit V2 recorded worker origins;
-no workflow selector or hidden-worker routing is enabled by this support.
-Do not add `factory.ticket_supervisor.native_runtime`; explicit values, including
-false/null, are unsupported. Updated startup, ledger-opening and rollout entrypoints
-refuse unsupported retained native history before mutation. Artifact-only release
-qualification is not workflow/ledger admission or deployment evidence.
+Native-history admission supports legacy/V1 and explicit V2 recorded worker origins.
+The optional `factory.ticket_supervisor.native_runtime` V2 origin is validated
+before startup effects and again before a fresh worker reserves its attempt.
+False/null, malformed origins, and replaced directories refuse. Already reserved
+attempts and same-thread continuations retain their recorded origin, including a
+legacy normal-store binding, regardless of the configured default. Ticket master
+chats, the broker, and controller operations keep their existing storage routes.
+Updated startup, ledger-opening, and rollout entrypoints refuse unsupported
+retained native history before mutation. Artifact-only release qualification is
+not workflow/ledger admission or deployment evidence.
