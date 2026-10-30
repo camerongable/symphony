@@ -609,6 +609,15 @@ silently rewritten. Ordinary adoption records MR identity only; CI preflight
 adoption advances to `CI_WAITING`. Native send wiring and runtime
 acceptance are still pending, and this does not enable the route.
 
+While a controller handoff is pending, native scheduler ticks continue refreshing
+the Jira intake snapshot without admitting work or advancing other workflows.
+Queue-read failures remain tick failures rather than reporting a successful idle
+tick. Legacy controller-backed intake remains fenced until the controller is free.
+Idle MR readers accept bounded non-interactive startup and account-update
+notifications. Interactive or malformed messages still invalidate admission.
+The broker distinguishes a named unavailable-admission response from a lost
+CLI observation; neither error automatically retries a claim or sends a follow-up.
+
 The internal V1 scheduler prepares an exact typed MR request after the completed
 push. Broker discovery requires the validated factory policy; discovery is not
 claim authority. `factory.desktop claim-ticket-mr-interactive` reads Jira directly,

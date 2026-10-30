@@ -48,6 +48,10 @@ defmodule SymphonyElixir.FactoryMrBrokerDriverTest do
     assert result["counts"]["finalize"] == 1
   end
 
+  test "a named reader refusal is not mislabeled transport uncertainty and never sends" do
+    assert %{"error" => "MR_OWNER_ADMISSION_UNAVAILABLE", "counts" => %{"prepare" => 1, "finalize" => 1, "send" => 0}} = run(%{scenario: "reader_rejected"})
+  end
+
   test "recovery consumes one compact grant and transport loss never reparses or retries it" do
     issued = request() |> Map.put("status", "FOLLOWUP_UNCERTAIN") |> Map.put("claimed_at", "2026-10-20T08:34:13.866648Z")
     assert %{"result" => %{"status" => "MR_SEND_RETURNED"}, "counts" => %{"prepare" => 1, "finalize" => 1, "send" => 1}} = run(%{mode: "recover", request: issued})

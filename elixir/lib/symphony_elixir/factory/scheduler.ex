@@ -1492,7 +1492,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
       maybe_consume_review_feedback(context, workspace)
 
       if feedback_controller_in_flight?(context.store) do
-        {:ok, %{launches: [], events: [], routing_required: []}}
+        refresh_waiting_intake(context, workspace)
       else
         result = run_factory_tick(context, workspace)
         maybe_poll_review_feedback(context, workspace)
@@ -1506,6 +1506,18 @@ defmodule SymphonyElixir.Factory.Scheduler do
       maybe_consume_review_feedback(context, workspace)
       maybe_admit_review_rework(context, workspace)
       result
+    end
+  end
+
+  defp refresh_waiting_intake(context, workspace) do
+    if native_transport?(context) do
+      with {:ok, jql} <- Queue.jql(context.factory.queue),
+           {:ok, snapshots} <- fetch_queue(context, workspace, jql),
+           {:ok, _snapshot} <- IntakeLedger.replace(context.store, context.factory.scope, snapshots) do
+        {:ok, %{launches: [], events: [], routing_required: []}}
+      end
+    else
+      {:ok, %{launches: [], events: [], routing_required: []}}
     end
   end
 

@@ -877,7 +877,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     with :ok <- native_reader_owned(reader),
          true <- count < 64 and bytes + byte_size(raw) <= 65_536,
          {:ok, %{"method" => method, "params" => params} = message} <- Jason.decode(raw),
-         true <- method in ~w(configWarning remoteControl/status/changed mcpServer/startupStatus/updated),
+         true <- method in ~w(configWarning account/updated remoteControl/status/changed mcpServer/startupStatus/updated),
          true <- is_map(params) and Map.keys(message) -- ~w(method params emittedAtMs jsonrpc) == [],
          true <- not Map.has_key?(message, "jsonrpc") or message["jsonrpc"] == "2.0" do
       Process.put(key, {count + 1, bytes + byte_size(raw)})

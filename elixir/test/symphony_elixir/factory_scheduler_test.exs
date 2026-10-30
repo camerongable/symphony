@@ -622,7 +622,7 @@ defmodule SymphonyElixir.FactorySchedulerTest do
 
     Store.query!(store, "UPDATE mr_feedback_notes SET status = 'CLAIMED', request_key = 'feedback-request'")
 
-    assert {:ok, %{launches: [], events: []}} =
+    assert {:error, :queue_offline} =
              Scheduler.tick(%{context | factory: factory},
                jira_reader: FakeReviewJiraReader,
                gitlab_reader: FakeReviewGitLabReader,
@@ -643,7 +643,7 @@ defmodule SymphonyElixir.FactorySchedulerTest do
 
     Store.query!(store, "UPDATE mr_feedback_notes SET status = 'SUPERSEDED'")
 
-    assert {:ok, %{launches: [], events: [], routing_required: []}} =
+    assert {:error, :queue_offline} =
              Scheduler.tick(%{context | factory: factory},
                jira_reader: FakeReviewJiraReader,
                gitlab_reader: FakeReviewGitLabReader,
@@ -711,6 +711,9 @@ defmodule SymphonyElixir.FactorySchedulerTest do
 
     assert {:ok, %{launches: [], events: [], routing_required: []}} = Scheduler.tick(%{context | factory: factory}, tick_opts)
     assert Store.query!(store, "SELECT * FROM runs WHERE run_id = 'legacy-890'").rows == before_run
+    assert {:ok, %{snapshots: [^snapshot]}} = IntakeLedger.get(store, context.factory.scope)
+    assert_received {:jira_search_jql, _jql}
+    refute_received {:controller_prompt, _prompt}
 
     assert {:ok, _other_legacy} = RunLedger.register(store, %{run_id: "legacy-901", issue_key: "PPL-901", kind: "DELIVERY", state: "READY_FOR_REVIEW"})
     Store.query!(store, "UPDATE desktop_requests SET status = 'PENDING', thread_id = NULL, turn_id = NULL WHERE request_key = 'controller-v1-uncertain'")

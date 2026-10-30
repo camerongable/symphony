@@ -52,6 +52,8 @@ const tools = {
     observed.push(argv.slice(0, 3));
     const value = argv[1]?.endsWith("read-broker-binding.py")
       ? {automation_id: "fixture", broker_thread_id: broker} : cli(argv);
+    if (scenario === "reader_rejected" && argv[2]?.startsWith("finalize-ticket-mr-"))
+      return {output: 'Factory runtime exchange failed: ":mr_owner_admission_unavailable"\n', exit_code: 1};
     return {output: JSON.stringify(value), exit_code: 0};
   },
   write_stdin: async () => { throw new Error("TEST_UNEXPECTED_POLL"); },

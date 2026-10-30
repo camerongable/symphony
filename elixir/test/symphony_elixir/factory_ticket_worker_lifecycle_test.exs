@@ -11038,7 +11038,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
   @tag mr_owner_service: true
   @tag mr_projectless: true
   @tag broker_thread_id: "00000000-0000-0000-0000-000000000001"
-  test "MR owner survives a startup warning between preparation and finalization", ctx do
+  test "MR owner survives startup warning and account updates between preparation and finalization", ctx do
     fixture = mr_reader_lifetime_fixture(ctx)
     File.write!(fixture.config["slow_first_initialize"], "use normal initialization")
     start_supervised!({BrokerRuntime, factory: fixture.factory, store: ctx.store, name: nil})
@@ -11046,7 +11046,11 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     broker = fixture.proof["source_thread_id"]
     assert {:ok, prepared} = BrokerRuntime.call(["prepare-ticket-mr-correction", key, fixture.request["payload_sha256"], "--source-thread-id", broker, "--workflow", fixture.workflow])
     File.write!(fixture.phase, "finalize")
-    File.write!(fixture.config["idle_file"], Jason.encode!(%{method: "configWarning", params: %{summary: "A harmless startup warning", details: nil}}))
+    notifications = [
+      %{method: "configWarning", params: %{summary: "A harmless startup warning", details: nil}},
+      %{method: "account/updated", params: %{authMode: "chatgpt"}, emittedAtMs: 1}
+    ]
+    File.write!(fixture.config["idle_file"], Enum.map_join(notifications, "\n", &Jason.encode!/1))
     assert Enum.reduce_while(1..100, false, fn _, _ ->
              if File.read!(fixture.trace) =~ "idle_emitted", do: {:halt, true}, else: (Process.sleep(10); {:cont, false})
            end)
