@@ -198,11 +198,11 @@ defmodule SymphonyElixir.Factory.TicketPushIO do
   @file_source_publication_history Path.expand("../../../priv/ticket_push_history_validator_v27.py", __DIR__)
   @external_resource @file_source_publication_history
   @file_source_publication_history_sha :crypto.hash(:sha256, File.read!(@file_source_publication_history)) |> Base.encode16(case: :lower)
-  @capability_origins Path.expand("../../../priv/ticket_push_readback_origins_v22.json", __DIR__)
+  @capability_origins Path.expand("../../../priv/ticket_push_readback_origins_v23.json", __DIR__)
   @external_resource @capability_origins
   @capability_origins_raw File.read!(@capability_origins)
   @capability_origins_sha :crypto.hash(:sha256, @capability_origins_raw) |> Base.encode16(case: :lower)
-  @capability_reader Path.expand("../../../priv/ticket_push_status_reader_v23.py", __DIR__)
+  @capability_reader Path.expand("../../../priv/ticket_push_status_reader_v24.py", __DIR__)
   @external_resource @capability_reader
   @capability_reader_sha :crypto.hash(:sha256, File.read!(@capability_reader)) |> Base.encode16(case: :lower)
   @large_helper_shas [
@@ -1142,8 +1142,8 @@ defmodule SymphonyElixir.Factory.TicketPushIO do
          true <- execution["companion_path"] == Path.join(Path.dirname(execution["helper_path"]), "worker_file_companion.py"),
          true <- execution["companion_sha256"] == @companion_sha,
          :ok <- status_program(helper, @capability_helper_sha, execution["root"]),
-         {:ok, reader} <- PathSafety.canonicalize(Application.app_dir(:symphony_elixir, "priv/ticket_push_status_reader_v23.py")),
-         {:ok, origins} <- PathSafety.canonicalize(Application.app_dir(:symphony_elixir, "priv/ticket_push_readback_origins_v22.json")),
+         {:ok, reader} <- PathSafety.canonicalize(Application.app_dir(:symphony_elixir, "priv/ticket_push_status_reader_v24.py")),
+         {:ok, origins} <- PathSafety.canonicalize(Application.app_dir(:symphony_elixir, "priv/ticket_push_readback_origins_v23.json")),
          :ok <- status_program(reader, @capability_reader_sha, execution["root"]),
          :ok <- status_program(origins, @capability_origins_sha, execution["root"]) do
       {:ok, reader}
