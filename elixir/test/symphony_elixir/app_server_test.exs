@@ -620,6 +620,7 @@ defmodule SymphonyElixir.AppServerTest do
           else
             assert :ok = AppServer.check_ticket_runtime(workspace)
           end
+
           refute File.read!(trace) =~ ~s("method":"thread/start")
           refute File.read!(trace) =~ ~s("method":"thread/resume")
           refute File.read!(trace) =~ ~s("method":"turn/start")
@@ -708,20 +709,26 @@ defmodule SymphonyElixir.AppServerTest do
   @tag :runtime_startup_sanity
   test "startup accepts unfamiliar versions after a read-only protocol roundtrip without a chat or turn" do
     runtime = Map.put(fixture_runtime(), "userAgent", "symphony-orchestrator/0.166.0-alpha.5.1 (fixture)")
+
     handler = """
     case "$line" in
       *'"method":"config/read"'*) printf '%s\\n' '{"id":15,"result":{"config":{},"futureField":true}}' ;;
     esac
     """
 
-    with_thread_listing_server("startup-future-runtime", handler, fn workspace, trace ->
-      assert :ok = AppServer.check_ticket_startup(workspace)
-      requests = File.read!(trace) |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!(String.trim_leading(&1, "JSON:")))
-      assert Enum.map(requests, & &1["method"]) == ["initialize", "initialized", "config/read"]
-      {:ok, canonical} = SymphonyElixir.PathSafety.canonicalize(workspace)
-      assert List.last(requests)["params"] == %{"cwd" => canonical, "includeLayers" => false}
-      assert File.read!(trace <> ".terminated") == "terminated\n"
-    end, runtime)
+    with_thread_listing_server(
+      "startup-future-runtime",
+      handler,
+      fn workspace, trace ->
+        assert :ok = AppServer.check_ticket_startup(workspace)
+        requests = File.read!(trace) |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!(String.trim_leading(&1, "JSON:")))
+        assert Enum.map(requests, & &1["method"]) == ["initialize", "initialized", "config/read"]
+        {:ok, canonical} = SymphonyElixir.PathSafety.canonicalize(workspace)
+        assert List.last(requests)["params"] == %{"cwd" => canonical, "includeLayers" => false}
+        assert File.read!(trace <> ".terminated") == "terminated\n"
+      end,
+      runtime
+    )
   end
 
   @tag :runtime_startup_sanity
@@ -732,6 +739,7 @@ defmodule SymphonyElixir.AppServerTest do
         *'"method":"config/read"'*) printf '%s\\n' '#{Jason.encode!(%{"id" => 15, "result" => response})}' ;;
       esac
       """
+
       with_thread_listing_server("startup-malformed-config", handler, fn workspace, trace ->
         assert {:error, :ticket_runtime_configuration_unavailable} = AppServer.check_ticket_startup(workspace)
         assert File.read!(trace <> ".terminated") == "terminated\n"
@@ -747,7 +755,9 @@ defmodule SymphonyElixir.AppServerTest do
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: Path.dirname(workspace),
         codex_command: Path.join(Path.dirname(trace), "fake-codex") <> " app-server",
-        codex_read_timeout_ms: 30_000)
+        codex_read_timeout_ms: 30_000
+      )
+
       started = System.monotonic_time(:millisecond)
       assert {:error, _} = AppServer.check_ticket_startup(workspace)
       elapsed = System.monotonic_time(:millisecond) - started
@@ -769,9 +779,11 @@ defmodule SymphonyElixir.AppServerTest do
         while :; do printf '%s\\n' '{"method":"configWarning","params":{}}'; done ;;
     esac
     """
+
     with_thread_listing_server("startup-noisy-shutdown", handler, fn workspace, trace ->
       task = Task.async(fn -> AppServer.check_ticket_startup(workspace) end)
       started = System.monotonic_time(:millisecond)
+
       try do
         assert {:ok, {:error, :ticket_runtime_process_failed}} = Task.yield(task, 21_000)
         assert System.monotonic_time(:millisecond) - started < 20_000
@@ -780,9 +792,11 @@ defmodule SymphonyElixir.AppServerTest do
         assert status != 0
       after
         Task.shutdown(task, :brutal_kill)
+
         if File.exists?(trace <> ".pid") do
           pid = File.read!(trace <> ".pid") |> String.trim()
           {command, _} = System.cmd("/bin/ps", ["-p", pid, "-o", "command="], stderr_to_stdout: true)
+
           if String.contains?(command, Path.join(Path.dirname(trace), "fake-codex")),
             do: System.cmd("/bin/kill", ["-KILL", pid], stderr_to_stdout: true)
         end
@@ -902,7 +916,7 @@ defmodule SymphonyElixir.AppServerTest do
   end
 
   test "ephemeral connector scope never resumes a controller or starts a model and always closes" do
-    scopes = [{"GitLab", &AppServer.with_gitlab_read_session/2}, {"Jira", &AppServer.with_jira_controller_session/2}]
+    scopes = [{"GitLab", &AppServer.with_gitlab_read_session/2}, {"Jira", &AppServer.with_jira_controller_session/2}, {"Jira", &AppServer.with_jira_read_session/2}]
 
     for {server, scope} <- scopes,
         outcome <- [:ok, :error, :raise] do
@@ -928,7 +942,8 @@ defmodule SymphonyElixir.AppServerTest do
             case outcome do
               :ok ->
                 for _ <- 1..2 do
-                  assert {:ok, %{"content" => []}} = AppServer.call_mcp_tool_in_session(session, server, "fixture_tool", %{"fixture" => true})
+                  tool = if session[:jira_read_deadline], do: "jira_search", else: "fixture_tool"
+                  assert {:ok, %{"content" => []}} = AppServer.call_mcp_tool_in_session(session, server, tool, %{"fixture" => true})
                 end
 
                 {:ok, :readback}
@@ -960,6 +975,62 @@ defmodule SymphonyElixir.AppServerTest do
         end
       )
     end
+  end
+
+  test "Jira read recovery is bounded, read-only, and closes every transport" do
+    with_thread_listing_server(
+      "jira-read-recovery",
+      """
+      case "$line" in
+        *'"method":"thread/start"'*)
+          printf '%s\\n' '{"method":"mcpServer/startupStatus/updated","params":{"name":"Jira","status":"ready"}}'
+          printf '%s\\n' '{"id":2,"result":{"thread":{"id":"jira-read"}}}' ;;
+        *'"method":"thread/unsubscribe"'*) printf '%s\\n' '{"id":6,"result":{}}' ;;
+      esac
+      """,
+      fn workspace, trace ->
+        assert {:error, :mcp_tool_response_timeout} =
+                 AppServer.with_jira_read_session(workspace, fn session ->
+                   send(self(), {:read_transport, session.port})
+                   assert {:error, :jira_read_session_tool_forbidden} = AppServer.call_mcp_tool_in_session(session, "Jira", "jira_update_issue", %{})
+                   expired = Map.put(session, :jira_read_deadline, System.monotonic_time(:millisecond) - 1)
+                   assert {:error, :jira_read_deadline_exceeded} = AppServer.call_mcp_tool_in_session(expired, "Jira", "jira_search", %{})
+                   {:error, :mcp_tool_response_timeout}
+                 end)
+
+        assert_received {:read_transport, first}
+        assert_received {:read_transport, second}
+        refute_received {:read_transport, _}
+        assert :erlang.port_info(first) == :undefined
+        assert :erlang.port_info(second) == :undefined
+        refute File.read!(trace) =~ "mcpServer/tool/call"
+      end
+    )
+  end
+
+  test "Jira startup rejection is not retried and diagnostics omit provider text" do
+    with_thread_listing_server(
+      "jira-read-rejected",
+      """
+      case "$line" in
+        *'"method":"thread/start"'*)
+          printf '%s\\n' '{"id":2,"result":{"thread":{"id":"jira-rejected"}}}'
+          printf '%s\\n' '{"method":"mcpServer/startupStatus/updated","params":{"name":"Jira","status":"failed","failureReason":"synthetic-private-provider-text"}}' ;;
+      esac
+      """,
+      fn workspace, trace ->
+        log =
+          capture_log(fn ->
+            assert {:error, {:required_mcp_server_failed, "Jira", %{"status" => "failed"}}} =
+                     AppServer.with_jira_read_session(workspace, fn _ -> flunk("read invoked after startup rejection") end)
+          end)
+
+        assert log =~ "category=startup_rejected"
+        assert log =~ "elapsed_ms="
+        refute log =~ "synthetic-private-provider-text"
+        assert length(Regex.scan(~r/"method":"thread\/start"/, File.read!(trace))) == 1
+      end
+    )
   end
 
   test "factory Jira provider overrides are session-local and preserve connector authentication" do

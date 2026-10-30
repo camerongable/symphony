@@ -29,6 +29,48 @@ defmodule SymphonyElixir.FactoryJiraMcpReaderTest do
     end
   end
 
+  defmodule SessionAppServer do
+    def with_jira_read_session(workspace, operation) do
+      session = %{fixture_session: make_ref()}
+      send(self(), {:jira_session_opened, workspace, session})
+
+      try do
+        operation.(session)
+      after
+        send(self(), {:jira_session_closed, session})
+      end
+    end
+
+    def call_mcp_tool_in_session(session, "Jira", tool, arguments) do
+      send(self(), {:jira_session_call, session, tool})
+
+      case Connector.call(tool, arguments, []) do
+        {:ok, value} -> {:ok, %{"structuredContent" => value}}
+        error -> error
+      end
+    end
+  end
+
+  test "one search owns one session for search and hydration" do
+    Process.put(:search_page, %{"issues" => [%{"key" => "PPL-10035"}]})
+    Process.put(:issue, raw_issue("exact", []))
+    assert {:ok, [_]} = JiraMcpReader.search("assigned", workspace: "/tmp", app_server: SessionAppServer)
+    assert_received {:jira_session_opened, "/tmp", session}
+    assert_received {:jira_session_call, ^session, "jira_search"}
+    assert_received {:jira_session_call, ^session, "jira_get_issue"}
+    assert_received {:jira_session_closed, ^session}
+    refute_received {:jira_session_opened, _, _}
+  end
+
+  test "a supplied session remains owned by its caller" do
+    Process.put(:search_page, %{"issues" => []})
+    session = %{fixture_session: make_ref()}
+    assert {:ok, []} = JiraMcpReader.search("assigned", workspace: "/tmp", app_server: SessionAppServer, mcp_session: session)
+    assert_received {:jira_session_call, ^session, "jira_search"}
+    refute_received {:jira_session_opened, _, _}
+    refute_received {:jira_session_closed, _}
+  end
+
   test "assignee intake preserves exact Markdown and comment bytes from Jira" do
     description = "## Ticket Delivery Contract\n\n**Spec revision:** 1\n"
     comment = "<!-- AI FACTORY CONTRACT BEGIN -->\n**exact**\n"
@@ -80,6 +122,11 @@ defmodule SymphonyElixir.FactoryJiraMcpReaderTest do
     assert_receive {:search_args, %{"page_token" => "next"}}
   end
 
+  test "search refuses a repeated empty page token immediately" do
+    Process.put(:search_pages, [%{"issues" => [], "nextPageToken" => "same"}, %{"issues" => [], "nextPageToken" => "same"}])
+    assert {:error, :jira_search_page_token_repeated} = JiraMcpReader.search("assigned", connector: Connector, workspace: "/tmp")
+  end
+
   test "search follows a full server page by start index" do
     keys = Enum.map(1..50, &"PPL-#{&1}")
 
@@ -100,7 +147,7 @@ defmodule SymphonyElixir.FactoryJiraMcpReaderTest do
   end
 
   test "runaway pagination fails closed" do
-    Process.put(:search_page, %{"issues" => [], "nextPageToken" => "again"})
+    Process.put(:search_pages, Enum.map(1..20, &%{"issues" => [], "nextPageToken" => "next-#{&1}"}))
 
     assert {:error, :jira_search_page_limit_exceeded} =
              JiraMcpReader.search("assigned", connector: Connector, workspace: "/tmp")

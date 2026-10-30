@@ -11,6 +11,7 @@ defmodule SymphonyElixir.Factory.Supervisor do
 
   @store_name SymphonyElixir.Factory.Store
   @read_store_name SymphonyElixir.Factory.ReadStore
+  @control_read_store_name SymphonyElixir.Factory.ControlReadStore
   @control_name SymphonyElixir.Factory.ControlServer
   @task_supervisor_name SymphonyElixir.Factory.TaskSupervisor
 
@@ -39,8 +40,12 @@ defmodule SymphonyElixir.Factory.Supervisor do
     case validate_startup(factory) do
       :ok ->
         memory_database = factory.database in [:memory, ":memory:"]
-        read_store = if memory_database, do: @store_name, else: @read_store_name
-        reader_children = if memory_database, do: [], else: [%{id: @read_store_name, start: {Store, :start_read_only, [[database: Path.expand(factory.database), name: @read_store_name]]}}]
+        read_store = if memory_database, do: @store_name, else: @control_read_store_name
+
+        reader_children =
+          if memory_database,
+            do: [],
+            else: Enum.map([@read_store_name, @control_read_store_name], fn name -> %{id: name, start: {Store, :start_read_only, [[database: Path.expand(factory.database), name: name]]}} end)
 
         controller_options = [
           settings: settings,

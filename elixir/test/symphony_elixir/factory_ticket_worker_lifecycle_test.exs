@@ -425,6 +425,11 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     end
   end
 
+  defmodule OfflineIntakeJiraReader do
+    def search(_jql, _opts), do: {:error, :queue_offline}
+    def issue(key, opts), do: JiraReader.issue(key, opts)
+  end
+
   defmodule ParentPollJiraReader do
     def search(_jql, _opts), do: {:ok, []}
     def issue(key, opts), do: JiraReader.issue(key, opts)
@@ -1472,14 +1477,21 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
       callback = options[:on_message]
       packet = Jason.decode!(prompt)
       role = packet["role"]
+
       transform = fn
         %{payload: %{"method" => "item/completed", "params" => %{"item" => %{"type" => "agentMessage", "text" => raw}}}} = message when role == "feature-writer" ->
           output = raw |> Jason.decode!() |> Map.put("status", "COMPLETE")
           output = update_in(output, ["review_report", "criteria"], &Enum.map(&1, fn row -> Map.put(row, "status", "NOT_CHECKED") end))
-          output = put_in(output, ["review_report", "affected_path_checks"], [%{"id" => "executable-validation", "status" => "UNAVAILABLE", "evidence" => ["File-only source worker; controller checks pending"]}])
+
+          output =
+            put_in(output, ["review_report", "affected_path_checks"], [
+              %{"id" => "executable-validation", "status" => "UNAVAILABLE", "evidence" => ["File-only source worker; controller checks pending"]}
+            ])
+
           callback.(put_in(message, [:payload, "params", "item", "text"], Jason.encode!(output)))
 
-        message -> callback.(message)
+        message ->
+          callback.(message)
       end
 
       WorkerServer.run_turn(session, prompt, issue, Keyword.put(options, :on_message, transform))
@@ -1500,6 +1512,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     assert is_binary(adopted["candidate_sha"])
     assert String.trim(git(ctx.path, ["rev-list", "--count", ctx.sha <> "..HEAD"])) == "1"
     {:ok, reopened} = Store.start_link(database: ctx.database)
+
     try do
       assert {:error, :ticket_role_stage_not_admitted} = TicketWorkerRunner.adoption(reopened, request)
       assert {:ok, after_adoption} = WorkerEvidence.get(reopened, request)
@@ -1512,6 +1525,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     after
       GenServer.stop(reopened)
     end
+
     refute_receive {:factory_task_started, _, _}
   end
 
@@ -1535,6 +1549,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     {:ok, execution} = TicketPushIO.prepare(ctx.store, claimed, proof)
     assert {:ok, _} = TicketPushIO.execute(execution, &TicketPush.attach_execution(ctx.store, "run", &1, &2, proof, authorized))
     {:ok, reopened} = Store.start_link(database: ctx.database)
+
     try do
       {recovery_context, tick_options} = tick_controller(%{context | store: reopened}, options)
       assert {:ok, %{events: events}} = Scheduler.reconcile_ticket_jira(recovery_context, tick_options)
@@ -1549,6 +1564,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     after
       GenServer.stop(reopened)
     end
+
     refute_receive {:factory_task_started, _, _}
   end
 
@@ -4345,6 +4361,25 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     assert git(run["worktree"], ["rev-parse", "HEAD"]) |> String.trim() == run["candidate_sha"]
     Store.query!(ctx.store, "DELETE FROM controller_checks WHERE check_key = 'fixture-unresolved-check'")
     assert {:ok, _} = TicketWorkerRunner.delivery_facts(ctx.store, run, options)
+  end
+
+  test "normal tick adopts a stopped verifier before unrelated intake fails", ctx do
+    {context, options} = controller(ctx)
+    assert complete_stage(context, options)["state"] == "VERIFYING"
+    request = finish_worker(context, options)
+    {:ok, original} = RunLedger.get(ctx.store, "run")
+    {context, tick_opts} = tick_controller(context, options)
+    tick_opts = Keyword.put(tick_opts, :jira_reader, OfflineIntakeJiraReader)
+    requests = Store.query!(ctx.store, "SELECT * FROM desktop_requests ORDER BY request_key").rows
+
+    assert {:error, :queue_offline} = Scheduler.tick(context, tick_opts)
+    assert {:ok, %{"status" => "CONSUMED"}} = WorkerEvidence.get(ctx.store, request)
+    assert {:ok, %{"state" => "PUSHING"} = adopted} = RunLedger.get(ctx.store, "run")
+    assert adopted["candidate_sha"] == original["candidate_sha"]
+    assert {:error, :queue_offline} = Scheduler.tick(context, tick_opts)
+    assert {:ok, ^adopted} = RunLedger.get(ctx.store, "run")
+    assert Store.query!(ctx.store, "SELECT * FROM desktop_requests ORDER BY request_key").rows == requests
+    refute_receive {:factory_task_started, _, _}
   end
 
   test "disabled normal tick leaves completed worker evidence unconsumed and launches no next turn", ctx do
@@ -11046,18 +11081,39 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     broker = fixture.proof["source_thread_id"]
     assert {:ok, prepared} = BrokerRuntime.call(["prepare-ticket-mr-correction", key, fixture.request["payload_sha256"], "--source-thread-id", broker, "--workflow", fixture.workflow])
     File.write!(fixture.phase, "finalize")
+
     notifications = [
       %{method: "configWarning", params: %{summary: "A harmless startup warning", details: nil}},
       %{method: "account/updated", params: %{authMode: "chatgpt"}, emittedAtMs: 1}
     ]
+
     File.write!(fixture.config["idle_file"], Enum.map_join(notifications, "\n", &Jason.encode!/1))
+
     assert Enum.reduce_while(1..100, false, fn _, _ ->
-             if File.read!(fixture.trace) =~ "idle_emitted", do: {:halt, true}, else: (Process.sleep(10); {:cont, false})
+             if File.read!(fixture.trace) =~ "idle_emitted",
+               do: {:halt, true},
+               else:
+                 (
+                   Process.sleep(10)
+                   {:cont, false}
+                 )
            end)
+
     owner = put_in(fixture.frame, ["owner", "observed_at"], DateTime.to_iso8601(DateTime.utc_now()))
+
     assert {:ok, %{"status" => "MR_ACTOR_CWD_CORRECTED"}} =
-             BrokerRuntime.call(["finalize-ticket-mr-correction", key, prepared["handle"], "--source-thread-id", broker,
-               "--payload-base64", Base.encode64(Jason.encode!(owner)), "--workflow", fixture.workflow])
+             BrokerRuntime.call([
+               "finalize-ticket-mr-correction",
+               key,
+               prepared["handle"],
+               "--source-thread-id",
+               broker,
+               "--payload-base64",
+               Base.encode64(Jason.encode!(owner)),
+               "--workflow",
+               fixture.workflow
+             ])
+
     assert {:ok, %{"status" => "PENDING", "claimed_at" => nil}} = DesktopRequest.get(ctx.store, key)
   end
 
@@ -11168,9 +11224,11 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
             finalize
 
           notification when notification in [:unknown_notification, :interactive_notification] ->
-            message = if notification == :unknown_notification,
-              do: %{method: "fixture/idle", params: %{}},
-              else: %{id: "approval-request", method: "configWarning", params: %{}}
+            message =
+              if notification == :unknown_notification,
+                do: %{method: "fixture/idle", params: %{}},
+                else: %{id: "approval-request", method: "configWarning", params: %{}}
+
             File.write!(fixture.config["idle_file"], Jason.encode!(message))
             wait_mr_reader_removed(server, prepared["handle"])
             finalize
@@ -11215,6 +11273,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
       else
         assert after_attempt == before_attempt
       end
+
       File.write!(fixture.workflow, original_workflow)
       File.write!(Path.join(ctx.path, "fixture.txt"), original_source)
       Enum.each(~w(latest_file queue_file idle_file), &File.rm(fixture.config[&1]))

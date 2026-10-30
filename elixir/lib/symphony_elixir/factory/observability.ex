@@ -888,7 +888,7 @@ defmodule SymphonyElixir.Factory.Observability do
   defp decode_map(_json), do: %{}
 
   defp enrich_ticket_context(runs, store, opts) do
-    context_reader = Keyword.get(opts, :ticket_context, &TicketContext.context/2)
+    context_reader = Keyword.get(opts, :ticket_context, &TicketContext.dashboard/2)
     synchronization_reader = Keyword.get(opts, :ticket_synchronization, &TicketChatOutbox.synchronization/2)
 
     Enum.map(runs, &enrich_ticket_context_run(&1, store, context_reader, synchronization_reader))

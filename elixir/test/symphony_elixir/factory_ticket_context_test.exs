@@ -6,6 +6,21 @@ defmodule SymphonyElixir.FactoryTicketContextTest do
 
   setup :setup_fixture
 
+  test "dashboard context excludes retained delivery and journal payloads without changing drilldown", ctx do
+    retained = Jason.encode!(%{"history" => String.duplicate("retained receipt", 100_000)})
+    Store.query!(ctx.store, "UPDATE runs SET candidate_handoff = ? WHERE run_id = 'run'", [retained])
+    assert {:ok, packet} = TicketContext.dashboard(ctx.store, "run")
+    assert packet.run["run_id"] == "run"
+    refute Map.has_key?(packet, :run_details)
+    refute Map.has_key?(packet, :journal)
+    assert byte_size(Jason.encode!(packet)) < 16_384
+    assert {:ok, full} = TicketContext.context(ctx.store, "run")
+    assert {:ok, page} = TicketContext.details(ctx.store, ctx.chat["chat_key"], full.run_details.artifact_ref)
+    assert page.total_bytes > byte_size(retained)
+    assert {:ok, saved} = RunLedger.get(ctx.store, "run")
+    assert saved["candidate_handoff"] == retained
+  end
+
   test "oversized native recovery receipts and Unicode task failures remain bounded with exact drilldown", ctx do
     register_task(ctx, "run:feature-writer", "feature-writer", %{})
     failure = String.duplicate("Native writer rejected 😀\n", 2000)

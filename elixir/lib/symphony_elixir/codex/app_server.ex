@@ -126,6 +126,59 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
+  @doc "Owns one bounded Jira read batch, with one fresh-transport recovery at most."
+  @spec with_jira_read_session(Path.t(), (session() -> term())) :: term()
+  def with_jira_read_session(workspace, operation) when is_function(operation, 1) do
+    native_read_scope(120_000, fn -> jira_read_attempt(workspace, operation, 1) end)
+  end
+
+  defp jira_read_attempt(workspace, operation, retries) do
+    started = System.monotonic_time(:millisecond)
+
+    result =
+      with {:ok, session} <-
+             start_session(workspace,
+               ephemeral: true,
+               required_mcp_servers: ["Jira"],
+               mcp_startup_timeout_ms: effective_turn_timeout(60_000),
+               service_name: "symphony-factory-connector",
+               thread_source: "symphonyFactoryConnector"
+             ) do
+        try do
+          operation.(Map.put(session, :jira_read_deadline, Process.get(@native_read_deadline_key)))
+        after
+          stop_session(session)
+        end
+      end
+
+    if match?({:error, _}, result) do
+      Logger.warning("Jira read batch failed category=#{jira_read_failure_category(result)} elapsed_ms=#{System.monotonic_time(:millisecond) - started} attempts_remaining=#{retries}")
+    end
+
+    if retries > 0 and effective_turn_timeout(120_000) > 0 and retryable_jira_read?(result) do
+      Logger.warning("Jira read batch recovering once after transport/startup failure")
+      jira_read_attempt(workspace, operation, retries - 1)
+    else
+      sanitize_jira_read_failure(result)
+    end
+  end
+
+  defp jira_read_failure_category({:error, {:required_mcp_servers_unavailable, _}}), do: "startup_timeout"
+  defp jira_read_failure_category({:error, {:required_mcp_server_failed, _, _}}), do: "startup_rejected"
+  defp jira_read_failure_category({:error, {:port_exit, _}}), do: "transport_exit"
+  defp jira_read_failure_category({:error, reason}) when reason in [:response_timeout, :mcp_tool_response_timeout, :jira_read_deadline_exceeded], do: "read_timeout"
+  defp jira_read_failure_category(_), do: "read_rejected"
+
+  defp sanitize_jira_read_failure({:error, {:required_mcp_server_failed, "Jira", details}}),
+    do: {:error, {:required_mcp_server_failed, "Jira", Map.take(details, ["status"])}}
+
+  defp sanitize_jira_read_failure(result), do: result
+
+  defp retryable_jira_read?({:error, {:required_mcp_servers_unavailable, ["Jira"]}}), do: true
+  defp retryable_jira_read?({:error, {:port_exit, _}}), do: true
+  defp retryable_jira_read?({:error, reason}) when reason in [:response_timeout, :mcp_tool_response_timeout], do: true
+  defp retryable_jira_read?(_), do: false
+
   @doc "Owns a bounded Jira controller connector without starting a model turn."
   @spec with_jira_controller_session(Path.t(), (session() -> term())) :: term()
   def with_jira_controller_session(workspace, operation) when is_function(operation, 1) do
@@ -148,8 +201,20 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   @doc "Calls a configured MCP tool on an already-open, caller-owned session."
   @spec call_mcp_tool_in_session(session(), String.t(), String.t(), map()) :: {:ok, map()} | {:error, term()}
+  def call_mcp_tool_in_session(%{jira_read_deadline: deadline} = session, server, tool, arguments) do
+    cond do
+      server != "Jira" or tool not in ~w(jira_search jira_get_issue) -> {:error, :jira_read_session_tool_forbidden}
+      System.monotonic_time(:millisecond) >= deadline -> {:error, :jira_read_deadline_exceeded}
+      true -> call_mcp_tool_with_deadline(session, server, tool, arguments, deadline)
+    end
+  end
+
   def call_mcp_tool_in_session(%{port: port, thread_id: thread_id}, server, tool, arguments)
       when is_binary(server) and is_binary(tool) and is_map(arguments) do
+    call_mcp_tool_with_deadline(%{port: port, thread_id: thread_id}, server, tool, arguments, System.monotonic_time(:millisecond) + effective_turn_timeout(Config.settings!().codex.read_timeout_ms))
+  end
+
+  defp call_mcp_tool_with_deadline(%{port: port, thread_id: thread_id}, server, tool, arguments, deadline_ms) do
     send_message(port, %{
       "method" => "mcpServer/tool/call",
       "id" => @mcp_tool_call_id,
@@ -161,7 +226,6 @@ defmodule SymphonyElixir.Codex.AppServer do
       }
     })
 
-    deadline_ms = System.monotonic_time(:millisecond) + Config.settings!().codex.read_timeout_ms
     await_mcp_tool_response(port, deadline_ms, "")
   end
 
@@ -1061,6 +1125,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     with {:ok, response} <- initialization_response(port),
          :ok <- qualify_ticket_runtime_identity(response) do
       send_message(port, %{"method" => "initialized", "params" => %{}})
+
       if startup? do
         warn_unfamiliar_runtime(response)
         send_message(port, %{"method" => "config/read", "id" => @worker_config_id, "params" => %{"cwd" => cwd, "includeLayers" => false}})
@@ -1098,7 +1163,8 @@ defmodule SymphonyElixir.Codex.AppServer do
                   _ -> {:error, :worker_shutdown_unproven}
                 end
 
-              result -> result
+              result ->
+                result
             end
           else
             _ -> {:error, :worker_shutdown_unproven}
@@ -1674,6 +1740,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp warn_unfamiliar_runtime(%{"userAgent" => agent}) do
     version = runtime_version(agent)
+
     if version not in @ticket_worker_runtime_versions,
       do: Logger.warning("Codex runtime version=#{version} is unfamiliar; startup protocol checks determine compatibility")
   end
@@ -3429,10 +3496,18 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp handle_native_read_response(port, request_id, timeout, response, bytes) do
     cond do
-      bytes > 4_194_304 -> {:error, :native_history_exceeds_read_budget}
-      Map.has_key?(response, "method") and Map.has_key?(response, "id") -> {:error, :native_read_requests_unsupported}
-      Map.has_key?(response, "method") -> with_timeout_response(port, request_id, timeout, "")
-      true -> handle_response_payload(port, request_id, timeout, response)
+      bytes > 4_194_304 ->
+        {:error, :native_history_exceeds_read_budget}
+
+      Map.has_key?(response, "method") and Map.has_key?(response, "id") ->
+        {:error, :native_read_requests_unsupported}
+
+      Map.has_key?(response, "method") ->
+        record_mcp_startup_status(response)
+        with_timeout_response(port, request_id, timeout, "")
+
+      true ->
+        handle_response_payload(port, request_id, timeout, response)
     end
   end
 
@@ -3504,7 +3579,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp await_required_mcp_servers(_port, [], _timeout_ms), do: :ok
 
   defp await_required_mcp_servers(port, required_servers, timeout_ms) do
-    deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
+    deadline_ms = System.monotonic_time(:millisecond) + effective_turn_timeout(timeout_ms)
     await_required_mcp_servers(port, required_servers, deadline_ms, "")
   end
 

@@ -6,6 +6,7 @@ defmodule SymphonyElixir.Factory.JiraMcpReader do
   bytes. An incomplete page, issue, or comment set fails the tick closed.
   """
 
+  alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.Factory.JiraMcpConnector
 
   @page_size 50
@@ -17,7 +18,16 @@ defmodule SymphonyElixir.Factory.JiraMcpReader do
   @spec search(String.t(), keyword()) :: {:ok, [map()]} | {:error, term()}
   def search(jql, opts) when is_binary(jql) do
     connector = Keyword.get(opts, :connector, JiraMcpConnector)
-    read_pages(connector, opts, jql, 0, nil, MapSet.new(), [], 0)
+
+    if connector == JiraMcpConnector and is_nil(opts[:mcp_session]) do
+      app_server = Keyword.get(opts, :app_server, AppServer)
+
+      app_server.with_jira_read_session(Keyword.fetch!(opts, :workspace), fn session ->
+        read_pages(connector, Keyword.put(opts, :mcp_session, session), jql, 0, nil, MapSet.new(), [], 0)
+      end)
+    else
+      read_pages(connector, opts, jql, 0, nil, MapSet.new(), [], 0)
+    end
   end
 
   @doc "Reads one issue and normalizes only the fields the factory consumes."
@@ -63,7 +73,13 @@ defmodule SymphonyElixir.Factory.JiraMcpReader do
 
       cond do
         is_binary(next_token) and next_token != "" ->
-          read_pages(connector, opts, jql, start_at, next_token, seen, snapshots, page_count + 1)
+          tokens = Keyword.get(opts, :page_tokens_seen, MapSet.new())
+
+          if MapSet.member?(tokens, next_token) do
+            {:error, :jira_search_page_token_repeated}
+          else
+            read_pages(connector, Keyword.put(opts, :page_tokens_seen, MapSet.put(tokens, next_token)), jql, start_at, next_token, seen, snapshots, page_count + 1)
+          end
 
         length(hits) == @page_size ->
           read_pages(connector, opts, jql, start_at + @page_size, nil, seen, snapshots, page_count + 1)

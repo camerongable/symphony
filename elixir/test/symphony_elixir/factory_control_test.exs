@@ -1,7 +1,7 @@
 defmodule SymphonyElixir.FactoryControlTest do
   use ExUnit.Case, async: true
 
-  alias SymphonyElixir.Factory.{Control, Store}
+  alias SymphonyElixir.Factory.{Control, ControlServer, Store}
 
   @now ~U[2026-09-21 20:00:00Z]
   @config %{
@@ -16,7 +16,38 @@ defmodule SymphonyElixir.FactoryControlTest do
     connection = start_supervised!({Store, database: database})
     Control.initialize(connection, @config, now: @now)
     on_exit(fn -> File.rm(database) end)
-    %{connection: connection}
+    %{connection: connection, database: database}
+  end
+
+  test "control status remains readable while the dashboard connection is checked out", ctx do
+    dashboard = start_supervised!(%{id: :dashboard_reader, start: {Store, :start_read_only, [[database: ctx.database]]}})
+    control_reader = start_supervised!(%{id: :control_reader, start: {Store, :start_read_only, [[database: ctx.database]]}})
+    control = start_supervised!({ControlServer, store: ctx.connection, read_store: control_reader, factory: @config, name: nil})
+    parent = self()
+
+    held =
+      Task.async(fn ->
+        Store.transaction!(
+          dashboard,
+          fn _ ->
+            send(parent, :dashboard_checked_out)
+
+            receive do
+              :release_dashboard -> :ok
+            end
+          end,
+          mode: :deferred
+        )
+      end)
+
+    assert_receive :dashboard_checked_out
+
+    try do
+      assert ControlServer.status(control)["status"] == "PAUSED"
+    after
+      send(held.pid, :release_dashboard)
+      Task.await(held)
+    end
   end
 
   test "initialization is idempotent and begins paused", %{connection: connection} do

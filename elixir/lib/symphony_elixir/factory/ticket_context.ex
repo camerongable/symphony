@@ -36,6 +36,39 @@ defmodule SymphonyElixir.Factory.TicketContext do
     Store.transaction!(store, &context_transaction(&1, run_id))
   end
 
+  @doc "Projects current dashboard fields without serializing retained delivery history."
+  @spec dashboard(Store.connection(), String.t()) :: {:ok, map()} | {:error, term()}
+  def dashboard(store, run_id) do
+    Store.transaction!(store, &dashboard_transaction(&1, run_id), mode: :deferred)
+  end
+
+  defp dashboard_transaction(store, run_id) do
+    with {:ok, chat} <- TicketChat.for_run(store, run_id),
+         {:ok, run} <- RunLedger.get(store, run_id) do
+      disposition = current_writer_disposition(store, run)
+      tasks = rows(store, "SELECT * FROM factory_tasks WHERE run_id = ? ORDER BY created_at DESC, task_key DESC LIMIT 6", [run_id])
+
+      questions =
+        rows(
+          store,
+          "SELECT question_key, body, answers_json, binding_json, opened_at FROM ticket_chat_questions WHERE chat_key = ? AND run_id = ? AND status = 'OPEN' ORDER BY opened_at DESC LIMIT 4",
+          [chat["chat_key"], run_id]
+        )
+
+      {:ok,
+       %{
+         identity: Map.take(chat, ~w(chat_key scope_key issue_id issue_key repo_key generation thread_id context_sequence)),
+         run: Map.take(run, @run_fields),
+         tasks: Enum.map(tasks, &task_projection/1),
+         open_questions: Enum.map(questions, &question_projection(&1, chat, run)),
+         ci: %{checked_at: run["ci_last_checked_at"], pipeline_url: run["ci_pipeline_url"], artifact: artifact("ci", run_id, run["ci_evidence_json"])},
+         manual_validation: manual_validation(store, run),
+         writer_disposition: disposition,
+         next_action: next_action(run, disposition)
+       }}
+    end
+  end
+
   @spec replay(Store.connection(), String.t()) :: {:ok, map()} | {:error, term()}
   def replay(store, run_id) do
     with {:ok, packet} <- context(store, run_id),

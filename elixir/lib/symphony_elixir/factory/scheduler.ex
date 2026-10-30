@@ -1104,6 +1104,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
 
     with {:ok, run} <- RunLedger.get(tx, adopted.run["run_id"]),
          true <- run == adopted.run or {:error, :ticket_adoption_run_changed},
+         :ok <- local_adoption_commands_clear(context, run["run_id"]),
          :ok <- TicketChat.ordinary_delivery_eligibility(run),
          {:ok, _} <- TicketChat.ready_for_run(tx, run["run_id"]),
          {:ok, task} <- WorkerEvidence.adopt_completed(tx, key),
@@ -1487,6 +1488,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
   defp run_tick(context) do
     workspace = controller_workspace(context)
     File.mkdir_p!(workspace)
+    context = Map.put(context, :locally_adopted_runs, adopt_stopped_verifiers(context))
 
     if feedback_controller_in_flight?(context.store) do
       maybe_consume_review_feedback(context, workspace)
@@ -1553,6 +1555,56 @@ defmodule SymphonyElixir.Factory.Scheduler do
       end
 
     result
+  end
+
+  defp adopt_stopped_verifiers(context) do
+    Store.query!(context.store, """
+    SELECT DISTINCT run.run_id FROM runs AS run
+    JOIN worker_evidence AS evidence ON evidence.run_id = run.run_id
+    JOIN factory_tasks AS task ON task.task_key = evidence.task_key
+    WHERE run.execution_mode = 'TICKET_SUPERVISOR_V1' AND run.state = 'VERIFYING'
+      AND evidence.status = 'RESULT_RECORDED' AND task.role = 'change-verifier'
+      AND task.stage = 'VERIFYING' AND task.status = 'COMPLETE'
+    ORDER BY run.created_at, run.run_id LIMIT 50
+    """).rows
+    |> Enum.flat_map(fn [run_id] ->
+      case adopt_stopped_verifier(context, run_id) do
+        {:ok, %{status: "ADOPTED"}} -> [run_id]
+        _ -> []
+      end
+    end)
+  end
+
+  defp adopt_stopped_verifier(context, run_id) do
+    :global.trans({{__MODULE__, :ticket_stage, run_id}, self()}, fn ->
+      local_context = Map.put(context, :local_result_adoption, true)
+
+      with {:ok, %{"state" => "VERIFYING"} = run} <- RunLedger.get(context.store, run_id),
+           true <- Policy.ticket_selected?(Map.get(context.factory, :ticket_supervisor, %{}), run["issue_key"]),
+           nil <- ReviewProtocol.pending_status(context.store, run),
+           [[key, "RESULT_RECORDED"]] <- current_ticket_attempts(context.store, run),
+           {:ok, evidence} <- WorkerEvidence.get(context.store, key),
+           true <- WorkerEvidence.owner_stopped?(context.store, evidence),
+           :ok <- local_adoption_commands_clear(local_context, run_id) do
+        adopt_recorded_ticket_stage(local_context, key)
+      else
+        _ -> :ok
+      end
+    end)
+  rescue
+    error -> Logger.warning("Local verifier adoption deferred run_id=#{run_id} category=#{inspect(error.__struct__)}")
+  catch
+    :exit, _ -> Logger.warning("Local verifier adoption deferred run_id=#{run_id} category=store_exit")
+  end
+
+  defp local_adoption_commands_clear(context, run_id) do
+    if context[:local_result_adoption] do
+      command = Store.one!(context.store, "SELECT command_key FROM ticket_chat_commands WHERE run_id = ? AND status IN ('PENDING', 'ACCEPTED') LIMIT 1", [run_id])
+      amendment = Store.one!(context.store, "SELECT command_key FROM ticket_contract_amendments WHERE run_id = ? AND phase NOT IN ('APPLIED', 'SUPERSEDED', 'REJECTED') LIMIT 1", [run_id])
+      if command || amendment, do: {:error, :ticket_local_command_pending}, else: :ok
+    else
+      :ok
+    end
   end
 
   defp retry_rejected_verifier_creation(context) do
@@ -2584,6 +2636,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
       result.rows
       |> Enum.map(&Map.new(Enum.zip(result.columns, &1)))
       |> Enum.reject(&(&1["run_id"] == recovery_run_id))
+      |> Enum.reject(&(&1["run_id"] in Map.get(context, :locally_adopted_runs, [])))
 
     {:ok, Enum.reduce(runs, acc, &advance_ticket_run(context, &1, &2))}
   end
