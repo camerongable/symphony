@@ -100,6 +100,8 @@ Rollout's cutover primitives and thaw watchdog are tracked under `plans/rollout`
 and byte-pinned by the release adapter, not loaded from a temporary checkout.
 The watchdog only thaws the exact stopped issuer before bootout is committed.
 Backups are verified read-only recovery evidence; rollout never restores SQLite.
+Closed backup copies use immutable reads; the live ledger keeps ordinary
+WAL-aware read-only connections.
 
 Preparation errors, all finalize outcomes, parse-rejected finalize with a known
 reader handle (including an omitted positional ticket key), expiry, registered

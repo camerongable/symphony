@@ -23,7 +23,7 @@ _compat_spec = importlib.util.spec_from_file_location('review_native_runtime_com
 native_compatibility = importlib.util.module_from_spec(_compat_spec)
 _compat_spec.loader.exec_module(native_compatibility)
 HISTORICAL = TOOLS
-GUARD_SHA = 'faf925b22fde8b02da62b6c307c1b1355762b34372019d737a307b5c9df43c13'
+GUARD_SHA = 'dd09fd64cb8e58b621bf424b55c4a827c73bd276f42d84cce31df7bb4c2c80f5'
 THAW_SHA = 'cec22fd5003117f496bbe369baaf935f8c9f4797ae519ae0ca90578fb12b4534'
 OLD_RELEASE = Path('/Users/cgable/Library/Application Support/ai-factory/releases/symphony-review-report-e47cce2-r2')
 OLD_MANIFEST_SHA = 'bef269d33f281ea679b9050f7e0cbe5f54f0ab4b30dc4790ee8709cf1b05cda3'

@@ -27,7 +27,7 @@ def module(name):
 
 
 @contextmanager
-def fixture():
+def fixture(wal=False):
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory).resolve()
         child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
@@ -38,6 +38,8 @@ def fixture():
         guard.PLIST.write_bytes(b'original plist fixture')
         shutil.copy2(TOOLS / 'thaw_guardian.py', root / 'thaw_guardian.py')
         with closing(sqlite3.connect(guard.DB)) as db:
+            if wal:
+                db.execute('PRAGMA journal_mode=WAL')
             db.executescript('''
 CREATE TABLE control(scope TEXT,status TEXT,tick_id TEXT,lease_expires_at TEXT);
 INSERT INTO control VALUES('assigned-jira-work','PAUSED',NULL,NULL);
@@ -107,6 +109,15 @@ INSERT INTO protected_result VALUES('original receipt');
 
 
 class CutoverPrimitiveTests(unittest.TestCase):
+    def test_completed_wal_backup_is_readable_after_exclusive_hardlink_publication(self):
+        with fixture(wal=True) as (guard, _child, calls, original):
+            guard.stop()
+            guard.finish_stop()
+            backup_path = guard.ROOT / 'before-cutover.sqlite'
+            with closing(sqlite3.connect(backup_path.as_uri() + '?mode=ro&immutable=1', uri=True)) as backup:
+                self.assertEqual(guard.logical_digest(backup), original)
+            self.assertEqual(len(calls), 1)
+
     def test_finish_stop_recovers_interrupted_backup_without_reissuing_service_operations(self):
         for interruption in ('before_completion', 'after_completion', 'after_publish'):
             with self.subTest(interruption=interruption), fixture() as (guard, _child, calls, original):

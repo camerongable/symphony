@@ -25,7 +25,7 @@ _compat_spec = importlib.util.spec_from_file_location('ready_native_runtime_comp
 native_compatibility = importlib.util.module_from_spec(_compat_spec)
 _compat_spec.loader.exec_module(native_compatibility)
 HISTORICAL = TOOLS
-GUARD_SHA = 'faf925b22fde8b02da62b6c307c1b1355762b34372019d737a307b5c9df43c13'
+GUARD_SHA = 'dd09fd64cb8e58b621bf424b55c4a827c73bd276f42d84cce31df7bb4c2c80f5'
 THAW_SHA = 'cec22fd5003117f496bbe369baaf935f8c9f4797ae519ae0ca90578fb12b4534'
 OLD_RELEASE = Path('/Users/cgable/Library/Application Support/ai-factory/releases/symphony-review-report-first-publication-20261029')
 OLD_SOURCE = '15021478779145049f54d37b2d4b5adfb59f8924'

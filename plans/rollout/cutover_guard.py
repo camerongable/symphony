@@ -243,7 +243,8 @@ def finish_stop():
                 pass
         metadata = backup.lstat()
         assert stat.S_ISREG(metadata.st_mode) and metadata.st_uid == os.getuid() and not backup.is_symlink()
-        with readonly() as source, closing(sqlite3.connect(backup.as_uri() + '?mode=ro', uri=True)) as verified:
+        # Only this closed backup is immutable; the live ledger still needs WAL reads.
+        with readonly() as source, closing(sqlite3.connect(backup.as_uri() + '?mode=ro&immutable=1', uri=True)) as verified:
             assert verified.execute('PRAGMA quick_check').fetchone()[0] == 'ok'
             assert logical_digest(source) == logical_digest(verified)
         protected(audit)
