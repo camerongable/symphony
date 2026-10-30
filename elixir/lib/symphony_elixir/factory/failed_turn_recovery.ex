@@ -24,7 +24,9 @@ defmodule SymphonyElixir.Factory.FailedTurnRecovery do
   alias SymphonyElixir.Factory.Control
 
   @event "TICKET_FAILED_TURN_RECOVERY_APPLIED"
-  @closed_connection inspect("connection is closed because of an error, disconnect or timeout")
+  @closed_connection_message "connection is closed because of an error, disconnect or timeout"
+  @closed_connection inspect(@closed_connection_message)
+  @closed_connection_exception inspect({:worker_exception, :error, inspect(%DBConnection.ConnectionError{message: @closed_connection_message, severity: :error, reason: :error})})
   @run_fields ~w(run_id state worktree branch candidate_sha spec_revision contract_sha256 implementation_iteration plan_markdown)
 
   defp native_history(opts), do: if(Keyword.has_key?(opts, :native_runtime), do: {:ok, opts[:native_history]}, else: legacy_native_history(opts))
@@ -120,7 +122,7 @@ defmodule SymphonyElixir.Factory.FailedTurnRecovery do
          :ok <- quiescent(store, old),
          {:ok, files} <- files(store, old, access),
          {:ok, head} <- WorkerEvidence.checkout_head(access),
-         true <- head == binding["expected_sha"] and head == run["candidate_sha"],
+         true <- recovery_head_matches?(head, run, binding),
          {:ok, base} <- TicketWorkerRunner.read_packet(store, run["run_id"], "feature-writer", binding["base_sha"]),
          true <- packet_matches?(store, old, base) do
       {:ok, %{"request_key" => request, "thread_id" => old["thread_id"], "turn_id" => turn, "head" => head, "native" => native, "files" => Enum.map(files, & &1["path"])}}
@@ -160,7 +162,7 @@ defmodule SymphonyElixir.Factory.FailedTurnRecovery do
          :ok <- quiescent(store, old),
          {:ok, files} <- files(store, old, access),
          {:ok, head} <- WorkerEvidence.checkout_head(access),
-         true <- (head == binding["expected_sha"] and head == run["candidate_sha"]) or {:error, :failed_retry_head_changed},
+         true <- recovery_head_matches?(head, run, binding) or {:error, :failed_retry_head_changed},
          {:ok, base} <- TicketWorkerRunner.read_packet(store, run["run_id"], "feature-writer", binding["base_sha"]),
          true <- packet_matches?(store, old, base) or {:error, :failed_retry_packet_changed},
          :ok <- WorkspaceAccess.source_capacity(store, run, Keyword.take(opts, [:capacity_policy, :free_bytes])) do
@@ -402,7 +404,9 @@ defmodule SymphonyElixir.Factory.FailedTurnRecovery do
 
   defp failure_matches?(old, task, opts) do
     if interrupted_mode?(opts),
-      do: old["failure_code"] == @closed_connection and task["failure_code"] == inspect(:worker_observation_failed),
+      do:
+        (old["failure_code"] == @closed_connection and task["failure_code"] == inspect(:worker_observation_failed)) or
+          (old["failure_code"] == @closed_connection_exception and task["failure_code"] == @closed_connection_exception),
       else: String.starts_with?(old["failure_code"] || "", "{:worker_turn_error,") and old["failure_code"] == task["failure_code"]
   end
 
@@ -573,7 +577,7 @@ defmodule SymphonyElixir.Factory.FailedTurnRecovery do
 
   defp native_failure_matches?(old, native, opts) do
     if interrupted_mode?(opts) do
-      native["status"] == "interrupted" and is_nil(native["error_json"]) and old["failure_code"] == @closed_connection
+      native["status"] == "interrupted" and is_nil(native["error_json"]) and old["failure_code"] in [@closed_connection, @closed_connection_exception]
     else
       with "failed" <- native["status"],
            {:ok, error} when is_map(error) <- Jason.decode(native["error_json"] || "null") do
@@ -808,7 +812,8 @@ defmodule SymphonyElixir.Factory.FailedTurnRecovery do
          true <- task["prompt_sha256"] == proof["new_prompt_sha256"],
          {:ok, access} <- WorkspaceAccess.validate(store, proof["new_reservation_key"], proof["new_generation"]),
          {:ok, head} <- WorkerEvidence.checkout_head(access),
-         true <- head == run["candidate_sha"],
+         {:ok, old} <- WorkerEvidence.get(store, proof["old_request_key"]),
+         true <- recovery_head_matches?(head, run, Jason.decode!(old["binding_json"])),
          {:ok, pending} <- Worktree.pending_source_paths(access["canonical_path"]),
          true <- pending == Enum.map(proof["files"], & &1["path"]),
          :ok <- current_files(access, proof["files"]),
@@ -850,7 +855,7 @@ defmodule SymphonyElixir.Factory.FailedTurnRecovery do
          :ok <- quiescent(store, old),
          {:ok, access} <- WorkspaceAccess.validate(store, proof["new_reservation_key"], proof["new_generation"]),
          {:ok, head} <- WorkerEvidence.checkout_head(access),
-         true <- head == run["candidate_sha"],
+         true <- recovery_head_matches?(head, run, Jason.decode!(old["binding_json"])),
          {:ok, pending} <- Worktree.pending_source_paths(access["canonical_path"]),
          true <- pending == Enum.map(proof["files"], & &1["path"]),
          :ok <- current_files(access, proof["files"]),
@@ -859,6 +864,13 @@ defmodule SymphonyElixir.Factory.FailedTurnRecovery do
     else
       _ -> {:error, :failed_retry_start_unproven}
     end
+  end
+
+  defp recovery_head_matches?(head, run, binding) do
+    head == binding["expected_sha"] and
+      (head == run["candidate_sha"] or
+         (is_nil(run["candidate_sha"]) and run["implementation_iteration"] == 0 and
+            is_nil(run["candidate_handoff"]) and head == binding["base_sha"]))
   end
 
   defp receipt(store, field, value), do: find(store, @event, field, value)

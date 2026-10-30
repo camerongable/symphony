@@ -78,6 +78,49 @@ defmodule SymphonyElixir.FactoryFailedTurnRecoveryTest do
     refute log =~ missing
   end
 
+  test "an explicitly recovered closed-connection exception preserves partial edits and the old failure", ctx do
+    {old, _, options} = interrupted(ctx, true)
+    reason = {:worker_exception, :error, inspect(%DBConnection.ConnectionError{message: "connection is closed because of an error, disconnect or timeout", severity: :error, reason: :error})}
+    {:ok, _} = WorkerEvidence.reconcile_required(ctx.store, old["request_key"], reason)
+    {:ok, _} = TaskLedger.update(ctx.store, "writer", %{failure_code: inspect(reason)})
+    {:ok, original} = WorkerEvidence.get(ctx.store, old["request_key"])
+
+    assert {:ok, proof} = FailedTurnRecovery.prepare_interrupted(ctx.store, old["request_key"], "failed-turn", options)
+    assert proof["kind"] == "INTERRUPTED_TURN_QUIESCENCE"
+    assert proof["quiescence_is_owned_stop"] == false
+    assert {:ok, ^original} = WorkerEvidence.get(ctx.store, old["request_key"])
+    assert File.read!(Path.join(ctx.path, "fixture.txt")) == "partial\n"
+    assert :ok = FailedTurnRecovery.start_preflight(ctx.store, proof, options)
+    assert {:ok, ^proof} = FailedTurnRecovery.prepare_interrupted(ctx.store, old["request_key"], "failed-turn", options)
+  end
+
+  test "initial interrupted writers recover without inventing a candidate commit", ctx do
+    {:ok, _} = RunLedger.update(ctx.store, "run", %{candidate_sha: nil, implementation_iteration: 0})
+    {old, _, options} = interrupted(ctx, true)
+    assert {:ok, proof} = FailedTurnRecovery.prepare_interrupted(ctx.store, old["request_key"], "failed-turn", options)
+    assert proof["run"]["candidate_sha"] == nil
+    assert :ok = FailedTurnRecovery.start_preflight(ctx.store, proof, options)
+  end
+
+  test "a missing candidate after implementation has begun cannot authorize recovery", ctx do
+    {:ok, _} = RunLedger.update(ctx.store, "run", %{candidate_sha: nil, implementation_iteration: 1})
+    {old, _, options} = interrupted(ctx)
+    assert {:error, :failed_retry_head_changed} = FailedTurnRecovery.prepare_interrupted(ctx.store, old["request_key"], "failed-turn", options)
+  end
+
+  test "other database exceptions and mismatched failure reports cannot authorize recovery", ctx do
+    {old, _, options} = interrupted(ctx)
+    closed = {:worker_exception, :error, inspect(%DBConnection.ConnectionError{message: "connection is closed because of an error, disconnect or timeout", severity: :error, reason: :error})}
+    other = {:worker_exception, :error, inspect(%DBConnection.ConnectionError{message: "connection not available", severity: :error, reason: :error})}
+    {:ok, _} = WorkerEvidence.reconcile_required(ctx.store, old["request_key"], other)
+    {:ok, _} = TaskLedger.update(ctx.store, "writer", %{failure_code: inspect(other)})
+    assert {:error, :failed_retry_not_eligible} = FailedTurnRecovery.prepare_interrupted(ctx.store, old["request_key"], "failed-turn", options)
+    {:ok, _} = WorkerEvidence.reconcile_required(ctx.store, old["request_key"], closed)
+    assert {:error, :failed_retry_not_eligible} = FailedTurnRecovery.prepare_interrupted(ctx.store, old["request_key"], "failed-turn", options)
+    {:ok, _} = TaskLedger.update(ctx.store, "writer", %{failure_code: inspect(closed)})
+    assert {:error, _} = FailedTurnRecovery.prepare_automatic(ctx.store, old["request_key"], "failed-turn", Keyword.delete(options, :manual_interrupted))
+  end
+
   test "persisted queue revision detects even an enqueue-delete roundtrip before start", ctx do
     {old, _, options} = interrupted(ctx)
     assert {:ok, proof} = FailedTurnRecovery.prepare_interrupted(ctx.store, old["request_key"], "failed-turn", options)
