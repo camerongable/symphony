@@ -356,6 +356,7 @@ INSERT INTO desktop_requests VALUES('old-uncertain','RECONCILE_REQUIRED');
             (root / 'rollout-approved.json').write_text(json.dumps({'evidence': {'cutover-audit.json': cutover.sha(audit_path)}}))
             (root / 'captured.json').write_text(json.dumps({'configuration': g.configuration(), 'plist_sha256': cutover.sha(saved)}))
             database = root / 'fixture.sqlite'
+            g.DB = database
             with sqlite3.connect(database) as db:
                 db.execute('CREATE TABLE factory_schema_migrations(version INTEGER)')
                 db.execute('INSERT INTO factory_schema_migrations VALUES (54)')

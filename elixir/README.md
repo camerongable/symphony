@@ -96,6 +96,11 @@ This does not prove model access or full worker safety: actual worker admission
 still checks its permissions, tools, containment, and storage identity. Handoffs
 retain fresh identity checks without repeating the startup configuration probe.
 
+Rollout's cutover primitives and thaw watchdog are tracked under `plans/rollout`
+and byte-pinned by the release adapter, not loaded from a temporary checkout.
+The watchdog only thaws the exact stopped issuer before bootout is committed.
+Backups are verified read-only recovery evidence; rollout never restores SQLite.
+
 Preparation errors, all finalize outcomes, parse-rejected finalize with a known
 reader handle (including an omitted positional ticket key), expiry, registered
 rejected idle-port data/death, and broker termination close the reader. Wrong-bound finalize

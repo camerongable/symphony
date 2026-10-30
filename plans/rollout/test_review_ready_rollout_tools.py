@@ -29,6 +29,16 @@ def load_tools():
 
 
 class ReadyRolloutTests(unittest.TestCase):
+    def test_cutover_dependencies_are_tracked_beside_the_rollout_not_in_a_temporary_directory(self):
+        tools = load_tools()
+        self.assertEqual(tools.HISTORICAL, ROOT)
+        for name, expected in (('cutover_guard.py', tools.GUARD_SHA), ('thaw_guardian.py', tools.THAW_SHA)):
+            self.assertEqual(tools.sha(ROOT / name), expected)
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(subprocess, 'run', side_effect=AssertionError('import performed a process operation')):
+                guard, _ = tools.bind(Path(directory))
+            self.assertEqual(guard.ROOT, Path(directory))
+
     def test_only_explicit_source_context_qualifies_the_exact_dangling_phoenix_placeholder(self):
         tools = load_tools()
         for name in ('symphony-review-report-216eadb', 'symphony-review-report-new-frozen'):
@@ -288,10 +298,10 @@ INSERT INTO control VALUES('timer');
         tests = [{'environment': environment, 'category': category, 'count': 2,
                   'failures': 0, 'exit_code': 0, 'command': 'fixture-only synthetic command',
                   'log': log.name, 'log_sha256': tools.sha(log)}
-                 for environment in ('source', 'artifact') for category in tools.TEST_CATEGORIES]
-        validation = {**candidate, 'result': 'PASS', 'tests': tests,
+                 for environment in ('artifact',) for category in ('readback', 'composed')]
+        validation = {**candidate, 'result': 'PASS', 'tests': tests, 'scope': 'MINIMAL_DEPLOYMENT_QUALIFICATION',
                       'all_143_retained_and_five_022_private_resources_unchanged': True,
-                      'quality_limits': {'credo_baseline': 653, 'credo_added': 0,
+                      'quality_limits': {'credo_baseline': 653, 'credo_added': 'NOT_RERUN',
                                          'coverage': 'NOT_REACHED', 'dialyzer': 'NOT_REACHED'}}
         return candidate, validation
 

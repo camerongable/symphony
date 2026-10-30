@@ -22,8 +22,8 @@ TOOLS = Path(__file__).resolve().parent
 _compat_spec = importlib.util.spec_from_file_location('review_native_runtime_compatibility', TOOLS / 'native_runtime_compatibility.py')
 native_compatibility = importlib.util.module_from_spec(_compat_spec)
 _compat_spec.loader.exec_module(native_compatibility)
-HISTORICAL = Path('/private/tmp/symphony-push-handoff.cnRVdUfY/review-cutover-r19f2')
-GUARD_SHA = '41c26ac2067bdba97ecbf92238e11f813e0e45c8068283b75565677abfe53482'
+HISTORICAL = TOOLS
+GUARD_SHA = 'faf925b22fde8b02da62b6c307c1b1355762b34372019d737a307b5c9df43c13'
 THAW_SHA = 'cec22fd5003117f496bbe369baaf935f8c9f4797ae519ae0ca90578fb12b4534'
 OLD_RELEASE = Path('/Users/cgable/Library/Application Support/ai-factory/releases/symphony-review-report-e47cce2-r2')
 OLD_MANIFEST_SHA = 'bef269d33f281ea679b9050f7e0cbe5f54f0ab4b30dc4790ee8709cf1b05cda3'

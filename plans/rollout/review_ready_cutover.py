@@ -24,8 +24,8 @@ TOOLS = Path(__file__).resolve().parent
 _compat_spec = importlib.util.spec_from_file_location('ready_native_runtime_compatibility', TOOLS / 'native_runtime_compatibility.py')
 native_compatibility = importlib.util.module_from_spec(_compat_spec)
 _compat_spec.loader.exec_module(native_compatibility)
-HISTORICAL = Path('/private/tmp/symphony-push-handoff.cnRVdUfY/review-cutover-r19f2')
-GUARD_SHA = '41c26ac2067bdba97ecbf92238e11f813e0e45c8068283b75565677abfe53482'
+HISTORICAL = TOOLS
+GUARD_SHA = 'faf925b22fde8b02da62b6c307c1b1355762b34372019d737a307b5c9df43c13'
 THAW_SHA = 'cec22fd5003117f496bbe369baaf935f8c9f4797ae519ae0ca90578fb12b4534'
 OLD_RELEASE = Path('/Users/cgable/Library/Application Support/ai-factory/releases/symphony-review-report-first-publication-20261029')
 OLD_SOURCE = '15021478779145049f54d37b2d4b5adfb59f8924'
@@ -416,7 +416,7 @@ def validate_replacement_absent(process_listing, audit):
 
 
 def bind(evidence_root):
-    """Retain only dynamic-global stop/thaw/backup primitives from the sealed guard."""
+    """Bind the tracked stop/thaw/backup primitives to this exact release admission."""
     assert sha(HISTORICAL / 'thaw_guardian.py') == THAW_SHA
     g = import_pinned(HISTORICAL / 'cutover_guard.py', GUARD_SHA, 'ready_retained_guard')
     g.ROOT, g.OLD_PID, g.OLD_START, g.OLD_FINGERPRINT = evidence_root, OLD_PID, OLD_START, OLD_FINGERPRINT
