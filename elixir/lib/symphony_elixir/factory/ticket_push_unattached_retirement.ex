@@ -10,7 +10,7 @@ defmodule SymphonyElixir.Factory.TicketPushUnattachedRetirement do
   @preissuance_path Path.expand("../../../priv/ticket_push_preissuance_audit_v1.json", __DIR__)
   @external_resource @preissuance_path
   @preissuance_sha :crypto.hash(:sha256, File.read!(@preissuance_path)) |> Base.encode16(case: :lower)
-  @initial_preissuance_path Path.expand("../../../priv/ticket_push_preissuance_audit_v2.json", __DIR__)
+  @initial_preissuance_path Path.expand("../../../priv/ticket_push_preissuance_audit_v3.json", __DIR__)
   @external_resource @initial_preissuance_path
   @initial_preissuance_raw File.read!(@initial_preissuance_path)
   @initial_preissuance_sha :crypto.hash(:sha256, @initial_preissuance_raw) |> Base.encode16(case: :lower)
@@ -302,7 +302,7 @@ defmodule SymphonyElixir.Factory.TicketPushUnattachedRetirement do
   defp audited_identity(:preissuance, %{run_id: run_id, nonce: nonce, envelope_sha256: envelope}) do
     if run_id == @initial_preissuance_identity["operation"]["run_id"] and
          nonce == @initial_preissuance_identity["owner_nonce"] and envelope == @initial_preissuance_identity["original_envelope_sha256"] do
-      load_audited_identity("ticket_push_preissuance_audit_v2.json", @initial_preissuance_sha, "AUDITED_PREISSUANCE_REJECTED_PUSH")
+      load_audited_identity("ticket_push_preissuance_audit_v3.json", @initial_preissuance_sha, "AUDITED_PREISSUANCE_REJECTED_PUSH")
     else
       audited_identity(:preissuance)
     end

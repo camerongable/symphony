@@ -1,0 +1,54 @@
+{
+  "database_identity": {
+    "device": 16777233,
+    "inode": 619477098,
+    "path": "/Users/cgable/Documents/Codex/factory-state/factory.sqlite",
+    "uid": 505
+  },
+  "execution_sha256": "4017085f55bbeff189d670515d050d7c7137f1842c2d3758f1837823b06b642c",
+  "helper_pid": 42957,
+  "issuer": {
+    "pid": 40832,
+    "started_at": "Thu Oct 29 20:10:11 2026",
+    "uid": 505
+  },
+  "kind": "AUDITED_PREISSUANCE_REJECTED_PUSH",
+  "operation": {
+    "branch": "cgable/PPL-10231-normalize-string-elements-inside-docextract-data-arrays",
+    "candidate_sha": "fd577776f5f5a1eb615f021d70b29a1c9df9ec33",
+    "contract_sha256": "5a7daf735fdefcf0eb95271d4cc39b27a69764298ef762e7df97f600c9be4e1a",
+    "run_id": "ba73f533-1855-4c69-ae1a-51428352bdfd",
+    "spec_revision": 2,
+    "state": "CI_PUSHING"
+  },
+  "original_envelope_sha256": "780ea01be9ad9a7fc381045deb3f785203ce52aaee39253976d302c7a929f692",
+  "owner_nonce": "0047706c958e2d0f8f431c924d8f278ea03db6a4e73ca546996a16afe35e9122",
+  "pins": {
+    "/Users/cgable/Library/Application Support/ai-factory/releases/symphony-review-report-2da06b6/dev/lib/symphony_elixir/priv/ticket_push_executor_v37.py": "792e99282acc8546d7ead2153a81a2180fb3ca0bd95e4792fb62fb7779508799",
+    "/Users/cgable/Library/Application Support/ai-factory/releases/symphony-review-report-2da06b6/dev/lib/symphony_elixir/priv/ticket_push_history_validator_v26.py": "2d6b6947f0beb9fd0d26e00a893b42e8b88523c0cd3c753f63902afdae8de49c",
+    "/Users/cgable/Library/Application Support/ai-factory/releases/symphony-review-report-2da06b6/dev/lib/symphony_elixir/priv/worker_file_companion.py": "87f3dd595ddc70205ed881b42ab5a9401b0705c13cdc8fda2c2b8b5bac4b0b3b",
+    "/Users/cgable/Library/Application Support/ai-factory/releases/symphony-review-report-2da06b6/evidence/release-manifest.json": "758a0074e74316e4c446a40d5a5effa63e4503c9e3bb15bd5f3a11be7309794d"
+  },
+  "protected_snapshot": {
+    "event_limit": 4691,
+    "path": "/private/tmp/symphony-first-publish-upgrade.8re3y8/deploy-evidence/recovery-protected-before.json",
+    "sha256": "049244003011e92bbf8baeda152ae2b07bf0374e5125fc5b0e86ec0ae4472765"
+  },
+  "rejection": {
+    "bytes": 68055,
+    "path": "/Users/cgable/Documents/Codex/factory-state/.factory-file-io/0047706c958e2d0f8f431c924d8f278ea03db6a4e73ca546996a16afe35e9122.push-rejection",
+    "reason": "ci_evidence_successor_changed",
+    "sha256": "b8b410d813d4a1fab08f792c4a72123758cad360f81ec70f8c53db0708e1b914"
+  },
+  "replacement_build": "/Users/cgable/Library/Application Support/ai-factory/releases/symphony-review-report-first-publication-20261029-v2/dev",
+  "replacement_launcher": "/Users/cgable/Library/Application Support/ai-factory/releases/symphony-review-report-first-publication-20261029-v2/run-local-factory",
+  "replacement_manifest": "/Users/cgable/Library/Application Support/ai-factory/releases/symphony-review-report-first-publication-20261029-v2/evidence/release-manifest.json",
+  "reservation_generation": 4,
+  "reservation_key": "ticket-push:b73e8d645ba5fd955add54472462735787e1ac7149a9d8ec3591539142d2b895",
+  "version": 1,
+  "workflow": {
+    "path": "/Users/cgable/Repos/symphony/elixir/WORKFLOW.local.md",
+    "sha256": "bba710167780a64da5336b4247d97de765d499d0cbdf59dadfcdee6ef2b69927",
+    "working_directory": "/Users/cgable/Repos/symphony-ticket-chat-implementation/elixir"
+  }
+}
