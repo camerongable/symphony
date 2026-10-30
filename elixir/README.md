@@ -84,6 +84,9 @@ Reader failure or expiry records a request-and-candidate-bound pre-claim event
 without claiming or replacing the request. The dashboard reports that current
 event as factory handoff attention, not human code review; historical events stop
 being current when the request is claimed or its binding changes.
+Completed publication readback retains the retiring release's exact
+manifest-backed publisher origin in a versioned catalog; identical bytes at a
+new path do not by themselves authorize an old receipt.
 
 Preparation errors, all finalize outcomes, parse-rejected finalize with a known
 reader handle (including an omitted positional ticket key), expiry, registered
