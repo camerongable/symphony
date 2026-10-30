@@ -359,6 +359,7 @@ defmodule SymphonyElixir.Factory.Observability do
             ci_attention(source),
             operation_attention(store, source),
             journal_attention(store, source),
+            mr_preclaim_attention(store, source),
             request_attention(store, source, now, stale_seconds),
             check_attention(store, source, now, stale_seconds),
             worker_attention(store, source),
@@ -582,6 +583,48 @@ defmodule SymphonyElixir.Factory.Observability do
             "Reconcile the existing operation and its recorded receipt; do not issue a replacement."
           )
         ]
+    end)
+  end
+
+  defp mr_preclaim_attention(store, run) do
+    rows = Store.query!(store, """
+    SELECT request.* FROM desktop_requests AS request
+    WHERE request.target_kind='CONTROLLER' AND request.status='PENDING'
+      AND request.claimed_at IS NULL
+      AND json_extract(CASE WHEN json_valid(request.metadata_json) THEN request.metadata_json ELSE '{}' END, '$.delivery_operation.run_id')=?
+      AND NOT EXISTS (SELECT 1 FROM ticket_mr_claims AS claim WHERE claim.request_key=request.request_key)
+      AND NOT EXISTS (SELECT 1 FROM desktop_requests AS newer WHERE newer.target_kind=request.target_kind AND newer.target_key=request.target_key
+        AND (newer.created_at>request.created_at OR (newer.created_at=request.created_at AND newer.rowid>request.rowid)))
+    ORDER BY request.created_at DESC LIMIT 10
+    """, [run["run_id"]])
+
+    Enum.flat_map(rows.rows, fn row ->
+      request = Map.new(Enum.zip(rows.columns, row))
+      binding = get_in(decode_map(request["metadata_json"]), ["delivery_operation"])
+
+      if current_binding?(binding, run) and DesktopRequest.payload_intact?(request) and
+           SymphonyElixir.Factory.TicketMrOperation.typed_request?(request) do
+        event = Store.one!(store, """
+        SELECT occurred_at,payload_json FROM events WHERE run_id=? AND event_type='MR_OWNER_PRECLAIM_FAILED'
+          AND json_extract(CASE WHEN json_valid(payload_json) THEN payload_json ELSE '{}' END,'$.request_key')=?
+          AND json_extract(CASE WHEN json_valid(payload_json) THEN payload_json ELSE '{}' END,'$.payload_sha256')=?
+        ORDER BY id DESC LIMIT 1
+        """, [run["run_id"], request["request_key"], request["payload_sha256"]])
+        evidence = decode_map(event && event["payload_json"])
+        fields = ~w(run_id candidate_sha spec_revision contract_sha256)
+        valid_reason = {evidence["phase"], evidence["reason_code"]} in [{"READER", "MR_READER_PROTOCOL_REJECTED"}, {"READER", "MR_READER_EXITED"}, {"EXPIRED", "MR_ADMISSION_EXPIRED"}]
+
+        if evidence["version"] == 1 and evidence["action"] in ~w(claim correct) and valid_reason and
+             Map.take(evidence, fields) == Map.take(run, fields) and evidence["stage"] == run["state"] do
+          [notice("BROKER", "MR_PRECLAIM_FAILED", request["request_key"],
+            "The factory could not prepare the existing MR handoff. No MR operation was claimed; this is not a request for human code review.",
+            event["occurred_at"], "Reconcile the factory reader and retry admission of the existing request; do not resend or create a replacement.")]
+        else
+          []
+        end
+      else
+        []
+      end
     end)
   end
 
@@ -1063,7 +1106,7 @@ defmodule SymphonyElixir.Factory.Observability do
 
   defp broker_signal_keys(signals, blocking) do
     signals
-    |> Enum.filter(&(&1[:blocking] === blocking and &1[:source] in ~w(PARENT_SYNC TASK CONTROLLER) and is_binary(&1[:request_key])))
+    |> Enum.filter(&(&1[:blocking] === blocking and &1[:source] in ~w(PARENT_SYNC TASK CONTROLLER BROKER) and is_binary(&1[:request_key])))
     |> Enum.map(& &1.request_key)
     |> MapSet.new()
   end

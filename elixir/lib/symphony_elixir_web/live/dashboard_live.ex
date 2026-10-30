@@ -1226,6 +1226,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
         end)
 
     cond do
+      get_in(run, [:attention, :source]) == "BROKER" -> "Factory · MR handoff needs attention"
       run[:state] == "READY_FOR_REVIEW" and ticket_mr(ticket) -> "Human review"
       run[:state] == "AWAITING_CONTRACT_INPUT" and current_question -> "Human decision"
       get_in(run, [:worker_execution, :running_proven]) === true -> "Factory · recorded observation, not a current heartbeat"

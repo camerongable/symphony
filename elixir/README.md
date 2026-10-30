@@ -77,9 +77,17 @@ bounded by min20s and remaining admission lifetime; expiry stays exactly the
 minimum of authorization+60s, runtime+60s, and remote+10s. No initialization or
 model command occurs in finalize. A slow final physical/read still fails closed.
 
+Idle readers tolerate only bounded, non-interactive startup notifications
+(`configWarning`, remote-control status, and MCP-server startup status). Unknown,
+malformed, oversized, or interactive messages still invalidate the admission.
+Reader failure or expiry records a request-and-candidate-bound pre-claim event
+without claiming or replacing the request. The dashboard reports that current
+event as factory handoff attention, not human code review; historical events stop
+being current when the request is claimed or its binding changes.
+
 Preparation errors, all finalize outcomes, parse-rejected finalize with a known
 reader handle (including an omitted positional ticket key), expiry, registered
-idle-port data/death, and broker termination close the reader. Wrong-bound finalize
+rejected idle-port data/death, and broker termination close the reader. Wrong-bound finalize
 now also consumes the associated native
 reader handle rather than retaining a port for a later retry. Unknown messages
 are not suppressed. Close validates ownership; repeat cleanup of an owned dead

@@ -39,7 +39,14 @@ atexit.register(lambda: record("closed"))
 def emit_idle():
     while True:
         if pathlib.Path(config["idle_file"]).exists():
-            print(json.dumps({"method": "fixture/idle", "params": {}}), flush=True)
+            try:
+                notification = json.loads(pathlib.Path(config["idle_file"]).read_text())
+            except ValueError:
+                print(pathlib.Path(config["idle_file"]).read_text(), flush=True)
+                record("idle_emitted", method=None)
+                return
+            print(json.dumps(notification), flush=True)
+            record("idle_emitted", method=notification.get("method"))
             return
         time.sleep(0.01)
 

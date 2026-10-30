@@ -860,6 +860,28 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   def read_native_thread(_reader, _thread_id, _opts), do: {:error, :invalid_native_thread_id}
 
+  @doc "Consumes bounded, non-interactive startup notifications on an owned idle reader."
+  @spec consume_native_reader_notification(native_reader(), term()) :: :ok | {:error, atom()}
+  def consume_native_reader_notification(%{port: port} = reader, {:eol, raw}) when is_port(port) and is_binary(raw) and byte_size(raw) <= 16_384 do
+    key = {__MODULE__, :native_reader_notifications, port}
+    {count, bytes} = Process.get(key, {0, 0})
+
+    with :ok <- native_reader_owned(reader),
+         true <- count < 64 and bytes + byte_size(raw) <= 65_536,
+         {:ok, %{"method" => method, "params" => params} = message} <- Jason.decode(raw),
+         true <- method in ~w(configWarning remoteControl/status/changed mcpServer/startupStatus/updated),
+         true <- is_map(params) and Map.keys(message) -- ~w(method params emittedAtMs jsonrpc) == [],
+         true <- not Map.has_key?(message, "jsonrpc") or message["jsonrpc"] == "2.0" do
+      Process.put(key, {count + 1, bytes + byte_size(raw)})
+      :ok
+    else
+      _ -> {:error, :native_reader_notification_rejected}
+    end
+  end
+
+  # Port line framing cannot fragment a valid notification below the smaller read budget.
+  def consume_native_reader_notification(_reader, _raw), do: {:error, :native_reader_notification_rejected}
+
   @doc "Exports storage provenance only from the same successfully attested owned reader."
   @spec native_reader_origin(native_reader()) :: {:ok, map()} | {:error, term()}
   def native_reader_origin(reader) do
@@ -883,11 +905,13 @@ defmodule SymphonyElixir.Codex.AppServer do
     cond do
       is_nil(Port.info(port)) and binding in [nil, reader] ->
         Process.delete({__MODULE__, :native_reader, port})
+        Process.delete({__MODULE__, :native_reader_notifications, port})
         drain_native_reader(port)
 
       native_reader_owned(reader, false) == :ok ->
         stop_port(port)
         Process.delete({__MODULE__, :native_reader, port})
+        Process.delete({__MODULE__, :native_reader_notifications, port})
         drain_native_reader(port)
 
       true ->

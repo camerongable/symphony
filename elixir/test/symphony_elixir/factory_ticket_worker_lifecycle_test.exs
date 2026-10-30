@@ -11033,6 +11033,30 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     refute Enum.any?(events, &(&1["pid"] == native["pid"] and &1["method"] in ~w(thread/start thread/resume thread/fork turn/start)))
   end
 
+  @tag mr_reader_notifications: true
+  @tag mr_preflight: true
+  @tag mr_owner_service: true
+  @tag mr_projectless: true
+  @tag broker_thread_id: "00000000-0000-0000-0000-000000000001"
+  test "MR owner survives a startup warning between preparation and finalization", ctx do
+    fixture = mr_reader_lifetime_fixture(ctx)
+    File.write!(fixture.config["slow_first_initialize"], "use normal initialization")
+    start_supervised!({BrokerRuntime, factory: fixture.factory, store: ctx.store, name: nil})
+    key = fixture.request["request_key"]
+    broker = fixture.proof["source_thread_id"]
+    assert {:ok, prepared} = BrokerRuntime.call(["prepare-ticket-mr-correction", key, fixture.request["payload_sha256"], "--source-thread-id", broker, "--workflow", fixture.workflow])
+    File.write!(fixture.phase, "finalize")
+    File.write!(fixture.config["idle_file"], Jason.encode!(%{method: "configWarning", params: %{summary: "A harmless startup warning", details: nil}}))
+    assert Enum.reduce_while(1..100, false, fn _, _ ->
+             if File.read!(fixture.trace) =~ "idle_emitted", do: {:halt, true}, else: (Process.sleep(10); {:cont, false})
+           end)
+    owner = put_in(fixture.frame, ["owner", "observed_at"], DateTime.to_iso8601(DateTime.utc_now()))
+    assert {:ok, %{"status" => "MR_ACTOR_CWD_CORRECTED"}} =
+             BrokerRuntime.call(["finalize-ticket-mr-correction", key, prepared["handle"], "--source-thread-id", broker,
+               "--payload-base64", Base.encode64(Jason.encode!(owner)), "--workflow", fixture.workflow])
+    assert {:ok, %{"status" => "PENDING", "claimed_at" => nil}} = DesktopRequest.get(ctx.store, key)
+  end
+
   @tag mr_reader_matrix: true
   @tag mr_preflight: true
   @tag mr_owner_service: true
@@ -11058,12 +11082,15 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
       :expiry,
       :port_death,
       :idle_data,
+      :unknown_notification,
+      :interactive_notification,
       :restart,
       :kill_restart,
       :final_physical
     ]
 
     for defect <- defects do
+      before_attempt = snapshot.()
       File.write!(fixture.phase, "prepare")
       server = start_supervised!(Supervisor.child_spec({BrokerRuntime, factory: fixture.factory, store: ctx.store, name: nil}, restart: :temporary))
 
@@ -11136,6 +11163,14 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
             wait_mr_reader_removed(server, prepared["handle"])
             finalize
 
+          notification when notification in [:unknown_notification, :interactive_notification] ->
+            message = if notification == :unknown_notification,
+              do: %{method: "fixture/idle", params: %{}},
+              else: %{id: "approval-request", method: "configWarning", params: %{}}
+            File.write!(fixture.config["idle_file"], Jason.encode!(message))
+            wait_mr_reader_removed(server, prepared["handle"])
+            finalize
+
           :restart ->
             stop_supervised!(BrokerRuntime)
             start_supervised!(Supervisor.child_spec({BrokerRuntime, factory: fixture.factory, store: ctx.store, name: nil}, restart: :temporary))
@@ -11157,7 +11192,25 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
       assert {:error, _} = BrokerRuntime.call(finalize), "unexpected success for #{defect}"
       assert Port.info(reader.port) == nil, "reader remained live after #{defect}"
       assert_mr_reader_closed(reader)
-      assert snapshot.() == original
+      after_attempt = snapshot.()
+      assert Map.delete(after_attempt, "events") == Map.delete(original, "events")
+
+      if defect in [:expiry, :port_death, :idle_data, :unknown_notification, :interactive_notification] do
+        previous_events = before_attempt["events"]
+        assert Enum.take(after_attempt["events"], length(previous_events)) == previous_events
+        new_events = Store.query!(ctx.store, "SELECT event_type,payload_json FROM events ORDER BY id").rows |> Enum.drop(length(previous_events))
+        if defect in [:unknown_notification, :interactive_notification], do: assert(new_events == [])
+        if defect not in [:unknown_notification, :interactive_notification], do: assert(length(new_events) == 1)
+        ["MR_OWNER_PRECLAIM_FAILED", raw] = Store.query!(ctx.store, "SELECT event_type,payload_json FROM events ORDER BY id DESC LIMIT 1").rows |> hd()
+        evidence = Jason.decode!(raw)
+        assert evidence["request_key"] == fixture.request["request_key"]
+        assert evidence["payload_sha256"] == fixture.request["payload_sha256"]
+        assert evidence["reason_code"] in ~w(MR_ADMISSION_EXPIRED MR_READER_EXITED MR_READER_PROTOCOL_REJECTED)
+        assert {:error, _} = BrokerRuntime.call(finalize)
+        assert snapshot.() == after_attempt
+      else
+        assert after_attempt == before_attempt
+      end
       File.write!(fixture.workflow, original_workflow)
       File.write!(Path.join(ctx.path, "fixture.txt"), original_source)
       Enum.each(~w(latest_file queue_file idle_file), &File.rm(fixture.config[&1]))
@@ -11188,7 +11241,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     initialized = fixture.trace |> File.read!() |> String.split("\n", trim: true) |> Enum.drop(before) |> Enum.map(&Jason.decode!/1) |> Enum.filter(&(&1["event"] == "initialized"))
     assert initialized != []
     Enum.each(initialized, &assert_mr_reader_pid_closed(Integer.to_string(&1["pid"])))
-    assert snapshot.() == original
+    assert Map.delete(snapshot.(), "events") == Map.delete(original, "events")
   end
 
   @tag mr_reader_omitted_key: true

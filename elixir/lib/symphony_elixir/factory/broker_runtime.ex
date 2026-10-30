@@ -6,6 +6,7 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
   alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.Factory.Supervisor
   alias SymphonyElixir.Factory.TicketMrOwnerAdmission
+  alias SymphonyElixir.Factory.{DesktopRequest, RunLedger, Store, TicketMrOperation}
   alias SymphonyElixir.{PathSafety, Workflow}
 
   @owner_operations ~w(prepare-ticket-mr-correction prepare-ticket-mr-claim prepare-ticket-mr-recovery finalize-ticket-mr-correction finalize-ticket-mr-claim finalize-ticket-mr-recovery)
@@ -84,9 +85,20 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
   end
 
   @impl true
-  def handle_info({port, {:data, _}}, state) when is_port(port), do: invalidate_reader(state, port)
+  def handle_info({port, {:data, raw}}, state) when is_port(port) do
+    case Enum.find(state.owner_admissions, fn {_, context} -> match?(%{port: ^port}, context.native_reader) end) do
+      {_, context} ->
+        case SymphonyElixir.Codex.AppServer.consume_native_reader_notification(context.native_reader, raw) do
+          :ok -> {:noreply, state}
+          {:error, _} -> invalidate_reader(state, port, "MR_READER_PROTOCOL_REJECTED")
+        end
 
-  def handle_info({port, {:exit_status, _}}, state) when is_port(port), do: invalidate_reader(state, port)
+      nil ->
+        invalidate_reader(state, port)
+    end
+  end
+
+  def handle_info({port, {:exit_status, _}}, state) when is_port(port), do: invalidate_reader(state, port, "MR_READER_EXITED")
 
   @impl true
   def terminate(_reason, state) do
@@ -95,9 +107,10 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
     :ok
   end
 
-  defp invalidate_reader(state, port) do
+  defp invalidate_reader(state, port, reason \\ "MR_READER_PROTOCOL_REJECTED") do
     case Enum.find(state.owner_admissions, fn {_, context} -> match?(%{port: ^port}, context.native_reader) end) do
       {handle, context} ->
+        record_preclaim_failure(state, context, "READER", reason)
         TicketMrOwnerAdmission.close(context)
         {:noreply, %{state | owner_admissions: Map.delete(state.owner_admissions, handle)}}
 
@@ -249,6 +262,7 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
     alive =
       Enum.reduce(state.owner_admissions, %{}, fn {handle, context}, current ->
         if DateTime.compare(DateTime.utc_now(), context.expires_at) == :gt do
+          record_preclaim_failure(state, context, "EXPIRED", "MR_ADMISSION_EXPIRED")
           TicketMrOwnerAdmission.close(context)
           current
         else
@@ -286,6 +300,32 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
       end
 
     {result, consumed}
+  end
+
+  defp record_preclaim_failure(state, context, phase, reason) do
+    expected = context.prepared.request
+    fields = ~w(run_id candidate_sha spec_revision contract_sha256)
+
+    Store.transaction!(state.store, fn tx ->
+      with {:ok, request} <- DesktopRequest.get(tx, context.key),
+           true <- request == expected and request["status"] == "PENDING" and is_nil(request["claimed_at"]),
+           true <- DesktopRequest.payload_intact?(request) and TicketMrOperation.typed_request?(request),
+           nil <- Store.one!(tx, "SELECT request_key FROM ticket_mr_claims WHERE request_key=?", [context.key]),
+           {:ok, run} <- RunLedger.get(tx, context.prepared.run["run_id"]),
+           true <- Map.take(run, fields) == Map.take(context.prepared.run, fields) and run["state"] == context.prepared.run["state"] do
+        payload = Map.take(run, fields) |> Map.merge(%{
+          "version" => 1, "request_key" => context.key, "payload_sha256" => request["payload_sha256"],
+          "stage" => run["state"], "action" => Atom.to_string(context.action), "phase" => phase, "reason_code" => reason})
+        raw = Jason.encode!(payload)
+        prior = Store.one!(tx, "SELECT id FROM events WHERE run_id=? AND event_type='MR_OWNER_PRECLAIM_FAILED' AND payload_json=? LIMIT 1", [run["run_id"], raw])
+
+        if is_nil(prior) do
+          Store.query!(tx, "INSERT INTO events(occurred_at,event_type,run_id,payload_json) VALUES (?,'MR_OWNER_PRECLAIM_FAILED',?,?)", [DateTime.to_iso8601(DateTime.utc_now()), run["run_id"], raw])
+        end
+      else
+        _ -> :ok
+      end
+    end)
   end
 
   defp execute(["prepare-ticket-stage" | _] = args, store, factory),
