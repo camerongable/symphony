@@ -54,7 +54,7 @@ CREATE TABLE worker_file_operations(request_key TEXT,call_id TEXT,phase TEXT,io_
             'successors':('ticket_ci_repair_evidence_successors','attempt_index',('proof_json','evidence_json')),
             'generation_intents':('ticket_ordinary_generation_intents','intent_key',('binding_json',)),
             'generation_events':('ticket_ordinary_generation_events','event_key',('receipt_json',))}
-        proof = {'worker_key_order':list(self.worker)}
+        proof = {'worker_key_order':list(self.worker), 'review_events_json':'[]'}
         for name,(table,order,digests) in fields.items():
             rows = [dict(row) for row in self.db.execute('SELECT * FROM '+table+' ORDER BY '+order)]
             compact = [{key:hashlib.sha256(value.encode()).hexdigest() if key in digests and isinstance(value,str) else value for key,value in row.items()} for row in rows]
@@ -77,6 +77,15 @@ CREATE TABLE worker_file_operations(request_key TEXT,call_id TEXT,phase TEXT,io_
     def test_unknown_helper_cannot_claim_capability_format(self):
         with self.assertRaises(ValueError):
             load('ticket_push_history_validator_v20.py')(self.db,self.execution('unregistered.py',1))
+
+    def test_file_source_publishers_preserve_required_capability_history(self):
+        check = load('ticket_push_history_validator_v27.py')
+        self.assertIsNone(check(self.db, self.execution('ticket_push_executor_v39.py')))
+        self.assertIsNone(check(self.db, self.execution('ticket_push_executor_v39.py', 1)))
+        for version in (None, True, 0, 2, '1'):
+            with self.subTest(version=version), self.assertRaises(ValueError):
+                check(self.db, self.execution('ticket_push_executor_v40.py', version))
+        self.assertIsNone(check(self.db, self.execution('ticket_push_executor_v40.py', 1)))
 
     def test_marker_does_not_authorize_a_transfer_without_its_grant(self):
         old = dict(self.worker,request_key='blocked',status='RESULT_RECORDED',reservation_key='old-source')

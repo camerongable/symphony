@@ -31,7 +31,7 @@ def main():
     assert tools.inventory(Path(manifest['build']), artifact_source=source) == manifest['artifact']
     assert tools.inventory(source, True) == manifest['source']
     local = Path(manifest['build']) / 'lib/symphony_elixir/priv'
-    history_path = local / 'ticket_push_history_validator_v26.py'
+    history_path = local / 'ticket_push_history_validator_v27.py'
     history_raw = history_path.read_bytes()
     assert tools.digest(history_raw) == manifest['artifact']['lib/symphony_elixir/priv/'+history_path.name]['sha256']
     codec = types.ModuleType('ready_historical_publication')

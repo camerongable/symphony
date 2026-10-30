@@ -322,7 +322,7 @@ INSERT INTO control VALUES('timer');
     def test_publication_requires_two_actual_read_only_proofs_on_exact_build(self):
         tools = load_tools()
         candidate = {'source_commit': 'a'*40, 'manifest_sha256': 'b'*64}
-        manifest = {'artifact': {'lib/symphony_elixir/priv/ticket_push_history_validator_v26.py': {'sha256': 'c'*64}}}
+        manifest = {'artifact': {'lib/symphony_elixir/priv/ticket_push_history_validator_v27.py': {'sha256': 'c'*64}}}
         common = {**candidate, 'result': 'PASS', 'run_id': tools.RUN, 'current_candidate_sha': tools.CANDIDATE,
                   'envelope_sha256': tools.TICKET['envelope_sha256'], 'receipt_sha256': tools.TICKET['receipt_sha256'],
                   'receipt_bytes': 387927, 'read_only_sqlite_reopens': 2,
@@ -401,7 +401,7 @@ INSERT INTO control VALUES('timer');
             with self.subTest(field=field), self.assertRaises(AssertionError):
                 tools.validate_old_binding(bad, tools.OLD_START, launchd, True)
         for start, output in (('new start', launchd), (tools.OLD_START, 'pid = 1\n'),
-                              (tools.OLD_START, launchd.replace('216eadb', 'e47cce2-r2'))):
+                              (tools.OLD_START, launchd.replace(str(tools.OLD_RELEASE), '/unreviewed/release'))):
             with self.subTest(start=start, output=output), self.assertRaises(AssertionError):
                 tools.validate_old_binding(control, start, output, True)
         for field in ('tick_id', 'lease_expires_at'):
@@ -456,7 +456,7 @@ CREATE TABLE worker_evidence(owner_process_json TEXT,owner_stopped_at TEXT);
         tools.validate_restore_plist(original, original, audit, '/workflow', '/original/dev')
         replacement = tools.replacement_plist(original, audit['replacement_launcher'], audit['replacement_build'])
         tools.validate_restore_plist(original, replacement, audit, '/workflow', '/original/dev')
-        for raw in (original.replace(b'216eadb', b'e47cce2'),
+        for raw in (original.replace(str(tools.OLD_RELEASE).encode(), b'/unreviewed/release'),
                     plistlib.dumps({**plistlib.loads(replacement), 'KeepAlive': False})):
             with self.assertRaises(AssertionError):
                 tools.validate_restore_plist(original, raw, audit, '/workflow', '/original/dev')
@@ -517,7 +517,7 @@ CREATE TABLE worker_evidence(owner_process_json TEXT,owner_stopped_at TEXT);
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             candidate, manifest = self.fixture_artifact(tools, root)
-            manifest['artifact']['lib/symphony_elixir/priv/ticket_push_history_validator_v26.py'] = {'sha256': 'd'*64}
+            manifest['artifact']['lib/symphony_elixir/priv/ticket_push_history_validator_v27.py'] = {'sha256': 'd'*64}
             manifest_path = Path(candidate['release']) / 'evidence/release-manifest.json'
             manifest_path.write_bytes(tools.encode(manifest))
             candidate['manifest_sha256'] = tools.sha(manifest_path)

@@ -1515,6 +1515,43 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     refute_receive {:factory_task_started, _, _}
   end
 
+  @tag structured_review: true
+  @tag first_publication_boundary: true
+  test "initial file-only completion publishes once with honest unavailable execution evidence", ctx do
+    {context, options} = controller(ctx)
+    context = put_in(context, [:factory, :repositories, "grail", "ci_preflight"], "draft_mr")
+    {:ok, _} = RunLedger.update(ctx.store, "run", %{candidate_sha: nil})
+    options = Keyword.put(options, :app_server, PendingExecutionWorkerServer)
+    request = finish_worker(context, options)
+    {:ok, original} = WorkerEvidence.get(ctx.store, request)
+    assert {:ok, %{status: "ADOPTED", run: adopted}} = Scheduler.ticket_step(context, "run", options)
+    assert adopted["state"] == "CI_PUSHING"
+    remote = Path.join(ctx.root, "initial-origin.git")
+    git(ctx.root, ["init", "--bare", remote])
+    git(ctx.repo, ["remote", "add", "origin", remote])
+    proof = push_authorization(ctx.store, adopted)
+    authorized = Keyword.put(options, :ci_preflight_authorized, true)
+    {:ok, claimed} = TicketPush.claim(ctx.store, "run", proof, authorized)
+    {:ok, execution} = TicketPushIO.prepare(ctx.store, claimed, proof)
+    assert {:ok, _} = TicketPushIO.execute(execution, &TicketPush.attach_execution(ctx.store, "run", &1, &2, proof, authorized))
+    {:ok, reopened} = Store.start_link(database: ctx.database)
+    try do
+      {recovery_context, tick_options} = tick_controller(%{context | store: reopened}, options)
+      assert {:ok, %{events: events}} = Scheduler.reconcile_ticket_jira(recovery_context, tick_options)
+      assert Enum.any?(events, &(&1.event == "TICKET_PUSH_COMPLETED"))
+      assert {:ok, %{"state" => "CI_MR_CREATING"}} = RunLedger.get(reopened, "run")
+      assert String.trim(git(ctx.root, ["--git-dir", remote, "rev-parse", "refs/heads/" <> adopted["branch"]])) == adopted["candidate_sha"]
+      assert {:ok, retained} = WorkerEvidence.get(reopened, request)
+      assert retained["output_json"] == original["output_json"]
+      assert retained["output_sha256"] == original["output_sha256"]
+      assert {:error, :ticket_role_stage_not_admitted} = TicketWorkerRunner.adoption(reopened, request)
+      assert String.trim(git(ctx.path, ["rev-list", "--count", ctx.sha <> "..HEAD"])) == "1"
+    after
+      GenServer.stop(reopened)
+    end
+    refute_receive {:factory_task_started, _, _}
+  end
+
   test "planner, resumed writer slices and blind verifier share one checkout and adopt exactly once", ctx do
     {context, options} = controller(ctx)
     {:ok, _} = RunLedger.update(ctx.store, "run", %{state: "PLANNING", candidate_sha: nil})

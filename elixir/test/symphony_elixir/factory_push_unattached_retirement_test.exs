@@ -1,5 +1,6 @@
 defmodule SymphonyElixir.FactoryPushUnattachedRetirementTest do
   use ExUnit.Case, async: false
+  @moduletag :first_publication_retirement
   alias SymphonyElixir.Factory.{Control, Store, TicketPushUnattachedRetirement}
 
   test "equal empty snapshots and an unreviewed replacement cannot prove shutdown" do
@@ -84,6 +85,28 @@ defmodule SymphonyElixir.FactoryPushUnattachedRetirementTest do
 
     assert {:error, :unattached_retirement_protected_history_changed} =
              TicketPushUnattachedRetirement.prepare(ctx.store, operation, receipt, %{}, operator_tick: tick)
+
+    assert Enum.map(~w(runs events workspace_access), &Store.query!(ctx.store, "SELECT * FROM #{&1}").rows) == before
+  end
+
+  @tag :initial_preissuance_audit
+  test "the exact initial-publication audit cannot authorize a different ledger", _ctx do
+    ctx = SymphonyElixir.TicketChatFixture.setup_fixture(%{})
+    config = %{scope: "initial-preissuance-fixture", dispatcher_id: "fixture", lease_seconds: 240}
+    Control.initialize(ctx.store, config)
+    assert {:ok, _} = Control.activate(ctx.store, config, config.dispatcher_id)
+    assert %{result: "ACQUIRED"} = Control.acquire_tick(ctx.store, config, config.dispatcher_id)
+    tick = Control.status(ctx.store, config.scope) |> Map.take(~w(scope dispatcher_id generation tick_id))
+    before = Enum.map(~w(runs events workspace_access), &Store.query!(ctx.store, "SELECT * FROM #{&1}").rows)
+    sha = String.duplicate("a", 64)
+    operation = %{run_id: "run", nonce: sha, envelope_sha256: sha}
+    receipt = %{path: "/missing", sha256: sha}
+    audit = Application.app_dir(:symphony_elixir, "priv/ticket_push_preissuance_audit_v2.json") |> File.read!() |> Jason.decode!()
+    exact = %{run_id: audit["operation"]["run_id"], nonce: audit["owner_nonce"], envelope_sha256: audit["original_envelope_sha256"]}
+    for rejected <- [exact, %{exact | nonce: sha}, %{exact | envelope_sha256: sha}, operation] do
+      assert {:error, :unattached_retirement_protected_history_changed} =
+               TicketPushUnattachedRetirement.prepare_preissuance(ctx.store, rejected, receipt, %{}, operator_tick: tick)
+    end
 
     assert Enum.map(~w(runs events workspace_access), &Store.query!(ctx.store, "SELECT * FROM #{&1}").rows) == before
   end

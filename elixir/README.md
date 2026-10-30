@@ -1626,6 +1626,17 @@ before the first candidate commit. Scheduling leaves that result and its edits
 intact rather than repeatedly attempting adoption; a compatible validated report
 can then proceed through normal exact-result adoption.
 
+Initial CI publication applies the same bound file-only supplemental-check
+policy as adoption. UNAVAILABLE execution evidence never becomes a passing test
+or verifier result. Versioned publication validators retain prior helper bytes
+and readback support for completed receipts across upgrades.
+
+The audited preissuance-retirement command retains separate pinned cases. The
+initial-publication case is selected only by its exact run, nonce, and envelope
+digest; it still requires stopped issuance, an unchanged protected ledger, a
+verified replacement runtime, and absence of a push claim or receipt. Retirement
+archives the rejection and prepares a new nonce; it does not issue a push.
+
 Schema v38 stores controller-owned intake rejection decisions separately from
 the observed Jira snapshot. Missing, ambiguous or unsupported manual-validation
 declarations, disabled/unsupported selected capability, and forbidden admission

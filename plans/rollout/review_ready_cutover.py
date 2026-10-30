@@ -27,15 +27,15 @@ _compat_spec.loader.exec_module(native_compatibility)
 HISTORICAL = Path('/private/tmp/symphony-push-handoff.cnRVdUfY/review-cutover-r19f2')
 GUARD_SHA = '41c26ac2067bdba97ecbf92238e11f813e0e45c8068283b75565677abfe53482'
 THAW_SHA = 'cec22fd5003117f496bbe369baaf935f8c9f4797ae519ae0ca90578fb12b4534'
-OLD_RELEASE = Path('/Users/cgable/Library/Application Support/ai-factory/releases/symphony-review-report-7dcc70b')
-OLD_SOURCE = '7dcc70bad203ee228b8b7f66d075e5656229b19a'
-OLD_MANIFEST = 'd6ce5ee22db6e9aa0bfbd8b026296de939b34587f8a3cb0b043e196256d826f9'
-OLD_LAUNCHER = 'a989234c3eed4b808f97019632c478f16a781bdf9e9481d06c24b68d0584053c'
+OLD_RELEASE = Path('/Users/cgable/Library/Application Support/ai-factory/releases/symphony-review-report-2da06b6')
+OLD_SOURCE = '2da06b68b7c3127c9099c0f8f63660946840dd07'
+OLD_MANIFEST = '758a0074e74316e4c446a40d5a5effa63e4503c9e3bb15bd5f3a11be7309794d'
+OLD_LAUNCHER = '5af8478cba9f2288b956d5e91608bf3bb39eaddc7f5aadc776b193b8534b63cb'
 OLD_BOOT = '08e4e34861a12ee3a9934471f59f9adae968daa0ef4523dfa135da0ed779bc29'
-OLD_PLIST = '3c1ab89462a2e8f8dfdba53f7ab7dc67298abac6a22ce16fd52b0fbb9a29e0f2'
-OLD_PID = '19268'
-OLD_START = 'Thu Oct 29 12:09:06 2026'
-OLD_FINGERPRINT = 'ad2a59b0e6032231fb11d56acfcdb521bd49c9a25a2daf01a921d4519402ae0c'
+OLD_PLIST = '55e31d8009baab17b932cda36e7d740919fdc054a7559a86286dd4f895e3f1d8'
+OLD_PID = '39353'
+OLD_START = 'Thu Oct 29 14:11:54 2026'
+OLD_FINGERPRINT = '2e2f665f45a8f78fd2d170ca11094dbdaf2b19c32ee7b2834db06c471e21de87'
 RUN = 'ab5ab1fe-32cc-48c1-985e-3c3800adcfa2'
 CANDIDATE = 'eb9c67f06a00a38d98dd0d4ba1dd2e83a0883834'
 DB = Path('/Users/cgable/Documents/Codex/factory-state/factory.sqlite')
@@ -274,7 +274,7 @@ def validate_publication(value, manifest, public, history):
                   'recorded_git_diff_paths_and_generated_blobs', 'historical_rollover_verifier_and_ci'):
         assert history[field] is True
     assert history['issuance_freshness'] == 'NOT_RERUN_HISTORICAL_READ_ONLY'
-    assert history['history_sha256'] == manifest['artifact']['lib/symphony_elixir/priv/ticket_push_history_validator_v26.py']['sha256']
+    assert history['history_sha256'] == manifest['artifact']['lib/symphony_elixir/priv/ticket_push_history_validator_v27.py']['sha256']
 
 
 def replace_plist(path, expected_sha, raw):

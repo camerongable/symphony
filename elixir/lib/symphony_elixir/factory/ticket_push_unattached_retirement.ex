@@ -10,6 +10,11 @@ defmodule SymphonyElixir.Factory.TicketPushUnattachedRetirement do
   @preissuance_path Path.expand("../../../priv/ticket_push_preissuance_audit_v1.json", __DIR__)
   @external_resource @preissuance_path
   @preissuance_sha :crypto.hash(:sha256, File.read!(@preissuance_path)) |> Base.encode16(case: :lower)
+  @initial_preissuance_path Path.expand("../../../priv/ticket_push_preissuance_audit_v2.json", __DIR__)
+  @external_resource @initial_preissuance_path
+  @initial_preissuance_raw File.read!(@initial_preissuance_path)
+  @initial_preissuance_sha :crypto.hash(:sha256, @initial_preissuance_raw) |> Base.encode16(case: :lower)
+  @initial_preissuance_identity Jason.decode!(@initial_preissuance_raw)
   @publisher_path Path.expand("ticket_push.ex", __DIR__)
   @external_resource @publisher_path
   @publisher_sha :crypto.hash(:sha256, File.read!(@publisher_path)) |> Base.encode16(case: :lower)
@@ -32,7 +37,7 @@ defmodule SymphonyElixir.Factory.TicketPushUnattachedRetirement do
   defp prepare_case(store, %{run_id: run_id, nonce: nonce} = operation, receipt, authorization, opts, retirement_case) do
     with {:ok, _} <- TicketPushRecovery.tick_binding(store, opts),
          :ok <- human_inputs_clear(store, run_id),
-         {:ok, audit} <- audited_identity(retirement_case),
+         {:ok, audit} <- audited_identity(retirement_case, operation),
          :ok <- protected_history(store, audit),
          {:ok, proof} <- verify_fence(audit, receipt.path, receipt.sha256),
          {:ok, run} <- RunLedger.get(store, run_id),
@@ -139,7 +144,7 @@ defmodule SymphonyElixir.Factory.TicketPushUnattachedRetirement do
     :global.trans({{TicketPush, run_id}, self()}, fn ->
       with {:ok, plan} <- prepare_case(store, operation, receipt, authorization, opts, retirement_case),
            true <- plan.plan_sha256 == plan_sha or {:error, :unattached_retirement_plan_changed},
-           {:ok, audit} <- audited_identity(retirement_case),
+           {:ok, audit} <- audited_identity(retirement_case, operation),
            {:ok, proof} <- verify_fence(audit, receipt.path, receipt.sha256),
            true <- proof == plan.proof or {:error, :unattached_retirement_proof_changed} do
         persist_observed(store, operation, receipt, plan, audit, authorization, opts)
@@ -294,6 +299,17 @@ defmodule SymphonyElixir.Factory.TicketPushUnattachedRetirement do
 
   defp audited_identity, do: audited_identity(:unattached)
 
+  defp audited_identity(:preissuance, %{run_id: run_id, nonce: nonce, envelope_sha256: envelope}) do
+    if run_id == @initial_preissuance_identity["operation"]["run_id"] and
+         nonce == @initial_preissuance_identity["owner_nonce"] and envelope == @initial_preissuance_identity["original_envelope_sha256"] do
+      load_audited_identity("ticket_push_preissuance_audit_v2.json", @initial_preissuance_sha, "AUDITED_PREISSUANCE_REJECTED_PUSH")
+    else
+      audited_identity(:preissuance)
+    end
+  end
+
+  defp audited_identity(retirement_case, _operation), do: audited_identity(retirement_case)
+
   defp audited_identity(retirement_case) do
     {filename, expected_sha, kind} =
       case retirement_case do
@@ -301,6 +317,10 @@ defmodule SymphonyElixir.Factory.TicketPushUnattachedRetirement do
         :preissuance -> {"ticket_push_preissuance_audit_v1.json", @preissuance_sha, "AUDITED_PREISSUANCE_REJECTED_PUSH"}
       end
 
+    load_audited_identity(filename, expected_sha, kind)
+  end
+
+  defp load_audited_identity(filename, expected_sha, kind) do
     path = Application.app_dir(:symphony_elixir, "priv/" <> filename)
 
     with {:ok, path} <- PathSafety.canonicalize(path),
@@ -384,7 +404,8 @@ defmodule SymphonyElixir.Factory.TicketPushUnattachedRetirement do
 
   defp replacement_runtime(proof, build) do
     with {:ok, raw} <- verified_file(proof["replacement_manifest"], proof["replacement_manifest_sha256"], false),
-         {:ok, %{"kind" => "FACTORY_PUSH_HANDOFF_RELEASE_V1"} = manifest} <- Jason.decode(raw),
+         {:ok, %{"kind" => kind} = manifest} <- Jason.decode(raw),
+         true <- kind == "FACTORY_PUSH_HANDOFF_RELEASE_V1" or (kind == "FACTORY_REVIEW_REPORT_RELEASE_V1" and manifest["schema_version"] == 54),
          true <- manifest["build"] == build and manifest["source_hashes"]["elixir/lib/symphony_elixir/factory/ticket_push.ex"] == @publisher_sha,
          modules = manifest["factory_modules"],
          true <- is_map(modules) and map_size(modules) > 100,
