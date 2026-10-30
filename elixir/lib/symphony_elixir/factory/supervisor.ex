@@ -86,7 +86,7 @@ defmodule SymphonyElixir.Factory.Supervisor do
         dated = is_binary(root) and String.contains?(root, "{date}")
         root = if is_binary(root), do: SymphonyElixir.Factory.TicketChat.output_root(root), else: root
         if dated, do: File.mkdir_p!(root)
-        AppServer.check_ticket_runtime(root)
+        AppServer.check_ticket_startup(root)
       else
         :ok
       end

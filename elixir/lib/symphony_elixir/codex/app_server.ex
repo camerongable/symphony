@@ -642,11 +642,19 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp await_owned_worker_exit(port, deadline) do
     remaining = max(0, deadline - System.monotonic_time(:millisecond))
 
-    receive do
-      {^port, {:exit_status, status}} -> {:ok, status}
-      {^port, {:data, _}} -> await_owned_worker_exit(port, deadline)
-    after
-      remaining -> {:error, :worker_shutdown_unproven}
+    if remaining == 0 do
+      receive do
+        {^port, {:exit_status, status}} -> {:ok, status}
+      after
+        0 -> {:error, :worker_shutdown_unproven}
+      end
+    else
+      receive do
+        {^port, {:exit_status, status}} -> {:ok, status}
+        {^port, {:data, _}} -> await_owned_worker_exit(port, deadline)
+      after
+        remaining -> {:error, :worker_shutdown_unproven}
+      end
     end
   end
 
@@ -1009,7 +1017,15 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   @doc "Checks the configured runtime without a thread, model turn, connector call or transferable authority."
   @spec check_ticket_runtime(Path.t()) :: :ok | {:error, term()}
-  def check_ticket_runtime(workspace) when is_binary(workspace) do
+  def check_ticket_runtime(workspace), do: probe_ticket_runtime(workspace, false)
+
+  @doc "Checks startup protocol usability once, without a chat or model turn; the total budget is 20 seconds."
+  @spec check_ticket_startup(Path.t()) :: :ok | {:error, term()}
+  def check_ticket_startup(workspace), do: probe_ticket_runtime(workspace, true)
+
+  defp probe_ticket_runtime(workspace, startup?) when is_binary(workspace) do
+    deadline = System.monotonic_time(:millisecond) + 20_000
+
     with true <- Path.type(workspace) == :absolute,
          {:ok, cwd} <- PathSafety.canonicalize(workspace),
          true <- File.dir?(cwd),
@@ -1017,13 +1033,14 @@ defmodule SymphonyElixir.Codex.AppServer do
       Process.unlink(port)
       pid = port_metadata(port, nil)[:codex_app_server_pid]
       previous = Process.get(@native_read_deadline_key)
-      deadline = System.monotonic_time(:millisecond) + 20_000
-      Process.put(@native_read_deadline_key, if(is_integer(previous), do: min(deadline, previous), else: deadline))
+      # Reserve five seconds of the total budget for stopping the owned process.
+      read_deadline = deadline - 5_000
+      Process.put(@native_read_deadline_key, if(is_integer(previous), do: min(read_deadline, previous), else: read_deadline))
 
       try do
-        result = inspect_ticket_runtime(port)
+        result = inspect_ticket_runtime(port, cwd, startup?)
 
-        case stop_ticket_runtime(port, pid) do
+        case stop_ticket_runtime(port, pid, deadline) do
           {:ok, status} when status in [0, 143] -> result
           {:ok, _status} -> {:error, :ticket_runtime_process_failed}
           {:error, _} = error -> error
@@ -1038,13 +1055,24 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  def check_ticket_runtime(_workspace), do: {:error, :ticket_runtime_cwd_unproven}
+  defp probe_ticket_runtime(_workspace, _startup?), do: {:error, :ticket_runtime_cwd_unproven}
 
-  defp inspect_ticket_runtime(port) do
+  defp inspect_ticket_runtime(port, cwd, startup?) do
     with {:ok, response} <- initialization_response(port),
          :ok <- qualify_ticket_runtime_identity(response) do
       send_message(port, %{"method" => "initialized", "params" => %{}})
-      :ok
+      if startup? do
+        warn_unfamiliar_runtime(response)
+        send_message(port, %{"method" => "config/read", "id" => @worker_config_id, "params" => %{"cwd" => cwd, "includeLayers" => false}})
+
+        case await_response(port, @worker_config_id) do
+          {:ok, %{"config" => config}} when is_map(config) -> :ok
+          {:error, _} = error -> error
+          _ -> {:error, :ticket_runtime_configuration_unavailable}
+        end
+      else
+        :ok
+      end
     end
   rescue
     _ -> {:error, :ticket_runtime_initialization_failed}
@@ -1052,12 +1080,29 @@ defmodule SymphonyElixir.Codex.AppServer do
     _kind, _reason -> {:error, :ticket_runtime_initialization_failed}
   end
 
-  defp stop_ticket_runtime(port, pid) do
+  defp stop_ticket_runtime(port, pid, deadline) do
     if is_nil(Process.get({@owned_exit_key, port})) do
       receive do
         {^port, {:exit_status, _status}} -> {:error, :ticket_runtime_process_failed}
       after
-        0 -> signal_owned_worker(port, pid)
+        0 ->
+          with {:os_pid, actual} <- Port.info(port, :os_pid),
+               true <- to_string(actual) == pid,
+               {_, 0} <- System.cmd("/bin/kill", ["-TERM", pid], stderr_to_stdout: true) do
+            case await_owned_worker_exit(port, deadline - 1_000) do
+              {:error, :worker_shutdown_unproven} ->
+                with {:os_pid, ^actual} <- Port.info(port, :os_pid),
+                     {_, 0} <- System.cmd("/bin/kill", ["-KILL", pid], stderr_to_stdout: true) do
+                  await_owned_worker_exit(port, deadline)
+                else
+                  _ -> {:error, :worker_shutdown_unproven}
+                end
+
+              result -> result
+            end
+          else
+            _ -> {:error, :worker_shutdown_unproven}
+          end
       end
     else
       {:error, :ticket_runtime_process_failed}
@@ -1613,17 +1658,25 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp worker_runtime_supported("unix", "macos", agent) do
-    supported_agent? =
-      Enum.any?(@ticket_worker_runtime_versions, fn version ->
-        String.starts_with?(agent, "symphony-orchestrator/#{version} (")
-      end)
-
-    if byte_size(agent) <= 2_048 and supported_agent?,
+    if byte_size(agent) <= 2_048 and is_binary(runtime_version(agent)),
       do: :ok,
       else: {:error, :worker_runtime_unsupported}
   end
 
   defp worker_runtime_supported(_family, _os, _agent), do: {:error, :worker_runtime_unsupported}
+
+  defp runtime_version(agent) do
+    case Regex.run(~r/\Asymphony-orchestrator\/([A-Za-z0-9][A-Za-z0-9.+_-]{0,127}) \([^\r\n]*\)\z/, agent) do
+      [_, version] -> version
+      _ -> nil
+    end
+  end
+
+  defp warn_unfamiliar_runtime(%{"userAgent" => agent}) do
+    version = runtime_version(agent)
+    if version not in @ticket_worker_runtime_versions,
+      do: Logger.warning("Codex runtime version=#{version} is unfamiliar; startup protocol checks determine compatibility")
+  end
 
   defp worker_runtime_home(home) do
     expected = System.get_env("CODEX_HOME") || Path.join(System.user_home!(), ".codex")
@@ -3314,10 +3367,12 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp with_timeout_response(port, request_id, timeout_ms, pending_line) do
     timeout_ms = effective_turn_timeout(timeout_ms)
 
-    if turn_deadline_expired?() do
-      {:error, :turn_timeout}
-    else
-      with_timeout_response_loop(port, request_id, timeout_ms, pending_line)
+    native_deadline = Process.get(@native_read_deadline_key)
+
+    cond do
+      is_integer(native_deadline) and System.monotonic_time(:millisecond) >= native_deadline -> {:error, :response_timeout}
+      turn_deadline_expired?() -> {:error, :turn_timeout}
+      true -> with_timeout_response_loop(port, request_id, timeout_ms, pending_line)
     end
   end
 

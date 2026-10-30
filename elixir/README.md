@@ -88,6 +88,14 @@ Completed publication readback retains the retiring release's exact
 manifest-backed publisher origin in a versioned catalog; identical bytes at a
 new path do not by themselves authorize an old receipt.
 
+Factory startup performs one runtime sanity probe: initialize, verify the local
+home/platform identity, read configuration, and stop the owned process. Its total
+budget is 20 seconds, including five seconds reserved for shutdown; the normal
+target is 5–10 seconds. Unfamiliar versions produce a warning, not a refusal.
+This does not prove model access or full worker safety: actual worker admission
+still checks its permissions, tools, containment, and storage identity. Handoffs
+retain fresh identity checks without repeating the startup configuration probe.
+
 Preparation errors, all finalize outcomes, parse-rejected finalize with a known
 reader handle (including an omitted positional ticket key), expiry, registered
 rejected idle-port data/death, and broker termination close the reader. Wrong-bound finalize

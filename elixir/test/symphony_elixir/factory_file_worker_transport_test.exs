@@ -171,11 +171,15 @@ defmodule SymphonyElixir.FactoryFileWorkerTransportTest do
     end
   end
 
-  test "effective capability drift rejects startup before creating a thread", ctx do
+  @tag :runtime_startup_sanity
+  test "effective capability drift rejects startup even on an unfamiliar runtime", ctx do
     files = starting_files(ctx)
     trace = configure_server(ctx)
     config_path = trace <> ".config"
     config = Jason.decode!(File.read!(config_path))
+    initialization = Jason.decode!(File.read!(trace <> ".initialize"))
+    initialization = put_in(initialization, ["result", "userAgent"], "symphony-orchestrator/0.166.0-alpha.5.1 (fixture)")
+    File.write!(trace <> ".initialize", Jason.encode!(initialization))
     File.write!(config_path, Jason.encode!(put_in(config, ["config", "features", "shell_tool"], true)))
 
     assert {:error, :file_worker_effective_capabilities_mismatch} =
@@ -185,7 +189,7 @@ defmodule SymphonyElixir.FactoryFileWorkerTransportTest do
     assert File.read!(Path.join(ctx.path, "fixture.txt")) == "base\n"
     File.write!(config_path, Jason.encode!(config))
     initialization = Jason.decode!(File.read!(trace <> ".initialize"))
-    initialization = put_in(initialization, ["result", "userAgent"], "symphony-orchestrator/0.161.0 (fixture)")
+    initialization = put_in(initialization, ["result", "userAgent"], "other/0.161.0 (fixture)")
     File.write!(trace <> ".initialize", Jason.encode!(initialization))
 
     assert {:error, :worker_runtime_unsupported} =

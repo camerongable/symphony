@@ -488,8 +488,9 @@ defmodule SymphonyElixir.AppServerTest do
   end
 
   @tag :provider_schema
+  @tag :runtime_startup_sanity
   test "internal review workers use named scoped profiles, explicit turns and no controller connectors" do
-    for {mode, profile} <- [{"REVIEW", "symphony_ticket_review_v1"}] do
+    for {mode, profile, runtime} <- [{"REVIEW", "symphony_ticket_review_v1", "0.163.0-alpha.10.2"}, {"REVIEW", "symphony_ticket_review_v1", "0.166.0-alpha.5.1"}] do
       handler = """
       case "$line" in
         *'"method":"initialize"'*) printf '%s\\n' "$*" >> "$trace_file.args" ;;
@@ -554,14 +555,15 @@ defmodule SymphonyElixir.AppServerTest do
           assert schema["properties"]["changed_paths"]["enum"] == [[]]
           refute Map.has_key?(turn, "sandboxPolicy")
         end,
-        Map.put(fixture_runtime(), "userAgent", "symphony-orchestrator/0.163.0-alpha.10.2 (fixture)")
+        Map.put(fixture_runtime(), "userAgent", "symphony-orchestrator/#{runtime} (fixture)")
       )
     end
   end
 
   @tag installed_runtime_112: true
   @tag :runtime_165_qualification
-  test "V1 workers reject unqualified runtime identity before thread creation", _ctx do
+  @tag :runtime_startup_sanity
+  test "runtime identity rejects foreign or malformed identities without rejecting unfamiliar versions", _ctx do
     supported = Map.put(fixture_runtime(), "userAgent", "symphony-orchestrator/0.163.0-alpha.10.2 (fixture)")
     agent164 = "symphony-orchestrator/0.164.0-alpha.11.1"
     suffix164 = Map.put(supported, "userAgent", agent164 <> "suffix (fixture)")
@@ -611,9 +613,13 @@ defmodule SymphonyElixir.AppServerTest do
         "runtime-#{name}",
         handler,
         fn workspace, trace ->
-          result = AppServer.start_session(workspace, worker_access: "REVIEW", model: "gpt-6-luna")
-          if match?({:ok, _}, result), do: AppServer.stop_session(elem(result, 1))
-          assert result == {:error, reason}
+          if name in ~w(missing null malformed-home agent platform home) do
+            result = AppServer.start_session(workspace, worker_access: "REVIEW", model: "gpt-6-luna")
+            if match?({:ok, _}, result), do: AppServer.stop_session(elem(result, 1))
+            assert result == {:error, reason}
+          else
+            assert :ok = AppServer.check_ticket_runtime(workspace)
+          end
           refute File.read!(trace) =~ ~s("method":"thread/start")
           refute File.read!(trace) =~ ~s("method":"thread/resume")
           refute File.read!(trace) =~ ~s("method":"turn/start")
@@ -625,7 +631,8 @@ defmodule SymphonyElixir.AppServerTest do
 
   @tag installed_runtime_112: true
   @tag :runtime_165_qualification
-  test "ticket runtime probes finish only qualified handshakes and observe process exit" do
+  @tag :runtime_startup_sanity
+  test "ticket identity probes accept version changes and observe process exit" do
     candidate_runtime = Map.put(fixture_runtime(), "userAgent", "symphony-orchestrator/0.162.0-alpha.2 (fixture)")
     updated_runtime = Map.put(fixture_runtime(), "userAgent", "symphony-orchestrator/0.162.0-alpha.17.2 (fixture)")
     current_runtime = Map.put(fixture_runtime(), "userAgent", "symphony-orchestrator/0.163.0-alpha.10.2 (fixture)")
@@ -647,7 +654,7 @@ defmodule SymphonyElixir.AppServerTest do
           {"patch-installed-version", patch_runtime, :ok},
           {"next-patch-installed-version", next_patch_runtime, :ok},
           {"missing-identity", %{}, {:error, :worker_runtime_identity_unproven}},
-          {"unsupported-version", unqualified_runtime, {:error, :worker_runtime_unsupported}},
+          {"unfamiliar-version", unqualified_runtime, :ok},
           {"unsupported-platform", Map.put(current_runtime, "platformOs", "linux"), {:error, :worker_runtime_unsupported}},
           {"foreign-home", Map.put(current_runtime, "codexHome", System.tmp_dir!()), {:error, :worker_runtime_home_mismatch}}
         ] do
@@ -695,6 +702,91 @@ defmodule SymphonyElixir.AppServerTest do
       pid = trace |> Kernel.<>(".pid") |> File.read!() |> String.trim()
       assert {_output, status} = System.cmd("/bin/kill", ["-0", pid], stderr_to_stdout: true)
       assert status != 0
+    end)
+  end
+
+  @tag :runtime_startup_sanity
+  test "startup accepts unfamiliar versions after a read-only protocol roundtrip without a chat or turn" do
+    runtime = Map.put(fixture_runtime(), "userAgent", "symphony-orchestrator/0.166.0-alpha.5.1 (fixture)")
+    handler = """
+    case "$line" in
+      *'"method":"config/read"'*) printf '%s\\n' '{"id":15,"result":{"config":{},"futureField":true}}' ;;
+    esac
+    """
+
+    with_thread_listing_server("startup-future-runtime", handler, fn workspace, trace ->
+      assert :ok = AppServer.check_ticket_startup(workspace)
+      requests = File.read!(trace) |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!(String.trim_leading(&1, "JSON:")))
+      assert Enum.map(requests, & &1["method"]) == ["initialize", "initialized", "config/read"]
+      {:ok, canonical} = SymphonyElixir.PathSafety.canonicalize(workspace)
+      assert List.last(requests)["params"] == %{"cwd" => canonical, "includeLayers" => false}
+      assert File.read!(trace <> ".terminated") == "terminated\n"
+    end, runtime)
+  end
+
+  @tag :runtime_startup_sanity
+  test "startup refuses failed or malformed read-only responses and reaps the owned process" do
+    for response <- [%{"config" => nil}, %{}, %{"config" => []}] do
+      handler = """
+      case "$line" in
+        *'"method":"config/read"'*) printf '%s\\n' '#{Jason.encode!(%{"id" => 15, "result" => response})}' ;;
+      esac
+      """
+      with_thread_listing_server("startup-malformed-config", handler, fn workspace, trace ->
+        assert {:error, :ticket_runtime_configuration_unavailable} = AppServer.check_ticket_startup(workspace)
+        assert File.read!(trace <> ".terminated") == "terminated\n"
+        refute File.read!(trace) =~ ~s("method":"thread/start")
+        refute File.read!(trace) =~ ~s("method":"turn/start")
+      end)
+    end
+  end
+
+  @tag :runtime_startup_sanity
+  test "startup timeout includes owned-process shutdown within its twenty-second budget" do
+    with_thread_listing_server("startup-timeout", "", fn workspace, trace ->
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: Path.dirname(workspace),
+        codex_command: Path.join(Path.dirname(trace), "fake-codex") <> " app-server",
+        codex_read_timeout_ms: 30_000)
+      started = System.monotonic_time(:millisecond)
+      assert {:error, _} = AppServer.check_ticket_startup(workspace)
+      elapsed = System.monotonic_time(:millisecond) - started
+      assert elapsed >= 14_000 and elapsed < 20_000
+      assert File.read!(trace <> ".terminated") == "terminated\n"
+      refute File.read!(trace) =~ ~s("method":"thread/start")
+    end)
+  end
+
+  @tag :runtime_startup_sanity
+  @tag timeout: 30_000
+  @tag :runtime_startup_noisy
+  test "a noisy runtime ignoring TERM cannot extend startup beyond its hard deadline" do
+    handler = """
+    case "$line" in
+      *'"method":"config/read"'*)
+        trap '' TERM
+        printf '%s\\n' '{"id":15,"result":{"config":{}}}'
+        while :; do printf '%s\\n' '{"method":"configWarning","params":{}}'; done ;;
+    esac
+    """
+    with_thread_listing_server("startup-noisy-shutdown", handler, fn workspace, trace ->
+      task = Task.async(fn -> AppServer.check_ticket_startup(workspace) end)
+      started = System.monotonic_time(:millisecond)
+      try do
+        assert {:ok, {:error, :ticket_runtime_process_failed}} = Task.yield(task, 21_000)
+        assert System.monotonic_time(:millisecond) - started < 20_000
+        pid = trace |> Kernel.<>(".pid") |> File.read!() |> String.trim()
+        assert {_, status} = System.cmd("/bin/kill", ["-0", pid], stderr_to_stdout: true)
+        assert status != 0
+      after
+        Task.shutdown(task, :brutal_kill)
+        if File.exists?(trace <> ".pid") do
+          pid = File.read!(trace <> ".pid") |> String.trim()
+          {command, _} = System.cmd("/bin/ps", ["-p", pid, "-o", "command="], stderr_to_stdout: true)
+          if String.contains?(command, Path.join(Path.dirname(trace), "fake-codex")),
+            do: System.cmd("/bin/kill", ["-KILL", pid], stderr_to_stdout: true)
+        end
+      end
     end)
   end
 
