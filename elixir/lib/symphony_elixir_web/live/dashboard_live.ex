@@ -25,11 +25,15 @@ defmodule SymphonyElixirWeb.DashboardLive do
       |> assign(:theme, "dark")
       |> assign(:ticket_filter, "ALL")
 
-    if connected?(socket) do
-      :ok = ObservabilityPubSub.subscribe()
-      schedule_runtime_tick()
-      schedule_payload_refresh()
-    end
+    socket =
+      if connected?(socket) do
+        :ok = ObservabilityPubSub.subscribe()
+        schedule_runtime_tick()
+        schedule_payload_refresh()
+        if socket.assigns.snapshot_error, do: start_snapshot_refresh(socket), else: socket
+      else
+        socket
+      end
 
     {:ok, socket}
   end
@@ -147,7 +151,10 @@ defmodule SymphonyElixirWeb.DashboardLive do
           <small>Polling and admission control</small>
         </div>
       </header>
-      <p :if={@snapshot_error} class="factory-alert factory-alert-danger" role="alert" data-snapshot-stale="true">Dashboard data stale: <%= @snapshot_error %></p>
+      <p :if={@snapshot_error} class="factory-alert factory-alert-danger" role="alert" data-snapshot-stale="true">
+        Dashboard data stale: <%= @snapshot_error %>
+        <a :if={is_nil(@snapshot_observed_at)} href="/">Reload dashboard</a>
+      </p>
       <p :if={!@snapshot_observed_at} class="section-copy">Ticket counts unknown until a successful dashboard observation.</p>
       <p class="section-copy snapshot-caption">Snapshot observed <.local_time id="dashboard-observed-at" value={if @snapshot_observed_at, do: DateTime.to_iso8601(@snapshot_observed_at)} /></p>
 
@@ -1103,8 +1110,10 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp broker_request_status(%{blocking_attention: count}) when count > 0, do: "Needs attention"
   defp broker_request_status(%{blocking_attention: 0, communication_warnings: count}) when count > 0, do: "Communication warning"
+
   defp broker_request_status(%{needs_reconciliation: count} = broker) when count > 0,
     do: if(Map.has_key?(broker, :blocking_attention), do: "Unknown", else: "Needs attention")
+
   defp broker_request_status(%{uncertain: count}) when count > 0, do: "Outcome uncertain"
   defp broker_request_status(%{claimed_unverified: count}) when count > 0, do: "Claimed"
   defp broker_request_status(%{pending: count}) when count > 0, do: "Pending"

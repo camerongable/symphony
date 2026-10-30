@@ -1677,6 +1677,31 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert recovered =~ "Factory scheduling: Enabled"
   end
 
+  test "a connected dashboard immediately recovers after its initial snapshots time out" do
+    name = Module.concat(__MODULE__, :RecoveringInitialDashboardOrchestrator)
+    {:ok, _pid} = StaticOrchestrator.start_link(name: name, snapshot: static_snapshot(), refresh: :unavailable)
+    calls = start_supervised!({Agent, fn -> 0 end})
+    fixture = factory_dashboard_snapshot() |> put_in([:control, :status], "ACTIVE") |> put_in([:control, :controller_writer_conflict_count], 0)
+
+    reader = fn ->
+      if Agent.get_and_update(calls, &{&1, &1 + 1}) < 2 do
+        receive do
+          :release -> fixture
+        end
+      else
+        fixture
+      end
+    end
+
+    start_test_endpoint(orchestrator: name, snapshot_timeout_ms: 50, dashboard_refresh_timeout_ms: 25, factory_observability: reader)
+    {:ok, view, initial} = live(build_conn(), "/")
+    assert initial =~ "Initial snapshot unavailable"
+    recovered = render_async(view)
+    assert recovered =~ "Factory scheduling: Enabled"
+    refute recovered =~ "Initial snapshot unavailable"
+    refute recovered =~ "Ticket counts unknown"
+  end
+
   test "an initial hung snapshot shows unknown counts without claiming healthy scheduler data" do
     name = Module.concat(__MODULE__, :InitialHungDashboardOrchestrator)
     {:ok, _pid} = StaticOrchestrator.start_link(name: name, snapshot: static_snapshot(), refresh: :unavailable)
@@ -1697,6 +1722,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert Floki.find(document, ".overview-grid .metric-value") == []
     assert html =~ "Ticket counts unknown"
     assert html =~ "Dashboard data stale"
+    assert has_element?(view, "a[href='/']", "Reload dashboard")
     refute html =~ "Factory scheduling: Enabled"
     assert Process.alive?(view.pid)
   end
@@ -1939,6 +1965,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       })
 
     {:ok, state} = Agent.start_link(fn -> factory_snapshot end)
+
     start_test_endpoint(
       orchestrator: orchestrator_name,
       snapshot_timeout_ms: 50,
