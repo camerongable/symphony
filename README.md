@@ -154,11 +154,12 @@ classification, required-repair or observation disposition, and a contract or
 established safety basis. An initial review is comprehensive; repair follow-ups
 bind closure, the exact changed-path delta, regressions, and any previously
 unverified criteria. Carried PASS evidence retains its original provenance.
-Optional observations do not block PASS or become writer obligations. A late
-mandatory new finding requires an explicit scope decision.
+Optional observations do not block PASS or become writer obligations. New and
+unresolved in-contract defects use the same bounded repair process.
 The controller, not the reviewer, owns the normal limit of
-two automatic repairs after the initial review, with an earlier stop for an
-unresolved prior finding. Dashboard policy stops explain the rule independently
+two automatic repairs after the initial review, without earlier classification-based
+stops. Genuine contract, environment, or human-decision blocks remain distinct.
+Dashboard policy stops explain the rule independently
 of factory health. Legacy admitted instructions and verdicts remain unchanged.
 An explicitly approved, exact-verifier single-repair budget exception can resume
 one stopped legacy `BLOCK` without changing global limits or resetting history.
@@ -175,6 +176,19 @@ SHA, actual edit scope and exactly-once adoption remain enforced. Rejected unsaf
 operational results require report recovery without discarding edits or rerunning
 the source worker. Independent verifier PASS still requires all admitted criteria
 and bound path checks to pass.
+Core ticket admission and advancement are independent of parent presentation: attested route identity is
+required, but a bootstrap acknowledgement or successful native history read is
+not source authority. Unavailable readback is a communication warning. Durable
+OPEN questions, staged PENDING commands, ACCEPTED commands awaiting application,
+and active amendments hold ordinary progress. Accepted decisions apply before
+work advances; uncollected raw text is not an immediate hold or cancellation.
+Fresh checkout intents bind immutable parent payload/identity rather than changing
+bootstrap presentation fields. Retained intents keep their original field sets
+and bytes, including their original uncertainty fences.
+Physical publication still uses its existing presentation fences. Fresh CI and
+generation action snapshots also retain mutable parent/bootstrap observations;
+removing those dependencies belongs to the subsequent effect-recovery work, not
+this core-advancement change.
 One explicit, deterministic report-only correction can reconcile duplicated v1
 finding descriptions without changing original bytes, evidence, verdict, or repair
 budget. An exact policy-stopped REPAIR can receive a separately journaled,

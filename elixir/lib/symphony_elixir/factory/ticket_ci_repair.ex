@@ -84,7 +84,7 @@ defmodule SymphonyElixir.Factory.TicketCiRepair do
 
   defp prepare_reassessment(store, run, collected, project, row, opts) do
     with nil <- Store.one!(store, "SELECT claim_key FROM ticket_ci_repair_claims WHERE diagnosis_key=?", [row["diagnosis_key"]]),
-         {:ok, _} <- TicketChat.ready_for_run(store, run["run_id"]),
+         {:ok, _} <- TicketChat.bound_for_run(store, run["run_id"]),
          {:ok, inputs} <- input_snapshot(store, run["run_id"]),
          %{"status" => "ACTIVE"} = control <- Control.status(store, opts[:ci_repair_scope]) do
       outcome = observe_diagnosis(run, collected, project, opts)
@@ -191,7 +191,7 @@ defmodule SymphonyElixir.Factory.TicketCiRepair do
            true <- round_available?(store, run, opts) or {:error, :ci_repair_round_limit},
            {:ok, generated_only} <- TicketCiGeneratedScope.prepare(run, row),
            {:ok, review} <- TicketCiReview.observe(collected["snapshots"]["mr"]["project_id"], run["mr_iid"], opts),
-           {:ok, _} <- TicketChat.ready_for_run(store, run["run_id"]),
+           {:ok, _} <- TicketChat.bound_for_run(store, run["run_id"]),
            {:ok, inputs} <- input_snapshot(store, run["run_id"]),
            :ok <- WorkspaceAccess.source_capacity(store, run, opts),
            {:ok, source} <- source_observation(store, run, opts),
@@ -280,7 +280,7 @@ defmodule SymphonyElixir.Factory.TicketCiRepair do
     if run["failure_code"] == "CI_REPAIR_EXHAUSTED" and run["last_error"] == message do
       {:ok, nil}
     else
-      with {:ok, _} <- TicketChat.ready_for_run(store, run["run_id"]),
+      with {:ok, _} <- TicketChat.bound_for_run(store, run["run_id"]),
            {:ok, inputs} <- input_snapshot(store, run["run_id"]),
            %{"status" => "ACTIVE"} = control <- Control.status(store, opts[:ci_repair_scope]) do
         {:ok,

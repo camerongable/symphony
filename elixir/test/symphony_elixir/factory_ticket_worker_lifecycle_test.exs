@@ -3949,6 +3949,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     assert Store.one!(ctx.store, "SELECT * FROM workspace_access WHERE request_key = ?", [prior_request]) == before_access
   end
 
+  @tag parent_independent_progress: true
   test "ready-parent polling applies an accepted answer from an earlier collection without launching source work", ctx do
     {context, options} = controller(ctx)
     {:ok, chat} = TicketChat.ready_for_run(ctx.store, "run")
@@ -3987,6 +3988,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     assert [%{task_key: "run:feature-writer"}] = launches
   end
 
+  @tag parent_independent_progress: true
   test "mixed accepted commands and readback failures defer without authorizing source work; absent input advances normally", ctx do
     {context, options} = controller(ctx)
     {:ok, chat} = TicketChat.ready_for_run(ctx.store, "run")
@@ -4015,7 +4017,73 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     assert {:error, :unknown_task} = TaskLedger.get(ctx.store, "run:feature-writer")
   end
 
-  test "ready-parent polling with no direct input retains normal role advancement", ctx do
+  @tag parent_independent_progress: true
+  test "unavailable parent history does not strand a saved writer increment or replace its writer", ctx do
+    {context, options} = controller(ctx)
+    {:ok, _} = RunLedger.update(ctx.store, "run", %{candidate_sha: nil})
+    {:ok, chat} = TicketChat.ready_for_run(ctx.store, "run")
+    Store.query!(ctx.store, "UPDATE desktop_requests SET status='THREAD_RECORDED',turn_id=NULL,output_json=NULL WHERE request_key=?", [chat["create_request_key"]])
+    request = finish_worker(context, options)
+    {:ok, original} = WorkerEvidence.get(ctx.store, request)
+    {:ok, reader_options} = parent_reader_options(chat, {:error, :native_history_unavailable})
+
+    assert {:ok, %{launches: [], events: events}} = normal_poll(context, options, reader_options)
+    assert Enum.any?(events, &(&1.event == "TICKET_ADOPTED"))
+    assert {:ok, %{"state" => "WRITING", "implementation_iteration" => 1}} = RunLedger.get(ctx.store, "run")
+    assert {:ok, consumed} = WorkerEvidence.get(ctx.store, request)
+    assert consumed["status"] == "CONSUMED"
+    assert consumed["output_json"] == original["output_json"]
+    assert git(ctx.path, ["rev-list", "--count", ctx.sha <> "..HEAD"]) |> String.trim() == "1"
+
+    assert {:ok, %{launches: [%{task_key: "run:feature-writer"}]}} = normal_poll(context, options, reader_options)
+    assert_receive {:factory_task_started, "run:feature-writer", _}, 15_000
+    assert_receive {:factory_task_finished, "run:feature-writer", {:ok, _}}, 60_000
+    assert {:ok, current} = TaskLedger.get(ctx.store, "run:feature-writer")
+    assert current["thread_id"] == original["thread_id"]
+    assert {:ok, %{launches: [], events: completed}} = normal_poll(context, options, reader_options)
+    assert Enum.any?(completed, &(&1.event == "TICKET_ADOPTED"))
+    assert {:ok, %{"state" => "VERIFYING"}} = RunLedger.get(ctx.store, "run")
+    assert {:ok, %{launches: [%{task_key: "run:change-verifier:1"}]}} = normal_poll(context, options, reader_options)
+    assert_receive {:factory_task_started, "run:change-verifier:1", _}, 15_000
+    assert_receive {:factory_task_finished, "run:change-verifier:1", {:ok, _}}, 60_000
+    assert {:ok, %{launches: []}} = normal_poll(context, options, reader_options)
+    assert {:ok, %{"state" => "PUSHING"}} = RunLedger.get(ctx.store, "run")
+    assert {:ok, %{"status" => "CONSUMED"}} = TaskLedger.get(ctx.store, "run:change-verifier:1")
+    refute_receive {:factory_task_started, _, _}
+  end
+
+  @tag parent_independent_progress: true
+  test "durable questions and staged commands hold saved work while accepted answers apply without another parent read", ctx do
+    {context, options} = controller(ctx)
+    {:ok, _} = RunLedger.update(ctx.store, "run", %{candidate_sha: nil})
+    request = finish_worker(context, options)
+    {:ok, original} = WorkerEvidence.get(ctx.store, request)
+    {:ok, chat} = TicketChat.bound_for_run(ctx.store, "run")
+    {:ok, reader_options} = parent_reader_options(chat, {:error, :native_history_unavailable})
+    {:ok, _} = TicketChatCommands.open_question(ctx.store, "run", %{"question_key" => "Q-durable", "body" => "Keep the current behavior?", "answers" => %{"yes" => true}})
+    assert {:error, :ticket_control_pending} = TicketWorkerRunner.adoption(ctx.store, request)
+    assert {:ok, %{launches: [], events: held}} = normal_poll(context, options, reader_options)
+    refute Enum.any?(held, &(&1.event in ~w(TICKET_ADOPTED TICKET_LAUNCHED)))
+    assert {:ok, ^original} = WorkerEvidence.get(ctx.store, request)
+
+    body = "Answer Q-durable: yes"
+    {:ok, staged} = SymphonyElixir.TicketChatFixture.stage(%{store: ctx.store}, "durable-answer", body, [%{"operation" => "answer_question", "question_key" => "Q-durable", "value" => true}])
+    assert {:ok, %{launches: []}} = normal_poll(context, options, reader_options)
+    assert {:ok, %{"status" => "PENDING"}} = TicketChatCommands.get(ctx.store, staged["command_key"])
+    native = SymphonyElixir.TicketChatFixture.native(%{store: ctx.store, cwd: chat["cwd"], root: ctx.root}, [body])
+    assert {:ok, %{receipts: [%{"status" => "ACCEPTED"}]}} = TicketChatCommands.admit_readback(ctx.store, "run", native)
+    assert {:ok, %{launches: [], events: applied}} = normal_poll(context, options, reader_options)
+    assert Enum.any?(applied, &(&1.event == "TICKET_COMMAND_APPLIED"))
+    assert {:ok, %{"status" => "APPLIED"}} = TicketChatCommands.get(ctx.store, staged["command_key"])
+    assert {:ok, %{launches: [], events: advanced}} = normal_poll(context, options, reader_options)
+    assert Enum.any?(advanced, &(&1.event == "TICKET_ADOPTED"))
+    assert {:ok, %{"status" => "CONSUMED"}} = WorkerEvidence.get(ctx.store, request)
+    assert String.trim(git(ctx.path, ["rev-list", "--count", ctx.sha <> "..HEAD"])) == "1"
+    refute_receive {:factory_task_started, _, _}
+  end
+
+  @tag parent_independent_progress: true
+  test "ready-parent polling advances absent input but a rejected answer does not clear an open question", ctx do
     {context, options} = controller(ctx)
     {:ok, chat} = TicketChat.ready_for_run(ctx.store, "run")
     empty = %{"id" => chat["thread_id"], "cwd" => chat["cwd"], "projectId" => nil, "turns" => []}
@@ -4038,9 +4106,10 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     assert {:ok, %{launches: []}} = normal_poll(context, options, history_options)
     assert {:ok, %{"status" => "REJECTED"}} = TicketChatCommands.get(ctx.store, rejected["command_key"])
     assert {:ok, %{launches: [], events: replay_events}} = normal_poll(context, options, history_options)
-    assert Enum.any?(replay_events, &(&1.event == "TICKET_ADOPTED"))
+    refute Enum.any?(replay_events, &(&1.event == "TICKET_ADOPTED"))
   end
 
+  @tag parent_independent_progress: true
   test "an answer applied to a blocked writer does not resume or adopt the source task", ctx do
     {context, options} = controller(ctx)
     {:ok, _} = RunLedger.update(ctx.store, "run", %{plan_markdown: "blocked"})
@@ -13337,7 +13406,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     request = finish_worker(context, options)
     {:ok, _} = TaskLedger.update(ctx.store, "run:feature-writer", %{status: "RUNNING", output_json: nil})
     before = Store.query!(ctx.store, "SELECT * FROM factory_tasks").rows
-    Store.query!(ctx.store, "UPDATE desktop_requests SET status = 'FAILED' WHERE target_kind = 'TICKET_CHAT'")
+    Store.query!(ctx.store, "UPDATE desktop_requests SET verified_cwd = '/foreign-parent' WHERE target_kind = 'TICKET_CHAT'")
     assert {:error, :ticket_chat_parent_not_ready} = TicketWorkerRunner.adoption(ctx.store, request)
     assert Store.query!(ctx.store, "SELECT * FROM factory_tasks").rows == before
     assert git(ctx.path, ["rev-parse", "HEAD"]) |> String.trim() == ctx.sha
@@ -13434,7 +13503,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
 
     Store.query!(ctx.store, """
     CREATE TRIGGER invalidate_parent AFTER UPDATE OF candidate_sha ON runs
-    BEGIN UPDATE desktop_requests SET status = 'FAILED' WHERE target_kind = 'TICKET_CHAT'; END
+    BEGIN UPDATE desktop_requests SET verified_cwd = '/foreign-parent' WHERE target_kind = 'TICKET_CHAT'; END
     """)
 
     assert {:error, :ticket_chat_parent_not_ready} = Scheduler.ticket_step(context, "run", options)
@@ -13444,7 +13513,8 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     assert {:ok, %{"status" => "RESULT_RECORDED"}} = WorkerEvidence.get(ctx.store, request)
     assert Store.one!(ctx.store, "SELECT COUNT(*) AS count FROM workspace_access WHERE released_at IS NULL")["count"] == 1
     Store.query!(ctx.store, "DROP TRIGGER invalidate_parent")
-    Store.query!(ctx.store, "UPDATE desktop_requests SET status = 'SUCCEEDED' WHERE target_kind = 'TICKET_CHAT'")
+    {:ok, parent} = TicketChat.for_run(ctx.store, "run")
+    Store.query!(ctx.store, "UPDATE desktop_requests SET verified_cwd = ? WHERE target_kind = 'TICKET_CHAT'", [parent["cwd"]])
     assert {:ok, %{status: "ADOPTED", run: recovered}} = Scheduler.ticket_step(context, "run", options)
     assert recovered["candidate_sha"] == retained["candidate_sha"] and recovered["implementation_iteration"] == 1
     assert git(ctx.path, ["rev-list", "--count", ctx.sha <> "..HEAD"]) |> String.trim() == "1"

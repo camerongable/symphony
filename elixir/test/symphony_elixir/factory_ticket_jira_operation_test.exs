@@ -98,6 +98,16 @@ defmodule SymphonyElixir.FactoryTicketJiraOperationTest do
     assert length(Process.get(:jira_calls)) == 2
   end
 
+  @tag :parent_identity
+  test "initial Jira effects need bound parent identity rather than its bootstrap acknowledgement", ctx do
+    Store.query!(ctx.store, "UPDATE desktop_requests SET status='THREAD_RECORDED',turn_id=NULL,output_json=NULL WHERE target_kind='TICKET_CHAT' AND action='CREATE'")
+
+    assert {:ok, %{status: "WRITER_ADMITTED"}} = step(ctx)
+    assert length(Process.get(:jira_calls)) == 2
+    assert {:error, :ticket_writer_admission_changed} = step(ctx)
+    assert length(Process.get(:jira_calls)) == 2
+  end
+
   test "scheduler opens initial Jira effects in its controller workspace rather than the ticket parent", ctx do
     context = %{store: ctx.store, workspace_root: ctx.options[:workspace_root], factory: %{scope: "scope"}}
     expected = Path.join([context.workspace_root, "factory-controller", "scope"])

@@ -23,6 +23,19 @@ Chat with the parent to inspect the candidate, findings or next action and to
 stage explicit answers/rework. A bounded answer uses `Answer QUESTION_KEY: value`
 with the current declared value. The controller independently admits the native
 input; a model's acknowledgment or staged PENDING proposal is not authority.
+An attested parent route is required before execution, but its bootstrap model
+acknowledgement and current chat availability are presentation, not source
+authorization. Parent readback is best-effort: failures are communication
+warnings, while already ACCEPTED decisions can still be applied from recorded
+evidence. OPEN questions, PENDING or ACCEPTED material commands, and active
+amendments fence ordinary advancement, including the final adoption transaction.
+PENDING means staged, not accepted. Raw chat text that has not been staged and
+admitted is not an immediate hold or cancellation; there is no new per-ticket
+cancel command. Global pause and terminal CANCELLED behavior remain unchanged.
+This separation covers core admission and advancement, including preparation of
+literal human commands. Physical publication retains its existing presentation
+fences, and CI/generation action snapshots still compare mutable parent/bootstrap
+observations until the separate effect-recovery change replaces those fields.
 Parent instructions are behavioral constraints, not an enforced read-only OS
 sandbox. This route deliberately trusts the operator-facing chat's permissions.
 The legacy stage graph below remains applicable to legacy runs.
@@ -144,7 +157,9 @@ The pilot's reliability and model-routing follow-ups are tracked in
 - Dashboard worker activity distinguishes a recorded turn from measured live
   activity, and a stopped returned result from waiting for a new worker.
 - A fresh, detached change verifier gates the exact candidate SHA. At most two
-  non-PASS code-repair rounds return to the same writer.
+  non-PASS code-repair rounds return to the same writer. In-contract new and
+  unresolved findings use that same budget, not an additional taxonomy stop.
+  Genuine BLOCK decisions and exact contract/candidate checks remain enforced.
 - Only after verifier `PASS` does the controller push that exact reachable SHA
   with `--no-verify`, create or reuse one reviewer-free draft MR, and read back
   its source branch, target branch, SHA, draft state, reviewer state, and URL.

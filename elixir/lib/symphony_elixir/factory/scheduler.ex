@@ -239,7 +239,8 @@ defmodule SymphonyElixir.Factory.Scheduler do
     run_id = run["run_id"]
 
     with :ok <- TicketChat.ordinary_delivery_eligibility(run),
-         {:ok, _} <- TicketChat.ready_for_run(context.store, run_id) do
+         :ok <- TicketChatCommands.progress_allowed(context.store, run_id),
+         {:ok, _} <- TicketChat.bound_for_run(context.store, run_id) do
       case ReviewProtocol.pending_status(context.store, run) do
         %{request_key: key, reason: reason} ->
           {:ok, %{status: "REPORT_REJECTED", request_key: key, reason: reason, model_invoked: false}}
@@ -392,7 +393,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
   defp ticket_unreserved_step(context, run, opts), do: launch_ticket_stage(context, run, opts)
 
   defp admit_ticket_writer(context, run, opts) do
-    with {:ok, _chat} <- TicketChat.ready_for_run(context.store, run["run_id"]) do
+    with {:ok, _chat} <- TicketChat.bound_for_run(context.store, run["run_id"]) do
       TicketJiraOperation.start_implementation(context.store, run["run_id"], Keyword.put(opts, :workspace, controller_workspace(context)))
     end
   end
@@ -416,7 +417,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
   end
 
   defp create_ticket_checkout(store, run, authorization, opts) do
-    with {:ok, chat} <- TicketChat.ready_for_run(store, run["run_id"]),
+    with {:ok, chat} <- TicketChat.bound_for_run(store, run["run_id"]),
          :ok <- AppServer.check_ticket_runtime(chat["cwd"]) do
       TicketCheckout.create(store, run["run_id"], authorization, Keyword.put(opts, :expected_run, run))
     end
@@ -1029,7 +1030,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
     with {:ok, run} <- RunLedger.get(tx, completed.run["run_id"]),
          true <- run == completed.run or {:error, :ticket_writer_block_binding_changed},
          :ok <- TicketChat.ordinary_delivery_eligibility(run),
-         {:ok, _} <- TicketChat.ready_for_run(tx, run["run_id"]),
+         {:ok, _} <- TicketChat.bound_for_run(tx, run["run_id"]),
          {:ok, task} <- TaskLedger.get(tx, completed.task["task_key"]),
          true <- task_binding_current?(task, completed.task, run) or {:error, :ticket_writer_block_task_changed},
          {:ok, evidence} <- WorkerEvidence.get(tx, key),
@@ -1106,7 +1107,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
          true <- run == adopted.run or {:error, :ticket_adoption_run_changed},
          :ok <- local_adoption_commands_clear(context, run["run_id"]),
          :ok <- TicketChat.ordinary_delivery_eligibility(run),
-         {:ok, _} <- TicketChat.ready_for_run(tx, run["run_id"]),
+         {:ok, _} <- TicketChat.bound_for_run(tx, run["run_id"]),
          {:ok, task} <- WorkerEvidence.adopt_completed(tx, key),
          :ok <- TicketWorkerRunner.admitted_stage(run, task["role"]),
          true <- task["stage"] == run["state"] or {:error, :ticket_worker_stage_changed},
@@ -1334,7 +1335,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
         with {:ok, current} <- RunLedger.get(context.store, run["run_id"]),
              true <- current == Map.drop(run, ~w(recovery_operation recovery_key)) or {:error, :ticket_recovery_run_changed},
              :ok <- ticket_recovery_operation(context.store, current, run),
-             {:ok, chat} <- TicketChat.ready_for_run(context.store, run["run_id"]),
+             {:ok, chat} <- TicketChat.bound_for_run(context.store, run["run_id"]),
              true <- chat["scope_key"] == context.factory.scope or {:error, :ticket_recovery_scope_changed} do
           options =
             context.ticket_options
@@ -1598,13 +1599,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
   end
 
   defp local_adoption_commands_clear(context, run_id) do
-    if context[:local_result_adoption] do
-      command = Store.one!(context.store, "SELECT command_key FROM ticket_chat_commands WHERE run_id = ? AND status IN ('PENDING', 'ACCEPTED') LIMIT 1", [run_id])
-      amendment = Store.one!(context.store, "SELECT command_key FROM ticket_contract_amendments WHERE run_id = ? AND phase NOT IN ('APPLIED', 'SUPERSEDED', 'REJECTED') LIMIT 1", [run_id])
-      if command || amendment, do: {:error, :ticket_local_command_pending}, else: :ok
-    else
-      :ok
-    end
+    TicketChatCommands.progress_allowed(context.store, run_id)
   end
 
   defp retry_rejected_verifier_creation(context) do
@@ -2682,7 +2677,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
     do: ticket_step(context, run["run_id"], Keyword.put(options, :ordinary_controller_tick, true))
 
   defp ticket_tick_step(context, run, options) do
-    case TicketChat.ready_for_run(context.store, run["run_id"]) do
+    case TicketChat.bound_for_run(context.store, run["run_id"]) do
       {:ok, _} ->
         if run["state"] in ~w(ADMITTING_WRITER PLANNING WRITING REPAIRING REVIEW_WRITING VERIFYING READY_FOR_REVIEW),
           do: ticket_ready_parent_step(context, run, options),
@@ -2708,18 +2703,49 @@ defmodule SymphonyElixir.Factory.Scheduler do
     with {:ok, run} <- RunLedger.get(context.store, run_id),
          true <- run["state"] in ~w(ADMITTING_WRITER PLANNING WRITING REPAIRING REVIEW_WRITING VERIFYING READY_FOR_REVIEW) or {:error, :ticket_command_run_state_changed},
          :ok <- TicketChat.ordinary_delivery_eligibility(run),
-         {:ok, chat} <- TicketChat.ready_for_run(context.store, run_id),
+         {:ok, chat} <- TicketChat.bound_for_run(context.store, run_id),
          previous <- command_statuses(context.store, chat["chat_key"], run_id),
-         {:ok, collected} <- TicketChatCommands.collect(context.store, run_id, native_reader: Keyword.get(options, :ticket_chat_reader, AppServer)),
-         :ok <- no_new_native_rejections(context.store, run, chat, previous, collected.receipts),
+         :ok <- collect_parent_commands(context.store, run, chat, previous, options),
          {:ok, current_run} <- RunLedger.get(context.store, run_id),
-         {:ok, current_chat} <- TicketChat.ready_for_run(context.store, run_id),
+         {:ok, current_chat} <- TicketChat.bound_for_run(context.store, run_id),
          :ok <- validate_ticket_binding(run, chat, current_run, current_chat) do
       apply_or_advance_ticket(context, current_run, current_chat, options)
     else
       {:error, {:answer_recovered, receipt}} -> {:ok, %{status: "ANSWER_RECOVERED", receipt: receipt, source_advanced: false}}
       {:error, reason} -> {:error, {:ticket_command_readback_deferred, reason}}
     end
+  end
+
+  defp collect_parent_commands(store, run, chat, previous, options) do
+    case TicketChatCommands.collect(store, run["run_id"], native_reader: Keyword.get(options, :ticket_chat_reader, AppServer)) do
+      {:ok, collected} ->
+        record_parent_collection(store, run, chat, nil)
+        no_new_native_rejections(store, run, chat, previous, collected.receipts)
+
+      {:error, reason} ->
+        record_parent_collection(store, run, chat, reason)
+        :ok
+    end
+  end
+
+  defp record_parent_collection(store, run, chat, reason) do
+    payload =
+      Map.take(run, ~w(run_id spec_revision contract_sha256))
+      |> Map.merge(%{
+        "chat_key" => chat["chat_key"],
+        "thread_id" => chat["thread_id"],
+        "state" => if(is_nil(reason), do: "AVAILABLE", else: "UNAVAILABLE"),
+        "reason" => if(reason, do: ticket_deferral_code(reason, 3))
+      })
+
+    raw = Jason.encode!(payload)
+    previous = Store.one!(store, "SELECT payload_json FROM events WHERE run_id=? AND event_type='TICKET_PARENT_COLLECTION' ORDER BY id DESC LIMIT 1", [run["run_id"]])
+
+    if (previous || reason) && (!previous || previous["payload_json"] != raw) do
+      Store.query!(store, "INSERT INTO events(event_type,run_id,payload_json,occurred_at) VALUES ('TICKET_PARENT_COLLECTION',?,?,?)", [run["run_id"], raw, DateTime.utc_now() |> DateTime.to_iso8601()])
+    end
+
+    :ok
   end
 
   defp validate_ticket_binding(run, chat, current_run, current_chat) do
@@ -2805,6 +2831,12 @@ defmodule SymphonyElixir.Factory.Scheduler do
   end
 
   defp ticket_idle_or_advance(context, run, options) do
+    with :ok <- TicketChatCommands.progress_allowed(context.store, run["run_id"]) do
+      ticket_control_clear_step(context, run, options)
+    end
+  end
+
+  defp ticket_control_clear_step(context, run, options) do
     cond do
       run["state"] == "READY_FOR_REVIEW" ->
         {:ok, %{status: "READY_IDLE", model_invoked: false}}
@@ -3215,7 +3247,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
 
   defp finalize_adopted_mr_delivery(context, run, options) do
     with {:ok, _receipt} <- TicketMrOperation.current_delivery_receipt(context.store, run["run_id"], context.factory, options),
-         {:ok, _chat} <- TicketChat.ready_for_run(context.store, run["run_id"]) do
+         {:ok, _chat} <- TicketChat.bound_for_run(context.store, run["run_id"]) do
       finalization_options =
         options
         |> Keyword.put(:workspace, controller_workspace(context))

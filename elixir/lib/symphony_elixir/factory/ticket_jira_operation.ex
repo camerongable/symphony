@@ -202,7 +202,7 @@ defmodule SymphonyElixir.Factory.TicketJiraOperation do
   end
 
   defp controller_available(store, run, key) do
-    with {:ok, chat} <- TicketChat.ready_for_run(store, run["run_id"]) do
+    with {:ok, chat} <- TicketChat.bound_for_run(store, run["run_id"]) do
       if DesktopRequest.controller_busy?(store, chat["scope_key"], key),
         do: {:error, :controller_jira_reconciliation_required},
         else: :ok

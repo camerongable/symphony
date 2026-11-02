@@ -48,7 +48,7 @@ defmodule SymphonyElixir.Factory.ReviewProtocol do
         "repair_attempt_limit" => @limit,
         "repairs_used" => Enum.count(history, & &1["repair_admitted"]),
         "instructions" =>
-          "Follow the controller-bound review_scope. COMPREHENSIVE means the entire contract including success, failure, fallback, retry and public entry boundaries. FOCUSED means independently close all supplied obligations, inspect affected execution paths and regressions; carried evidence is historical provenance, never a claim of new inspection. Do not invent a full sweep of unchanged areas. Findings are authored once in review_report.findings: stable unique ID, description, classification, disposition and basis. REQUIRED_REPAIR requires a supplied AC, authenticated prior finding or established safety invariant PRIVACY, SECURITY, CONTRACT_INTEGRITY or EXACT_IDENTITY. Only preferences may be OBSERVATION. Reuse prior IDs for REGRESSION/UNRESOLVED; NEW IDs must be disjoint. Late NEW mandatory findings are escalated by the controller, not automatically broadened into repairs. Keep factual REPAIR for code-fixable findings regardless of review count; the controller alone enforces limits. BLOCK is only CONTRACT_CHANGED, HUMAN_DECISION or ENVIRONMENT. Unrun checks remain NOT_RUN."
+          "Follow the controller-bound review_scope. COMPREHENSIVE means the entire contract including success, failure, fallback, retry and public entry boundaries. FOCUSED means independently close all supplied obligations, inspect affected execution paths and regressions; carried evidence is historical provenance, never a claim of new inspection. Do not invent a full sweep of unchanged areas. Findings are authored once in review_report.findings: stable unique ID, description, classification, disposition and basis. REQUIRED_REPAIR requires a supplied AC, authenticated prior finding or established safety invariant PRIVACY, SECURITY, CONTRACT_INTEGRITY or EXACT_IDENTITY. Only preferences may be OBSERVATION. Reuse prior IDs for REGRESSION/UNRESOLVED; NEW IDs must be disjoint. In-contract NEW and UNRESOLVED mandatory findings use the same controller-owned two-repair budget; classifications do not introduce an earlier stop. Keep factual REPAIR for code-fixable findings regardless of review count; the controller alone enforces limits. BLOCK is only CONTRACT_CHANGED, HUMAN_DECISION or ENVIRONMENT. Unrun checks remain NOT_RUN."
       })
     end
   end
@@ -542,18 +542,10 @@ defmodule SymphonyElixir.Factory.ReviewProtocol do
   end
 
   @spec decision(map(), map()) :: :legacy | :pass | :block | :repair | {:stop, map()}
-  def decision(%{"review_protocol" => protocol}, %{"status" => "REPAIR"} = output) do
-    unresolved = protocol["repairs_used"] > 0 and unresolved_closure?(output[@report])
-
+  def decision(%{"review_protocol" => protocol}, %{"status" => "REPAIR"}) do
     cond do
-      unresolved ->
-        {:stop, stop(protocol, "UNRESOLVED_FINDING")}
-
       protocol["repairs_used"] >= @limit ->
         {:stop, stop(protocol, "REPAIR_LIMIT")}
-
-      protocol["version"] == 2 and protocol["review_scope"]["mode"] == "FOCUSED" and Enum.any?(output[@report]["findings"], &(&1["disposition"] == "REQUIRED_REPAIR" and &1["classification"] == "NEW")) ->
-        {:stop, stop(protocol, "LATE_FINDING_ESCALATION")}
 
       true ->
         :repair

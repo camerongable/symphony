@@ -266,7 +266,7 @@ defmodule SymphonyElixir.FactoryReviewProtocolTest do
     assert {:error, :review_report_verdict_contradiction} = ReviewProtocol.validate(verifier, binding(verifier), verifier_result)
   end
 
-  test "focused reviews bind prior provenance and escalate late mandatory findings without a third repair" do
+  test "focused reviews bind prior provenance and keep new in-contract findings within the same two-repair budget" do
     finding = %{
       "id" => "F-1",
       "description" => "Private value reaches error logger",
@@ -305,7 +305,7 @@ defmodule SymphonyElixir.FactoryReviewProtocolTest do
     assert {:error, :review_report_finding_identity_changed} = ReviewProtocol.validate(followup, binding(followup), reused)
     late = typed_result(followup, [Map.put(finding, "id", "NEW-2")])
     assert :ok = ReviewProtocol.validate(followup, binding(followup), late)
-    assert {:stop, %{"reason" => "LATE_FINDING_ESCALATION", "repairs_used" => 1}} = ReviewProtocol.decision(followup, late)
+    assert :repair = ReviewProtocol.decision(followup, late)
     exhausted = put_in(followup, ["review_protocol", "repairs_used"], 2)
     assert {:stop, %{"reason" => "REPAIR_LIMIT", "repairs_used" => 2}} = ReviewProtocol.decision(exhausted, result)
   end
@@ -438,12 +438,12 @@ defmodule SymphonyElixir.FactoryReviewProtocolTest do
     assert :pass = ReviewProtocol.decision(third, output(third))
   end
 
-  test "an unresolved prior finding stops after the first repair without falsifying the verdict" do
+  test "an unresolved prior finding uses the remaining repair without falsifying the verdict" do
     packet = packet([prior()])
     repaired = output(packet, "REPAIR") |> put_in(["review_report", "closures", Access.at(0), "status"], "UNRESOLVED")
     assert :ok = ReviewProtocol.validate(packet, binding(packet), repaired)
     assert repaired["status"] == "REPAIR"
-    assert {:stop, %{"reason" => "UNRESOLVED_FINDING", "repairs_used" => 1}} = ReviewProtocol.decision(packet, repaired)
+    assert :repair = ReviewProtocol.decision(packet, repaired)
   end
 
   test "unresolved classification without a prior repaired finding cannot stop the first review" do

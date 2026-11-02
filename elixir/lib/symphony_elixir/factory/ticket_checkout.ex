@@ -1,6 +1,6 @@
 defmodule SymphonyElixir.Factory.TicketCheckout do
   @moduledoc "Durable initial checkout reservation, one owned creation, and receipt-only recovery."
-  alias SymphonyElixir.Factory.{RunLedger, Store, TicketChat, TicketCheckoutIO, TicketWorkerRunner}
+  alias SymphonyElixir.Factory.{RunLedger, Store, TicketChat, TicketChatCommands, TicketCheckoutIO, TicketWorkerRunner}
   alias SymphonyElixir.Factory.{WorkspaceAccess, Worktree}
   alias SymphonyElixir.PathSafety
 
@@ -182,7 +182,8 @@ defmodule SymphonyElixir.Factory.TicketCheckout do
 
   defp finalization_binding(store, run, captured, authorization, opts) do
     with :ok <- TicketChat.ordinary_delivery_eligibility(run),
-         {:ok, chat} <- TicketChat.ready_for_run(store, run["run_id"]),
+         :ok <- TicketChatCommands.progress_allowed(store, run["run_id"]),
+         {:ok, chat} <- TicketChat.bound_for_run(store, run["run_id"]),
          true <- initial?(store, run) or {:error, :ticket_checkout_not_initial},
          {:ok, current} <- binding(store, run, chat, opts),
          true <- current == captured or {:error, :ticket_checkout_intent_changed},
@@ -239,7 +240,8 @@ defmodule SymphonyElixir.Factory.TicketCheckout do
     with {:ok, run} <- RunLedger.get(store, run_id),
          true <- is_nil(opts[:expected_run]) or run == opts[:expected_run] or {:error, :ticket_checkout_run_changed},
          :ok <- TicketChat.ordinary_delivery_eligibility(run),
-         {:ok, chat} <- TicketChat.ready_for_run(store, run_id),
+         :ok <- TicketChatCommands.progress_allowed(store, run_id),
+         {:ok, chat} <- TicketChat.bound_for_run(store, run_id),
          true <- parent_matches?(run, chat) or {:error, :ticket_checkout_parent_mismatch},
          true <- initial?(store, run) or {:error, :ticket_checkout_not_initial},
          {:ok, binding} <- binding(store, run, chat, opts),
@@ -293,11 +295,7 @@ defmodule SymphonyElixir.Factory.TicketCheckout do
        %{
          "run" => Map.take(run, @run_fields),
          "parent" => Map.take(chat, ~w(chat_key generation thread_id create_request_key)),
-         "bootstrap" =>
-           Map.take(
-             bootstrap,
-             ~w(target_kind target_key action status payload_json payload_sha256 metadata_json output_json target_observation_json thread_id turn_id verified_cwd verified_project_id)
-           ),
+         "bootstrap" => bootstrap_binding(store, run["run_id"], bootstrap),
          "repo_path" => repo,
          "repo_device" => repo_stat.major_device,
          "repo_inode" => repo_stat.inode,
@@ -311,6 +309,19 @@ defmodule SymphonyElixir.Factory.TicketCheckout do
     else
       _ -> {:error, :ticket_checkout_binding_unproven}
     end
+  end
+
+  defp bootstrap_binding(store, run_id, bootstrap) do
+    # Retained claims keep their original field set; only fresh intents omit presentation state.
+    fields =
+      with {:ok, intent} <- get(store, run_id),
+           {:ok, %{"bootstrap" => saved}} when is_map(saved) <- Jason.decode(intent["binding_json"]) do
+        Map.keys(saved)
+      else
+        _ -> ~w(request_key target_kind target_key action payload_json payload_sha256 metadata_json thread_id verified_cwd verified_project_id)
+      end
+
+    Map.take(bootstrap, fields)
   end
 
   defp parent_matches?(run, chat) do

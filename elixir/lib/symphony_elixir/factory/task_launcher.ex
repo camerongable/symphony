@@ -202,7 +202,7 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
 
     with :ok <- TicketChat.ordinary_delivery_eligibility(admitted_run),
          :ok <- TicketWorkerRunner.validate_authorization(admitted_run, launch.opts[:authorization]),
-         {:ok, _} <- TicketChat.ready_for_run(launch.store, launch.run["run_id"]),
+         {:ok, _} <- TicketChat.bound_for_run(launch.store, launch.run["run_id"]),
          :ok <- TicketWorkerRunner.admitted_stage(admitted_run, launch.route.requested_role),
          true <- launch.stage == admitted_run["state"] or {:error, :ticket_worker_stage_changed},
          {:ok, packet} <- ticket_base_packet(launch),
@@ -293,8 +293,15 @@ defmodule SymphonyElixir.Factory.TaskLauncher do
         launch.store,
         fn tx ->
           case prepare_ticket_task_transaction(tx, launch) do
-            {:error, reason} -> Exqlite.rollback(tx, reason)
-            {:ok, prepared} -> bind_task_instructions(tx, prepared)
+            {:error, reason} ->
+              Exqlite.rollback(tx, reason)
+
+            {:ok, prepared} ->
+              with :ok <- TicketChatCommands.progress_allowed(tx, launch.run["run_id"]) do
+                bind_task_instructions(tx, prepared)
+              else
+                {:error, reason} -> Exqlite.rollback(tx, reason)
+              end
           end
         end,
         timeout: 60_000

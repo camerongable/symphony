@@ -1,16 +1,17 @@
 defmodule SymphonyElixir.FactoryCiRepairReassessmentTest do
   use ExUnit.Case, async: true
-  alias SymphonyElixir.Factory.{CiRepairReassessment, Store, TicketCiRepair}
+  alias SymphonyElixir.Factory.{CiRepairReassessment, Control, Store, TicketCiRepair}
 
-  setup do
+  setup context do
     ctx = SymphonyElixir.TicketChatFixture.setup_fixture(%{})
     Store.query!(ctx.store, "UPDATE runs SET state='CI_WAITING',ci_pipeline_id=7,code_repair_round=1 WHERE run_id='run'")
     run = Store.one!(ctx.store, "SELECT * FROM runs WHERE run_id='run'")
     preimage = Jason.encode!(%{"run" => run, "ci_snapshots" => %{}})
     raw = Jason.encode!(%{"status" => "BLOCKED", "reason" => "UNSUPPORTED_FAILURE"})
+    key = if context[:parent_identity], do: "ci-repair:" <> hash(Jason.encode!(["run", run["candidate_sha"], 7])), else: "original"
 
     Store.query!(ctx.store, "INSERT INTO ticket_ci_repair_diagnoses VALUES (?,?,?,?,?,?,?,?,?,?)", [
-      "original",
+      key,
       "run",
       run["candidate_sha"],
       7,
@@ -22,7 +23,7 @@ defmodule SymphonyElixir.FactoryCiRepairReassessmentTest do
       "2026-10-15T00:00:00Z"
     ])
 
-    original = Store.one!(ctx.store, "SELECT * FROM ticket_ci_repair_diagnoses WHERE diagnosis_key='original'")
+    original = Store.one!(ctx.store, "SELECT * FROM ticket_ci_repair_diagnoses WHERE diagnosis_key=?", [key])
     {:ok, store: ctx.store, run: run, original: original}
   end
 
@@ -52,6 +53,23 @@ defmodule SymphonyElixir.FactoryCiRepairReassessmentTest do
     for sql <- ["UPDATE ticket_ci_repair_reassessments SET verdict='BLOCKED'", "DELETE FROM ticket_ci_repair_reassessments", "DELETE FROM factory_schema_migrations WHERE version=44"] do
       assert_raise Exqlite.Error, fn -> Store.query!(ctx.store, sql) end
     end
+  end
+
+  @tag :parent_identity
+  test "CI reassessment needs bound parent identity but not a bootstrap acknowledgement", ctx do
+    key = ctx.original["diagnosis_key"]
+    Store.query!(ctx.store, "UPDATE desktop_requests SET status='THREAD_RECORDED',turn_id=NULL,output_json=NULL WHERE target_kind='TICKET_CHAT' AND action='CREATE'")
+    Control.initialize(ctx.store, %{scope: "scope", dispatcher_id: "controller"})
+    Store.query!(ctx.store, "UPDATE control SET status='ACTIVE' WHERE scope='scope'")
+    collected = %{"evidence" => %{"status" => "BLOCK", "pipeline_id" => 7}, "snapshots" => %{}}
+    options = [ci_repair_policy: "diagnosis_only_v1", ci_repair_scope: "scope"]
+
+    assert {:ok, persist} = TicketCiRepair.prepare_diagnosis(ctx.store, ctx.run, collected, 1, options)
+    assert is_function(persist, 2)
+    assert {:ok, ctx.run} == Store.transaction!(ctx.store, &persist.(&1, ctx.run))
+    assert Store.one!(ctx.store, "SELECT verdict FROM ticket_ci_repair_reassessments WHERE diagnosis_key=?", [key]) == %{"verdict" => "BLOCKED"}
+    assert Store.query!(ctx.store, "SELECT * FROM ticket_ci_repair_claims").rows == []
+    assert Store.one!(ctx.store, "SELECT code_repair_round FROM runs WHERE run_id='run'")["code_repair_round"] == 1
   end
 
   test "current evidence pair is exact while legacy claimed bytes remain valid", ctx do

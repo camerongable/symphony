@@ -45,10 +45,16 @@ defmodule SymphonyElixir.Factory.TicketStagePayload do
   end
 
   defp capture(store, run_id) do
-    with {:ok, chat} <- TicketChat.ready_for_run(store, run_id),
+    with {:ok, chat} <- TicketChat.bound_for_run(store, run_id),
          {:ok, run} <- RunLedger.get(store, run_id),
          :ok <- TicketChat.ordinary_delivery_eligibility(run) do
-      {:ok, chat, run}
+      identity =
+        Map.take(
+          chat,
+          ~w(chat_key scope_key issue_id issue_key repo_key route generation create_request_key directory_name cwd model reasoning_effort broker_thread_id thread_id observation_json context_reader_json created_at)
+        )
+
+      {:ok, identity, run}
     end
   end
 

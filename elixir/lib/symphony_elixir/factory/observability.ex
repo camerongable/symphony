@@ -356,6 +356,8 @@ defmodule SymphonyElixir.Factory.Observability do
         if run.state not in @overview_hidden_states do
           [
             if(is_nil(historical_failure), do: review_stop_attention(source, review_stop)),
+            control_attention(store, source),
+            parent_collection_attention(store, source),
             report_attention(store, source),
             ci_attention(source),
             operation_attention(store, source),
@@ -412,6 +414,54 @@ defmodule SymphonyElixir.Factory.Observability do
           pending.evidence_at,
           pending.next_action
         )
+    end
+  end
+
+  defp control_attention(store, run) do
+    case SymphonyElixir.Factory.TicketChatCommands.control_state(store, run["run_id"]) do
+      %{records: [first | _]} ->
+        {reason, action} =
+          case {first.kind, first.status} do
+            {"QUESTION", _} ->
+              {"A recorded product question is awaiting an answer.", "Answer the recorded question in the ticket chat; source work waits until the accepted answer is applied."}
+
+            {"COMMAND", "PENDING"} ->
+              {"A staged ticket command has not yet been accepted from native chat history.",
+               "Complete the staged command in the ticket chat. The factory will preserve it until native input can be verified."}
+
+            {"COMMAND", "ACCEPTED"} ->
+              {"An accepted ticket command is waiting for controller application.", "The factory must apply the accepted command before advancing source work; do not restart the worker or pipeline."}
+
+            {"AMENDMENT", _} ->
+              {"A contract amendment owns the ticket's next decision.", "Complete the existing contract amendment before ordinary source work resumes."}
+          end
+
+        notice("TICKET_CONTROL", first.kind <> "_" <> first.status, first.key, reason, run["updated_at"], action)
+
+      _ ->
+        nil
+    end
+  end
+
+  defp parent_collection_attention(store, run) do
+    with %{"payload_json" => raw, "occurred_at" => at} <-
+           Store.one!(store, "SELECT payload_json,occurred_at FROM events WHERE run_id=? AND event_type='TICKET_PARENT_COLLECTION' ORDER BY id DESC LIMIT 1", [run["run_id"]]),
+         %{"state" => "UNAVAILABLE"} = payload <- decode_map(raw),
+         true <- Map.take(payload, ~w(run_id spec_revision contract_sha256)) == Map.take(run, ~w(run_id spec_revision contract_sha256)),
+         {:ok, chat} <- SymphonyElixir.Factory.TicketChat.for_run(store, run["run_id"]),
+         true <- Map.take(payload, ~w(chat_key thread_id)) == Map.take(chat, ~w(chat_key thread_id)) do
+      notice(
+        "PARENT_CHAT",
+        "COLLECTION_UNAVAILABLE",
+        chat["chat_key"],
+        "Ticket chat readback is unavailable (#{bounded_reason(payload["reason"])}). Durable decisions remain authoritative; this communication warning alone does not stop ticket work.",
+        at,
+        "Restore ticket-chat readback when available; do not replay commands or restart source work."
+      )
+      |> Map.put(:blocking, false)
+      |> Map.put(:category, "COMMUNICATION")
+    else
+      _ -> nil
     end
   end
 

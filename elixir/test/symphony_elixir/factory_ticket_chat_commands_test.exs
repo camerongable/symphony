@@ -42,6 +42,17 @@ defmodule SymphonyElixir.FactoryTicketChatCommandsTest do
     {:ok, fixture}
   end
 
+  defmodule ExitedParentReader do
+    def read_native_thread(_thread, _options), do: exit(:fixture_parent_unavailable)
+  end
+
+  test "a parent reader exit remains a communication failure and preserves staged control", ctx do
+    {:ok, staged} = stage(ctx, "unavailable-read", "Rework the current candidate.", [%{"operation" => "request_rework"}])
+    assert {:error, :native_parent_read_unavailable} = TicketChatCommands.collect(ctx.store, "run", native_reader: ExitedParentReader)
+    assert {:ok, %{"status" => "PENDING"}} = TicketChatCommands.get(ctx.store, staged["command_key"])
+    assert TicketChatCommands.control_state(ctx.store, "run").held
+  end
+
   test "captured native Python staging command decodes the literal proposal" do
     command =
       String.trim(~S"""
@@ -211,6 +222,9 @@ defmodule SymphonyElixir.FactoryTicketChatCommandsTest do
            } == before
 
     assert amendment["phase"] == "RESERVED"
+    assert %{held: true, records: controls} = TicketChatCommands.control_state(ctx.store, "run")
+    assert Enum.any?(controls, &(&1.kind == "AMENDMENT" and &1.status == "RESERVED"))
+    assert {:error, :ticket_control_pending} = TicketChatCommands.progress_allowed(ctx.store, "run")
   end
 
   test "amendment insertion failure rolls back reservation state", ctx do

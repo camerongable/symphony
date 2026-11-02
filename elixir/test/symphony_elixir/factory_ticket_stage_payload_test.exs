@@ -68,6 +68,27 @@ defmodule SymphonyElixir.FactoryTicketStagePayloadTest do
     assert protected(ctx.store) == before
   end
 
+  @tag :parent_identity
+  test "preparation accepts an attested parent without ACK and ignores presentation updates during its read", ctx do
+    Store.query!(ctx.store, "UPDATE desktop_requests SET status='THREAD_RECORDED',turn_id=NULL,output_json=NULL WHERE target_kind='TICKET_CHAT' AND action='CREATE'")
+    Process.put(:stage_payload_native, native(ctx, "Rework the current candidate."))
+    before = protected(ctx.store)
+    assert {:ok, prepared} = TicketStagePayload.prepare(ctx.store, "run", ctx.workflow, reader: NativeReader)
+    assert prepared.staged == false
+    assert protected(ctx.store) == before
+
+    Process.put(:stage_payload_mutation, fn ->
+      Store.query!(ctx.store, "UPDATE ticket_chats SET context_sequence=context_sequence+1,presentation_sha256='presentation',updated_at='later' WHERE chat_key=?", [ctx.chat["chat_key"]])
+
+      Store.query!(ctx.store, "UPDATE desktop_requests SET status='SUCCEEDED',turn_id='ack',output_json=? WHERE target_kind='TICKET_CHAT' AND action='CREATE'", [
+        Jason.encode!(%{"result" => %{"acknowledged" => true}, "completed_tool_calls" => []})
+      ])
+    end)
+
+    assert {:ok, ^prepared} = TicketStagePayload.prepare(ctx.store, "run", ctx.workflow, reader: NativeReader)
+    assert Store.one!(ctx.store, "SELECT COUNT(*) AS count FROM ticket_chat_commands")["count"] == 0
+  end
+
   test "the existing public stage and synthetic completed-turn receipt admit the prepared exact body", ctx do
     body = "Revise the contract:\n## Goal\nLiteral contract\n"
     native = native(ctx, body)
@@ -155,6 +176,13 @@ defmodule SymphonyElixir.FactoryTicketStagePayloadTest do
     Process.put(:stage_payload_native, native(ctx, "Rework the current candidate."))
     Process.put(:stage_payload_mutation, fn -> RunLedger.update(ctx.store, "run", %{candidate_sha: String.duplicate("b", 40)}) end)
     assert {:error, :native_preparation_binding_changed} = TicketStagePayload.prepare(ctx.store, "run", ctx.workflow, reader: NativeReader)
+    assert Store.one!(ctx.store, "SELECT COUNT(*) AS count FROM ticket_chat_commands")["count"] == 0
+  end
+
+  test "a stored parent identity change during native read cannot produce a staged payload", ctx do
+    Process.put(:stage_payload_native, native(ctx, "Rework the current candidate."))
+    Process.put(:stage_payload_mutation, fn -> Store.query!(ctx.store, "UPDATE desktop_requests SET verified_cwd=? WHERE target_kind='TICKET_CHAT' AND action='CREATE'", [ctx.root]) end)
+    assert {:error, :ticket_chat_parent_not_ready} = TicketStagePayload.prepare(ctx.store, "run", ctx.workflow, reader: NativeReader)
     assert Store.one!(ctx.store, "SELECT COUNT(*) AS count FROM ticket_chat_commands")["count"] == 0
   end
 

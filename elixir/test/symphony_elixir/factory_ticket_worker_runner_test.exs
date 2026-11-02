@@ -398,6 +398,36 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
     refute_receive {:factory_task_started, _, _}
   end
 
+  @tag structured_writer: true, durable_control_race: true
+  test "a product question arriving after commit prevents consumption and stage advancement", ctx do
+    {prompt, options} = prepare(ctx)
+    output = %{"status" => "CONTINUE", "changed_paths" => ["fixture.txt"], "commit_message" => "fix(PPL-123): retain interrupted increment", "blockers" => [], "checks" => []}
+    :persistent_term.put(ContinuationWorkerServer, %{output: output})
+    on_exit(fn -> :persistent_term.erase(ContinuationWorkerServer) end)
+    options = Keyword.put(options, :app_server, ContinuationWorkerServer)
+    assert {:ok, _} = TicketWorkerRunner.run(ctx.path, issue(), prompt, StageSchemas.for_stage(:native_feature_writer), options)
+    {:ok, evidence} = WorkerEvidence.get(ctx.store, options[:request_key])
+    {:ok, _} = TaskLedger.update(ctx.store, "writer", Map.merge(Map.take(evidence, ~w(output_json thread_id turn_id)), %{"status" => "COMPLETE"}))
+    {:ok, chat} = SymphonyElixir.Factory.TicketChat.bound_for_run(ctx.store, "run")
+
+    Store.query!(ctx.store, """
+    CREATE TRIGGER question_after_commit AFTER UPDATE OF candidate_sha ON runs WHEN OLD.candidate_sha IS NOT NEW.candidate_sha
+    BEGIN INSERT INTO ticket_chat_questions(question_key,chat_key,run_id,binding_json,body,answers_json,opened_at,status)
+      VALUES('Q-race','#{chat["chat_key"]}',NEW.run_id,json_object('generation',1,'spec_revision',NEW.spec_revision,'contract_sha256',NEW.contract_sha256,'candidate_sha',NEW.candidate_sha),'Keep this behavior?','{"yes":true}',strftime('%Y-%m-%dT%H:%M:%fZ','now'),'OPEN'); END
+    """)
+
+    context = %{
+      store: ctx.store,
+      workspace_root: Path.join(ctx.root, "workspaces"),
+      factory: %{maximum_implementation_iterations: 25, maximum_code_repair_rounds: 2, repositories: %{"grail" => %{"path" => ctx.repo, "base_branch" => "master"}}}
+    }
+
+    assert {:error, :ticket_control_pending} = Scheduler.ticket_step(context, "run", opts(ctx))
+    assert {:ok, %{"state" => "WRITING", "implementation_iteration" => 0}} = RunLedger.get(ctx.store, "run")
+    assert {:ok, %{"status" => "RESULT_RECORDED"}} = WorkerEvidence.get(ctx.store, options[:request_key])
+    assert String.trim(git(ctx.path, ["rev-list", "--count", ctx.sha <> "..HEAD"])) == "1"
+  end
+
   defp prepare_verifier(ctx, candidate \\ nil) do
     unless ctx[:parent_bound], do: bind_parent(ctx)
     candidate = candidate || ctx[:candidate_sha] || ctx.sha
@@ -782,7 +812,9 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
         assert {:ok, %{status: "VERIFIER_REPAIR_APPLIED"}} = SymphonyElixir.Factory.TicketVerifierRepair.stage_policy_stop(reopened, input, factory, options)
         assert {:ok, writer_prompt} = TicketWorkerRunner.packet(reopened, "run", "feature-writer", ctx.sha)
         writer_packet = Jason.decode!(writer_prompt)
-        assert writer_packet["review_protocol"]["repairs_used"] == 2
+        refute Map.has_key?(writer_packet, "review_protocol")
+        assert {:ok, history} = ReviewProtocol.history(reopened, writer_packet)
+        assert Enum.count(history, & &1["repair_admitted"]) == 2
         assert writer_packet["repair_review"]["operator_authorization"]["authorization_event_id"] == authorized["authorization_event_id"]
         packet_path = Path.join(ctx.root, "policy-stop-writer-packet.json")
         File.write!(packet_path, writer_prompt)
@@ -824,7 +856,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
     end
   end
 
-  defp assert_policy_stop_writer_publication(ctx, store, prompt, context, options) do
+  defp assert_policy_stop_writer_publication(ctx, store, _prompt, context, options) do
     factory = context.factory
     assert {:ok, _} = SymphonyElixir.Factory.Control.pause(store, factory, factory.dispatcher_id)
     tasks = start_supervised!({Task.Supervisor, []}, id: :policy_stop_source_tasks)
@@ -836,32 +868,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
 
     assert {:ok, _} = SymphonyElixir.Factory.Controller.cached_generation_policy(store, "grail")
     {:ok, _} = TaskLedger.update(store, "writer", %{role: "feature-planner"})
-    packet = Jason.decode!(prompt)
-    candidate = packet["candidate_sha"]
     key = "run:feature-writer"
-
-    rows = fn ids, status -> Enum.map(ids, &%{"id" => &1, "status" => status, "evidence" => ["Synthetic no-edit source-ready scope; independent review remains required"]}) end
-    criteria = packet["review_protocol"]["review_scope"]["criterion_ids"]
-
-    report = %{
-      "version" => 2,
-      "candidate_sha" => candidate,
-      "block_reason" => "NONE",
-      "criteria" => rows.(criteria, "NOT_CHECKED"),
-      "closures" => rows.(Enum.map(packet["review_protocol"]["finding_obligations"], & &1["id"]), "ADDRESSED"),
-      "boundary_sweeps" => Enum.map(rows.(criteria, "CHECKED"), &Map.put(&1, "paths", ["fixture.txt"])),
-      "findings" => [],
-      "affected_path_checks" => []
-    }
-
-    report =
-      if ctx.writer_status == "COMPLETE" do
-        report
-        |> Map.update!("boundary_sweeps", &Enum.map(&1, fn row -> if row["id"] == "AC-2", do: Map.merge(row, %{"status" => "UNAVAILABLE", "paths" => []}), else: row end))
-        |> Map.put("affected_path_checks", [%{"id" => "repaired source boundary", "status" => "CHECKED", "evidence" => ["fixture.txt:1 inspected source; tests NOT_RUN"]}])
-      else
-        report
-      end
 
     continuing? = ctx.writer_status == "CONTINUE"
 
@@ -870,8 +877,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
       "changed_paths" => if(continuing?, do: ["fixture.txt"], else: []),
       "commit_message" => if(continuing?, do: "fix(PPL-123): bounded repair slice", else: nil),
       "blockers" => [],
-      "checks" => ["NOT_RUN"],
-      "review_report" => report
+      "checks" => ["NOT_RUN"]
     }
 
     :persistent_term.put(ContinuationWorkerServer, %{output: output})
@@ -941,12 +947,12 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
     assert Jason.decode!(evidence["output_json"]) == output
     assert :ok = ReviewProtocol.validate_result(store, task, binding, output)
     {:ok, packet} = ReviewProtocol.context(store, task)
-    origin = hd(packet["review_protocol"]["review_scope"]["carried_evidence"])
-    prior = Store.one!(store, "SELECT * FROM worker_evidence WHERE request_key=?", [origin["request_key"]])
+    prior = Store.one!(store, "SELECT * FROM worker_evidence WHERE request_key=?", [packet["repair_review"]["verifier_request_key"]])
 
-    Store.query!(store, "UPDATE worker_evidence SET output_sha256=? WHERE request_key=?", [String.duplicate("0", 64), origin["request_key"]])
-    assert {:error, :review_report_scope_unproven} = ReviewProtocol.validate_result(store, task, binding, output)
-    Store.query!(store, "UPDATE worker_evidence SET output_sha256=? WHERE request_key=?", [prior["output_sha256"], origin["request_key"]])
+    Store.query!(store, "UPDATE worker_evidence SET output_sha256=? WHERE request_key=?", [String.duplicate("0", 64), prior["request_key"]])
+    assert :ok = ReviewProtocol.validate_result(store, task, binding, output)
+    assert {:error, :review_protocol_history_unproven} = ReviewProtocol.history(store, packet)
+    Store.query!(store, "UPDATE worker_evidence SET output_sha256=? WHERE request_key=?", [prior["output_sha256"], prior["request_key"]])
     assert :ok = ReviewProtocol.validate_result(store, task, binding, output)
     assert {:ok, ^packet} = ReviewProtocol.context(store, task)
     assert Store.one!(store, "SELECT * FROM worker_evidence WHERE task_key=? ORDER BY rowid DESC LIMIT 1", [key]) == evidence
@@ -1017,8 +1023,9 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
   end
 
   @tag structured_review: true
-  test "controller stops early when independent review leaves a prior finding unresolved", ctx do
-    assert_structured_loop(ctx, 1, "UNRESOLVED_FINDING")
+  @tag repair_budget: true
+  test "controller allows the remaining repair for unresolved findings but never a third repair", ctx do
+    assert_structured_loop(Map.put(ctx, :unresolved_findings, true), 2, "REPAIR_LIMIT")
   end
 
   defp assert_structured_loop(ctx, last_round, reason, correction? \\ false) do
@@ -1059,7 +1066,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
           else: output
 
       output =
-        if reason == "UNRESOLVED_FINDING" and round == last_round do
+        if ctx[:unresolved_findings] == true and round > 0 do
           output |> put_in(["review_report", "closures", Access.at(0), "status"], "UNRESOLVED") |> put_in(["review_report", "findings", Access.at(0), "classification"], "UNRESOLVED")
         else
           output

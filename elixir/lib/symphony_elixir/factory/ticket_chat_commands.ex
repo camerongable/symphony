@@ -8,6 +8,30 @@ defmodule SymphonyElixir.Factory.TicketChatCommands do
   @binding ~w(generation spec_revision contract_sha256 candidate_sha)
   @fields @binding ++ ~w(proposal_id body operations)
 
+  @doc "Reads durable product controls; unavailable chat history is neither a hold nor proof that a staged command was accepted."
+  @spec control_state(Store.connection(), String.t()) :: map()
+  def control_state(store, run_id) do
+    records =
+      Store.query!(
+        store,
+        """
+        SELECT 'COMMAND' AS kind, command_key AS key, status FROM ticket_chat_commands WHERE run_id=? AND status IN ('PENDING','ACCEPTED')
+        UNION ALL SELECT 'QUESTION', question_key, status FROM ticket_chat_questions WHERE run_id=? AND status='OPEN'
+        UNION ALL SELECT 'AMENDMENT', command_key, phase FROM ticket_contract_amendments WHERE run_id=? AND active_owner=1
+        ORDER BY kind, key
+        """,
+        [run_id, run_id, run_id]
+      ).rows
+      |> Enum.map(fn [kind, key, status] -> %{kind: kind, key: key, status: status} end)
+
+    %{held: records != [], records: records}
+  end
+
+  @spec progress_allowed(Store.connection(), String.t()) :: :ok | {:error, atom()}
+  def progress_allowed(store, run_id) do
+    if control_state(store, run_id).held, do: {:error, :ticket_control_pending}, else: :ok
+  end
+
   @doc false
   @spec rework_body?(term()) :: boolean()
   def rework_body?(body) when is_binary(body),
@@ -1476,11 +1500,23 @@ defmodule SymphonyElixir.Factory.TicketChatCommands do
          {:ok, request} <- DesktopRequest.get(store, chat["create_request_key"]),
          {:ok, proof} <- Jason.decode(request["target_observation_json"] || "null"),
          {:ok, _request} <- TicketChat.record_thread(store, request, chat["thread_id"], proof),
-         {:ok, native} <- native_reader.read_native_thread(chat["thread_id"], workspace: chat["cwd"]),
+         {:ok, native} <- read_parent_history(native_reader, chat),
          {:ok, collected} <- admit_readback(store, run_id, native),
          {:ok, recovery} <- recover_failed_preparation(store, run_id, native) do
       {:ok, %{collected | receipts: collected.receipts ++ recovery}}
     end
+  end
+
+  defp read_parent_history(reader, chat) do
+    case reader.read_native_thread(chat["thread_id"], workspace: chat["cwd"]) do
+      {:ok, native} when is_map(native) -> {:ok, native}
+      {:error, _} = error -> error
+      _ -> {:error, :native_parent_read_unavailable}
+    end
+  rescue
+    _ -> {:error, :native_parent_read_unavailable}
+  catch
+    :exit, _ -> {:error, :native_parent_read_unavailable}
   end
 
   @doc false

@@ -77,7 +77,7 @@ defmodule SymphonyElixir.Factory.TicketCiGeneration do
          base when is_map(base) <- Store.one!(store, "SELECT * FROM ticket_review_bases WHERE run_id = ?", [run["run_id"]]),
          :ok <- stopped_writer(store, run, task, evidence, binding, access, source, output),
          {:ok, inputs} <- TicketCiRepair.input_snapshot(store, run["run_id"]),
-         {:ok, _} <- TicketChat.ready_for_run(store, run["run_id"]),
+         {:ok, _} <- TicketChat.bound_for_run(store, run["run_id"]),
          %{"status" => "ACTIVE"} = control <- Control.status(store, policy["scope"]),
          true <- control["dispatcher_id"] == policy["dispatcher_id"] or {:error, :controller_generation_dispatcher_changed},
          :ok <- no_pending_io(store, run["run_id"]),

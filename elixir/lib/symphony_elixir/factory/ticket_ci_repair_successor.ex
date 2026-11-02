@@ -494,7 +494,7 @@ defmodule SymphonyElixir.Factory.TicketCiRepairSuccessor do
          :ok <- TicketWorkerRunner.validate_authorization(run, authorization),
          {:ok, policy} <- policy_receipt(store, run),
          true <- attempts_used(store, run["run_id"]) < policy["effective_limit"] or {:error, :ci_repair_attempt_limit},
-         {:ok, _} <- TicketChat.ready_for_run(store, run["run_id"]),
+         {:ok, _} <- TicketChat.bound_for_run(store, run["run_id"]),
          {:ok, inputs} <- TicketCiRepair.input_snapshot(store, run["run_id"]),
          {:ok, retained} <- TicketCiRepair.retained_preimage(store, run),
          :ok <- TicketPush.validate_historical_completed_preimage(store, retained),

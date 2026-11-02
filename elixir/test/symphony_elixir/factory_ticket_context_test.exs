@@ -1,10 +1,46 @@
 defmodule SymphonyElixir.FactoryTicketContextTest do
   use ExUnit.Case, async: true
   import SymphonyElixir.TicketChatFixture
-  alias SymphonyElixir.Factory.{Contract, DesktopRequest, RunLedger, Store, TaskLedger}
+  alias SymphonyElixir.Factory.{Contract, ControlServer, DesktopRequest, Observability, RunLedger, Store, TaskLedger}
   alias SymphonyElixir.Factory.{TicketChatCommands, TicketContext}
 
   setup :setup_fixture
+
+  test "staged and accepted material decisions remain explicit without treating raw chat text as authority", ctx do
+    body = "Rework the current candidate."
+    {:ok, staged} = stage(ctx, "decision-state", body, [%{"operation" => "request_rework"}])
+    assert {:ok, pending} = TicketContext.context(ctx.store, "run")
+    assert [%{"command_key" => key, "status" => "PENDING"}] = pending.decisions
+    assert key == staged["command_key"]
+    assert %{held: true, records: [%{kind: "COMMAND", key: ^key, status: "PENDING"}]} = pending.control_state
+    assert {:ok, %{receipts: [%{"status" => "ACCEPTED"}]}} = TicketChatCommands.admit_readback(ctx.store, "run", native(ctx, [body]))
+    assert {:ok, accepted} = TicketContext.context(ctx.store, "run")
+    assert [%{"command_key" => ^key, "status" => "ACCEPTED"}] = accepted.decisions
+  end
+
+  test "dashboard distinguishes a parent communication warning from a staged product decision", ctx do
+    factory = %{enabled: true, scope: "scope", dispatcher_id: "controller", lease_seconds: 240, maximum_specifiers: 2, maximum_writers: 2, maximum_validators: 2, writer_disk_gb: 20, repositories: %{}}
+    control = start_supervised!({ControlServer, store: ctx.store, factory: factory, name: nil})
+    options = [settings: %{factory: factory}, store: ctx.store, control_server: control]
+    {:ok, run} = RunLedger.get(ctx.store, "run")
+
+    payload =
+      Map.take(run, ~w(run_id spec_revision contract_sha256))
+      |> Map.merge(%{"chat_key" => ctx.chat["chat_key"], "thread_id" => "parent", "state" => "UNAVAILABLE", "reason" => "native_history_unavailable"})
+
+    Store.query!(ctx.store, "INSERT INTO events(event_type,run_id,payload_json,occurred_at) VALUES ('TICKET_PARENT_COLLECTION','run',?,?)", [
+      Jason.encode!(payload),
+      DateTime.to_iso8601(DateTime.utc_now())
+    ])
+
+    assert [%{attention_signals: signals}] = Observability.snapshot(options).current_runs
+    assert Enum.any?(signals, &(&1.source == "PARENT_CHAT" and &1.category == "COMMUNICATION" and not &1.blocking))
+    refute Enum.any?(signals, & &1.blocking)
+
+    {:ok, staged} = stage(ctx, "staged-control", "Rework the current candidate.", [%{"operation" => "request_rework"}])
+    assert [%{attention_signals: held}] = Observability.snapshot(options).current_runs
+    assert Enum.any?(held, &(&1.source == "TICKET_CONTROL" and &1.phase == "COMMAND_PENDING" and &1.blocking and &1.request_key == staged["command_key"]))
+  end
 
   test "dashboard context excludes retained delivery and journal payloads without changing drilldown", ctx do
     retained = Jason.encode!(%{"history" => String.duplicate("retained receipt", 100_000)})

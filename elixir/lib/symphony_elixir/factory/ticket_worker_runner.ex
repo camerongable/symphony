@@ -49,7 +49,8 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
     with {:ok, current} <- RunLedger.get(store, run["run_id"]),
          true <- (current == run and current["state"] == "ADMITTING_WRITER") or {:error, :ticket_writer_admission_changed},
          :ok <- TicketChat.ordinary_delivery_eligibility(current),
-         {:ok, _} <- TicketChat.ready_for_run(store, run["run_id"]),
+         :ok <- TicketChatCommands.progress_allowed(store, run["run_id"]),
+         {:ok, _} <- TicketChat.bound_for_run(store, run["run_id"]),
          %{"base_sha" => base} <- Store.one!(store, "SELECT base_sha FROM ticket_review_bases WHERE run_id = ?", [run["run_id"]]),
          true <- is_binary(run["worktree"]) or {:error, :ticket_source_checkout_not_admitted},
          {:ok, root} <- Keyword.fetch(opts, :workspace_root),
@@ -300,7 +301,7 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
   def delivery_facts(store, run, opts) do
     with {:ok, facts} <- delivery_ledger_facts(store, run, opts),
          current = facts.run,
-         {:ok, _} <- TicketChat.ready_for_run(store, current["run_id"]),
+         {:ok, _} <- TicketChat.bound_for_run(store, current["run_id"]),
          {:ok, root} <- Keyword.fetch(opts, :workspace_root),
          {:ok, checkout} <- bound_checkout(store, current, current["candidate_sha"], root, opts),
          {:ok, after_check} <- RunLedger.get(store, current["run_id"]),
@@ -339,6 +340,7 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
          true <- current == run or {:error, :ticket_delivery_binding_changed},
          true <- current["state"] in ~w(PUSHING MR_CREATING CI_PUSHING CI_MR_CREATING CI_WAITING) or {:error, :ticket_delivery_stage_not_admitted},
          :ok <- TicketChat.ordinary_delivery_eligibility(current),
+         :ok <- TicketChatCommands.progress_allowed(store, current["run_id"]),
          true <- is_binary(current["candidate_sha"]) or {:error, :ticket_delivery_candidate_missing},
          :ok <- stopped_delivery_evidence(store, current),
          {:ok, verifier} <- delivery_verifier(store, current, opts) do
@@ -567,7 +569,8 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
          {:ok, task} <- TaskLedger.get(store, evidence["task_key"]),
          {:ok, run} <- RunLedger.get(store, task["run_id"]),
          :ok <- TicketChat.ordinary_delivery_eligibility(run),
-         {:ok, _} <- TicketChat.ready_for_run(store, run["run_id"]),
+         :ok <- TicketChatCommands.progress_allowed(store, run["run_id"]),
+         {:ok, _} <- TicketChat.bound_for_run(store, run["run_id"]),
          :ok <- admitted_stage(run, task["role"]),
          true <- task["stage"] == run["state"] or {:error, :ticket_worker_stage_changed},
          {:ok, output} <- Jason.decode(evidence["output_json"] || "null"),
@@ -603,9 +606,10 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
 
   defp adoption_role(store, run, %{"role" => "feature-writer"}, evidence, output) do
     with :ok <- WorkerFileTools.reconcile(store, evidence["request_key"]),
-         {:ok, _} <- TicketChat.ready_for_run(store, run["run_id"]),
+         {:ok, _} <- TicketChat.bound_for_run(store, run["run_id"]),
          {:ok, current} <- RunLedger.get(store, run["run_id"]),
          true <- current == run or {:error, :ticket_writer_adoption_changed},
+         :ok <- TicketChatCommands.progress_allowed(store, run["run_id"]),
          {:ok, effective} <- SymphonyElixir.Factory.TicketCiGeneration.complete(store, evidence["request_key"], run, output),
          :ok <- SymphonyElixir.Factory.TicketCiRepair.writer_result(store, run, output, effective["changed_paths"]),
          {:ok, candidate} <- writer_candidate(run, evidence, effective),
@@ -1090,7 +1094,8 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
   end
 
   defp prerequisites(run, task, chat, issue, workspace, prompt, opts) do
-    with :ok <- bound_route(Keyword.fetch!(opts, :store), run, chat),
+    with :ok <- TicketChatCommands.progress_allowed(Keyword.fetch!(opts, :store), run["run_id"]),
+         :ok <- bound_route(Keyword.fetch!(opts, :store), run, chat),
          :ok <- scoped_input(run, task, issue, workspace, prompt, opts),
          :ok <- role_input(run, task, prompt, opts) do
       exact_contract(run)
@@ -1101,7 +1106,7 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
     valid = {run["execution_mode"], chat["route"]} == {"TICKET_SUPERVISOR_V1", "desktop_owned_ticket_chat_v1"}
 
     if valid and is_binary(chat["thread_id"]) do
-      case TicketChat.ready_for_run(store, run["run_id"]) do
+      case TicketChat.bound_for_run(store, run["run_id"]) do
         {:ok, _} -> :ok
         error -> error
       end

@@ -45,6 +45,52 @@ defmodule SymphonyElixir.FactoryTicketCheckoutTest do
     assert {:ok, ^intent} = TicketCheckout.get(ctx.store, "run")
   end
 
+  test "fresh checkout admission survives a bootstrap acknowledgement arriving after preparation", ctx do
+    {:ok, parent} = SymphonyElixir.Factory.TicketChat.bound_for_run(ctx.store, "run")
+    Store.query!(ctx.store, "UPDATE desktop_requests SET status='THREAD_RECORDED',turn_id=NULL,output_json=NULL WHERE request_key=?", [parent["create_request_key"]])
+    assert {:ok, intent} = TicketCheckout.reserve(ctx.store, "run", ctx.authorization, ctx.options)
+    binding = Jason.decode!(intent["binding_json"])
+    refute Enum.any?(~w(status turn_id output_json target_observation_json), &Map.has_key?(binding["bootstrap"], &1))
+
+    assert {:ok, _} =
+             SymphonyElixir.Factory.DesktopRequest.complete(ctx.store, parent["create_request_key"], %{
+               thread_id: parent["thread_id"],
+               turn_id: "later-bootstrap",
+               output: %{"result" => %{"acknowledged" => true}, "completed_tool_calls" => []}
+             })
+
+    assert {:ok, %{status: "CHECKOUT_ADMITTED"}} = TicketCheckout.create(ctx.store, "run", ctx.authorization, ctx.options)
+    assert {:ok, completed} = TicketCheckout.get(ctx.store, "run")
+    assert completed["binding_json"] == intent["binding_json"]
+    assert completed["binding_sha256"] == intent["binding_sha256"]
+  end
+
+  test "retained checkout field sets remain byte-exact through reservation replay and an uncertain claim", ctx do
+    assert {:ok, fresh} = TicketCheckout.reserve(ctx.store, "run", ctx.authorization, ctx.options)
+    {:ok, parent} = SymphonyElixir.Factory.TicketChat.bound_for_run(ctx.store, "run")
+    {:ok, bootstrap} = SymphonyElixir.Factory.DesktopRequest.get(ctx.store, parent["create_request_key"])
+
+    legacy =
+      Map.take(bootstrap, ~w(target_kind target_key action status payload_json payload_sha256 metadata_json output_json target_observation_json thread_id turn_id verified_cwd verified_project_id))
+
+    raw = Jason.decode!(fresh["binding_json"]) |> Map.put("bootstrap", legacy) |> Jason.encode!()
+    digest = :crypto.hash(:sha256, raw) |> Base.encode16(case: :lower)
+    Store.query!(ctx.store, "UPDATE ticket_checkout_intents SET binding_json=?,binding_sha256=? WHERE run_id='run'", [raw, digest])
+    assert {:ok, retained} = TicketCheckout.reserve(ctx.store, "run", ctx.authorization, ctx.options)
+    assert retained["binding_json"] == raw and retained["binding_sha256"] == digest
+    assert {:ok, claimed} = TicketCheckout.claim(ctx.store, "run", ctx.authorization, ctx.options)
+    {:ok, reopened} = Store.start_link(database: ctx.database)
+
+    try do
+      assert {:ok, ^claimed} = TicketCheckout.get(reopened, "run")
+      assert {:error, :ticket_checkout_already_claimed} = TicketCheckout.claim(reopened, "run", ctx.authorization, ctx.options)
+      assert claimed["binding_json"] == raw and claimed["binding_sha256"] == digest
+      refute File.exists?(claimed["canonical_path"])
+    after
+      GenServer.stop(reopened)
+    end
+  end
+
   test "low disk and expired authorization reject before intent or base pin and leave source unchanged", ctx do
     assert {:error, :insufficient_writer_capacity} = TicketCheckout.reserve(ctx.store, "run", ctx.authorization, Keyword.put(ctx.options, :free_bytes, 19_999_999_999))
     {:ok, expired} = TicketWorkerRunner.authorization(ctx.run, ctx.snapshot, DateTime.add(DateTime.utc_now(), -61))
@@ -450,7 +496,7 @@ defmodule SymphonyElixir.FactoryTicketCheckoutTest do
 
                  case change do
                    :manual_validation -> Store.query!(ctx.store, "UPDATE runs SET manual_validation_required = 1 WHERE run_id = 'run'")
-                   :bootstrap -> Store.query!(ctx.store, "UPDATE desktop_requests SET status = 'FAILED' WHERE target_kind = 'TICKET_CHAT'")
+                   :bootstrap -> Store.query!(ctx.store, "UPDATE desktop_requests SET verified_cwd = '/foreign-parent' WHERE target_kind = 'TICKET_CHAT'")
                  end
 
                  TicketCheckout.get(ctx.store, "run")

@@ -331,15 +331,28 @@ defmodule SymphonyElixir.Factory.TicketChat do
   @doc "Requires the exact observed projectless parent and its successful bootstrap acknowledgement."
   @spec ready_for_run(Store.connection(), String.t()) :: {:ok, map()} | {:error, atom()}
   def ready_for_run(store, run_id) do
+    with {:ok, chat} <- bound_for_run(store, run_id),
+         {:ok, request} <- DesktopRequest.get(store, chat["create_request_key"]),
+         true <- request["status"] in ~w(SUCCEEDED FAILED),
+         true <- is_binary(request["turn_id"]) and request["turn_id"] != "",
+         true <- readiness_completion?(store, chat, request) do
+      {:ok, chat}
+    else
+      _ -> {:error, :ticket_chat_parent_not_ready}
+    end
+  end
+
+  @doc "Authenticates the recorded parent route without treating its presentation acknowledgement as source authority."
+  @spec bound_for_run(Store.connection(), String.t()) :: {:ok, map()} | {:error, atom()}
+  def bound_for_run(store, run_id) do
     with {:ok, chat} <- for_run(store, run_id),
          {:ok, request} <- DesktopRequest.get(store, chat["create_request_key"]),
          true <-
            {request["target_kind"], request["target_key"], request["action"], request["status"]} ==
-             {"TICKET_CHAT", chat["chat_key"], "CREATE", request["status"]} and request["status"] in ["SUCCEEDED", "FAILED"],
+             {"TICKET_CHAT", chat["chat_key"], "CREATE", request["status"]} and request["status"] in ~w(THREAD_RECORDED SUCCEEDED FAILED),
          true <-
            is_binary(chat["thread_id"]) and chat["thread_id"] != "" and
              request["thread_id"] == chat["thread_id"],
-         true <- is_binary(request["turn_id"]) and request["turn_id"] != "",
          true <- DesktopRequest.payload_intact?(request),
          {:ok, metadata} <- decode_metadata(request["metadata_json"]),
          true <- metadata == request_metadata(chat) and valid_schema?(request["schema_json"]),
@@ -350,8 +363,7 @@ defmodule SymphonyElixir.Factory.TicketChat do
          :ok <- validate_observation(chat, request, chat["thread_id"], arguments, proof),
          true <-
            request_observation_matches_chat?(request, chat) and
-             request["verified_cwd"] == chat["cwd"] and is_nil(request["verified_project_id"]),
-         true <- readiness_completion?(store, chat, request) do
+             request["verified_cwd"] == chat["cwd"] and is_nil(request["verified_project_id"]) do
       {:ok, chat}
     else
       _ -> {:error, :ticket_chat_parent_not_ready}

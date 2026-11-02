@@ -2,7 +2,7 @@ defmodule SymphonyElixir.Factory.TicketContext do
   @moduledoc "Bounded, read-only ticket projections with digest-pinned evidence drilldown."
 
   alias SymphonyElixir.Factory.{Contract, DesktopRequest, RunLedger, StageSchemas, Store}
-  alias SymphonyElixir.Factory.{TaskLedger, TicketChat, TicketChatOutbox, WorkerEvidence, WorkspaceAccess}
+  alias SymphonyElixir.Factory.{TaskLedger, TicketChat, TicketChatCommands, TicketChatOutbox, WorkerEvidence, WorkspaceAccess}
 
   @run_fields ~w(run_id issue_key repo_key repo_path kind state spec_revision contract_sha256 candidate_sha base_branch branch worktree workspace_state implementation_iteration verifier_round mr_url mr_state jira_status manual_validation_required updated_at)
   @task_fields ~w(task_key role stage status thread_id turn_id workspace workspace_sha prompt_sha256 failure_code updated_at)
@@ -61,6 +61,7 @@ defmodule SymphonyElixir.Factory.TicketContext do
          run: Map.take(run, @run_fields),
          tasks: Enum.map(tasks, &task_projection/1),
          open_questions: Enum.map(questions, &question_projection(&1, chat, run)),
+         control_state: TicketChatCommands.control_state(store, run_id),
          ci: %{checked_at: run["ci_last_checked_at"], pipeline_url: run["ci_pipeline_url"], artifact: artifact("ci", run_id, run["ci_evidence_json"])},
          manual_validation: manual_validation(store, run),
          writer_disposition: disposition,
@@ -233,8 +234,9 @@ defmodule SymphonyElixir.Factory.TicketContext do
       contract: %{binding: contract_binding(run), artifact: artifact("contract", run["run_id"], run["contract_markdown"])},
       plan: artifact("plan", run["run_id"], run["plan_markdown"]),
       open_questions: Enum.map(questions, &question_projection(&1, chat, run)),
+      control_state: TicketChatCommands.control_state(store, run["run_id"]),
       decisions:
-        rows(store, "SELECT command_key, status, receipt_json, updated_at FROM ticket_chat_commands WHERE chat_key = ? AND run_id = ? AND status != 'PENDING' ORDER BY updated_at DESC LIMIT 4", [
+        rows(store, "SELECT command_key, status, receipt_json, updated_at FROM ticket_chat_commands WHERE chat_key = ? AND run_id = ? ORDER BY updated_at DESC LIMIT 4", [
           chat["chat_key"],
           run["run_id"]
         ])

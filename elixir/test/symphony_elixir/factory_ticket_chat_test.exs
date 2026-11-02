@@ -10,6 +10,18 @@ defmodule SymphonyElixir.FactoryTicketChatTest do
     assert "prompt" in missing
   end
 
+  test "attested parent identity is usable before bootstrap acknowledgement but not after identity corruption", ctx do
+    {:ok, first} = TicketChat.reserve(ctx.store, "run-one", attrs(ctx.root))
+    simulate_claim(ctx.store, first.request)
+    assert {:ok, _} = DesktopRequest.record_ticket_thread(ctx.store, first.request["request_key"], proof(first.request))
+    assert {:error, :ticket_chat_parent_not_ready} = TicketChat.ready_for_run(ctx.store, "run-one")
+    assert {:ok, bound} = TicketChat.bound_for_run(ctx.store, "run-one")
+    assert bound["thread_id"] == "parent-thread"
+
+    Store.query!(ctx.store, "UPDATE desktop_requests SET verified_cwd=? WHERE request_key=?", [ctx.root, first.request["request_key"]])
+    assert {:error, :ticket_chat_parent_not_ready} = TicketChat.bound_for_run(ctx.store, "run-one")
+  end
+
   test "only an unissued parent can be rehomed with audited request rebinding", ctx do
     original = attrs(ctx.root)
     {:ok, first} = TicketChat.reserve(ctx.store, "run-one", original)
