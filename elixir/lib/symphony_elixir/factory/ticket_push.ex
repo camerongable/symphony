@@ -49,7 +49,7 @@ defmodule SymphonyElixir.Factory.TicketPush do
           binding = Jason.decode!(intent["binding_json"])
           fields = ~w(run_id candidate_sha spec_revision contract_sha256 verifier_round)
 
-          if Map.has_key?(binding, "verified_ci_rollover") and Map.take(binding, fields) == Map.take(run, fields),
+          if (Map.has_key?(binding, "verified_ci_rollover") or binding["publication_version"] == 2) and Map.take(binding, fields) == Map.take(run, fields),
             do: {:ok, intent},
             else: prepare_new(store, run, authorization, opts, raw)
         end
@@ -310,7 +310,7 @@ defmodule SymphonyElixir.Factory.TicketPush do
          admitted = if(is_nil(identity), do: admitted, else: Map.put(admitted, :prepared_requalification, identity)),
          true <- previous_checkout?(previous, admitted.checkout) or {:error, :ticket_push_checkout_changed},
          {:ok, origin} <- Worktree.origin_identity(%{"path" => run["repo_path"]}, run["worktree"]),
-         {:ok, parent} <- TicketChat.ready_for_run(store, run["run_id"]),
+         {:ok, parent} <- TicketChat.bound_for_run(store, run["run_id"]),
          binding = binding(store, run, admitted, parent, origin),
          encoded = Jason.encode!(binding),
          key = "ticket-push:" <> digest(encoded),
@@ -354,7 +354,7 @@ defmodule SymphonyElixir.Factory.TicketPush do
          {:ok, access_binding} <- Jason.decode(access["binding_json"]),
          true <- Map.take(access_binding, ~w(path git_dir common_dir root_device root_inode)) == stringify(plan.admitted.checkout) or {:error, :ticket_push_checkout_changed},
          {:ok, current_parent} <- TicketChat.for_run(tx, run["run_id"]),
-         true <- current_parent == plan.parent or {:error, :ticket_push_parent_changed},
+         true <- current_parent == plan.parent or plan.binding["publication_version"] == 2 or {:error, :ticket_push_parent_changed},
          true <- binding(tx, run, plan.admitted, current_parent, plan.origin) == plan.binding or {:error, :ticket_push_binding_changed} do
       :ok
     else
@@ -433,6 +433,22 @@ defmodule SymphonyElixir.Factory.TicketPush do
   end
 
   defp push_step(store, run_id, authorization, opts) do
+    with {:ok, run} <- RunLedger.get(store, run_id) do
+      case Jason.decode(run["candidate_handoff"] || "null") do
+        {:ok, %{"binding_json" => raw} = intent} ->
+          case {Jason.decode(raw), intent["phase"]} do
+            {{:ok, %{"publication_version" => 2}}, "PUSH_UNCERTAIN"} -> complete_current(store, run_id, intent, authorization, opts)
+            {{:ok, %{"publication_version" => 2}}, "COMPLETED"} -> advance_current_completion(store, run, intent, authorization, opts)
+            _ -> qualified_push_step(store, run_id, authorization, opts)
+          end
+
+        _ ->
+          qualified_push_step(store, run_id, authorization, opts)
+      end
+    end
+  end
+
+  defp qualified_push_step(store, run_id, authorization, opts) do
     case TicketPushRequalification.maybe_requalify(store, run_id, authorization, opts) do
       {:ok, :not_applicable} -> ordinary_push_step(store, run_id, authorization, opts)
       result -> result
@@ -440,7 +456,9 @@ defmodule SymphonyElixir.Factory.TicketPush do
   end
 
   defp ordinary_push_step(store, run_id, authorization, opts) do
-    with {:ok, %{intent: intent} = preparation} <- ordinary_preparation(store, run_id, authorization, opts) do
+    with {:ok, run} <- RunLedger.get(store, run_id),
+         {:ok, authorization} <- refresh_push_authorization(run, authorization, opts),
+         {:ok, %{intent: intent} = preparation} <- ordinary_preparation(store, run_id, authorization, opts) do
       if intent["phase"] == "COMPLETED" and Map.has_key?(Jason.decode!(intent["binding_json"]), "verified_ci_rollover") do
         with {:ok, proof} <- completed_proof(store, run_id),
              :ok <- TicketWorkerRunner.validate_authorization(proof.run, authorization) do
@@ -556,9 +574,12 @@ defmodule SymphonyElixir.Factory.TicketPush do
          true <-
            is_nil(opts[:expected_envelope]) or raw == opts[:expected_envelope] or
              {:error, :ticket_push_intent_changed},
-         {:ok, %{"phase" => "PUSH_UNCERTAIN"}} <- Jason.decode(raw),
-         {:ok, invoked} <- validate_existing(store, run, raw, authorization, opts) do
-      complete_issued(store, run_id, invoked, authorization, opts)
+         {:ok, %{"phase" => "PUSH_UNCERTAIN"} = invoked} <- Jason.decode(raw) do
+      if current_publication?(invoked) do
+        complete_current(store, run_id, invoked, authorization, Keyword.put(opts, :settlement_only, true))
+      else
+        with {:ok, invoked} <- validate_existing(store, run, raw, authorization, opts), do: complete_issued(store, run_id, invoked, authorization, opts)
+      end
     else
       {:error, _} = error -> error
       _ -> {:error, :ticket_push_recovery_unissued}
@@ -566,6 +587,12 @@ defmodule SymphonyElixir.Factory.TicketPush do
   end
 
   defp complete_issued(store, run_id, invoked, authorization, opts) do
+    if current_publication?(invoked),
+      do: complete_current(store, run_id, invoked, authorization, opts),
+      else: complete_legacy_issued(store, run_id, invoked, authorization, opts)
+  end
+
+  defp complete_legacy_issued(store, run_id, invoked, authorization, opts) do
     with {:ok, raw} <- TicketPushIO.readback(invoked),
          :ok <- issued_receipt(raw, invoked),
          binding = Jason.decode!(invoked["binding_json"]),
@@ -577,6 +604,132 @@ defmodule SymphonyElixir.Factory.TicketPush do
          {:ok, fresh} <- refresh_push_authorization(run, authorization, opts) do
       finalize(store, run_id, invoked, raw, sha, fresh, opts)
     end
+  end
+
+  defp current_publication?(intent), do: match?({:ok, %{"publication_version" => 2}}, Jason.decode(intent["binding_json"] || "null"))
+
+  defp complete_current(store, run_id, intent, authorization, opts) do
+    with true <-
+           (valid_intent?(intent) and digest(intent["binding_json"]) == intent["binding_sha256"] and intent["reservation_key"] == "ticket-push:" <> intent["binding_sha256"]) or
+             {:error, :ticket_push_intent_invalid},
+         {:ok, run} <- RunLedger.get(store, run_id),
+         {:ok, ^intent} <- Jason.decode(run["candidate_handoff"] || "null") do
+      read_current_outcome(store, run_id, intent, authorization, opts)
+    end
+  end
+
+  defp read_current_outcome(store, run_id, intent, authorization, opts) do
+    case TicketPushIO.readback(intent) do
+      {:ok, raw} ->
+        if TicketPushIO.receipt_valid?(raw, intent) do
+          settle_current(store, run_id, intent, raw, authorization, opts)
+        else
+          with {:ok, _proof} <- TicketPushIO.not_started_proof(raw, intent), do: retry_current_nonissuance(store, run_id, intent, raw, authorization, opts)
+        end
+
+      {:error, _} = error ->
+        if opts[:settlement_only] == true, do: error, else: retry_current_nonissuance(store, run_id, intent, :fence, authorization, opts)
+    end
+  end
+
+  defp settle_current(store, run_id, intent, receipt, authorization, opts) do
+    binding = Jason.decode!(intent["binding_json"])
+
+    with {:ok, origin} <- Worktree.origin_identity(%{"path" => binding["repo_path"]}, binding["worktree"]),
+         true <- origin == binding["origin"] or {:error, :ticket_push_destination_changed},
+         {:ok, sha} <- Worktree.read_remote_branch(%{"path" => binding["repo_path"]}, binding["branch"]),
+         true <- sha == binding["candidate_sha"] or {:error, :ticket_push_remote_mismatch} do
+      transaction(store, fn tx ->
+        with {:ok, run} <- RunLedger.get(tx, run_id),
+             {:ok, ^intent} <- Jason.decode(run["candidate_handoff"] || "null"),
+             completed = Map.merge(intent, %{"phase" => "COMPLETED", "receipt_json" => receipt, "receipt_sha256" => digest(receipt), "remote_sha" => sha}),
+             :ok <- persist(tx, run, run["candidate_handoff"], completed),
+             {:ok, _} <- WorkspaceAccess.release_current_push(tx, run_id, completed, receipt),
+             {:ok, saved} <- RunLedger.get(tx, run_id) do
+          {:ok, %{status: "PUSH_SETTLED", run: saved, model_invoked: false}}
+        end
+      end)
+      |> case do
+        {:ok, %{run: saved}} -> advance_current_completion(store, saved, Jason.decode!(saved["candidate_handoff"]), authorization, opts)
+        error -> error
+      end
+    end
+  end
+
+  defp advance_current_completion(store, run, intent, authorization, opts) do
+    with {:ok, _access} <- completed_history(store, run, run["candidate_handoff"], intent) do
+      advance_proven_current_completion(store, run, intent, authorization, opts)
+    end
+  end
+
+  defp advance_proven_current_completion(store, run, intent, authorization, opts) do
+    binding = Jason.decode!(intent["binding_json"])
+    identity = ~w(run_id candidate_sha spec_revision contract_sha256 verifier_round code_repair_round)
+
+    cond do
+      run["state"] in ~w(MR_CREATING CI_MR_CREATING CI_WAITING READY_FOR_REVIEW DELIVERED) and Map.take(binding, identity) == Map.take(run, identity) ->
+        {:ok, %{status: "PUSH_ALREADY_COMPLETED", run: run, model_invoked: false}}
+
+      opts[:settlement_only] == true ->
+        {:ok, %{status: "PUSH_SETTLED_HELD", run: run, model_invoked: false}}
+
+      true ->
+        with {:ok, fresh} <- refresh_push_authorization(run, authorization, opts),
+             {:ok, admitted} <- TicketWorkerRunner.delivery_admission(store, run, fresh, Keyword.delete(opts, :reservation)),
+             {:ok, _facts} <- TicketPushIO.current_action_facts(store, binding) do
+          transaction(store, fn tx ->
+            with {:ok, ^run} <- RunLedger.get(tx, run["run_id"]),
+                 :ok <- TicketWorkerRunner.recheck_delivery_admission(tx, run, fresh, opts, admitted),
+                 {:ok, _} <- TicketPushIO.current_action_facts(tx, binding),
+                 {:ok, %{run: advanced}} <- RunLedger.update(tx, run["run_id"], push_transition(run, intent["remote_sha"])) do
+              {:ok, %{status: "PUSH_COMPLETED", run: advanced, model_invoked: false}}
+            end
+          end)
+        else
+          _ -> {:ok, %{status: "PUSH_SETTLED_HELD", run: run, model_invoked: false}}
+        end
+    end
+  end
+
+  defp retry_current_nonissuance(store, run_id, intent, receipt, authorization, opts) do
+    binding = Jason.decode!(intent["binding_json"])
+
+    with {:ok, run} <- RunLedger.get(store, run_id),
+         true <- opts[:settlement_only] != true,
+         {:ok, _} <- TicketPushIO.current_action_facts(store, binding),
+         {:ok, fresh} <- refresh_push_authorization(run, authorization, opts),
+         owned = Keyword.put(opts, :reservation, %{key: intent["reservation_key"], generation: intent["reservation_generation"]}),
+         {:ok, admitted} <- TicketWorkerRunner.delivery_admission(store, run, fresh, owned) do
+      transaction(store, fn tx ->
+        with {:ok, ^run} <- RunLedger.get(tx, run_id),
+             {:ok, ^intent} <- Jason.decode(run["candidate_handoff"] || "null"),
+             :ok <- TicketWorkerRunner.recheck_delivery_admission(tx, run, fresh, owned, admitted),
+             {:ok, _} <- TicketPushIO.current_action_facts(tx, binding),
+             {:ok, proof} <- current_retry_proof(tx, intent, receipt),
+             successor = Map.merge(intent, %{"phase" => "PREPARED", "owner_nonce" => Base.encode16(:crypto.strong_rand_bytes(32), case: :lower), "helper_pid" => nil, "execution_json" => nil}),
+             :ok <- persist(tx, run, run["candidate_handoff"], successor) do
+          Store.query!(tx, "INSERT INTO events(event_type,run_id,payload_json,occurred_at) VALUES ('TICKET_PUSH_NOT_STARTED_RETRIED',?,?,?)", [
+            run_id,
+            Jason.encode!(%{"original_envelope" => run["candidate_handoff"], "nonissuance_proof" => proof, "successor_nonce" => successor["owner_nonce"]}),
+            DateTime.to_iso8601(DateTime.utc_now())
+          ])
+
+          {:ok, %{status: "PUSH_RETRY_PREPARED", model_invoked: false}}
+        end
+      end)
+    else
+      _ -> {:ok, %{status: "PUSH_NOT_STARTED_HELD", model_invoked: false}}
+    end
+  end
+
+  defp current_retry_proof(tx, intent, :fence) do
+    with {:ok, observation} <- TicketPushIO.current_fence_observation(tx, intent) do
+      {:ok, %{"kind" => "FENCED_NOT_STARTED", "original_envelope_sha256" => digest(Jason.encode!(intent)), "observation" => observation}}
+    end
+  end
+
+  defp current_retry_proof(_tx, intent, receipt) do
+    with {:ok, _} <- TicketPushIO.not_started_proof(receipt, intent), do: {:ok, %{"kind" => "TERMINAL_NOT_STARTED", "receipt_json" => receipt, "receipt_sha256" => digest(receipt)}}
   end
 
   defp issued_receipt(raw, invoked) do
@@ -938,6 +1091,33 @@ defmodule SymphonyElixir.Factory.TicketPush do
   end
 
   defp binding(store, run, admitted, parent, origin) do
+    source =
+      Store.one!(store, "SELECT * FROM worker_evidence WHERE run_id=? AND json_extract(binding_json,'$.mode')='SOURCE' ORDER BY created_at DESC,request_key DESC LIMIT 1", [run["run_id"]]) || %{}
+
+    verifier =
+      if admitted.verifier do
+        task = Store.one!(store, "SELECT * FROM factory_tasks WHERE task_key=?", [admitted.verifier["task_key"]])
+
+        %{
+          "evidence" =>
+            Map.take(admitted.verifier, ~w(request_key task_key run_id status thread_id turn_id binding_sha256 output_sha256 owner_pid owner_process_json owner_stopped_at owner_stop_json consumed_at)),
+          "task" => Map.take(task, ~w(task_key run_id role stage status thread_id turn_id prompt_sha256 model reasoning_effort))
+        }
+      end
+
+    Map.take(run, ~w(run_id issue_key state repo_path worktree branch base_branch candidate_sha contract_sha256 spec_revision verifier_round code_repair_round))
+    |> Map.merge(%{
+      "publication_version" => 2,
+      "controller_scope" => parent["scope_key"],
+      "checkout" => stringify(admitted.checkout),
+      "origin" => origin,
+      "verifier" => verifier,
+      "source_owner" => Map.take(source, ~w(request_key status binding_sha256 output_sha256 owner_pid owner_process_json owner_stopped_at owner_stop_json consumed_at)),
+      "ci_preflight" => is_nil(verifier)
+    })
+  end
+
+  defp legacy_binding(store, run, admitted, parent, origin) do
     bootstrap = Store.one!(store, "SELECT * FROM desktop_requests WHERE request_key = ?", [parent["create_request_key"]])
 
     result =
@@ -1019,7 +1199,7 @@ defmodule SymphonyElixir.Factory.TicketPush do
          owned_opts = Keyword.put(opts, :reservation, %{key: intent["reservation_key"], generation: intent["reservation_generation"]}),
          {:ok, admitted} <- TicketWorkerRunner.delivery_admission(store, run, authorization, owned_opts),
          {:ok, origin} <- Worktree.origin_identity(%{"path" => run["repo_path"]}, run["worktree"]),
-         {:ok, parent} <- TicketChat.ready_for_run(store, run["run_id"]),
+         {:ok, parent} <- TicketChat.bound_for_run(store, run["run_id"]),
          {:ok, stored_binding} <- Jason.decode(intent["binding_json"]),
          :ok <- TicketPushRequalification.current_binding(store, run, intent, stored_binding),
          {:ok, successor_context} <- retained_successor_context(store, run, stored_binding),
@@ -1027,7 +1207,7 @@ defmodule SymphonyElixir.Factory.TicketPush do
          :ok <- input_retirement_current(store, run, intent, stored_binding),
          :ok <- TicketPushPreissuanceRejection.current(store, run, intent, stored_binding),
          :ok <- TicketPushOrdinaryRejection.current(store, run, intent, stored_binding),
-         expected = binding(store, run, admitted, parent, origin),
+         expected = expected_binding(store, run, admitted, parent, origin, stored_binding),
          expected = if(Map.has_key?(stored_binding, "bootstrap_recovery"), do: expected, else: Map.delete(expected, "bootstrap_recovery")),
          expected = if(Map.has_key?(stored_binding, "code_repair_round"), do: expected, else: Map.delete(expected, "code_repair_round")),
          true <- stored_binding == expected or {:error, :ticket_push_binding_changed} do
@@ -1038,9 +1218,14 @@ defmodule SymphonyElixir.Factory.TicketPush do
     end
   end
 
+  defp expected_binding(store, run, admitted, parent, origin, %{"publication_version" => 2}), do: binding(store, run, admitted, parent, origin)
+  defp expected_binding(store, run, admitted, parent, origin, _legacy), do: legacy_binding(store, run, admitted, parent, origin)
+
   defp retained_successor_context(store, run, %{"ci_evidence_successor" => _} = binding) do
     retained_repair_context(store, run, binding)
   end
+
+  defp retained_successor_context(store, run, %{"publication_version" => 2}), do: TicketCiRepairSuccessor.push_context(store, run)
 
   defp retained_successor_context(store, run, %{"ordinary_verifier_repair" => _} = binding) do
     retained_repair_context(store, run, binding)
@@ -1146,8 +1331,8 @@ defmodule SymphonyElixir.Factory.TicketPush do
          true <- access == observed.access or {:error, :ticket_push_reservation_changed},
          :ok <- TicketWorkerRunner.recheck_delivery_admission(tx, run, authorization, opts, observed.admitted),
          {:ok, parent} <- TicketChat.for_run(tx, run["run_id"]),
-         true <- parent == observed.parent or {:error, :ticket_push_parent_changed},
-         expected = binding(tx, run, observed.admitted, parent, observed.origin),
+         true <- parent == observed.parent or observed.binding["publication_version"] == 2 or {:error, :ticket_push_parent_changed},
+         expected = expected_binding(tx, run, observed.admitted, parent, observed.origin, observed.binding),
          expected = if(Map.has_key?(observed.binding, "bootstrap_recovery"), do: expected, else: Map.delete(expected, "bootstrap_recovery")),
          true <- expected == observed.binding or {:error, :ticket_push_binding_changed} do
       :ok

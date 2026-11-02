@@ -176,8 +176,8 @@ SHA, actual edit scope and exactly-once adoption remain enforced. Rejected unsaf
 operational results require report recovery without discarding edits or rerunning
 the source worker. Independent verifier PASS still requires all admitted criteria
 and bound path checks to pass.
-Core ticket admission and advancement are independent of parent presentation: attested route identity is
-required, but a bootstrap acknowledgement or successful native history read is
+Core ticket admission and advancement are independent of parent presentation:
+attested route identity is required, but a bootstrap acknowledgement or successful native history read is
 not source authority. Unavailable readback is a communication warning. Durable
 OPEN questions, staged PENDING commands, ACCEPTED commands awaiting application,
 and active amendments hold ordinary progress. Accepted decisions apply before
@@ -185,10 +185,19 @@ work advances; uncollected raw text is not an immediate hold or cancellation.
 Fresh checkout intents bind immutable parent payload/identity rather than changing
 bootstrap presentation fields. Retained intents keep their original field sets
 and bytes, including their original uncertainty fences.
-Physical publication still uses its existing presentation fences. Fresh CI and
-generation action snapshots also retain mutable parent/bootstrap observations;
-removing those dependencies belongs to the subsequent effect-recovery work, not
-this core-advancement change.
+Fresh pushes bind the current candidate, checkout, origin, stopped source owner
+and exact consumed independent verifier. They do not replay advisory writer
+reports, parent acknowledgements or entire worker histories. CI-preflight
+publication remains separately authorized and never implies verifier PASS.
+The existing once-only journal records stable versioned receipt data. A terminal
+NOT_STARTED result, or an atomic nonce fence before the issuance marker, permits
+one fresh-nonce attempt with renewed authority. Missing/replaced spool identity
+or an issued-but-unknown result never permits reissue. Pause and durable product
+holds prevent retries and MR advancement, but do not prevent recording and
+releasing an already-issued effect. Legacy envelopes remain settlement-only;
+their bytes are not rewritten or silently retired.
+CI/generation action snapshots still retain mutable parent/bootstrap observations
+until the separate effect-recovery work replaces those fields.
 One explicit, deterministic report-only correction can reconcile duplicated v1
 finding descriptions without changing original bytes, evidence, verdict, or repair
 budget. An exact policy-stopped REPAIR can receive a separately journaled,

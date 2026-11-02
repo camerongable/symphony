@@ -828,7 +828,7 @@ defmodule SymphonyElixir.FactoryTicketPushReadbackTest do
 
   defp attested_reader_available?(reader, kind), do: kind != :completed_publication_relocation or File.exists?(reader)
 
-  defp install_forward_attestation(priv, entry, version) when version in [14, 15, 16, 17, 18, 19] do
+  defp install_forward_attestation(priv, entry, version) when version in 14..20 do
     forward = Jason.encode!(%{"version" => 15, "entries" => [entry]})
     File.write!(Path.join(priv, "ticket_push_readback_origins_v15.json"), forward)
 
@@ -861,6 +861,16 @@ defmodule SymphonyElixir.FactoryTicketPushReadbackTest do
     File.write!(Path.join(priv, "ticket_push_readback_origins_v20.json"), publication)
     publication_reader = Path.join(priv, "ticket_push_status_reader_v20.py")
     File.write!(publication_reader, Regex.replace(~r/ORIGINS_SHA256 = "[0-9a-f]{64}"/, File.read!(publication_reader), "ORIGINS_SHA256 = \"#{hash(publication)}\""))
+
+    for {catalog_version, readers} <- [{20, [21]}, {21, [22]}, {22, [23]}, {23, [24]}] do
+      catalog = Jason.encode!(%{"version" => catalog_version, "entries" => [entry]})
+      File.write!(Path.join(priv, "ticket_push_readback_origins_v#{catalog_version}.json"), catalog)
+
+      for reader_version <- readers do
+        reader = Path.join(priv, "ticket_push_status_reader_v#{reader_version}.py")
+        File.write!(reader, Regex.replace(~r/ORIGINS_SHA256 = "[0-9a-f]{64}"/, File.read!(reader), "ORIGINS_SHA256 = \"#{hash(catalog)}\""))
+      end
+    end
   end
 
   defp install_forward_attestation(_priv, _entry, _version), do: :ok

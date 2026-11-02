@@ -873,6 +873,18 @@ defmodule SymphonyElixir.Factory.WorkspaceAccess do
     transaction(store, fn tx -> release_push_transaction(tx, run_id, key, generation) end)
   end
 
+  @doc false
+  @spec release_current_push(Store.connection(), String.t(), map(), String.t()) :: {:ok, map()} | {:error, term()}
+  def release_current_push(store, run_id, intent, raw) do
+    with {:ok, binding} <- Jason.decode(intent["binding_json"]),
+         true <- binding["publication_version"] == 2 and TicketPushIO.receipt_valid?(raw, intent),
+         {:ok, access} <- get(store, intent["reservation_key"]) do
+      release_push_observed(store, run_id, intent["reservation_key"], intent["reservation_generation"], access, raw)
+    else
+      _ -> {:error, :controller_push_receipt_unproven}
+    end
+  end
+
   defp release_push_transaction(store, run_id, key, generation) do
     with {:ok, run} <- RunLedger.get(store, run_id),
          {:ok, intent} <- Jason.decode(run["candidate_handoff"] || "null"),
@@ -901,7 +913,7 @@ defmodule SymphonyElixir.Factory.WorkspaceAccess do
     with {:ok, run} <- RunLedger.get(store, run_id),
          {:ok, intent} <- Jason.decode(run["candidate_handoff"] || "null"),
          true <- (intent["kind"] == "TICKET_PUSH" and intent["phase"] == "COMPLETED") or {:error, :controller_push_completion_unproven},
-         true <- {intent["reservation_key"], intent["reservation_generation"], intent["remote_sha"]} == {key, generation, run["candidate_sha"]} or {:error, :controller_push_completion_unproven},
+         true <- {intent["reservation_key"], intent["reservation_generation"], intent["remote_sha"]} == {key, generation, push_candidate(intent, run)} or {:error, :controller_push_completion_unproven},
          {:ok, access} <- get(store, key),
          true <- (access == observed_access and access["generation"] == generation and is_nil(access["released_at"])) or {:error, :stale_workspace_reservation},
          true <- {access["run_id"], access["mode"], access["request_key"], access["task_key"]} == {run_id, "MAINTENANCE", key, nil} or {:error, :controller_push_completion_unproven},
@@ -915,13 +927,15 @@ defmodule SymphonyElixir.Factory.WorkspaceAccess do
   defp push_release_binding(run, intent, access) do
     fields = ~w(run_id issue_key state repo_path worktree branch base_branch candidate_sha contract_sha256 spec_revision verifier_round)
 
-    with true <- run["execution_mode"] == "TICKET_SUPERVISOR_V1" and run["state"] in ~w(PUSHING CI_PUSHING),
-         {:ok, binding} when is_map(binding) <- Jason.decode(intent["binding_json"] || "null"),
+    with {:ok, binding} when is_map(binding) <- Jason.decode(intent["binding_json"] || "null"),
+         current? = binding["publication_version"] == 2,
+         true <- run["execution_mode"] == "TICKET_SUPERVISOR_V1" and (current? or run["state"] in ~w(PUSHING CI_PUSHING)),
          {:ok, execution} when is_map(execution) <- Jason.decode(intent["execution_json"] || "null"),
          {:ok, owned} when is_map(owned) <- Jason.decode(access["binding_json"]),
          hash = receipt_hash(intent["binding_json"]),
          true <- hash == intent["binding_sha256"] and intent["reservation_key"] == "ticket-push:" <> hash,
-         true <- Map.take(binding, fields) == Map.take(run, fields),
+         identity = if(current?, do: ~w(run_id issue_key repo_path worktree branch base_branch), else: fields),
+         true <- Map.take(binding, identity) == Map.take(run, identity),
          true <-
            {execution["run_id"], execution["intent_json"], execution["intent_sha256"], execution["invocation"]} ==
              {run["run_id"], intent["binding_json"], hash, intent["owner_nonce"]},
@@ -930,10 +944,17 @@ defmodule SymphonyElixir.Factory.WorkspaceAccess do
            {checkout["path"], checkout["git_dir"], checkout["common_dir"]} ==
              {access["canonical_path"], access["git_dir"], access["common_dir"]},
          true <- Map.take(checkout, ~w(root_device root_inode)) == Map.take(owned, ~w(root_device root_inode)),
-         true <- owned["expected_sha"] == run["candidate_sha"] do
+         true <- owned["expected_sha"] == binding["candidate_sha"] do
       :ok
     else
       _ -> {:error, :controller_push_binding_unproven}
+    end
+  end
+
+  defp push_candidate(intent, run) do
+    case Jason.decode(intent["binding_json"] || "null") do
+      {:ok, %{"publication_version" => 2, "candidate_sha" => sha}} -> sha
+      _ -> run["candidate_sha"]
     end
   end
 

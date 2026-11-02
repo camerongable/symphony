@@ -5,8 +5,7 @@ defmodule SymphonyElixir.Factory.TicketPushIO do
     Store,
     TicketCheckoutIO,
     TicketCiRepair,
-    TicketCiRepairSuccessor,
-    TicketPushWorkerHistory,
+    TicketChatCommands,
     TicketWorkerRunner,
     WorkerFileIO
   }
@@ -17,6 +16,9 @@ defmodule SymphonyElixir.Factory.TicketPushIO do
   @helper Path.expand("../../../priv/ticket_push_executor_v2.py", __DIR__)
   @external_resource @helper
   @helper_sha :crypto.hash(:sha256, File.read!(@helper)) |> Base.encode16(case: :lower)
+  @publication_helper Path.expand("../../../priv/ticket_push_current.py", __DIR__)
+  @external_resource @publication_helper
+  @publication_helper_sha :crypto.hash(:sha256, File.read!(@publication_helper)) |> Base.encode16(case: :lower)
   @ci_helper Path.expand("../../../priv/ticket_push_executor_v3.py", __DIR__)
   @external_resource @ci_helper
   @ci_helper_sha :crypto.hash(:sha256, File.read!(@ci_helper)) |> Base.encode16(case: :lower)
@@ -356,16 +358,20 @@ defmodule SymphonyElixir.Factory.TicketPushIO do
 
   @doc false
   @spec prepare_issuance(Store.connection(), map(), map(), keyword()) :: {:ok, map()} | {:error, term()}
-  def prepare_issuance(store, intent, authorization, opts) do
+  def prepare_issuance(store, intent, authorization, _opts) do
     binding = Jason.decode!(intent["binding_json"])
 
-    with {:ok, capability} <- TicketPushWorkerHistory.capability_recovery(store, binding["run_id"]),
-         mode = if(capability, do: :capability, else: :large),
-         {:ok, helper} <- helper(binding["repo_path"], mode),
+    if binding["publication_version"] == 2,
+      do: prepare_current(store, intent, binding, authorization),
+      else: {:error, :legacy_push_requires_recorded_settlement}
+  end
+
+  defp prepare_current(store, intent, binding, authorization) do
+    with {:ok, helper} <- helper(binding["repo_path"], :publication),
          :ok <- WorkerFileIO.program_outside_source(helper, binding["worktree"]),
          {:ok, spool} <- WorkerFileIO.controller_spool(store, binding["repo_path"]),
          {:ok, program} <- File.read(@git),
-         {:ok, history} <- ci_history(store, binding, opts, mode) do
+         {:ok, facts} <- current_action_facts(store, binding) do
       environment = %{
         "HOME" => System.user_home!(),
         "PATH" => "/usr/bin:/bin:/Library/Developer/CommandLineTools/usr/bin",
@@ -379,23 +385,56 @@ defmodule SymphonyElixir.Factory.TicketPushIO do
 
       execution =
         Map.merge(spool, %{
+          "publication_version" => 2,
           "invocation" => intent["owner_nonce"],
           "intent_json" => intent["binding_json"],
           "intent_sha256" => intent["binding_sha256"],
           "run_id" => binding["run_id"],
           "helper_path" => helper,
-          "helper_sha256" => helper_sha(mode),
+          "helper_sha256" => @publication_helper_sha,
           "program_sha256" => hash(program),
           "authorization" => authorization,
-          "git_environment" => environment
+          "git_environment" => environment,
+          "action_facts" => facts
         })
-        |> Map.merge(history)
-        |> Map.merge(Map.take(binding, ~w(ci_evidence_successor ci_repair_policy_receipt verified_ci_rollover human_empty_commit_imports ordinary_verifier_repair)))
 
-      if transport_admissible?(execution),
-        do: {:ok, %{execution: execution, mode: mode}},
-        else: {:error, :ticket_push_input_too_large}
+      if transport_admissible?(execution), do: {:ok, %{execution: execution, mode: :publication}}, else: {:error, :ticket_push_input_too_large}
     end
+  end
+
+  @doc false
+  @spec current_action_facts(Store.connection(), map()) :: {:ok, map()} | {:error, term()}
+  def current_action_facts(store, binding) do
+    run_id = binding["run_id"]
+    controls = Store.query!(store, "SELECT scope,status,dispatcher_id,generation FROM control WHERE scope=?", [binding["controller_scope"]]).rows
+
+    with :ok <- TicketChatCommands.progress_allowed(store, run_id),
+         false <- Enum.any?(controls, fn [_scope, status, _dispatcher, _generation] -> status != "ACTIVE" end),
+         {:ok, run} <- RunLedger.get(store, run_id),
+         true <- Map.take(run, Map.keys(binding) -- ~w(publication_version checkout origin verifier ci_preflight)) == Map.take(binding, Map.keys(run)),
+         true <- current_mutators_quiet?(store, run_id) do
+      exemptions =
+        Store.query!(store, "SELECT request_key,status,binding_sha256,output_sha256,owner_stopped_at,owner_stop_json FROM worker_evidence WHERE run_id=? AND status!='CONSUMED' ORDER BY request_key", [
+          run_id
+        ]).rows
+
+      {:ok, %{"controls" => controls, "retained_noncurrent_attempts" => exemptions}}
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :ticket_push_current_action_unavailable}
+    end
+  end
+
+  defp current_mutators_quiet?(store, run_id) do
+    queries = [
+      "SELECT reservation_key FROM workspace_access WHERE run_id=? AND mode='SOURCE' AND released_at IS NULL LIMIT 1",
+      "SELECT op.call_id FROM worker_file_operations op JOIN worker_evidence worker ON worker.request_key=op.request_key WHERE worker.run_id=? AND (op.phase='PREPARED' OR op.io_pending=1) LIMIT 1",
+      "SELECT check_row.check_key FROM controller_checks check_row JOIN worker_evidence worker ON worker.request_key=check_row.worker_request_key WHERE worker.run_id=? AND check_row.phase!='COMPLETE' LIMIT 1",
+      "SELECT i.intent_key FROM ticket_ci_generation_intents i WHERE i.run_id=? AND NOT EXISTS(SELECT 1 FROM ticket_ci_generation_events e WHERE e.intent_key=i.intent_key AND e.event_type='FINALIZED' AND e.path='') LIMIT 1",
+      "SELECT i.intent_key FROM ticket_ordinary_generation_intents i WHERE i.run_id=? AND NOT EXISTS(SELECT 1 FROM ticket_ordinary_generation_events e WHERE e.intent_key=i.intent_key AND e.event_type='FINALIZED' AND e.path='') LIMIT 1"
+    ]
+
+    Enum.all?(queries, &is_nil(Store.one!(store, &1, [run_id])))
   end
 
   @doc false
@@ -407,44 +446,12 @@ defmodule SymphonyElixir.Factory.TicketPushIO do
 
   @doc false
   @spec recheck_issuance(Store.connection(), map()) :: :ok | {:error, term()}
-  def recheck_issuance(store, prepared) do
-    execution = prepared.execution
-    binding = Jason.decode!(execution["intent_json"])
-
-    with {:ok, run} <- RunLedger.get(store, execution["run_id"]),
-         {:ok, capability} <- TicketPushWorkerHistory.capability_recovery(store, run["run_id"]),
-         true <- if(capability, do: :capability, else: :large) == prepared.mode or {:error, :ticket_push_execution_changed},
-         {:ok, expected} <- TicketCiRepairSuccessor.push_context(store, run),
-         true <- Map.take(binding, ~w(ci_evidence_successor ci_repair_policy_receipt ordinary_verifier_repair)) == expected or {:error, :ci_successor_push_context_changed},
-         :ok <- TicketCiRepairSuccessor.recheck_push_context(store, run, Map.take(binding, ~w(ci_evidence_successor ci_repair_policy_receipt verified_ci_rollover ordinary_verifier_repair)), store),
-         {:ok, inputs} <- TicketCiRepair.input_snapshot(store, run["run_id"]),
-         true <- input_proof(inputs) == execution["ci_human_inputs"] or {:error, :ticket_push_execution_changed},
-         {:ok, history} <-
-           observe_history(
-             store,
-             run["run_id"],
-             prepared.mode,
-             execution["helper_sha256"] in [
-               @retained_publisher_helper_sha,
-               @generation_publisher_helper_sha,
-               @publication_compat_helper_sha,
-               @file_source_publication_helper_sha,
-               @ordinary_bindings_helper_sha,
-               @retained_publisher_capability_helper_sha,
-               @generation_publisher_capability_helper_sha,
-               @publication_compat_capability_helper_sha,
-               @file_source_publication_capability_helper_sha,
-               @ordinary_bindings_capability_helper_sha,
-               @writer_readiness_helper_sha,
-               @writer_readiness_capability_helper_sha,
-               @typed_review_helper_sha,
-               @typed_review_capability_helper_sha
-             ]
-           ),
-         true <- Map.put_new(history, "successors_json", "[]") == execution["worker_history"] or {:error, :ticket_push_execution_changed} do
-      :ok
-    end
+  def recheck_issuance(store, %{mode: :publication} = prepared) do
+    binding = Jason.decode!(prepared.execution["intent_json"])
+    with {:ok, facts} <- current_action_facts(store, binding), true <- facts == prepared.execution["action_facts"] or {:error, :ticket_push_execution_changed}, do: :ok
   end
+
+  def recheck_issuance(_store, _prepared), do: {:error, :legacy_push_requires_recorded_settlement}
 
   @doc false
   @spec recheck_issuance_freshness(Store.connection(), map()) :: :ok | {:error, term()}
@@ -628,43 +635,6 @@ defmodule SymphonyElixir.Factory.TicketPushIO do
     end
   end
 
-  defp ci_history(store, binding, opts, mode), do: retained_history(store, binding, opts, mode)
-
-  defp retained_history(store, binding, _opts, mode) do
-    {name, expected_history_sha} = history_program(mode)
-
-    with {:ok, run} <- RunLedger.get(store, binding["run_id"]),
-         {:ok, expected} <- TicketCiRepairSuccessor.push_context(store, run),
-         true <- Map.take(binding, ~w(ci_evidence_successor ci_repair_policy_receipt ordinary_verifier_repair)) == expected or {:error, :ci_successor_push_context_changed},
-         :ok <-
-           TicketCiRepairSuccessor.recheck_push_context(
-             store,
-             run,
-             Map.take(binding, ~w(ci_evidence_successor ci_repair_policy_receipt verified_ci_rollover ordinary_verifier_repair)),
-             store
-           ),
-         {:ok, inputs} <- TicketCiRepair.input_snapshot(store, binding["run_id"]),
-         {:ok, history} <- observe_history(store, binding["run_id"], mode),
-         {:ok, path} <- PathSafety.canonicalize(Application.app_dir(:symphony_elixir, "priv/" <> name)),
-         :ok <- WorkerFileIO.program_outside_source(path, binding["worktree"]),
-         {:ok, raw} <- File.read(path),
-         true <- hash(raw) == expected_history_sha or {:error, :ticket_push_program_changed} do
-      # v9 validates the complete successor projection even when it is empty.
-      # Do not change the historical observe/receipt codec used by older helpers.
-      history =
-        Map.put_new(history, "successors_json", "[]")
-
-      {:ok, %{"worker_history" => history, "ci_human_inputs" => input_proof(inputs), "history_program_path" => path, "history_program_sha256" => expected_history_sha}}
-    end
-  end
-
-  defp history_program(:capability), do: {"ticket_push_history_validator_v27.py", @file_source_publication_history_sha}
-  defp history_program(:large), do: {"ticket_push_history_validator_v27.py", @file_source_publication_history_sha}
-  defp observe_history(store, run_id, mode, review? \\ true)
-  defp observe_history(store, run_id, mode, true), do: TicketPushWorkerHistory.observe_review(store, run_id, mode)
-  defp observe_history(store, run_id, :capability, false), do: TicketPushWorkerHistory.observe_capability(store, run_id)
-  defp observe_history(store, run_id, :large, false), do: TicketPushWorkerHistory.observe_generated(store, run_id)
-
   defp source_observation(store, binding, opts) do
     if Enum.any?(~w(ci_repair ordinary_verifier_repair ci_evidence_successor), &Map.has_key?(binding, &1)),
       do: source_observation_for_run(store, binding["run_id"], opts),
@@ -677,15 +647,6 @@ defmodule SymphonyElixir.Factory.TicketPushIO do
 
   defp recheck_source(_store, nil), do: :ok
   defp recheck_source(store, source), do: TicketCiRepair.recheck_stopped_source(store, source)
-
-  defp input_proof(inputs) do
-    rows = Map.new(~w(ticket_chat_commands ticket_chat_questions ticket_contract_amendments inputs), &{&1, hash(Jason.encode!(inputs[&1]))})
-
-    Enum.reduce(~w(parent bootstrap), rows, fn name, result ->
-      keys = inputs[name] |> Map.keys() |> Enum.sort()
-      Map.put(result, name, %{"keys" => keys, "sha256" => hash(Jason.encode!(Enum.map(keys, &inputs[name][&1])))})
-    end)
-  end
 
   @spec execute(map(), (pos_integer(), String.t() -> {:ok, map()} | {:error, term()})) ::
           {:ok, String.t()} | {:error, term()}
@@ -704,6 +665,9 @@ defmodule SymphonyElixir.Factory.TicketPushIO do
   @spec receipt_valid?(String.t(), map()) :: boolean()
   def receipt_valid?(raw, intent) do
     case Jason.decode(intent["binding_json"] || "") do
+      {:ok, %{"publication_version" => 2}} ->
+        match?({:ok, %{"outcome" => "ISSUED"}}, current_receipt(raw, intent))
+
       {:ok, %{"run_id" => run_id}} when is_binary(run_id) ->
         ordinary_receipt_valid?(raw, Map.put(intent, "run_id", run_id))
 
@@ -711,6 +675,76 @@ defmodule SymphonyElixir.Factory.TicketPushIO do
         false
     end
   end
+
+  @doc false
+  @spec not_started_proof(String.t(), map()) :: {:ok, map()} | {:error, atom()}
+  def not_started_proof(raw, intent) do
+    case current_receipt(raw, intent) do
+      {:ok, %{"outcome" => "NOT_STARTED"} = receipt} -> {:ok, receipt}
+      _ -> {:error, :ticket_push_nonissuance_unproven}
+    end
+  end
+
+  @doc false
+  @spec current_fence_observation(DBConnection.t(), map()) :: {:ok, map()} | {:error, atom()}
+  def current_fence_observation(%DBConnection{}, %{"helper_pid" => nil, "execution_json" => nil} = intent) do
+    {:ok, %{"kind" => "UNATTACHED_CURRENT_INVOCATION", "nonce" => intent["owner_nonce"], "binding_sha256" => intent["binding_sha256"]}}
+  end
+
+  def current_fence_observation(%DBConnection{}, intent) do
+    with {:ok, execution} when is_map(execution) <- Jason.decode(intent["execution_json"] || "null"),
+         true <- execution["publication_version"] == 2,
+         true <- {execution["invocation"], execution["intent_json"], execution["intent_sha256"]} == {intent["owner_nonce"], intent["binding_json"], intent["binding_sha256"]},
+         {:ok, spool} <- PathSafety.canonicalize(execution["spool"]),
+         true <- spool == execution["spool"],
+         {:ok, %File.Stat{type: :directory} = stat} <- File.lstat(spool),
+         true <- {stat.major_device, stat.inode} == {execution["spool_device"], execution["spool_inode"]} and Bitwise.band(stat.mode, 0o777) == 0o700,
+         {:error, :enoent} <- File.lstat(Path.join(spool, intent["owner_nonce"] <> ".current-issued")) do
+      {:ok,
+       %{
+         "kind" => "CURRENT_ISSUANCE_MARKER_ABSENT",
+         "nonce" => intent["owner_nonce"],
+         "execution_sha256" => hash(intent["execution_json"]),
+         "spool" => Map.take(execution, ~w(spool spool_device spool_inode))
+       }}
+    else
+      _ -> {:error, :ticket_push_nonissuance_unproven}
+    end
+  end
+
+  defp current_receipt(raw, intent) do
+    fields = ~w(version kind execution_json execution_sha256 helper_pid child_pid outcome termination reason timed_out overflow stderr_bytes stderr_sha256)
+
+    with true <- is_binary(raw) and byte_size(raw) <= @receipt_limit,
+         {:ok, receipt} when is_map(receipt) <- Jason.decode(raw),
+         true <- Enum.sort(Map.keys(receipt)) == Enum.sort(fields),
+         true <- {receipt["version"], receipt["kind"]} == {2, "TICKET_PUSH_CURRENT"},
+         true <- is_binary(intent["execution_json"]) and is_binary(intent["binding_json"]),
+         true <- receipt["execution_json"] == intent["execution_json"] and hash(intent["execution_json"]) == receipt["execution_sha256"],
+         {:ok, execution} <- Jason.decode(intent["execution_json"]),
+         true <- execution["publication_version"] == 2,
+         {:ok, %{"publication_version" => 2, "run_id" => run_id}} <- Jason.decode(intent["binding_json"]),
+         true <- execution["run_id"] == run_id,
+         true <- {execution["intent_json"], execution["intent_sha256"], execution["invocation"]} == {intent["binding_json"], intent["binding_sha256"], intent["owner_nonce"]},
+         true <- hash(intent["binding_json"]) == intent["binding_sha256"],
+         true <- is_integer(intent["helper_pid"]) and intent["helper_pid"] > 0 and receipt["helper_pid"] == intent["helper_pid"],
+         true <- is_boolean(receipt["timed_out"]) and is_boolean(receipt["overflow"]),
+         true <- is_integer(receipt["stderr_bytes"]) and receipt["stderr_bytes"] in 0..16_384,
+         true <- is_binary(receipt["stderr_sha256"]) and Regex.match?(~r/\A[0-9a-f]{64}\z/, receipt["stderr_sha256"]),
+         true <- current_outcome?(receipt) do
+      {:ok, receipt}
+    else
+      _ -> {:error, :ticket_push_receipt_unproven}
+    end
+  end
+
+  defp current_outcome?(%{"outcome" => "ISSUED", "child_pid" => pid, "termination" => terminal, "reason" => nil}),
+    do: is_integer(pid) and pid > 0 and terminal_receipt?(terminal)
+
+  defp current_outcome?(%{"outcome" => "NOT_STARTED", "child_pid" => nil, "termination" => nil, "reason" => reason}),
+    do: is_binary(reason) and byte_size(reason) in 1..160
+
+  defp current_outcome?(_), do: false
 
   defp ordinary_receipt_valid?(raw, intent) do
     with {:ok, execution} when is_map(execution) <- Jason.decode(intent["execution_json"] || "null") do
@@ -1060,6 +1094,15 @@ defmodule SymphonyElixir.Factory.TicketPushIO do
   def receipt_frame(<<size::unsigned-big-32, raw::binary>>) when size in 1..@large_receipt_limit and byte_size(raw) == size, do: {:ok, raw}
   def receipt_frame(_), do: {:error, :ticket_push_transport_unproven}
 
+  defp execution_helper(%{"publication_version" => 2} = execution, mode) do
+    with {:ok, path} <- helper(execution["root"], :publication),
+         true <- mode == "--status" or (path == execution["helper_path"] and execution["helper_sha256"] == @publication_helper_sha) do
+      {:ok, path}
+    else
+      _ -> {:error, :ticket_push_program_changed}
+    end
+  end
+
   defp execution_helper(execution, "--status") do
     if TicketPushPreissuanceRejection.status_execution?(execution) and execution["helper_sha256"] != @previous_large_helper_sha do
       with :ok <- status_program(execution["helper_path"], execution["helper_sha256"], execution["root"]),
@@ -1071,43 +1114,7 @@ defmodule SymphonyElixir.Factory.TicketPushIO do
     end
   end
 
-  defp execution_helper(execution, _mode) do
-    capability_helpers = [
-      @retained_publisher_capability_helper_sha,
-      @generation_publisher_capability_helper_sha,
-      @publication_compat_capability_helper_sha,
-      @file_source_publication_capability_helper_sha,
-      @ordinary_bindings_capability_helper_sha,
-      @writer_readiness_capability_helper_sha,
-      @typed_review_capability_helper_sha,
-      @current_review_capability_helper_sha,
-      @review_capability_helper_sha,
-      @capability_helper_sha
-    ]
-
-    executable_helpers = [
-      @retained_publisher_helper_sha,
-      @generation_publisher_helper_sha,
-      @publication_compat_helper_sha,
-      @file_source_publication_helper_sha,
-      @ordinary_bindings_helper_sha,
-      @writer_readiness_helper_sha,
-      @typed_review_helper_sha,
-      @current_review_helper_sha,
-      @review_helper_sha,
-      @acknowledged_helper_sha | capability_helpers
-    ]
-
-    mode = if execution["helper_sha256"] in capability_helpers, do: :capability, else: :large
-
-    with true <- execution["helper_sha256"] in executable_helpers,
-         {:ok, path} <- helper(execution["root"], mode),
-         true <- path == execution["helper_path"] do
-      {:ok, path}
-    else
-      _ -> {:error, :ticket_push_program_changed}
-    end
-  end
+  defp execution_helper(_execution, _mode), do: {:error, :ticket_push_program_changed}
 
   defp status_helper(execution) do
     cond do
@@ -1474,6 +1481,7 @@ defmodule SymphonyElixir.Factory.TicketPushIO do
     end
   end
 
+  defp helper_name(:publication), do: "ticket_push_current.py"
   defp helper_name(:capability), do: "ticket_push_executor_v40.py"
 
   defp helper_name(mode) do
@@ -1489,6 +1497,7 @@ defmodule SymphonyElixir.Factory.TicketPushIO do
     end
   end
 
+  defp helper_sha(:publication), do: @publication_helper_sha
   defp helper_sha(:successor), do: @successor_helper_sha
   defp helper_sha(:ordinary_repair), do: @ordinary_helper_sha
   defp helper_sha(:current), do: @current_helper_sha

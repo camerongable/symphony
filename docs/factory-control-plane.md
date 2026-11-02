@@ -33,9 +33,29 @@ PENDING means staged, not accepted. Raw chat text that has not been staged and
 admitted is not an immediate hold or cancellation; there is no new per-ticket
 cancel command. Global pause and terminal CANCELLED behavior remain unchanged.
 This separation covers core admission and advancement, including preparation of
-literal human commands. Physical publication retains its existing presentation
-fences, and CI/generation action snapshots still compare mutable parent/bootstrap
+literal human commands and fresh physical publication. CI/generation action
+snapshots still compare mutable parent/bootstrap
 observations until the separate effect-recovery change replaces those fields.
+
+Fresh pushes use publication binding version 2 inside the existing push journal.
+Independent acceptance is validated in Elixir; the maintained physical helper
+checks its exact current verifier/task fingerprint, source ownership, checkout,
+destination and durable controls immediately before Git. It does not reinterpret
+historical review reports or parent acknowledgements.
+
+The helper holds the SQLite write lock through issuance-marker publication and
+child creation. Recovery may rotate a nonce under that same lock only with a
+typed terminal NOT_STARTED receipt or a proven absent issuance marker in the
+original attested spool. The old envelope and proof are retained in events.
+An absent PID or a replaced/missing/unreadable spool is not nonissuance proof;
+marker-present unknown effects remain unreissued. Receipt version 2 is stable
+data: a newer trusted reader can read it without executing old helper policy.
+
+Pause/read-only recovery can record and release a known old effect, but cannot
+create a successor, launch Git or advance to MR work. A product hold, changed
+contract or cancellation after launch does not discard the original receipt or
+rebind its effect to new authority. Old publication envelopes keep their recorded
+settlement/readback behavior; fresh routing never selects their executors.
 Parent instructions are behavioral constraints, not an enforced read-only OS
 sandbox. This route deliberately trusts the operator-facing chat's permissions.
 The legacy stage graph below remains applicable to legacy runs.

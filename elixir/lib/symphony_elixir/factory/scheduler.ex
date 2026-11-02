@@ -1246,12 +1246,15 @@ defmodule SymphonyElixir.Factory.Scheduler do
             SELECT push.run_id, 'PUSH',
               'ticket-push:' || json_extract(push.envelope, '$.binding_sha256') || ':' || json_extract(push.envelope, '$.owner_nonce'),
               push.created_at
-            FROM (SELECT run_id, created_at,
+            FROM (SELECT run_id, created_at, state,
               CASE WHEN json_valid(candidate_handoff) THEN candidate_handoff ELSE '{}' END AS envelope
-              FROM runs WHERE state IN ('PUSHING','CI_PUSHING')) AS push
+              FROM runs) AS push
             WHERE json_type(push.envelope, '$.version') = 'integer' AND json_extract(push.envelope, '$.version') = 1
               AND json_extract(push.envelope, '$.kind') = 'TICKET_PUSH'
               AND json_extract(push.envelope, '$.phase') = 'PUSH_UNCERTAIN'
+              AND (push.state IN ('PUSHING','CI_PUSHING') OR json_extract(
+                CASE WHEN json_valid(json_extract(push.envelope,'$.binding_json')) THEN json_extract(push.envelope,'$.binding_json') ELSE '{}' END,
+                '$.publication_version') = 2)
               AND json_type(push.envelope, '$.binding_sha256') = 'text' AND length(json_extract(push.envelope, '$.binding_sha256')) > 0
               AND json_type(push.envelope, '$.owner_nonce') = 'text' AND length(json_extract(push.envelope, '$.owner_nonce')) > 0
             UNION ALL
@@ -1384,6 +1387,49 @@ defmodule SymphonyElixir.Factory.Scheduler do
   end
 
   defp reconcile_jira_operation(context, %{"recovery_operation" => "PUSH"} = run, options) do
+    if current_push_envelope?(run), do: reconcile_current_push(context, run, options), else: reconcile_legacy_push(context, run, options)
+  end
+
+  defp reconcile_jira_operation(context, %{"recovery_operation" => "MR_RESULT"} = run, options) do
+    options =
+      options
+      |> Keyword.put(:ci_preflight_authorized, ci_preflight?(route_for_run(context, run)))
+      |> Keyword.put(:ticket_mr_ephemeral_read, true)
+      |> Keyword.put(:expected_request_key, run["recovery_key"])
+
+    with {:ok, authorization} <- ticket_authorization(context, run, options) do
+      TicketMrOperation.adopt_result(context.store, run["run_id"], authorization, context.factory, options)
+    end
+  end
+
+  defp current_push_envelope?(run) do
+    with {:ok, %{"kind" => "TICKET_PUSH", "binding_json" => raw}} <- Jason.decode(run["candidate_handoff"] || "null"),
+         {:ok, %{"publication_version" => 2}} <- Jason.decode(raw) do
+      true
+    else
+      _ -> false
+    end
+  end
+
+  defp reconcile_current_push(context, run, options) do
+    settle = fn -> TicketPush.reconcile(context.store, run["run_id"], %{}, Keyword.put(options, :expected_envelope, run["candidate_handoff"])) end
+
+    with true <- context[:ordinary_rejection_dispatch] == true and run["state"] in ~w(PUSHING CI_PUSHING),
+         %{"status" => "ACTIVE"} <- Control.status(context.store, context.factory.scope),
+         :ok <- TicketChatCommands.progress_allowed(context.store, run["run_id"]),
+         {:ok, authorization} <- ticket_authorization(context, run, options) do
+      options =
+        options
+        |> Keyword.put(:ci_preflight_authorized, ci_preflight?(route_for_run(context, run)))
+        |> Keyword.put(:push_authorization_reader, fn current, prior -> ticket_authorization(context, current, options, prior) end)
+
+      TicketPush.step(context.store, run["run_id"], authorization, options)
+    else
+      _ -> settle.()
+    end
+  end
+
+  defp reconcile_legacy_push(context, run, options) do
     options =
       options
       |> Keyword.put(:ci_preflight_authorized, ci_preflight?(route_for_run(context, run)))
@@ -1399,18 +1445,6 @@ defmodule SymphonyElixir.Factory.Scheduler do
       else
         TicketPush.reconcile(context.store, run["run_id"], authorization, options)
       end
-    end
-  end
-
-  defp reconcile_jira_operation(context, %{"recovery_operation" => "MR_RESULT"} = run, options) do
-    options =
-      options
-      |> Keyword.put(:ci_preflight_authorized, ci_preflight?(route_for_run(context, run)))
-      |> Keyword.put(:ticket_mr_ephemeral_read, true)
-      |> Keyword.put(:expected_request_key, run["recovery_key"])
-
-    with {:ok, authorization} <- ticket_authorization(context, run, options) do
-      TicketMrOperation.adopt_result(context.store, run["run_id"], authorization, context.factory, options)
     end
   end
 
