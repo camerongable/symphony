@@ -22,11 +22,12 @@ defmodule SymphonyElixir.Factory.ReviewProtocol do
     :review_report_unresolved_unproven,
     :review_report_verdict_contradiction,
     :review_report_scope_unproven,
-    :review_report_affected_paths_incomplete
+    :review_report_affected_paths_incomplete,
+    :worker_operational_result_invalid
   ]
 
   @spec attach(map(), [map()]) :: map()
-  def attach(%{"role" => role, "contract" => contract} = packet, history) when role in @roles do
+  def attach(%{"role" => "change-verifier", "contract" => contract} = packet, history) do
     ids = Regex.scan(~r/\bAC-\d+\b/, contract) |> List.flatten() |> Enum.uniq() |> Enum.sort()
 
     if ids == [] or Map.has_key?(packet, "ci_repair") do
@@ -47,8 +48,7 @@ defmodule SymphonyElixir.Factory.ReviewProtocol do
         "repair_attempt_limit" => @limit,
         "repairs_used" => Enum.count(history, & &1["repair_admitted"]),
         "instructions" =>
-          "Follow the controller-bound review_scope. COMPREHENSIVE means the entire contract including success, failure, fallback, retry and public entry boundaries. FOCUSED means independently close all supplied obligations, inspect affected execution paths and regressions; carried evidence is historical provenance, never a claim of new inspection. Do not invent a full sweep of unchanged areas. Findings are authored once in review_report.findings: stable unique ID, description, classification, disposition and basis. REQUIRED_REPAIR requires a supplied AC, authenticated prior finding or established safety invariant PRIVACY, SECURITY, CONTRACT_INTEGRITY or EXACT_IDENTITY. Only preferences may be OBSERVATION. Reuse prior IDs for REGRESSION/UNRESOLVED; NEW IDs must be disjoint. Late NEW mandatory findings are escalated by the controller, not automatically broadened into repairs. Keep factual REPAIR for code-fixable findings regardless of review count; the controller alone enforces limits. BLOCK is only CONTRACT_CHANGED, HUMAN_DECISION or ENVIRONMENT. Unrun checks remain NOT_RUN." <>
-            writer_instructions(role)
+          "Follow the controller-bound review_scope. COMPREHENSIVE means the entire contract including success, failure, fallback, retry and public entry boundaries. FOCUSED means independently close all supplied obligations, inspect affected execution paths and regressions; carried evidence is historical provenance, never a claim of new inspection. Do not invent a full sweep of unchanged areas. Findings are authored once in review_report.findings: stable unique ID, description, classification, disposition and basis. REQUIRED_REPAIR requires a supplied AC, authenticated prior finding or established safety invariant PRIVACY, SECURITY, CONTRACT_INTEGRITY or EXACT_IDENTITY. Only preferences may be OBSERVATION. Reuse prior IDs for REGRESSION/UNRESOLVED; NEW IDs must be disjoint. Late NEW mandatory findings are escalated by the controller, not automatically broadened into repairs. Keep factual REPAIR for code-fixable findings regardless of review count; the controller alone enforces limits. BLOCK is only CONTRACT_CHANGED, HUMAN_DECISION or ENVIRONMENT. Unrun checks remain NOT_RUN."
       })
     end
   end
@@ -101,12 +101,6 @@ defmodule SymphonyElixir.Factory.ReviewProtocol do
   end
 
   def bind_execution_scope(packet, _run), do: {:ok, packet}
-
-  defp writer_instructions("feature-writer"),
-    do:
-      " For a source writer, COMPLETE means the implementation candidate is ready for controller validation, not that tests or independent acceptance passed. Mark criteria NOT_CHECKED when execution is unavailable and explain the inspected source evidence. File-only writers may mark supplemental affected_path_checks UNAVAILABLE with evidence when commands cannot run; mandatory source boundary_sweeps still require CHECKED unless authenticated historical coverage applies. Use CONTINUE only when source implementation remains unfinished, not solely because formatting, generation, CI or independent verification is pending. Writer classifications are observations, not verifier findings or acceptance."
-
-  defp writer_instructions(_role), do: ""
 
   @doc "Projects a rejected current stopped report without adopting it or altering evidence."
   @spec pending_status(Store.connection(), map()) :: map() | nil
@@ -329,6 +323,10 @@ defmodule SymphonyElixir.Factory.ReviewProtocol do
   end
 
   @spec validate(map(), map(), map()) :: :ok | {:error, atom()}
+  def validate(%{"role" => "feature-writer"} = packet, binding, output) when not is_map_key(packet, "review_protocol"), do: validate_writer(packet, binding, output)
+
+  def validate(%{"role" => "feature-writer", "review_protocol" => %{"version" => version}} = packet, binding, output) when version in [1, 2], do: validate_writer(packet, binding, output)
+
   def validate(%{"review_protocol" => %{"version" => 2}} = packet, binding, output), do: ReviewReport.validate(packet, binding, output, schema(packet, legacy_schema(packet["role"])))
 
   def validate(%{"review_protocol" => %{"version" => 1} = protocol} = packet, binding, output) do
@@ -358,19 +356,38 @@ defmodule SymphonyElixir.Factory.ReviewProtocol do
     if binding["schema"] == legacy, do: StageSchemas.validate(output, legacy), else: {:error, :review_protocol_schema_changed}
   end
 
+  defp validate_writer(packet, binding, output) do
+    operational = schema(Map.delete(packet, "review_protocol"), legacy_schema("feature-writer"))
+
+    if binding["schema"] == schema(packet, legacy_schema("feature-writer")) do
+      with :ok <- StageSchemas.validate(output, binding["schema"]),
+           :ok <- StageSchemas.validate(operational_result("feature-writer", output), operational),
+           true <- output["status"] != "COMPLETE" or output["blockers"] == [] do
+        :ok
+      else
+        _ -> {:error, :worker_operational_result_invalid}
+      end
+    else
+      {:error, :review_protocol_schema_changed}
+    end
+  end
+
+  @doc "Projects writer progress without changing its immutable admitted output or interpreting advisory acceptance claims."
+  @spec operational_result(String.t(), map()) :: map()
+  def operational_result("feature-writer", output), do: Map.delete(output, @report)
+  def operational_result(_role, output), do: output
+
   @spec validate_result(Store.connection(), map(), map(), map()) :: :ok | {:error, atom()}
   def validate_result(store, task, binding, output) do
     with {:ok, packet} <- bound_context(store, task, binding),
          :ok <- exact_input(packet, task, binding),
          :ok <- validate_scope_history(store, packet) do
-      case validate(packet, binding, output) do
-        :ok -> :ok
-        error -> validate_correction(store, packet, task, binding, output, error)
-      end
+      result = validate(packet, binding, output)
+      if packet["role"] == "feature-writer" or result == :ok, do: result, else: validate_correction(store, packet, task, binding, output, result)
     end
   end
 
-  defp validate_scope_history(store, %{"review_protocol" => %{"version" => 2, "review_scope" => scope}} = packet) do
+  defp validate_scope_history(store, %{"role" => "change-verifier", "review_protocol" => %{"version" => 2, "review_scope" => scope}} = packet) do
     proven =
       Enum.all?(scope["carried_evidence"], fn origin ->
         with row when is_map(row) <- Store.one!(store, "SELECT * FROM worker_evidence WHERE request_key=? AND run_id=? AND status='CONSUMED'", [origin["request_key"], packet["run_id"]]),
@@ -745,21 +762,6 @@ defmodule SymphonyElixir.Factory.ReviewProtocol do
 
     Enum.sort(classified) == Enum.sort(findings) and length(classified) == length(Enum.uniq(classified)) and Enum.all?(findings, &(String.trim(&1) != "")) and
       verifier_verdict?(output["status"], findings, report)
-  end
-
-  defp consistent_result?("feature-writer", output, report) do
-    valid_writer_classifications?(report["finding_classifications"]) and
-      (output["status"] != "COMPLETE" or (output["blockers"] == [] and writer_coverage?(report)))
-  end
-
-  defp valid_writer_classifications?(rows) do
-    findings = Enum.map(rows, & &1["finding"])
-    length(findings) == length(Enum.uniq(findings)) and Enum.all?(findings, &(String.trim(&1) != ""))
-  end
-
-  defp writer_coverage?(report) do
-    Enum.all?(report["criteria"], &(&1["status"] in ~w(PASS NOT_CHECKED))) and not unresolved_closure?(report) and
-      checked?(report) and report["block_reason"] == "NONE"
   end
 
   defp verifier_verdict?("PASS", findings, report), do: findings == [] and complete_coverage?(report)

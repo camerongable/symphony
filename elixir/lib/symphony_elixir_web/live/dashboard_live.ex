@@ -1263,6 +1263,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
       "WAITING" -> "No current worker turn recorded"
       "STOPPED" -> "Stopped / result recorded"
       "STARTING" -> "Worker admission recorded"
+      "TURN_BOUND" -> "Worker turn recorded; live activity not measured"
       "RECONCILE_REQUIRED" -> "Outcome needs reconciliation"
       "NOT_APPLICABLE" -> "No source-worker activity implied"
       _other -> "Worker activity unconfirmed"

@@ -235,6 +235,7 @@ defmodule SymphonyElixir.Factory.Observability do
   defp worker_status(_, %{"execution_mode" => mode}, _, _, _, _, _) when mode != "TICKET_SUPERVISOR_V1", do: "NOT_APPLICABLE"
   defp worker_status(_, _, nil, _, _, _, _), do: "NOT_APPLICABLE"
   defp worker_status(_, _, _, nil, _, _, _), do: "WAITING"
+  defp worker_status(_, _, _, %{"status" => "COMPLETE"}, %{"status" => "RESULT_RECORDED"}, _, _), do: "STOPPED"
   defp worker_status(_, _, _, %{"status" => status}, _, _, _) when status in ~w(COMPLETE CONSUMED), do: "WAITING"
   defp worker_status(_, _, _, _, %{"status" => "CONSUMED"}, _, _), do: "WAITING"
   defp worker_status(_, _, _, _, nil, _, _), do: "UNKNOWN"
@@ -587,16 +588,21 @@ defmodule SymphonyElixir.Factory.Observability do
   end
 
   defp mr_preclaim_attention(store, run) do
-    rows = Store.query!(store, """
-    SELECT request.* FROM desktop_requests AS request
-    WHERE request.target_kind='CONTROLLER' AND request.status='PENDING'
-      AND request.claimed_at IS NULL
-      AND json_extract(CASE WHEN json_valid(request.metadata_json) THEN request.metadata_json ELSE '{}' END, '$.delivery_operation.run_id')=?
-      AND NOT EXISTS (SELECT 1 FROM ticket_mr_claims AS claim WHERE claim.request_key=request.request_key)
-      AND NOT EXISTS (SELECT 1 FROM desktop_requests AS newer WHERE newer.target_kind=request.target_kind AND newer.target_key=request.target_key
-        AND (newer.created_at>request.created_at OR (newer.created_at=request.created_at AND newer.rowid>request.rowid)))
-    ORDER BY request.created_at DESC LIMIT 10
-    """, [run["run_id"]])
+    rows =
+      Store.query!(
+        store,
+        """
+        SELECT request.* FROM desktop_requests AS request
+        WHERE request.target_kind='CONTROLLER' AND request.status='PENDING'
+          AND request.claimed_at IS NULL
+          AND json_extract(CASE WHEN json_valid(request.metadata_json) THEN request.metadata_json ELSE '{}' END, '$.delivery_operation.run_id')=?
+          AND NOT EXISTS (SELECT 1 FROM ticket_mr_claims AS claim WHERE claim.request_key=request.request_key)
+          AND NOT EXISTS (SELECT 1 FROM desktop_requests AS newer WHERE newer.target_kind=request.target_kind AND newer.target_key=request.target_key
+            AND (newer.created_at>request.created_at OR (newer.created_at=request.created_at AND newer.rowid>request.rowid)))
+        ORDER BY request.created_at DESC LIMIT 10
+        """,
+        [run["run_id"]]
+      )
 
     Enum.flat_map(rows.rows, fn row ->
       request = Map.new(Enum.zip(rows.columns, row))
@@ -604,21 +610,34 @@ defmodule SymphonyElixir.Factory.Observability do
 
       if current_binding?(binding, run) and DesktopRequest.payload_intact?(request) and
            SymphonyElixir.Factory.TicketMrOperation.typed_request?(request) do
-        event = Store.one!(store, """
-        SELECT occurred_at,payload_json FROM events WHERE run_id=? AND event_type='MR_OWNER_PRECLAIM_FAILED'
-          AND json_extract(CASE WHEN json_valid(payload_json) THEN payload_json ELSE '{}' END,'$.request_key')=?
-          AND json_extract(CASE WHEN json_valid(payload_json) THEN payload_json ELSE '{}' END,'$.payload_sha256')=?
-        ORDER BY id DESC LIMIT 1
-        """, [run["run_id"], request["request_key"], request["payload_sha256"]])
+        event =
+          Store.one!(
+            store,
+            """
+            SELECT occurred_at,payload_json FROM events WHERE run_id=? AND event_type='MR_OWNER_PRECLAIM_FAILED'
+              AND json_extract(CASE WHEN json_valid(payload_json) THEN payload_json ELSE '{}' END,'$.request_key')=?
+              AND json_extract(CASE WHEN json_valid(payload_json) THEN payload_json ELSE '{}' END,'$.payload_sha256')=?
+            ORDER BY id DESC LIMIT 1
+            """,
+            [run["run_id"], request["request_key"], request["payload_sha256"]]
+          )
+
         evidence = decode_map(event && event["payload_json"])
         fields = ~w(run_id candidate_sha spec_revision contract_sha256)
         valid_reason = {evidence["phase"], evidence["reason_code"]} in [{"READER", "MR_READER_PROTOCOL_REJECTED"}, {"READER", "MR_READER_EXITED"}, {"EXPIRED", "MR_ADMISSION_EXPIRED"}]
 
         if evidence["version"] == 1 and evidence["action"] in ~w(claim correct) and valid_reason and
              Map.take(evidence, fields) == Map.take(run, fields) and evidence["stage"] == run["state"] do
-          [notice("BROKER", "MR_PRECLAIM_FAILED", request["request_key"],
-            "The factory could not prepare the existing MR handoff. No MR operation was claimed; this is not a request for human code review.",
-            event["occurred_at"], "Reconcile the factory reader and retry admission of the existing request; do not resend or create a replacement.")]
+          [
+            notice(
+              "BROKER",
+              "MR_PRECLAIM_FAILED",
+              request["request_key"],
+              "The factory could not prepare the existing MR handoff. No MR operation was claimed; this is not a request for human code review.",
+              event["occurred_at"],
+              "Reconcile the factory reader and retry admission of the existing request; do not resend or create a replacement."
+            )
+          ]
         else
           []
         end

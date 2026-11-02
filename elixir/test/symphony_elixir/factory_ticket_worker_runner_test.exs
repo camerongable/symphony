@@ -5,7 +5,6 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
   alias SymphonyElixir.Factory.{
     Contract,
     ControlServer,
-    Observability,
     ReviewProtocol,
     RunLedger,
     Scheduler,
@@ -126,6 +125,17 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
 
     {:ok, _} = TicketWorkerRunner.bind_base(ctx.store, "run", ctx.sha)
     {:ok, prompt} = TicketWorkerRunner.packet(ctx.store, "run", role, ctx.sha)
+
+    prompt =
+      if ctx[:retained_writer] do
+        base = Jason.decode!(prompt) |> Map.drop(~w(shared_instructions instruction_delivery instruction_snapshot_sha256 instruction_binding_sha256))
+        base = ReviewProtocol.attach(Map.put(base, "role", "change-verifier"), []) |> Map.put("role", role)
+        {:ok, instructions} = WorkerInstructions.admit(ctx.store, base, role, Path.join(System.user_home!(), ".agents"))
+        Jason.encode!(Map.merge(base, instructions))
+      else
+        prompt
+      end
+
     sha = :crypto.hash(:sha256, prompt) |> Base.encode16(case: :lower)
     {:ok, _} = TaskLedger.update(ctx.store, "writer", %{role: role, prompt_sha256: sha})
 
@@ -312,73 +322,80 @@ defmodule SymphonyElixir.FactoryTicketWorkerRunnerTest do
     assert Jason.decode!(evidence["binding_json"])["native_runtime"] === origin
   end
 
-  @tag structured_writer: true
+  @tag structured_review: true
   @tag writer_adoption_boundary: true
-  test "stopped rejected reports are visible read-only and disappear after consumption or generation drift", ctx do
-    {prompt, options} = prepare(ctx)
+  test "stopped verifier coverage rejection remains visible read-only without restarting work", ctx do
+    key = "run:change-verifier:0"
+    {:ok, _} = TaskLedger.update(ctx.store, "writer", %{status: "CONSUMED"})
+    ctx = Map.put(ctx, :verifier_task_key, key)
+    {prompt, options, candidate} = prepare_verifier(ctx)
     packet = Jason.decode!(prompt)
-    report = %{"version" => 2, "candidate_sha" => ctx.sha, "block_reason" => "NONE", "criteria" => [], "closures" => [], "boundary_sweeps" => [], "findings" => [], "affected_path_checks" => []}
-    output = %{"status" => "CONTINUE", "changed_paths" => [], "commit_message" => nil, "blockers" => [], "checks" => [], "review_report" => report}
+    report = %{"version" => 2, "candidate_sha" => candidate, "block_reason" => "NONE", "criteria" => [], "closures" => [], "boundary_sweeps" => [], "findings" => [], "affected_path_checks" => []}
+    output = %{"status" => "PASS", "candidate_sha" => candidate, "checks" => [], "review_report" => report}
     Process.put(:worker_output, output)
-    schema = ReviewProtocol.schema(packet, StageSchemas.for_stage(:native_feature_writer))
+    schema = ReviewProtocol.schema(packet, StageSchemas.for_stage(:change_verifier))
     assert {:ok, _} = TicketWorkerRunner.run(ctx.path, issue(), prompt, schema, options)
-    {:ok, pending} = WorkerEvidence.get(ctx.store, "reservation:request")
-    {:ok, _} = TaskLedger.update(ctx.store, "writer", Map.merge(Map.take(pending, ~w(output_json thread_id turn_id)), %{"status" => "COMPLETE"}))
+    {:ok, pending} = WorkerEvidence.get(ctx.store, options[:request_key])
+    {:ok, _} = TaskLedger.update(ctx.store, key, Map.merge(Map.take(pending, ~w(output_json thread_id turn_id)), %{"status" => "COMPLETE"}))
     {:ok, run} = RunLedger.get(ctx.store, "run")
-    before = Store.query!(ctx.store, "SELECT id FROM events ORDER BY id").rows
-    assert %{reason: "review_report_criteria_incomplete", request_key: "reservation:request"} = ReviewProtocol.pending_status(ctx.store, run)
-    assert %{reason: "review_report_criteria_incomplete"} = ReviewProtocol.pending_status(ctx.store, run)
-    assert Store.query!(ctx.store, "SELECT id FROM events ORDER BY id").rows == before
-
-    factory = %{enabled: true, scope: "fixture", dispatcher_id: "fixture", lease_seconds: 240, repositories: %{}}
-    factory = Map.merge(factory, %{maximum_specifiers: 2, maximum_validators: 2})
-    factory = Map.merge(factory, %{maximum_writers: 2, writer_disk_gb: 20})
-    server = start_supervised!({ControlServer, [store: ctx.store, factory: factory, name: nil]})
-    snapshot = Observability.snapshot(settings: %{factory: factory}, store: ctx.store, control_server: server)
-    assert [%{attention: %{source: "WORKER_RESULT", phase: "REPORT_REJECTED", next_action: action}}] = snapshot.current_runs
-    assert action =~ "Factory intervention"
-    assert action =~ "Do not restart"
-
-    assert {:ok, _} = TicketWorkerRunner.bind_base(ctx.store, "run", ctx.sha)
-    {:ok, _} = RunLedger.update(ctx.store, "run", %{candidate_sha: nil})
-    {:ok, initial} = RunLedger.get(ctx.store, "run")
-    assert %{reason: "review_report_criteria_incomplete"} = ReviewProtocol.pending_status(ctx.store, initial)
-    initial_snapshot = Observability.snapshot(settings: %{factory: factory}, store: ctx.store, control_server: server)
-    assert [%{attention: %{phase: "REPORT_REJECTED"}}] = initial_snapshot.current_runs
-    assert initial_snapshot.overview.needs_attention == 1
     protected = Map.new(~w(runs factory_tasks worker_evidence controller_checks), &{&1, Store.query!(ctx.store, "SELECT * FROM #{&1} ORDER BY 1").rows})
+
     for _ <- 1..2 do
+      assert %{reason: "review_report_criteria_incomplete"} = ReviewProtocol.pending_status(ctx.store, run)
       assert {:ok, %{status: "REPORT_REJECTED", reason: "review_report_criteria_incomplete", model_invoked: false}} = Scheduler.ticket_step(%{store: ctx.store, factory: %{}}, "run")
     end
+
     for {table, rows} <- protected, do: assert(Store.query!(ctx.store, "SELECT * FROM #{table} ORDER BY 1").rows == rows)
-    assert {:ok, _} = RunLedger.update(ctx.store, "run", %{candidate_sha: ctx.sha})
-
-    Store.query!(ctx.store, "UPDATE worker_evidence SET status='CONSUMED' WHERE request_key='reservation:request'")
-    assert is_nil(ReviewProtocol.pending_status(ctx.store, run))
-    Store.query!(ctx.store, "UPDATE worker_evidence SET status='RESULT_RECORDED',binding_sha256='corrupt' WHERE request_key='reservation:request'")
-    assert is_nil(ReviewProtocol.pending_status(ctx.store, run))
-    Store.query!(ctx.store, "UPDATE worker_evidence SET binding_sha256=? WHERE request_key='reservation:request'", [pending["binding_sha256"]])
     assert is_nil(ReviewProtocol.pending_status(ctx.store, Map.put(run, "candidate_sha", String.duplicate("0", 40))))
-    assert is_nil(ReviewProtocol.pending_status(ctx.store, Map.put(run, "contract_sha256", String.duplicate("0", 64))))
-    assert is_nil(ReviewProtocol.pending_status(ctx.store, Map.put(run, "state", "VERIFYING")))
-    assert is_nil(ReviewProtocol.pending_status(ctx.store, Map.update!(run, "verifier_round", &(&1 + 1))))
-    assert is_nil(ReviewProtocol.pending_status(ctx.store, Map.update!(run, "implementation_iteration", &(&1 + 1))))
-    assert %{reason: "review_report_criteria_incomplete"} = ReviewProtocol.pending_status(ctx.store, run)
-    Store.query!(ctx.store, "UPDATE factory_tasks SET turn_id='different-turn' WHERE task_key='writer'")
+    assert is_nil(ReviewProtocol.pending_status(ctx.store, Map.put(run, "state", "WRITING")))
+    Store.query!(ctx.store, "UPDATE worker_evidence SET status='CONSUMED' WHERE request_key=?", [options[:request_key]])
     assert is_nil(ReviewProtocol.pending_status(ctx.store, run))
-    Store.query!(ctx.store, "UPDATE factory_tasks SET turn_id=? WHERE task_key='writer'", [pending["turn_id"]])
+  end
 
-    Store.query!(
-      ctx.store,
-      "INSERT INTO workspace_access(reservation_key,run_id,task_key,request_key,mode,generation,canonical_path,git_dir,common_dir,binding_json,acquired_at) VALUES('newer-reservation','run','writer','newer-attempt','SOURCE',2,'/fixture/newer','/fixture/newer/.git','/fixture/common','{}','2026-10-25T20:00:00Z')"
-    )
+  @tag structured_writer: true, retained_writer: true, writer_adoption_boundary: true
+  test "retained writer surplus closure adopts after reopening without rewriting raw evidence", ctx do
+    {prompt, options} = prepare(ctx)
+    packet = Jason.decode!(prompt)
 
-    Store.query!(
-      ctx.store,
-      "INSERT INTO worker_evidence(request_key,task_key,run_id,reservation_key,binding_json,binding_sha256,status,owner_id,created_at) VALUES('newer-attempt','writer','run','newer-reservation','{}','none','RESERVED','fixture','2026-10-25T20:00:00Z')"
-    )
+    report = %{
+      "version" => 2,
+      "candidate_sha" => ctx.sha,
+      "block_reason" => "NONE",
+      "criteria" => [],
+      "closures" => [%{"id" => "PPL-10240-W1", "status" => "ADDRESSED", "evidence" => ["Inspected source increment"]}],
+      "boundary_sweeps" => [],
+      "findings" => [],
+      "affected_path_checks" => []
+    }
 
-    assert is_nil(ReviewProtocol.pending_status(ctx.store, run))
+    assert packet["review_protocol"]["finding_obligations"] == []
+    output = %{"status" => "CONTINUE", "changed_paths" => ["fixture.txt"], "commit_message" => "fix(PPL-123): save source increment", "blockers" => [], "checks" => [], "review_report" => report}
+    Process.put(:worker_output, output)
+    :persistent_term.put(ContinuationWorkerServer, %{output: output})
+    on_exit(fn -> :persistent_term.erase(ContinuationWorkerServer) end)
+    options = Keyword.put(options, :app_server, ContinuationWorkerServer)
+    schema = ReviewProtocol.schema(packet, StageSchemas.for_stage(:native_feature_writer))
+    assert {:ok, _} = TicketWorkerRunner.run(ctx.path, issue(), prompt, schema, options)
+    {:ok, pending} = WorkerEvidence.get(ctx.store, options[:request_key])
+    {:ok, _} = TaskLedger.update(ctx.store, "writer", Map.merge(Map.take(pending, ~w(output_json thread_id turn_id)), %{"status" => "COMPLETE"}))
+    {:ok, reopened} = Store.start_link(database: ctx.database)
+
+    try do
+      {:ok, run} = RunLedger.get(reopened, "run")
+      assert is_nil(ReviewProtocol.pending_status(reopened, run))
+      assert {:ok, adopted} = TicketWorkerRunner.adoption(reopened, options[:request_key])
+      assert adopted.output == Map.delete(output, "review_report")
+      assert {:ok, _} = TicketWorkerRunner.adoption(reopened, options[:request_key])
+      assert git(ctx.path, ["rev-list", "--count", ctx.sha <> "..HEAD"]) |> String.trim() == "1"
+      {:ok, retained} = WorkerEvidence.get(reopened, options[:request_key])
+
+      assert Map.take(retained, ~w(output_json output_sha256 binding_json binding_sha256 thread_id turn_id)) ==
+               Map.take(pending, ~w(output_json output_sha256 binding_json binding_sha256 thread_id turn_id))
+    after
+      GenServer.stop(reopened)
+    end
+
+    refute_receive {:factory_task_started, _, _}
   end
 
   defp prepare_verifier(ctx, candidate \\ nil) do

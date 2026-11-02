@@ -34,6 +34,35 @@ defmodule SymphonyElixir.FactoryReviewProtocolTest do
   defp binding(packet), do: %{"expected_sha" => "candidate", "schema" => ReviewProtocol.schema(packet, StageSchemas.for_stage(:change_verifier))}
   defp prior(id \\ "finding", admitted \\ true), do: %{"status" => "REPAIR", "finding_entries" => [%{"id" => id, "finding" => "Prior privacy finding"}], "repair_admitted" => admitted}
 
+  test "fresh writers use operational results and retain repair feedback as context" do
+    source = Map.drop(packet(), ["review_protocol"]) |> Map.put("role", "feature-writer") |> Map.put("repair_findings", "Repair the supplied finding")
+    writer = ReviewProtocol.attach(source, [prior()])
+    assert writer == source
+    schema = ReviewProtocol.schema(writer, StageSchemas.for_stage(:native_feature_writer))
+    refute Map.has_key?(schema["properties"], "review_report")
+    result = %{"status" => "CONTINUE", "changed_paths" => ["handler.go"], "commit_message" => "fix: bounded increment", "blockers" => [], "checks" => []}
+    assert :ok = ReviewProtocol.validate(writer, %{"schema" => schema}, result)
+
+    for invalid <- [
+          Map.delete(result, "changed_paths"),
+          Map.put(result, "status", "PASS"),
+          Map.put(result, "changed_paths", "handler.go"),
+          Map.merge(result, %{"status" => "COMPLETE", "blockers" => ["Needs a decision"]})
+        ] do
+      assert {:error, :worker_operational_result_invalid} = ReviewProtocol.validate(writer, %{"schema" => schema}, invalid)
+    end
+  end
+
+  test "retained writer transport accepts surplus advisory closures without accepting verifier claims" do
+    writer = ReviewProtocol.attach(Map.drop(packet(), ["review_protocol"]), []) |> Map.put("role", "feature-writer")
+    report = typed_result(writer, [], "PASS")["review_report"] |> Map.put("closures", [%{"id" => "PPL-10240-W1", "status" => "ADDRESSED", "evidence" => ["Source increment inspected"]}])
+    result = %{"status" => "CONTINUE", "changed_paths" => ["handler.go"], "commit_message" => "fix: bounded increment", "blockers" => [], "checks" => [], "review_report" => report}
+    bound = %{"expected_sha" => "candidate", "schema" => ReviewProtocol.schema(writer, StageSchemas.for_stage(:native_feature_writer))}
+    assert :ok = StageSchemas.validate(result, bound["schema"])
+    assert :ok = ReviewProtocol.validate(writer, bound, result)
+    assert {:error, _} = ReviewProtocol.validate(writer, bound, Map.put(result, "status", "PASS"))
+  end
+
   test "typed findings have one authoritative description and observations do not block PASS" do
     packet = ReviewProtocol.attach(Map.drop(packet(), ["review_protocol"]), [])
     assert packet["review_protocol"]["version"] == 2
@@ -118,7 +147,7 @@ defmodule SymphonyElixir.FactoryReviewProtocolTest do
       "criteria" => [%{"id" => "AC-1", "status" => "PASS", "evidence" => ["prior verified behavior"]}, %{"id" => "AC-2", "status" => "FAIL", "evidence" => ["prior defect"]}]
     }
 
-    writer = ReviewProtocol.attach(Map.drop(packet(), ["review_protocol"]) |> Map.put("role", "feature-writer"), [history])
+    writer = ReviewProtocol.attach(Map.drop(packet(), ["review_protocol"]), [history]) |> Map.put("role", "feature-writer")
     report = typed_result(writer, [], "PASS")["review_report"]
     report = put_in(report, ["criteria", Access.at(0), "status"], "NOT_CHECKED")
     report = put_in(report, ["boundary_sweeps", Access.at(0)], %{"id" => "AC-1", "status" => "UNAVAILABLE", "evidence" => ["Unchanged area; historical verification only"], "paths" => []})
@@ -150,12 +179,8 @@ defmodule SymphonyElixir.FactoryReviewProtocolTest do
     assert :ok = ReviewProtocol.validate(writer, binding, result)
     assert get_in(result, ["review_report", "affected_path_checks", Access.at(1), "status"]) == "UNAVAILABLE"
 
-    for changed <- [Map.delete(binding, "policy"), put_in(binding, ["policy", "mode"], "REVIEW"), put_in(binding, ["policy", "file_tools_sha256"], "foreign")] do
-      assert {:error, :review_report_verdict_contradiction} = ReviewProtocol.validate(writer, changed, result)
-    end
-
     unchecked_source = put_in(result, ["review_report", "boundary_sweeps", Access.at(1), "status"], "UNAVAILABLE")
-    assert {:error, :review_report_verdict_contradiction} = ReviewProtocol.validate(writer, binding, unchecked_source)
+    assert :ok = ReviewProtocol.validate(writer, binding, unchecked_source)
     verifier = Map.put(writer, "role", "change-verifier")
     verifier_result = result |> Map.take(~w(checks review_report)) |> Map.merge(%{"status" => "PASS", "candidate_sha" => "candidate"})
     assert {:error, _} = ReviewProtocol.validate(verifier, binding(verifier), verifier_result)
@@ -173,7 +198,7 @@ defmodule SymphonyElixir.FactoryReviewProtocolTest do
              ReviewProtocol.validate(verifier, binding(verifier), put_in(result, ["review_report", "affected_path_checks", Access.at(0), "status"], "UNAVAILABLE"))
   end
 
-  test "writer readiness cannot invent current checks, historical passes or acceptance" do
+  test "retained writer advisory semantics do not establish acceptance or block operational progress" do
     {writer, binding, result} = focused_writer()
 
     mutations = [
@@ -191,7 +216,7 @@ defmodule SymphonyElixir.FactoryReviewProtocolTest do
     ]
 
     for {name, changed} <- mutations do
-      assert {:error, _} = ReviewProtocol.validate(writer, binding, changed), name
+      assert :ok = ReviewProtocol.validate(writer, binding, changed), name
     end
 
     for changed <-
@@ -204,11 +229,11 @@ defmodule SymphonyElixir.FactoryReviewProtocolTest do
             put_in(writer, ["review_protocol", "review_scope", "carried_evidence", Access.at(0), "criteria"], []),
             update_in(writer, ["review_protocol", "review_scope", "carried_evidence"], &(&1 ++ [put_in(hd(&1), ["criteria", Access.at(0), "status"], "FAIL")]))
           ] ++ Enum.map(~w(request_key output_sha256 candidate_sha), &put_in(writer, ["review_protocol", "review_scope", "carried_evidence", Access.at(0), &1], "")) do
-      assert {:error, _} = ReviewProtocol.validate(changed, binding, result)
+      assert :ok = ReviewProtocol.validate(changed, binding, result)
     end
 
     bound = put_in(writer, ["review_protocol", "review_scope", "affected_paths"], [])
-    assert {:error, _} = ReviewProtocol.validate(bound, binding, result)
+    assert :ok = ReviewProtocol.validate(bound, binding, result)
     assert {:error, :review_protocol_schema_changed} = ReviewProtocol.validate(writer, Map.put(binding, "schema", %{}), result)
 
     verifier = Map.put(writer, "role", "change-verifier")
@@ -486,6 +511,11 @@ defmodule SymphonyElixir.FactoryReviewProtocolTest do
     schema = ReviewProtocol.schema(writer, StageSchemas.for_stage(:native_feature_writer))
     result = %{"status" => "COMPLETE", "changed_paths" => [], "commit_message" => nil, "blockers" => [], "checks" => [], "review_report" => output(packet)["review_report"]}
     assert :ok = ReviewProtocol.validate(writer, %{"schema" => schema, "expected_sha" => "candidate"}, result)
+
+    for protocol <- [Map.put(writer["review_protocol"], "version", 99), %{}, "unsupported"] do
+      assert {:error, :review_protocol_unsupported} = ReviewProtocol.validate(Map.put(writer, "review_protocol", protocol), %{"schema" => schema}, result)
+    end
+
     assert {:error, _} = ReviewProtocol.validate(packet, binding(packet), result)
   end
 
@@ -508,11 +538,11 @@ defmodule SymphonyElixir.FactoryReviewProtocolTest do
     assert :ok = ReviewProtocol.validate(writer, binding, result)
     assert :ok = ReviewProtocol.validate(writer, binding, Map.put(result, "status", "COMPLETE"))
     failed = put_in(result, ["review_report", "criteria", Access.at(0), "status"], "FAIL")
-    assert {:error, _} = ReviewProtocol.validate(writer, binding, Map.put(failed, "status", "COMPLETE"))
+    assert :ok = ReviewProtocol.validate(writer, binding, Map.put(failed, "status", "COMPLETE"))
     assert {:error, _} = ReviewProtocol.validate(packet(), binding(packet()), result)
 
     for classifications <- [[%{"finding" => " ", "classification" => "NEW"}], report["finding_classifications"] ++ report["finding_classifications"]] do
-      assert {:error, _} = ReviewProtocol.validate(writer, binding, put_in(result, ["review_report", "finding_classifications"], classifications))
+      assert :ok = ReviewProtocol.validate(writer, binding, put_in(result, ["review_report", "finding_classifications"], classifications))
     end
   end
 end

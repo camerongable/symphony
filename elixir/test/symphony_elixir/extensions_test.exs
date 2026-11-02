@@ -881,6 +881,8 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert has_element?(view, "[data-ticket-record='OWNER-REVIEW'] .responsibility", "Human review")
     assert has_element?(view, "[data-ticket-record='OWNER-QUESTION'] .responsibility", "Human decision")
     assert has_element?(view, "[data-ticket-record='OWNER-FACTORY'] .responsibility", "Factory · recorded observation, not a current heartbeat")
+    assert has_element?(view, "[data-ticket-record='OWNER-STRING']", "Worker turn recorded; live activity not measured")
+    refute has_element?(view, "[data-ticket-record='OWNER-STRING']", "Worker activity unconfirmed")
 
     for key <- ~w(OWNER-NO-MR OWNER-STALE OWNER-WRONG-STAGE OWNER-STRING OWNER-PROSE) do
       assert has_element?(view, "[data-ticket-record='#{key}'] .responsibility", "Action owner not recorded")

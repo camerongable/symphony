@@ -575,7 +575,7 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
          {:ok, binding} <- Jason.decode(evidence["binding_json"]),
          :ok <- ReviewProtocol.validate_result(store, task, binding, output),
          {:ok, task} <- WorkerEvidence.adopt_completed(store, key) do
-      {:ok, %{run: run, task: task, evidence: evidence, output: output}}
+      {:ok, %{run: run, task: task, evidence: evidence, output: ReviewProtocol.operational_result(task["role"], output)}}
     end
   end
 
@@ -809,6 +809,8 @@ defmodule SymphonyElixir.Factory.TicketWorkerRunner do
               "plan" => run["plan_markdown"],
               "repair_findings" => run["repair_findings_json"],
               "output_rules" => %{
+                "progress" =>
+                  "CONTINUE saves a coherent unfinished source increment for the same writer. COMPLETE requests controller validation and independent review, never acceptance. Pending formatting, tests or CI alone do not make source implementation unfinished. Prior verifier feedback is repair context, not a writer acceptance report.",
                 "changed_slice" => "For CONTINUE or COMPLETE with changed_paths, commit_message must be a nonempty conventional message for the controller; never null.",
                 "commit_message" => "One line, at most 120 UTF-8 bytes, formatted as feat(#{run["issue_key"]}): short summary (or fix, chore, refactor, test, docs, perf).",
                 "no_edit_completion" => "For no-edit completion, use COMPLETE, changed_paths [], and commit_message null; preserve the existing candidate.",

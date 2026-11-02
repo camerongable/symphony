@@ -1481,12 +1481,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
       transform = fn
         %{payload: %{"method" => "item/completed", "params" => %{"item" => %{"type" => "agentMessage", "text" => raw}}}} = message when role == "feature-writer" ->
           output = raw |> Jason.decode!() |> Map.put("status", "COMPLETE")
-          output = update_in(output, ["review_report", "criteria"], &Enum.map(&1, fn row -> Map.put(row, "status", "NOT_CHECKED") end))
-
-          output =
-            put_in(output, ["review_report", "affected_path_checks"], [
-              %{"id" => "executable-validation", "status" => "UNAVAILABLE", "evidence" => ["File-only source worker; controller checks pending"]}
-            ])
+          output = Map.put(output, "checks", ["NOT_RUN: file-only source worker; controller checks pending"])
 
           callback.(put_in(message, [:payload, "params", "item", "text"], Jason.encode!(output)))
 
@@ -1586,6 +1581,76 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     assert Store.one!(ctx.store, "SELECT COUNT(*) AS count FROM desktop_requests WHERE target_kind = 'TASK'")["count"] == 0
     assert Store.one!(ctx.store, "SELECT COUNT(*) AS count FROM workspace_access WHERE released_at IS NULL")["count"] == 0
     assert Store.one!(ctx.store, "SELECT COUNT(*) AS count FROM worker_evidence WHERE status = 'CONSUMED'")["count"] == 4
+    assert {:ok, %{"status" => "CONSUMED", "thread_id" => writer_thread}} = TaskLedger.get(ctx.store, "run:feature-writer")
+    assert Store.query!(ctx.store, "SELECT DISTINCT thread_id FROM worker_evidence WHERE task_key = 'run:feature-writer'").rows == [[writer_thread]]
+    refute_receive {:factory_task_started, _, _}
+  end
+
+  defmodule AdvisoryWorkerServer do
+    alias SymphonyElixir.DesktopTicketLifecycleFixture.WorkerServer
+    defdelegate start_session(workspace, options), to: WorkerServer
+    defdelegate stop_session(session), to: WorkerServer
+
+    def run_turn(session, prompt, issue, options) do
+      callback = options[:on_message]
+
+      transform = fn
+        %{payload: %{"method" => "item/completed", "params" => %{"item" => %{"type" => "agentMessage", "text" => raw}}}} = message ->
+          output = Jason.decode!(raw)
+
+          output =
+            if output["status"] == "CONTINUE" and is_map(output["review_report"]) do
+              put_in(output, ["review_report", "closures"], [%{"id" => "PPL-10240-W1", "status" => "ADDRESSED", "evidence" => ["Synthetic source increment"]}])
+            else
+              output
+            end
+
+          callback.(put_in(message, [:payload, "params", "item", "text"], Jason.encode!(output)))
+
+        message ->
+          callback.(message)
+      end
+
+      WorkerServer.run_turn(session, prompt, issue, Keyword.put(options, :on_message, transform))
+    end
+  end
+
+  @tag structured_review: true, writer_adoption_boundary: true
+  test "retained advisory continuation, resumed writer and blind verifier adopt once across reopen", ctx do
+    {context, options} = controller(ctx)
+    {:ok, _} = RunLedger.update(ctx.store, "run", %{candidate_sha: nil})
+    {:ok, prompt} = TicketWorkerRunner.packet(ctx.store, "run", "feature-writer", ctx.sha)
+    base = Jason.decode!(prompt) |> Map.drop(~w(shared_instructions instruction_delivery instruction_snapshot_sha256 instruction_binding_sha256))
+    retained = SymphonyElixir.Factory.ReviewProtocol.attach(Map.put(base, "role", "change-verifier"), []) |> Map.put("role", "feature-writer")
+    assert {:ok, _} = WorkerInstructions.admit(ctx.store, retained, "feature-writer", Path.join(System.user_home!(), ".agents"))
+    options = Keyword.put(options, :app_server, AdvisoryWorkerServer)
+    request = finish_worker(context, options)
+    {:ok, original} = WorkerEvidence.get(ctx.store, request)
+    assert Jason.decode!(original["output_json"])["review_report"]["closures"] != []
+    assert Jason.decode!(original["binding_json"])["schema"]["properties"]["review_report"]
+    {:ok, reopened} = Store.start_link(database: ctx.database)
+
+    try do
+      context = %{context | store: reopened}
+      assert {:ok, %{status: "ADOPTED", run: first}} = Scheduler.ticket_step(context, "run", options)
+      assert first["state"] == "WRITING" and first["implementation_iteration"] == 1
+      _ = TicketWorkerRunner.adoption(reopened, request)
+      assert git(ctx.path, ["rev-list", "--count", ctx.sha <> "..HEAD"]) |> String.trim() == "1"
+      second = complete_stage(context, options)
+      assert second["state"] == "VERIFYING" and second["implementation_iteration"] == 2
+      verified = complete_stage(context, options)
+      assert verified["state"] == "PUSHING"
+      {:ok, after_adoption} = WorkerEvidence.get(reopened, request)
+      assert Map.take(after_adoption, ~w(output_json output_sha256 binding_json binding_sha256)) == Map.take(original, ~w(output_json output_sha256 binding_json binding_sha256))
+    after
+      GenServer.stop(reopened)
+    end
+
+    assert git(ctx.path, ["rev-list", "--count", ctx.sha <> "..HEAD"]) |> String.trim() == "2"
+    assert Store.query!(ctx.store, "SELECT DISTINCT workspace FROM factory_tasks").rows == [[ctx.path]]
+    assert Store.one!(ctx.store, "SELECT COUNT(*) AS count FROM desktop_requests WHERE target_kind = 'TASK'")["count"] == 0
+    assert Store.one!(ctx.store, "SELECT COUNT(*) AS count FROM workspace_access WHERE released_at IS NULL")["count"] == 0
+    assert Store.one!(ctx.store, "SELECT COUNT(*) AS count FROM worker_evidence WHERE status = 'CONSUMED'")["count"] == 3
     assert {:ok, %{"status" => "CONSUMED", "thread_id" => writer_thread}} = TaskLedger.get(ctx.store, "run:feature-writer")
     assert Store.query!(ctx.store, "SELECT DISTINCT thread_id FROM worker_evidence WHERE task_key = 'run:feature-writer'").rows == [[writer_thread]]
     refute_receive {:factory_task_started, _, _}

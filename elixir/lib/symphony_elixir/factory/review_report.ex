@@ -52,7 +52,7 @@ defmodule SymphonyElixir.Factory.ReviewReport do
   defp basis_schema(_protocol, text), do: object(%{"kind" => enum(~w(ACCEPTANCE_CRITERION SAFETY_INVARIANT PRIOR_FINDING PREFERENCE)), "reference" => text})
 
   @spec validate(map(), map(), map(), map()) :: :ok | {:error, atom()}
-  def validate(packet, binding, output, expected_schema) do
+  def validate(%{"role" => "change-verifier"} = packet, binding, output, expected_schema) do
     protocol = packet["review_protocol"]
     report = output["review_report"]
 
@@ -60,7 +60,7 @@ defmodule SymphonyElixir.Factory.ReviewReport do
          :ok <- check(StageSchemas.validate(output, expected_schema) == :ok, :review_report_schema_invalid),
          :ok <- check(valid_scope?(protocol), :review_report_scope_unproven),
          :ok <-
-           check(report["candidate_sha"] == binding["expected_sha"] and (packet["role"] != "change-verifier" or output["candidate_sha"] == binding["expected_sha"]), :review_report_candidate_changed),
+           check(report["candidate_sha"] == binding["expected_sha"] and output["candidate_sha"] == binding["expected_sha"], :review_report_candidate_changed),
          :ok <- check(exact_ids?(report["criteria"], protocol["review_scope"]["criterion_ids"]), :review_report_criteria_incomplete),
          :ok <- check(exact_ids?(report["closures"], Enum.map(protocol["finding_obligations"], & &1["id"])), :review_report_closures_incomplete),
          :ok <- check(exact_ids?(report["boundary_sweeps"], protocol["review_scope"]["criterion_ids"]), :review_report_boundaries_incomplete),
@@ -72,11 +72,11 @@ defmodule SymphonyElixir.Factory.ReviewReport do
          :ok <-
            check(
              Enum.all?(report["criteria"] ++ report["closures"] ++ report["boundary_sweeps"], &texts?(&1["evidence"])) and
-               Enum.all?(report["boundary_sweeps"], &(texts?(&1["paths"]) or (&1["paths"] == [] and historical_boundary?(packet, output, report, &1)))),
+               Enum.all?(report["boundary_sweeps"], &texts?(&1["paths"])),
              :review_report_evidence_missing
            ),
          :ok <- validate_findings(protocol, report),
-         :ok <- check(verdict?(packet, binding, output, report), :review_report_verdict_contradiction) do
+         :ok <- check(verdict?(output, report), :review_report_verdict_contradiction) do
       :ok
     end
   end
@@ -85,33 +85,8 @@ defmodule SymphonyElixir.Factory.ReviewReport do
     scope = packet["review_protocol"]["review_scope"]
     rows = report["affected_path_checks"]
 
-    if packet["role"] == "feature-writer" and not Map.has_key?(scope, "affected_paths") do
-      Enum.all?(rows, &text?(&1["id"])) and Enum.uniq_by(rows, & &1["id"]) == rows
-    else
-      exact_ids?(rows, Map.get(scope, "affected_paths", []))
-    end
+    exact_ids?(rows, Map.get(scope, "affected_paths", []))
   end
-
-  defp historical_boundary?(%{"role" => "feature-writer"} = packet, %{"status" => "COMPLETE"}, report, %{"status" => "UNAVAILABLE"} = boundary) do
-    scope = packet["review_protocol"]["review_scope"]
-    criterion = Enum.find(report["criteria"], &(&1["id"] == boundary["id"]))
-
-    latest =
-      Enum.reduce(scope["carried_evidence"], nil, fn origin, previous ->
-        case Enum.find(origin["criteria"] || [], &(&1["id"] == boundary["id"])) do
-          nil -> previous
-          row -> {row, origin}
-        end
-      end)
-
-    scope["mode"] == "FOCUSED" and criterion["status"] == "NOT_CHECKED" and texts?(boundary["evidence"]) and
-      case latest do
-        {%{"status" => "PASS"} = row, origin} -> texts?(row["evidence"]) and Enum.all?(~w(request_key output_sha256 candidate_sha), &text?(origin[&1]))
-        _ -> false
-      end
-  end
-
-  defp historical_boundary?(_, _, _, _), do: false
 
   defp valid_scope?(protocol) do
     scope = protocol["review_scope"]
@@ -185,7 +160,7 @@ defmodule SymphonyElixir.Factory.ReviewReport do
   defp basis?(%{"basis" => %{"kind" => "PREFERENCE", "reference" => ref}, "disposition" => "OBSERVATION"}, _protocol, _known), do: text?(ref)
   defp basis?(_, _, _), do: false
 
-  defp verdict?(%{"role" => "change-verifier"}, _binding, output, report) do
+  defp verdict?(output, report) do
     required = findings(output)
     checked = Enum.all?(report["boundary_sweeps"] ++ report["affected_path_checks"], &(&1["status"] == "CHECKED"))
     closed = Enum.all?(report["closures"], &(&1["status"] != "UNRESOLVED"))
@@ -196,25 +171,6 @@ defmodule SymphonyElixir.Factory.ReviewReport do
       "BLOCK" -> required != [] and report["block_reason"] in ~w(CONTRACT_CHANGED HUMAN_DECISION ENVIRONMENT)
     end
   end
-
-  defp verdict?(%{"role" => "feature-writer"} = packet, binding, output, report) do
-    output["status"] != "COMPLETE" or
-      (output["blockers"] == [] and report["block_reason"] == "NONE" and Enum.all?(report["criteria"], &(&1["status"] in ~w(PASS NOT_CHECKED))) and
-         Enum.all?(report["closures"], &(&1["status"] != "UNRESOLVED")) and
-         Enum.all?(report["affected_path_checks"], &writer_supplemental_check?(packet, binding, &1)) and
-         Enum.all?(report["boundary_sweeps"], &(&1["status"] == "CHECKED" or historical_boundary?(packet, output, report, &1))))
-  end
-
-  defp writer_supplemental_check?(_packet, _binding, %{"status" => "CHECKED"}), do: true
-
-  defp writer_supplemental_check?(packet, %{"policy" => %{"mode" => "FILE_SOURCE", "profile" => "symphony_ticket_file_source_v1", "source_access" => "read", "file_tools_sha256" => hash}}, %{
-         "status" => "UNAVAILABLE"
-       }) do
-    not Map.has_key?(packet["review_protocol"]["review_scope"], "affected_paths") and
-      hash == SymphonyElixir.Factory.WorkerFileTools.tool_contract_sha256()
-  end
-
-  defp writer_supplemental_check?(_packet, _binding, _check), do: false
 
   defp exact_ids?(rows, ids), do: Enum.sort(Enum.map(rows, & &1["id"])) == Enum.sort(ids)
   defp text?(value), do: is_binary(value) and String.trim(value) != ""

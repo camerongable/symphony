@@ -124,6 +124,10 @@ defmodule SymphonyElixir.FactoryObservabilityTest do
     assert %{status: "TURN_BOUND", turn_id: "exact-new-turn", thread_id: "exact-thread", running_proven: false} = project.()
     Store.query!(context.store, "UPDATE worker_evidence SET owner_stopped_at='2026-10-20T20:59:30Z' WHERE task_key=?", [key])
     assert project.().status == "STOPPED"
+    Store.query!(context.store, "UPDATE factory_tasks SET status='COMPLETE' WHERE task_key=?", [key])
+    Store.query!(context.store, "UPDATE worker_evidence SET status='RESULT_RECORDED' WHERE task_key=?", [key])
+    assert %{status: "STOPPED", running_proven: false} = project.()
+    Store.query!(context.store, "UPDATE factory_tasks SET status='RUNNING' WHERE task_key=?", [key])
     Store.query!(context.store, "UPDATE worker_evidence SET status='RECONCILE_REQUIRED' WHERE task_key=?", [key])
     assert project.().status == "RECONCILE_REQUIRED"
     Store.query!(context.store, "UPDATE worker_evidence SET status='CONSUMED' WHERE task_key=?", [key])
@@ -457,24 +461,57 @@ defmodule SymphonyElixir.FactoryObservabilityTest do
     register_run(context.store, "mr-admission", "PPL-123", "CI_MR_CREATING")
     {:ok, %{run: run}} = RunLedger.update(context.store, "mr-admission", %{candidate_sha: String.duplicate("c", 40), spec_revision: 1, contract_sha256: String.duplicate("d", 64)})
     binding = Map.take(run, ~w(run_id issue_key candidate_sha spec_revision contract_sha256)) |> Map.merge(%{"stage" => run["state"], "version" => 2, "operation" => "CREATE_OR_REUSE_DRAFT_MR"})
-    {:ok, request} = DesktopRequest.enqueue(context.store, %{
-      request_key: "mr-pending", target_kind: "CONTROLLER", target_key: context.factory.scope, action: "FOLLOWUP",
-      codex_project_id: "projectless", existing_thread_id: "controller", model: "gpt-6-sol", reasoning_effort: "high",
-      title: "fixture", prompt: "fixture", cwd: "/fixture", schema: %{type: "object"}, metadata: %{delivery_operation: binding}})
+
+    {:ok, request} =
+      DesktopRequest.enqueue(context.store, %{
+        request_key: "mr-pending",
+        target_kind: "CONTROLLER",
+        target_key: context.factory.scope,
+        action: "FOLLOWUP",
+        codex_project_id: "projectless",
+        existing_thread_id: "controller",
+        model: "gpt-6-sol",
+        reasoning_effort: "high",
+        title: "fixture",
+        prompt: "fixture",
+        cwd: "/fixture",
+        schema: %{type: "object"},
+        metadata: %{delivery_operation: binding}
+      })
+
     options = [settings: %{factory: Map.put(context.factory, :task_transport, "desktop_broker")}, store: context.store, control_server: context.control_server]
     assert Observability.snapshot(options).overview.needs_attention == 0
-    evidence = Map.take(binding, ~w(run_id candidate_sha spec_revision contract_sha256 stage)) |> Map.merge(%{"version" => 1, "request_key" => request["request_key"], "payload_sha256" => request["payload_sha256"], "action" => "claim", "phase" => "READER", "reason_code" => "MR_READER_PROTOCOL_REJECTED"})
-    Store.query!(context.store, "INSERT INTO events(occurred_at,event_type,run_id,payload_json) VALUES (?,?,?,?)", [DateTime.to_iso8601(DateTime.utc_now()), "MR_OWNER_PRECLAIM_FAILED", run["run_id"], Jason.encode!(evidence)])
+
+    evidence =
+      Map.take(binding, ~w(run_id candidate_sha spec_revision contract_sha256 stage))
+      |> Map.merge(%{
+        "version" => 1,
+        "request_key" => request["request_key"],
+        "payload_sha256" => request["payload_sha256"],
+        "action" => "claim",
+        "phase" => "READER",
+        "reason_code" => "MR_READER_PROTOCOL_REJECTED"
+      })
+
+    Store.query!(context.store, "INSERT INTO events(occurred_at,event_type,run_id,payload_json) VALUES (?,?,?,?)", [
+      DateTime.to_iso8601(DateTime.utc_now()),
+      "MR_OWNER_PRECLAIM_FAILED",
+      run["run_id"],
+      Jason.encode!(evidence)
+    ])
+
     blocked = Observability.snapshot(options)
     assert blocked.overview.by_issue["PPL-123"] == "NEEDS_ATTENTION"
     assert blocked.broker.blocking_attention == 1
     assert hd(blocked.current_runs).attention.source == "BROKER"
     {:ok, reopened} = Store.start_link(database: context.store |> Store.query!("PRAGMA database_list") |> Map.fetch!(:rows) |> Enum.find_value(fn [_, name, path] -> if name == "main", do: path end))
+
     try do
       assert Observability.snapshot(Keyword.put(options, :store, reopened)).broker.blocking_attention == 1
     after
       GenServer.stop(reopened)
     end
+
     {:ok, _} = RunLedger.update(context.store, run["run_id"], %{candidate_sha: String.duplicate("e", 40)})
     refute Enum.any?(hd(Observability.snapshot(options).current_runs).attention_signals, &(&1.source == "BROKER"))
     {:ok, _} = RunLedger.update(context.store, run["run_id"], %{candidate_sha: run["candidate_sha"]})

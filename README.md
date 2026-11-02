@@ -163,14 +163,18 @@ of factory health. Legacy admitted instructions and verdicts remain unchanged.
 An explicitly approved, exact-verifier single-repair budget exception can resume
 one stopped legacy `BLOCK` without changing global limits or resetting history.
 The controller and successor physical publication codec both validate its scope.
-Source writers may report classified observations and honestly unrun checks;
-source-ready completion does not replace independent verifier acceptance. Rejected
-stopped reports surface a concrete factory action without discarding their edits.
-For v2 writers without controller-bound affected paths, descriptive path checks
-are supplemental source evidence, not verifier coverage. A focused writer may
-leave an unchanged boundary unavailable only with a same-criterion NOT_CHECKED
-row and authenticated latest historical PASS provenance. Independent verifier
-PASS still requires all admitted criteria and bound path checks to pass.
+Source writers return small operational results: CONTINUE, COMPLETE or BLOCKED,
+changed paths, a controller commit message, blockers and honestly unrun checks.
+Verifier feedback remains repair context, not a second acceptance protocol the
+writer must satisfy. CONTINUE saves a coherent unfinished increment and resumes
+the same writer; COMPLETE requests independent verification, never acceptance.
+Retained writers still use their original admitted schema and immutable result
+bytes, but acceptance-style coverage, classifications and closure rows in their
+old reports are advisory. Ownership, settled tool I/O, checkout identity, parent
+SHA, actual edit scope and exactly-once adoption remain enforced. Rejected unsafe
+operational results require report recovery without discarding edits or rerunning
+the source worker. Independent verifier PASS still requires all admitted criteria
+and bound path checks to pass.
 One explicit, deterministic report-only correction can reconcile duplicated v1
 finding descriptions without changing original bytes, evidence, verdict, or repair
 budget. An exact policy-stopped REPAIR can receive a separately journaled,

@@ -133,6 +133,16 @@ The pilot's reliability and model-routing follow-ups are tracked in
   returning exact changed paths for each coherent slice. The controller stages
   those named paths and commits with `--no-verify` after a branch, parent-SHA,
   and path-set read-back. On restart it adopts only the exact matching commit.
+- Writer results describe operational progress, not acceptance coverage:
+  CONTINUE saves an unfinished increment, COMPLETE requests independent review,
+  and BLOCKED records a concrete impediment. Prior verifier findings remain
+  context. Old admitted reports retain their exact bytes and schema, while their
+  coverage and closure claims are advisory. The controller still requires the
+  owned turn to stop, settled file I/O, exact run/contract/checkout identity and
+  matching declared edits before committing or consuming a result. A malformed
+  operational result is not permission to rerun the writer or invent progress.
+- Dashboard worker activity distinguishes a recorded turn from measured live
+  activity, and a stopped returned result from waiting for a new worker.
 - A fresh, detached change verifier gates the exact candidate SHA. At most two
   non-PASS code-repair rounds return to the same writer.
 - Only after verifier `PASS` does the controller push that exact reachable SHA
