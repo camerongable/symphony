@@ -2012,6 +2012,11 @@ precedence over broader actions described by a skill. Verification remains
 independent and source-read-only; only the controller commits, pushes or manages
 MRs. Code-verification PASS never replaces required exact-SHA manual validation.
 
+New review packets require typed, canonical finding references. Retained packets
+keep their admitted schema; an unambiguous legacy reference such as `AC-3 / R-3`
+resolves to its supplied criterion for repair scope and finding identity, without
+rewriting stored reports. Unknown or ambiguous criterion references still fail.
+
 `TicketWorkerRunner.packet/4` admits instruction bytes once for the exact dynamic
 packet. Schema 43 adds append-only `worker_instruction_snapshots`; its binding
 includes run, role, stage, iterations/repair rounds, candidate/base/contract,

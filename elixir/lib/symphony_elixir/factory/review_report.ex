@@ -30,12 +30,26 @@ defmodule SymphonyElixir.Factory.ReviewReport do
             "description" => text,
             "classification" => enum(~w(NEW REGRESSION UNRESOLVED)),
             "disposition" => enum(~w(REQUIRED_REPAIR OBSERVATION)),
-            "basis" => object(%{"kind" => enum(~w(ACCEPTANCE_CRITERION SAFETY_INVARIANT PRIOR_FINDING PREFERENCE)), "reference" => text})
+            "basis" => basis_schema(protocol, text)
           })
         ),
       "block_reason" => enum(~w(NONE CONTRACT_CHANGED HUMAN_DECISION ENVIRONMENT))
     })
   end
+
+  defp basis_schema(%{"finding_reference_format" => "CANONICAL_V1"} = protocol, text) do
+    choices = [
+      object(%{"kind" => enum(["ACCEPTANCE_CRITERION"]), "reference" => enum(protocol["criterion_ids"])}),
+      object(%{"kind" => enum(["SAFETY_INVARIANT"]), "reference" => enum(@invariants)}),
+      object(%{"kind" => enum(["PREFERENCE"]), "reference" => text})
+    ]
+
+    prior = Enum.map(protocol["finding_obligations"], & &1["id"])
+    choices = if prior == [], do: choices, else: choices ++ [object(%{"kind" => enum(["PRIOR_FINDING"]), "reference" => enum(prior)})]
+    %{"anyOf" => choices}
+  end
+
+  defp basis_schema(_protocol, text), do: object(%{"kind" => enum(~w(ACCEPTANCE_CRITERION SAFETY_INVARIANT PRIOR_FINDING PREFERENCE)), "reference" => text})
 
   @spec validate(map(), map(), map(), map()) :: :ok | {:error, atom()}
   def validate(packet, binding, output, expected_schema) do
@@ -128,7 +142,7 @@ defmodule SymphonyElixir.Factory.ReviewReport do
   def entries(output) do
     output["review_report"]["findings"]
     |> Enum.filter(&(&1["disposition"] == "REQUIRED_REPAIR"))
-    |> Enum.map(&%{"id" => &1["id"], "finding" => &1["description"], "basis" => &1["basis"], "disposition" => &1["disposition"]})
+    |> Enum.map(&%{"id" => &1["id"], "finding" => &1["description"], "basis" => normalize_basis(&1["basis"]), "disposition" => &1["disposition"]})
   end
 
   defp validate_findings(protocol, report) do
@@ -151,8 +165,21 @@ defmodule SymphonyElixir.Factory.ReviewReport do
     end
   end
 
-  defp compatible?(prior, row), do: row["disposition"] == "REQUIRED_REPAIR" and (is_nil(prior["basis"]) or prior["basis"] == row["basis"])
-  defp basis?(%{"basis" => %{"kind" => "ACCEPTANCE_CRITERION", "reference" => ref}, "disposition" => "REQUIRED_REPAIR"}, protocol, _known), do: ref in protocol["criterion_ids"]
+  @spec criterion_reference(term()) :: String.t() | nil
+  def criterion_reference(reference) when is_binary(reference) do
+    case Regex.run(~r/\A(AC-[0-9]+)(?:\s*\/\s*R-[0-9]+)?\z/, reference) do
+      [_, criterion] -> criterion
+      _ -> nil
+    end
+  end
+
+  def criterion_reference(_reference), do: nil
+
+  defp normalize_basis(%{"kind" => "ACCEPTANCE_CRITERION", "reference" => ref} = basis), do: Map.put(basis, "reference", criterion_reference(ref) || ref)
+  defp normalize_basis(basis), do: basis
+
+  defp compatible?(prior, row), do: row["disposition"] == "REQUIRED_REPAIR" and (is_nil(prior["basis"]) or normalize_basis(prior["basis"]) == normalize_basis(row["basis"]))
+  defp basis?(%{"basis" => %{"kind" => "ACCEPTANCE_CRITERION", "reference" => ref}, "disposition" => "REQUIRED_REPAIR"}, protocol, _known), do: criterion_reference(ref) in protocol["criterion_ids"]
   defp basis?(%{"basis" => %{"kind" => "SAFETY_INVARIANT", "reference" => ref}}, _protocol, _known), do: ref in @invariants
   defp basis?(%{"id" => id, "basis" => %{"kind" => "PRIOR_FINDING", "reference" => ref}, "disposition" => "REQUIRED_REPAIR"}, _protocol, known), do: id == ref and Map.has_key?(known, id)
   defp basis?(%{"basis" => %{"kind" => "PREFERENCE", "reference" => ref}, "disposition" => "OBSERVATION"}, _protocol, _known), do: text?(ref)
@@ -180,7 +207,9 @@ defmodule SymphonyElixir.Factory.ReviewReport do
 
   defp writer_supplemental_check?(_packet, _binding, %{"status" => "CHECKED"}), do: true
 
-  defp writer_supplemental_check?(packet, %{"policy" => %{"mode" => "FILE_SOURCE", "profile" => "symphony_ticket_file_source_v1", "source_access" => "read", "file_tools_sha256" => hash}}, %{"status" => "UNAVAILABLE"}) do
+  defp writer_supplemental_check?(packet, %{"policy" => %{"mode" => "FILE_SOURCE", "profile" => "symphony_ticket_file_source_v1", "source_access" => "read", "file_tools_sha256" => hash}}, %{
+         "status" => "UNAVAILABLE"
+       }) do
     not Map.has_key?(packet["review_protocol"]["review_scope"], "affected_paths") and
       hash == SymphonyElixir.Factory.WorkerFileTools.tool_contract_sha256()
   end

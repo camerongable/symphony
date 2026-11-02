@@ -287,7 +287,8 @@ defmodule SymphonyElixir.Factory.StageSchemas do
   end
 
   defp valid_value?(value, schema) do
-    valid_type?(value, Map.get(schema, "type")) and
+    (not Map.has_key?(schema, "anyOf") or Enum.any?(schema["anyOf"], &valid_value?(value, &1))) and
+      valid_type?(value, Map.get(schema, "type")) and
       valid_enum?(value, Map.get(schema, "enum")) and
       valid_object?(value, schema) and
       valid_array?(value, schema)

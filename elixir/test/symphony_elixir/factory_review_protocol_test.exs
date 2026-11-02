@@ -65,6 +65,48 @@ defmodule SymphonyElixir.FactoryReviewProtocolTest do
     Map.put(result, "review_report", report)
   end
 
+  test "legacy criterion annotations normalize through repair scope while fresh schemas reject them" do
+    fresh = ReviewProtocol.attach(Map.drop(packet(), ["review_protocol"]), [])
+    legacy = update_in(fresh, ["review_protocol"], &Map.delete(&1, "finding_reference_format"))
+
+    finding = %{
+      "id" => "F-1",
+      "description" => "Required behavior remains unfinished",
+      "classification" => "NEW",
+      "disposition" => "REQUIRED_REPAIR",
+      "basis" => %{"kind" => "ACCEPTANCE_CRITERION", "reference" => "AC-1 / R-3"}
+    }
+
+    result = typed_result(legacy, [finding])
+    assert :ok = ReviewProtocol.validate(legacy, binding(legacy), result)
+    assert [%{"basis" => %{"reference" => "AC-1"}}] = ReviewProtocol.finding_entries(nil, nil, result)
+    assert {:error, :review_report_schema_invalid} = ReviewProtocol.validate(fresh, binding(fresh), result)
+    canonical = put_in(result, ["review_report", "findings", Access.at(0), "basis", "reference"], "AC-1")
+    assert :ok = ReviewProtocol.validate(fresh, binding(fresh), canonical)
+    forged = put_in(canonical, ["review_report", "findings", Access.at(0), "basis", "kind"], "SAFETY_INVARIANT")
+    assert {:error, :review_report_schema_invalid} = ReviewProtocol.validate(fresh, binding(fresh), forged)
+
+    for reference <- ["AC-99 / R-3", "AC-1 / AC-2", "not AC-1"] do
+      invalid = put_in(result, ["review_report", "findings", Access.at(0), "basis", "reference"], reference)
+      assert {:error, :review_report_finding_basis_invalid} = ReviewProtocol.validate(legacy, binding(legacy), invalid)
+    end
+
+    history = %{
+      "request_key" => "prior",
+      "output_sha256" => "digest",
+      "candidate_sha" => "previous",
+      "finding_entries" => [%{"id" => "F-1", "finding" => finding["description"], "basis" => finding["basis"]}],
+      "criteria" => Enum.map(["AC-1", "AC-2"], &%{"id" => &1, "status" => "PASS", "evidence" => ["Prior checked boundary"]}),
+      "repair_admitted" => true
+    }
+
+    focused = ReviewProtocol.attach(Map.drop(packet(), ["review_protocol"]), [history])
+    assert focused["review_protocol"]["review_scope"]["criterion_ids"] == ["AC-1"]
+    unresolved = typed_result(focused, [finding |> Map.put("classification", "UNRESOLVED") |> put_in(["basis", "reference"], "AC-1")])
+    unresolved = put_in(unresolved, ["review_report", "closures"], [%{"id" => "F-1", "status" => "UNRESOLVED", "evidence" => ["Not yet repaired"]}])
+    assert :ok = ReviewProtocol.validate(focused, binding(focused), unresolved)
+  end
+
   defp focused_writer do
     history = %{
       "status" => "REPAIR",
@@ -97,7 +139,14 @@ defmodule SymphonyElixir.FactoryReviewProtocolTest do
     {writer, binding, result} = focused_writer()
     policy = %{"mode" => "FILE_SOURCE", "profile" => "symphony_ticket_file_source_v1", "source_access" => "read", "file_tools_sha256" => SymphonyElixir.Factory.WorkerFileTools.tool_contract_sha256()}
     binding = Map.put(binding, "policy", policy)
-    result = update_in(result, ["review_report", "affected_path_checks"], &(&1 ++ [%{"id" => "executable-validation", "status" => "UNAVAILABLE", "evidence" => ["File-only worker cannot execute commands; controller tests are pending."]}]))
+
+    result =
+      update_in(
+        result,
+        ["review_report", "affected_path_checks"],
+        &(&1 ++ [%{"id" => "executable-validation", "status" => "UNAVAILABLE", "evidence" => ["File-only worker cannot execute commands; controller tests are pending."]}])
+      )
+
     assert :ok = ReviewProtocol.validate(writer, binding, result)
     assert get_in(result, ["review_report", "affected_path_checks", Access.at(1), "status"]) == "UNAVAILABLE"
 
@@ -119,7 +168,9 @@ defmodule SymphonyElixir.FactoryReviewProtocolTest do
     result = typed_result(verifier, [], "PASS")
     result = put_in(result, ["review_report", "affected_path_checks"], [%{"id" => "handler.go", "status" => "CHECKED", "evidence" => ["Inspected exact candidate execution path"]}])
     assert :ok = ReviewProtocol.validate(verifier, binding(verifier), result)
-    assert {:error, :review_report_verdict_contradiction} = ReviewProtocol.validate(verifier, binding(verifier), put_in(result, ["review_report", "affected_path_checks", Access.at(0), "status"], "UNAVAILABLE"))
+
+    assert {:error, :review_report_verdict_contradiction} =
+             ReviewProtocol.validate(verifier, binding(verifier), put_in(result, ["review_report", "affected_path_checks", Access.at(0), "status"], "UNAVAILABLE"))
   end
 
   test "writer readiness cannot invent current checks, historical passes or acceptance" do

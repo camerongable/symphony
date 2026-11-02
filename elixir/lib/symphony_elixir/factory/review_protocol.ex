@@ -39,6 +39,7 @@ defmodule SymphonyElixir.Factory.ReviewProtocol do
 
       Map.put(packet, "review_protocol", %{
         "version" => 2,
+        "finding_reference_format" => "CANONICAL_V1",
         "lineage" => digest(Jason.encode!(Map.take(packet, ~w(run_id spec_revision contract_sha256)))),
         "criterion_ids" => ids,
         "review_scope" => review_scope(ids, history),
@@ -63,7 +64,13 @@ defmodule SymphonyElixir.Factory.ReviewProtocol do
     unverified = Enum.reject(ids, &(get_in(coverage, [&1, "status"]) == "PASS"))
 
     affected =
-      latest["finding_entries"] |> Enum.flat_map(fn row -> if get_in(row, ["basis", "kind"]) == "ACCEPTANCE_CRITERION", do: [row["basis"]["reference"]], else: ids end) |> Enum.uniq() |> Enum.sort()
+      latest["finding_entries"]
+      |> Enum.flat_map(fn row ->
+        reference = ReviewReport.criterion_reference(get_in(row, ["basis", "reference"]))
+        if get_in(row, ["basis", "kind"]) == "ACCEPTANCE_CRITERION" and reference in ids, do: [reference], else: ids
+      end)
+      |> Enum.uniq()
+      |> Enum.sort()
 
     active = Enum.sort(Enum.uniq(affected ++ unverified))
     %{"mode" => "FOCUSED", "criterion_ids" => if(active == [], do: ids, else: active), "carried_evidence" => Enum.map(history, &Map.take(&1, ~w(request_key output_sha256 candidate_sha criteria)))}
