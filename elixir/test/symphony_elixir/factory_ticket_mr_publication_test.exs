@@ -28,10 +28,16 @@ defmodule SymphonyElixir.FactoryTicketMrPublicationTest do
 
     Process.put(:mr_responses, [{:ok, %{"structuredContent" => []}}, {:ok, %{"structuredContent" => mr}}, {:ok, %{"structuredContent" => mr}}])
     before = Store.query!(ctx.store, "SELECT * FROM desktop_requests").rows
+    {:ok, original} = RunLedger.get(ctx.store, "run")
+    snapshot = Jason.decode!(original["snapshot_json"]) |> Map.put("summary", "A concise Jira summary") |> Map.delete("title")
+    {:ok, _} = RunLedger.update(ctx.store, "run", %{snapshot_json: Jason.encode!(snapshot)})
 
     assert {:ok, %{launches: [], events: events}} = SymphonyElixir.TicketWorkerFixture.publication_tick(ctx, opts)
     assert Enum.any?(events, &(&1.event == "TICKET_MR_PUBLISHED"))
-    assert_receive {:mr_call, "create_merge_request", %{"draft" => true, "reviewer_ids" => [], "assignee_ids" => [11_599_766], "remove_source_branch" => false}}
+
+    assert_receive {:mr_call, "create_merge_request",
+                    %{"title" => "Draft: feat(PPL-123): A concise Jira summary", "draft" => true, "reviewer_ids" => [], "assignee_ids" => [11_599_766], "remove_source_branch" => false}}
+
     assert Store.query!(ctx.store, "SELECT * FROM desktop_requests").rows == before
     assert {:ok, published} = RunLedger.get(ctx.store, "run")
     assert {:ok, reopened} = Store.start_read_only(database: ctx.database)
@@ -193,6 +199,16 @@ defmodule SymphonyElixir.FactoryTicketMrPublicationTest do
       assert {:ok, %{status: "LAUNCHED", launch: launch}} = SymphonyElixir.Factory.Scheduler.ticket_step(context, "run", ctx.options)
       assert launch.task_key == "run:change-verifier:1"
       assert_receive {:factory_task_finished, _, {:ok, _}}, 60_000
+      assert {:ok, %{status: "ADOPTED", run: pushing}} = SymphonyElixir.Factory.Scheduler.ticket_step(context, "run", ctx.options)
+      assert pushing["state"] == "PUSHING"
+      assert {:ok, snapshot} = SymphonyElixir.TicketWorkerFixture.PublicationJiraReader.issue("PPL-123", store: reopened)
+      assert {:ok, authorization} = SymphonyElixir.Factory.TicketWorkerRunner.authorization(pushing, snapshot, DateTime.utc_now())
+      assert {:ok, %{status: "PUSH_COMPLETED", run: ordinary}} = SymphonyElixir.Factory.TicketPush.step(reopened, "run", authorization, ctx.options)
+      assert ordinary["state"] == "MR_CREATING" and ordinary["candidate_handoff"] != waiting["candidate_handoff"]
+      old = Jason.decode!(waiting["candidate_handoff"])
+      assert Store.one!(reopened, "SELECT release_receipt_json FROM workspace_access WHERE reservation_key=?", [old["reservation_key"]])["release_receipt_json"] == waiting["candidate_handoff"]
+      Process.put(:mr_responses, [{:ok, %{"structuredContent" => [mr]}}, {:ok, %{"structuredContent" => mr}}])
+      assert {:ok, %{status: "MR_PUBLISHED"}} = TicketMrPublication.step(reopened, "run", authorization, ctx.factory, ctx.root, "Ordinary verified content", opts)
       refute_received {:mr_call, "create_merge_request", _}
     after
       GenServer.stop(reopened)
@@ -279,6 +295,16 @@ defmodule SymphonyElixir.FactoryTicketMrPublicationTest do
     assert {:ok, retained} = TicketWorkerRunner.retained_review_preimage(ctx.store, pushing)
     assert {:ok, :direct_publication} = TicketMrPublication.receipt_format(ctx.store, retained)
     assert {:ok, :legacy} = TicketMrPublication.receipt_format(ctx.store, pushing)
+    assert {:ok, %{status: "PUSH_COMPLETED", run: pushed}} = SymphonyElixir.Factory.TicketPush.step(ctx.store, "run", authorization, opts)
+    assert pushed["state"] == "MR_CREATING" and pushed["candidate_handoff"] != ready["candidate_handoff"]
+    original = Jason.decode!(ready["candidate_handoff"])
+    assert Store.one!(ctx.store, "SELECT release_receipt_json FROM workspace_access WHERE reservation_key=?", [original["reservation_key"]])["release_receipt_json"] == ready["candidate_handoff"]
+    {publication_opts, mr} = remote_fixture(ctx)
+    mr = Map.put(mr, "sha", pushed["candidate_sha"])
+    Process.put(:mr_responses, [{:ok, %{"structuredContent" => [mr]}}, {:ok, %{"structuredContent" => mr}}])
+    assert {:ok, %{status: "MR_PUBLISHED"}} = TicketMrPublication.step(ctx.store, "run", authorization, ctx.factory, ctx.root, "Reworked content", publication_opts)
+    refute_received {:mr_call, "create_merge_request", _}
+    refute_received {:mr_call, "update_merge_request", _}
   end
 
   test "human MR state and unsafe or unknown branch removal are preserved without any update" do

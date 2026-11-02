@@ -442,7 +442,7 @@ defmodule SymphonyElixir.Factory.TicketPush do
         {:ok, %{"binding_json" => raw} = intent} ->
           case {Jason.decode(raw), intent["phase"]} do
             {{:ok, %{"publication_version" => 2}}, "PUSH_UNCERTAIN"} -> complete_current(store, run_id, intent, authorization, opts)
-            {{:ok, %{"publication_version" => 2}}, "COMPLETED"} -> advance_current_completion(store, run, intent, authorization, opts)
+            {{:ok, %{"publication_version" => 2} = binding}, "COMPLETED"} -> current_completed_step(store, run, intent, binding, authorization, opts)
             _ -> qualified_push_step(store, run_id, authorization, opts)
           end
 
@@ -450,6 +450,14 @@ defmodule SymphonyElixir.Factory.TicketPush do
           qualified_push_step(store, run_id, authorization, opts)
       end
     end
+  end
+
+  defp current_completed_step(store, run, intent, binding, authorization, opts) do
+    fields = ~w(run_id candidate_sha spec_revision contract_sha256 verifier_round)
+
+    if opts[:settlement_only] != true and run["state"] in ~w(PUSHING CI_PUSHING) and Map.take(binding, fields) != Map.take(run, fields),
+      do: qualified_push_step(store, run["run_id"], authorization, opts),
+      else: advance_current_completion(store, run, intent, authorization, opts)
   end
 
   defp qualified_push_step(store, run_id, authorization, opts) do

@@ -242,7 +242,8 @@ defmodule SymphonyElixir.Factory.TicketMrPublication do
     route = factory.repositories[run["repo_key"]]
     id = if is_map(route), do: Integer.parse(to_string(route["gitlab_project_id"])), else: :error
     snapshot = Jason.decode!(run["snapshot_json"])
-    title = (snapshot["title"] || "deliver the confirmed change") |> String.replace(~r/\s+/, " ") |> String.trim() |> String.slice(0, 80)
+    summary = Enum.find([snapshot["summary"], snapshot["title"]], &(is_binary(&1) and String.trim(&1) != "")) || "deliver the confirmed change"
+    title = summary |> String.replace(~r/\s+/, " ") |> String.trim() |> String.slice(0, 80)
 
     with {project_id, ""} when project_id > 0 <- id,
          true <- is_binary(description) and byte_size(description) <= 262_144 do
