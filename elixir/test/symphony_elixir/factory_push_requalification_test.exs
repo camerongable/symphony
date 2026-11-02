@@ -20,7 +20,7 @@ defmodule SymphonyElixir.FactoryPushRequalificationTest do
   end
 
   test "schema 53 adds a separate immutable one-use prepared requalification journal", ctx do
-    assert Store.one!(ctx.store, "SELECT MAX(version) AS version FROM factory_schema_migrations")["version"] == 54
+    assert Store.one!(ctx.store, "SELECT MAX(version) AS version FROM factory_schema_migrations")["version"] == 55
     assert Store.query!(ctx.store, "SELECT * FROM ticket_push_prepared_requalifications").rows == []
     triggers = Store.query!(ctx.store, "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'push_prepared_requalification_%' ORDER BY name").rows
     assert length(triggers) == 3

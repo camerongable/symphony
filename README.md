@@ -24,6 +24,21 @@ Reader lifetime never authorizes another model turn or restores a consumed handl
 Symphony turns project work into isolated, autonomous implementation runs, allowing teams to manage
 work instead of supervising coding agents.
 
+Fresh ticket merge requests are published directly by deterministic controller
+code on a short-lived GitLab connector session, without a model turn or Desktop
+broker handoff. Source writers and independent verifiers remain separate agents.
+An additive SQLite publication journal records intent before creation; a lost
+acknowledgement is reconciled by readback, never by creating another MR.
+Existing MRs are reused unchanged or preserved for human action, including their
+title, description, draft state, assignees, reviewers, and branch-removal setting.
+The route has no update, close, reopen, or merge capability.
+
+Schema 55 adds this journal. Deployment must separately verify the old ledger
+preimage and migrated postimage; historical schema-54 cutover scripts must not
+be reused unchanged. Configured GitLab creation permission still requires an
+explicit supported grant; capability discovery is not permission proof.
+See [direct MR publication](docs/factory-control-plane.md#direct-mr-publication).
+
 The local Jira factory keeps source-writing and exact-commit review in isolated
 worktrees; contract-only conversations can stay in their repository Project
 without allocating a worktree.

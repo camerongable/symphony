@@ -115,7 +115,7 @@ defmodule SymphonyElixir.FactoryCiRoundIdentityTest do
     repeated = for _ <- 1..2, do: Task.async(fn -> Store.initialize(ctx.store) end)
     assert Enum.map(repeated, &Task.await(&1, 30_000)) == [:ok, :ok]
     assert TicketCiRepairSuccessor.attempts_used(ctx.store, "run") == 8
-    assert Store.query!(ctx.store, "SELECT version FROM factory_schema_migrations ORDER BY version").rows == Enum.map(1..54, &[&1])
+    assert Store.query!(ctx.store, "SELECT version FROM factory_schema_migrations ORDER BY version").rows == Enum.map(1..55, &[&1])
     assert {:ok, reader} = Store.start_read_only(database: ctx.database)
     assert Store.one!(reader, "SELECT round FROM ticket_ci_repair_claims WHERE claim_key='claim-11'") == %{"round" => 11}
     GenServer.stop(reader)

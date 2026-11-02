@@ -1,9 +1,155 @@
 defmodule SymphonyElixir.TicketWorkerFixture do
   @moduledoc false
+  import ExUnit.Assertions
   alias SymphonyElixir.Factory.{Contract, DesktopRequest, DesktopToolArgs, RunLedger, Store, TaskLedger, TicketChat}
   alias SymphonyElixir.Factory.TicketContextReader
   alias SymphonyElixir.PathSafety
   alias SymphonyElixir.TicketChatFixture
+  alias __MODULE__.PublicationJiraReader
+
+  def publication_fixture(context \\ %{}) do
+    alias SymphonyElixir.Factory.{Control, Scheduler, TicketPush, TicketWorkerRunner}
+    ctx = setup_fixture(context)
+    TicketChatFixture.runtime_fixture(ctx.root)
+    bind_parent(ctx)
+    {:ok, _} = TicketWorkerRunner.bind_base(ctx.store, "run", ctx.sha)
+    Store.query!(ctx.store, "DELETE FROM factory_tasks WHERE task_key='writer'")
+    {:ok, _} = RunLedger.update(ctx.store, "run", %{plan_markdown: "Implement the fixture behavior."})
+    supervisor = ExUnit.Callbacks.start_supervised!(Task.Supervisor)
+
+    models = %{
+      "default_provider" => "codex",
+      "providers" => %{"codex" => %{"fast" => "gpt-6-luna", "deep" => "gpt-6.1-sol"}},
+      "roles" => Map.new(~w(feature-writer change-verifier), &{&1, %{"provider" => "codex", "model_class" => "fast", "reasoning_effort" => "medium"}})
+    }
+
+    route = %{"path" => ctx.repo, "base_branch" => "master", "gitlab_project" => "grailbio/grail", "gitlab_project_id" => "33747681"}
+    route = if ctx[:ci_preflight], do: Map.put(route, "ci_preflight", "draft_mr"), else: route
+
+    factory = %{
+      scope: "scope",
+      dispatcher_id: "fixture-dispatcher",
+      models: models,
+      maximum_implementation_iterations: 20,
+      maximum_code_repair_rounds: 2,
+      ticket_supervisor: %{"enabled" => true, "pilot_issue_keys" => ["PPL-123"], "ci_repair" => "native_bounded_v1"},
+      repositories: %{"grail" => route}
+    }
+
+    Control.initialize(ctx.store, factory)
+    assert {:ok, _} = Control.activate(ctx.store, factory, factory.dispatcher_id)
+    worker_context = %{store: ctx.store, task_supervisor: supervisor, recipient: self(), workspace_root: Path.join(ctx.root, "workspaces"), factory: factory, ticket_options: []}
+
+    options =
+      Keyword.merge(opts(ctx),
+        workspace_root: worker_context.workspace_root,
+        app_server: SymphonyElixir.DesktopTicketLifecycleFixture.WorkerServer,
+        jira_reader: PublicationJiraReader,
+        jira_session: fn _, callback -> callback.(%{thread_id: "jira-fixture"}) end
+      )
+
+    for expected <- if(ctx[:ci_preflight], do: ["CI_PUSHING"], else: ["VERIFYING", "PUSHING"]) do
+      assert {:ok, %{status: "LAUNCHED", launch: launch}} = Scheduler.ticket_step(worker_context, "run", options)
+      key = launch.task_key
+      assert_receive {:factory_task_started, ^key, _}, 15_000
+      assert_receive {:factory_task_finished, ^key, {:ok, _}}, 60_000
+      assert {:ok, %{status: "ADOPTED", run: adopted}} = Scheduler.ticket_step(worker_context, "run", options)
+      assert adopted["state"] == expected
+    end
+
+    remote = Path.join(ctx.root, "publication.git")
+    git(ctx.root, ["init", "--bare", remote])
+    git(ctx.repo, ["remote", "add", "origin", remote])
+    {:ok, run} = RunLedger.get(ctx.store, "run")
+    {:ok, snapshot} = PublicationJiraReader.issue(run["issue_key"], store: ctx.store)
+    {:ok, authorization} = TicketWorkerRunner.authorization(run, snapshot, DateTime.utc_now())
+    push_opts = Keyword.put(options, :ci_preflight_authorized, ctx[:ci_preflight] == true)
+    assert {:ok, %{status: "PUSH_COMPLETED", run: published}} = TicketPush.step(ctx.store, "run", authorization, push_opts)
+    Map.merge(ctx, %{factory: factory, worker_context: worker_context, options: push_opts, authorization: authorization, publication_run: published})
+  end
+
+  def publication_tick(ctx, opts) do
+    factory =
+      Map.merge(ctx.factory, %{
+        enabled: true,
+        task_transport: "desktop_broker",
+        stale_task_minutes: 90,
+        maximum_specifiers: 2,
+        maximum_writers: 2,
+        maximum_validators: 2,
+        writer_disk_gb: 20,
+        cleanup: %{},
+        queue: %{"assignee" => "currentUser()", "statuses" => ["To Do", "In Dev"], "factory_labels" => ["ai-ready", "ai-running"]}
+      })
+
+    context = Map.merge(ctx.worker_context, %{factory: factory, ticket_options: opts})
+    SymphonyElixir.Factory.Scheduler.tick(context, jira_reader: Keyword.get(opts, :jira_reader, PublicationJiraReader))
+  end
+
+  defmodule PublicationJiraReader do
+    def search(_, _), do: {:ok, []}
+
+    def issue(key, opts) do
+      {:ok, run} = RunLedger.get(opts[:store], "run")
+      {:ok, Map.merge(Jason.decode!(run["snapshot_json"]), %{"key" => key, "labels" => ["ai-running", "repo-grail"], "status" => "In Dev"})}
+    end
+  end
+
+  defmodule PublicationFinalJira do
+    def search(_, _), do: {:ok, []}
+    def issue(_, _), do: {:ok, Process.get(:publication_jira_snapshot)}
+    def validate_call(_, _, _), do: :ok
+
+    def call(name, args, _) do
+      send(self(), {:publication_jira_write, name, args})
+      snapshot = Process.get(:publication_jira_snapshot)
+
+      updated =
+        case name do
+          "jira_add_comment" -> Map.update!(snapshot, "comments", &(&1 ++ [%{"id" => "review-comment", "text" => args["body"]}]))
+          "jira_update_factory_labels" -> Map.update!(snapshot, "labels", &Enum.uniq((&1 -- args["remove_labels"]) ++ args["add_labels"]))
+        end
+
+      Process.put(:publication_jira_snapshot, updated)
+      {:error, :synthetic_lost_ack_after_apply}
+    end
+  end
+
+  defmodule PublicationMcpServer do
+    def mcp_tool_catalog_in_session(_session, "GitLab"), do: {:ok, Process.get(:mr_catalog)}
+
+    def call_mcp_tool_in_session(_session, "GitLab", name, args) do
+      send(self(), {:mr_call, name, args})
+      [response | remaining] = Process.get(:mr_responses)
+      Process.put(:mr_responses, remaining)
+      if is_function(response, 0), do: response.(), else: response
+    end
+  end
+
+  defmodule PublicationCiReader do
+    def catalog(_) do
+      calls = [
+        {"get_merge_request", ~w(project_id merge_request_iid), %{"include_summaries" => "boolean"}},
+        {"get_pipeline", ~w(project_id pipeline_id), %{}},
+        {"list_pipeline_jobs", ~w(project_id pipeline_id), %{"page" => "number", "per_page" => "number", "include_retried" => "boolean"}},
+        {"get_commit", ~w(project_id sha), %{"stats" => "boolean"}}
+      ]
+
+      {:ok,
+       Map.new(calls, fn {name, required, optional} ->
+         properties = Map.merge(Map.new(required, &{&1, "string"}), optional) |> Map.new(fn {key, type} -> {key, %{"type" => type}} end)
+         {name, %{"name" => name, "annotations" => %{"readOnlyHint" => true}, "inputSchema" => %{"type" => "object", "required" => required, "properties" => properties}}}
+       end)}
+    end
+
+    def call(name, _, _) do
+      [{^name, result} | rest] = Process.get(:publication_ci_reads)
+      Process.put(:publication_ci_reads, rest)
+      result
+    end
+
+    def call_list(name, args, opts), do: call(name, args, opts)
+  end
 
   def setup_fixture(context) do
     token = "#{System.pid()}-#{System.system_time(:nanosecond)}-#{System.unique_integer([:positive])}"

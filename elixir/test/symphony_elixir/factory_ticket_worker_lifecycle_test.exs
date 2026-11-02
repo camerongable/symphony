@@ -10739,6 +10739,8 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     assert args == %{"threadId" => request["existing_thread_id"], "model" => request["model"], "thinking" => request["reasoning_effort"], "prompt" => request["prompt"]}
     assert claimed["status"] == "FOLLOWUP_UNCERTAIN"
     original_claim = Store.one!(ctx.store, "SELECT * FROM ticket_mr_claims WHERE request_key = ?", [key])
+    assert {:error, :ticket_mr_legacy_request_pending} = SymphonyElixir.Factory.TicketMrPublication.step(ctx.store, "run", authorization, factory, request["cwd"], "No competing publication", options)
+    assert Store.query!(ctx.store, "SELECT * FROM ticket_mr_publications").rows == []
     assert :ok = TicketMrOperation.authorize_readback(ctx.store, claimed)
     assert [^claimed] = DesktopRequest.list_reconciliation(ctx.store)
     assert {:error, :ticket_mr_request_already_issued} = DesktopRequest.claim(ctx.store, key, claim_options)
@@ -10887,8 +10889,6 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
         {run, options}
       end
 
-    pushed = initial_mr_push(ctx, run, options)
-
     factory =
       Map.merge(context.factory, %{
         scope: "scope",
@@ -10902,7 +10902,9 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     factory = put_in(factory, [:models, "roles", "orchestrator"], %{"provider" => "codex", "model_class" => "fast", "reasoning_effort" => "low"})
     factory = if ctx[:mr_preflight], do: put_in(factory.repositories["grail"]["ci_preflight"], "draft_mr"), else: factory
     Control.initialize(ctx.store, factory)
+    assert {:ok, _} = Control.activate(ctx.store, factory, factory.dispatcher_id)
     Control.record_controller_task(ctx.store, factory, "controller-thread", "original-turn", %{project_id: factory.controller_codex_project_id})
+    pushed = initial_mr_push(ctx, run, options)
     options = Keyword.merge(options, connector: MrReader, mcp_session: %{thread_id: "controller-thread"}, store: ctx.store)
     cwd = Path.join(ctx.root, if(ctx[:mr_owner_service], do: "workspaces/control", else: "control"))
     File.mkdir_p!(cwd)

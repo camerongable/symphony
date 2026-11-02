@@ -255,7 +255,7 @@ defmodule SymphonyElixir.FactoryTicketCiRepairTest do
 
   test "schema 41 diagnosis and once-only claim are append-only and preserve existing hazard guards" do
     ctx = SymphonyElixir.TicketChatFixture.setup_fixture(%{})
-    assert Store.one!(ctx.store, "SELECT MAX(version) AS version FROM factory_schema_migrations")["version"] == 54
+    assert Store.one!(ctx.store, "SELECT MAX(version) AS version FROM factory_schema_migrations")["version"] == 55
     run = Store.one!(ctx.store, "SELECT * FROM runs WHERE run_id = 'run'")
     triggers = Store.query!(ctx.store, "SELECT name, sql FROM sqlite_master WHERE type='trigger' AND name LIKE 'push_unknown_%' ORDER BY name").rows
     values = ["diagnosis", "run", String.duplicate("a", 40), 99, "{}", String.duplicate("b", 64), "{}", String.duplicate("c", 64), "BLOCKED", "2026-10-14T00:00:00Z"]

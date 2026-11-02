@@ -58,6 +58,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
     TicketJiraJournal,
     TicketJiraOperation,
     TicketMrOperation,
+    TicketMrPublication,
     TicketPush,
     TicketVerifierRepair,
     TicketWorkerRunner,
@@ -1258,6 +1259,10 @@ defmodule SymphonyElixir.Factory.Scheduler do
               AND json_type(push.envelope, '$.binding_sha256') = 'text' AND length(json_extract(push.envelope, '$.binding_sha256')) > 0
               AND json_type(push.envelope, '$.owner_nonce') = 'text' AND length(json_extract(push.envelope, '$.owner_nonce')) > 0
             UNION ALL
+            SELECT publication.run_id, 'MR_PUBLICATION', publication.operation_key, publication.created_at
+            FROM ticket_mr_publications AS publication
+            WHERE publication.phase = 'ISSUED_UNKNOWN'
+            UNION ALL
             SELECT runs.run_id, 'MR_RESULT', request.request_key, request.created_at
             FROM (SELECT *, CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END AS metadata
               FROM desktop_requests WHERE status = 'SUCCEEDED' AND target_kind = 'CONTROLLER' AND action = 'FOLLOWUP') AS request
@@ -1402,6 +1407,11 @@ defmodule SymphonyElixir.Factory.Scheduler do
     end
   end
 
+  defp reconcile_jira_operation(context, %{"recovery_operation" => "MR_PUBLICATION"} = run, options) do
+    options = options |> Keyword.put(:reconciliation_only, true) |> Keyword.put(:ci_preflight_authorized, ci_preflight?(route_for_run(context, run)))
+    TicketMrPublication.step(context.store, run["run_id"], %{}, context.factory, controller_workspace(context), "", options)
+  end
+
   defp current_push_envelope?(run) do
     with {:ok, %{"kind" => "TICKET_PUSH", "binding_json" => raw}} <- Jason.decode(run["candidate_handoff"] || "null"),
          {:ok, %{"publication_version" => 2}} <- Jason.decode(raw) do
@@ -1461,6 +1471,15 @@ defmodule SymphonyElixir.Factory.Scheduler do
     with {:ok, %{"status" => "SUCCEEDED", "target_kind" => "CONTROLLER", "action" => "FOLLOWUP"}} <-
            DesktopRequest.get(store, selected["recovery_key"]),
          true <- current["state"] in ~w(MR_CREATING CI_MR_CREATING) or {:error, :ticket_recovery_operation_changed} do
+      :ok
+    else
+      _ -> {:error, :ticket_recovery_operation_changed}
+    end
+  end
+
+  defp ticket_recovery_operation(store, current, %{"recovery_operation" => "MR_PUBLICATION"} = selected) do
+    with {:ok, %{"phase" => "ISSUED_UNKNOWN", "run_id" => id}} <- TicketMrPublication.get(store, selected["recovery_key"]),
+         true <- id == current["run_id"] do
       :ok
     else
       _ -> {:error, :ticket_recovery_operation_changed}
@@ -3236,7 +3255,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
 
       case TicketMrOperation.adopt_result(context.store, run["run_id"], authorization, context.factory, options) do
         {:error, :unknown_request} ->
-          TicketMrOperation.prepare(context.store, run["run_id"], authorization, context.factory, controller_workspace(context), mr_description(run), options)
+          direct_mr_publication(context, run, authorization, options)
 
         result ->
           result
@@ -3262,11 +3281,25 @@ defmodule SymphonyElixir.Factory.Scheduler do
   end
 
   defp adopted_mr_delivery_step(context, run, options, authorization) do
+    with {:ok, format} <- TicketMrPublication.receipt_format(context.store, run) do
+      case format do
+        :direct_publication -> finalize_adopted_mr_delivery(context, run, options)
+        :legacy -> legacy_adopted_mr_delivery_step(context, run, options, authorization)
+      end
+    end
+  end
+
+  defp direct_mr_publication(context, run, authorization, options) do
+    options = Keyword.put(options, :mr_authorization_reader, fn current, prior -> ticket_authorization(context, current, options, prior) end)
+    TicketMrPublication.step(context.store, run["run_id"], authorization, context.factory, controller_workspace(context), mr_description(run), options)
+  end
+
+  defp legacy_adopted_mr_delivery_step(context, run, options, authorization) do
     ephemeral_read_options = Keyword.put(options, :ticket_mr_ephemeral_read, true)
 
     case TicketMrOperation.adopt_result(context.store, run["run_id"], authorization, context.factory, ephemeral_read_options) do
       {:error, :unknown_request} ->
-        TicketMrOperation.prepare(context.store, run["run_id"], authorization, context.factory, controller_workspace(context), mr_description(run), options)
+        direct_mr_publication(context, run, authorization, options)
 
       {:ok, %{status: "MR_WAITING_FOR_RESULT"}} = waiting ->
         waiting

@@ -5,7 +5,7 @@ defmodule SymphonyElixir.Factory.TicketMrOperation do
   alias SymphonyElixir.Factory.{ControllerGitRead, GitLabMcpConnector, JiraMcpReader, ModelRouter, Prompt}
   alias SymphonyElixir.Factory.{RunLedger, StageSchemas, Store, TicketChat, TicketMrGuard, TicketPush}
   alias SymphonyElixir.Factory.{TicketCiRepair, TicketMrCwdCorrection, TicketMrPresendRecovery}
-  alias SymphonyElixir.Factory.{TicketMrQualification, TicketWorkerRunner, Worktree}
+  alias SymphonyElixir.Factory.{TicketMrPublication, TicketMrQualification, TicketWorkerRunner, Worktree}
   alias SymphonyElixir.PathSafety
 
   @fields ~w(version operation run_id issue_key stage candidate_sha contract_sha256 spec_revision ci_preflight
@@ -43,6 +43,16 @@ defmodule SymphonyElixir.Factory.TicketMrOperation do
   def current_delivery_receipt(%DBConnection{}, _, _, _), do: {:error, :ticket_mr_observation_inside_transaction}
 
   def current_delivery_receipt(store, run_id, factory, opts) do
+    with {:ok, run} <- RunLedger.get(store, run_id),
+         {:ok, format} <- TicketMrPublication.receipt_format(store, run) do
+      case format do
+        :direct_publication -> TicketMrPublication.current_receipt(store, run_id, factory, opts)
+        :legacy -> legacy_current_delivery_receipt(store, run_id, factory, opts)
+      end
+    end
+  end
+
+  defp legacy_current_delivery_receipt(store, run_id, factory, opts) do
     with {:ok, %{"state" => "MR_CREATING", "mr_iid" => iid, "mr_url" => url} = run} <- RunLedger.get(store, run_id),
          true <- (is_integer(iid) and iid > 0 and present?(url)) or {:error, :ticket_mr_recorded_identity_missing},
          {:ok, push} <- TicketPush.completed_proof(store, run_id),
@@ -186,6 +196,23 @@ defmodule SymphonyElixir.Factory.TicketMrOperation do
   def recheck_retained_mr_history(_store, _prior, _proof), do: {:error, :ticket_mr_original_history_unproven}
 
   defp retained_mr_record(store, run) do
+    with {:ok, format} <- TicketMrPublication.receipt_format(store, run), do: retained_mr_record(store, run, format)
+  end
+
+  defp retained_mr_record(store, run, :direct_publication) do
+    with {:ok, row} <- TicketMrPublication.record_for_run(store, run),
+         receipt = Jason.decode!(row["receipt_json"]),
+         true <- receipt["outcome"] != "PRESERVED_HUMAN_STATE",
+         true <- {receipt["mr"]["iid"], receipt["mr"]["web_url"]} == {run["mr_iid"], run["mr_url"]} do
+      {:ok, %{format: :direct_publication, publication: row}}
+    else
+      _ -> {:error, :ticket_mr_original_history_unproven}
+    end
+  end
+
+  defp retained_mr_record(store, run, :legacy), do: legacy_retained_mr_record(store, run)
+
+  defp legacy_retained_mr_record(store, run) do
     with stage = if(run["state"] == "CI_WAITING", do: "CI_MR_CREATING", else: "MR_CREATING"),
          {:ok, request, binding} <- historical_request_for_push(store, run, stage, hash(run["candidate_handoff"])),
          true <- request["status"] == "SUCCEEDED",
@@ -207,6 +234,9 @@ defmodule SymphonyElixir.Factory.TicketMrOperation do
 
   @doc "Rechecks an in-memory qualified MR receipt's current bindings; it is not dispatch authorization."
   @spec validate_delivery_receipt(Store.connection(), map(), map(), keyword()) :: :ok | {:error, term()}
+  def validate_delivery_receipt(store, %{format: :direct_publication} = receipt, factory, opts),
+    do: TicketMrPublication.validate_receipt(store, receipt, factory, opts)
+
   def validate_delivery_receipt(
         store,
         %{
@@ -404,6 +434,41 @@ defmodule SymphonyElixir.Factory.TicketMrOperation do
   def adopt_ci(%DBConnection{}, _, _, _, _), do: {:error, :ticket_mr_observation_inside_transaction}
 
   def adopt_ci(store, run_id, authorization, factory, opts) do
+    with {:ok, run} <- RunLedger.get(store, run_id),
+         {:ok, format} <- TicketMrPublication.receipt_format(store, run) do
+      case format do
+        :direct_publication -> adopt_direct_ci(store, run_id, authorization, factory, opts)
+        :legacy -> adopt_legacy_ci(store, run_id, authorization, factory, opts)
+      end
+    end
+  end
+
+  defp adopt_direct_ci(store, run_id, authorization, factory, opts) do
+    with {:ok, %{"state" => "CI_WAITING"} = run} <- RunLedger.get(store, run_id),
+         {:ok, row} <- TicketMrPublication.record_for_run(store, run),
+         intent = Jason.decode!(row["intent_json"]) do
+      SymphonyElixir.Factory.GitLabMrWriter.with_session(intent["workspace"], opts, fn scoped ->
+        with {:ok, receipt} <- TicketMrPublication.current_receipt(store, run_id, factory, scoped),
+             {:ok, admission} <- TicketWorkerRunner.delivery_admission(store, run, authorization, scoped),
+             {:ok, collected} <- TicketWorkerRunner.collect_ci(store, run_id, intent["project_id"], scoped),
+             repair_opts = Keyword.merge(scoped, ci_repair_limit: factory.maximum_code_repair_rounds, ci_repair_scope: factory.scope, ci_repair_policy: factory.ticket_supervisor["ci_repair"]),
+             {:ok, persist} <- TicketCiRepair.prepare_diagnosis(store, run, collected, intent["project_id"], repair_opts),
+             :ok <- TicketMrPublication.validate_receipt(store, receipt, factory, scoped) do
+          options = Keyword.merge(scoped, ci_diagnosis_persist: persist, mr_branch_at: DateTime.from_iso8601(receipt.observed_at) |> elem(1), direct_ci_proof: {receipt, factory, admission})
+
+          case Exqlite.transaction(store, &adopt_ci_transaction(&1, run, receipt, collected, authorization, options)) do
+            {:ok, result} -> result
+            {:error, reason} -> {:error, reason}
+          end
+        end
+      end)
+    else
+      {:error, _} = error -> error
+      _ -> {:error, :ticket_ci_stage_invalid}
+    end
+  end
+
+  defp adopt_legacy_ci(store, run_id, authorization, factory, opts) do
     with {:ok, %{"state" => "CI_WAITING"} = run} <- RunLedger.get(store, run_id),
          :ok <- TicketChat.ordinary_delivery_eligibility(run),
          {:ok, push} <- TicketPush.completed_proof(store, run_id),
@@ -446,10 +511,8 @@ defmodule SymphonyElixir.Factory.TicketMrOperation do
     with :ok <- recent_branch(opts[:mr_branch_at]),
          {:ok, current} <- RunLedger.get(store, run["run_id"]),
          true <- current == run or {:error, :ticket_ci_candidate_changed},
-         {:ok, observed} <- DesktopRequest.get(store, request["request_key"]),
-         true <- observed == request or {:error, :ticket_mr_request_changed},
-         :ok <- authorize_readback(store, observed),
-         {:ok, admission} <- TicketWorkerRunner.delivery_admission(store, current, authorization, opts),
+         :ok <- ci_receipt_current(store, request, opts),
+         {:ok, admission} <- ci_admission_current(store, current, authorization, opts),
          {:ok, push} <- TicketPush.completed_proof(store, run["run_id"]),
          :ok <- validate_push(push.binding, current, admission.checkout) do
       evidence = collected["evidence"]
@@ -482,6 +545,28 @@ defmodule SymphonyElixir.Factory.TicketMrOperation do
       end
     else
       {:error, reason} -> Exqlite.rollback(store, reason)
+    end
+  end
+
+  defp ci_receipt_current(store, %{format: :direct_publication} = receipt, opts) do
+    {^receipt, factory, _} = opts[:direct_ci_proof]
+    TicketMrPublication.validate_receipt(store, receipt, factory, opts)
+  end
+
+  defp ci_receipt_current(store, request, _opts) do
+    with {:ok, observed} <- DesktopRequest.get(store, request["request_key"]),
+         true <- observed == request or {:error, :ticket_mr_request_changed} do
+      authorize_readback(store, observed)
+    end
+  end
+
+  defp ci_admission_current(store, run, authorization, opts) do
+    case opts[:direct_ci_proof] do
+      {_receipt, _factory, admission} ->
+        with :ok <- TicketWorkerRunner.recheck_delivery_admission(store, run, authorization, opts, admission), do: {:ok, admission}
+
+      _ ->
+        TicketWorkerRunner.delivery_admission(store, run, authorization, opts)
     end
   end
 
@@ -1087,7 +1172,8 @@ defmodule SymphonyElixir.Factory.TicketMrOperation do
   end
 
   defp enqueue_current(store, run, control, attrs, scope, actor_proof) do
-    with {:ok, current} <- RunLedger.get(store, run["run_id"]),
+    with true <- not TicketMrPublication.recorded?(store, run["run_id"]) or {:error, :ticket_mr_direct_publication_exists},
+         {:ok, current} <- RunLedger.get(store, run["run_id"]),
          true <- (current == run and Control.status(store, scope) == control) or {:error, :ticket_mr_candidate_changed},
          false <- DesktopRequest.controller_busy?(store),
          {:ok, request} <- DesktopRequest.enqueue(store, attrs),

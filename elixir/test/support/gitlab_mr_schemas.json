@@ -1,0 +1,259 @@
+{
+  "list_merge_requests": {
+    "name": "list_merge_requests",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_id": {
+          "description": "Project ID or URL-encoded path (optional - if not provided, lists all merge requests the user has access to)",
+          "type": "string"
+        },
+        "assignee_id": {
+          "description": "Return MRs assigned to the given user ID (integer), 'none', or 'any'. Mutually exclusive with assignee_username.",
+          "type": "string"
+        },
+        "assignee_username": {
+          "description": "Returns merge requests assigned to the given username. Mutually exclusive with assignee_id.",
+          "type": "string"
+        },
+        "author_id": {
+          "description": "Returns merge requests created by the given user ID (integer). Mutually exclusive with author_username.",
+          "type": "string"
+        },
+        "author_username": {
+          "description": "Returns merge requests created by the given username. Mutually exclusive with author_id.",
+          "type": "string"
+        },
+        "reviewer_id": {
+          "description": "Returns merge requests which have the user as a reviewer. Must be an integer, 'none', or 'any'. Mutually exclusive with reviewer_username.",
+          "type": "string"
+        },
+        "reviewer_username": {
+          "description": "Returns merge requests which have the user as a reviewer by username. Mutually exclusive with reviewer_id.",
+          "type": "string"
+        },
+        "approved_by_usernames": {
+          "description": "Returns merge requests approved by the given usernames (array).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "created_after": {
+          "description": "Return merge requests created after the given time",
+          "type": "string"
+        },
+        "created_before": {
+          "description": "Return merge requests created before the given time",
+          "type": "string"
+        },
+        "updated_after": {
+          "description": "Return merge requests updated after the given time",
+          "type": "string"
+        },
+        "updated_before": {
+          "description": "Return merge requests updated before the given time",
+          "type": "string"
+        },
+        "labels": {
+          "description": "Array of label names",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "milestone": {
+          "description": "Milestone title",
+          "type": "string"
+        },
+        "scope": {
+          "description": "Return merge requests from a specific scope",
+          "type": "string",
+          "enum": [
+            "created_by_me",
+            "assigned_to_me",
+            "all"
+          ]
+        },
+        "search": {
+          "description": "Search for specific terms",
+          "type": "string"
+        },
+        "state": {
+          "description": "Return merge requests with a specific state",
+          "type": "string",
+          "enum": [
+            "opened",
+            "closed",
+            "locked",
+            "merged",
+            "all"
+          ]
+        },
+        "order_by": {
+          "description": "Return merge requests ordered by the given field",
+          "type": "string",
+          "enum": [
+            "created_at",
+            "updated_at",
+            "priority",
+            "label_priority",
+            "milestone_due",
+            "popularity"
+          ]
+        },
+        "sort": {
+          "description": "Return merge requests sorted in ascending or descending order",
+          "type": "string",
+          "enum": [
+            "asc",
+            "desc"
+          ]
+        },
+        "target_branch": {
+          "description": "Return merge requests targeting a specific branch",
+          "type": "string"
+        },
+        "source_branch": {
+          "description": "Return merge requests from a specific source branch",
+          "type": "string"
+        },
+        "wip": {
+          "description": "Filter merge requests against their wip status",
+          "type": "string",
+          "enum": [
+            "yes",
+            "no"
+          ]
+        },
+        "with_labels_details": {
+          "description": "Return more details for each label",
+          "type": "boolean"
+        },
+        "page": {
+          "description": "Page number for pagination (default: 1)",
+          "type": "number"
+        },
+        "per_page": {
+          "description": "Number of items per page (max: 100, default: 20)",
+          "type": "number"
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true
+    }
+  },
+  "get_merge_request": {
+    "name": "get_merge_request",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_id": {
+          "description": "Project ID or complete URL-encoded path to project",
+          "type": "string"
+        },
+        "merge_request_iid": {
+          "description": "The IID of a merge request",
+          "type": "string"
+        },
+        "source_branch": {
+          "description": "Source branch name",
+          "type": "string"
+        },
+        "include_summaries": {
+          "description": "If true, include deployment_summary, commit_addition_summary and approval_summary (extra API calls, larger response). Default false to reduce token usage.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "project_id"
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": true
+    }
+  },
+  "create_merge_request": {
+    "name": "create_merge_request",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project_id": {
+          "type": "string",
+          "description": "Project ID or complete URL-encoded path to project"
+        },
+        "title": {
+          "type": "string",
+          "description": "Merge request title"
+        },
+        "description": {
+          "description": "Merge request description",
+          "type": "string"
+        },
+        "source_branch": {
+          "type": "string",
+          "description": "Branch containing changes"
+        },
+        "target_branch": {
+          "type": "string",
+          "description": "Branch to merge into"
+        },
+        "target_project_id": {
+          "description": "Numeric ID of the target project.",
+          "type": "string"
+        },
+        "assignee_ids": {
+          "description": "The ID of the users to assign the MR to",
+          "type": "array",
+          "items": {
+            "type": "number"
+          }
+        },
+        "reviewer_ids": {
+          "description": "The ID of the users to assign as reviewers of the MR",
+          "type": "array",
+          "items": {
+            "type": "number"
+          }
+        },
+        "labels": {
+          "description": "Labels for the MR",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "draft": {
+          "description": "Create as draft merge request",
+          "type": "boolean"
+        },
+        "allow_collaboration": {
+          "description": "Allow commits from upstream members",
+          "type": "boolean"
+        },
+        "remove_source_branch": {
+          "description": "Flag indicating if a merge request should remove the source branch when merging.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "squash": {
+          "description": "If true, squash all commits into a single commit on merge.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "project_id",
+        "title",
+        "source_branch",
+        "target_branch"
+      ]
+    },
+    "annotations": {}
+  }
+}

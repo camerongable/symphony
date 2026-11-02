@@ -915,6 +915,96 @@ defmodule SymphonyElixir.AppServerTest do
     )
   end
 
+  @tag timeout: 180_000
+  test "scheduler publication loses a real provider acknowledgement and reconciles one loopback POST after restart" do
+    alias SymphonyElixir.Factory.{RunLedger, Store, TicketMrPublication, TicketJiraFinalization}
+    alias SymphonyElixir.TicketWorkerFixture
+    ctx = TicketWorkerFixture.publication_fixture()
+    script = Path.expand("../support/gitlab_mr_loopback.mjs", __DIR__)
+    node = System.find_executable("node")
+    config_path = Path.join(ctx.root, "loopback.json")
+    state_path = Path.join(ctx.root, "http-state.json")
+
+    config = %{
+      "root" => ctx.root,
+      "sourceBranch" => ctx.publication_run["branch"],
+      "sha" => ctx.publication_run["candidate_sha"],
+      "statePath" => state_path,
+      "pidsPath" => Path.join(ctx.root, "provider-pids"),
+      "stderrPath" => Path.join(ctx.root, "provider-stderr")
+    }
+
+    File.write!(config_path, Jason.encode!(config))
+    server = Port.open({:spawn_executable, node}, [:binary, :exit_status, {:line, 16_384}, args: [script, "gitlab", config_path]])
+
+    try do
+      assert_receive {^server, {:data, {:eol, ready}}}, 10_000
+      port = Jason.decode!(ready)["port"]
+      File.write!(config_path, Jason.encode!(Map.put(config, "apiUrl", "http://127.0.0.1:#{port}/api/v4")))
+
+      handler = """
+      case "$line" in
+        *'"method":"initialize"'*) exec '#{node}' '#{script}' bridge '#{config_path}' ;;
+      esac
+      """
+
+      with_thread_listing_server("mr-provider-loopback", handler, fn _workspace, trace ->
+        write_workflow_file!(Workflow.workflow_file_path(), workspace_root: ctx.worker_context.workspace_root, codex_command: "#{Path.join(Path.dirname(trace), "fake-codex")} app-server")
+        opts = ctx.options |> Keyword.put(:app_server, AppServer) |> Keyword.delete(:mcp_session)
+        before = Store.query!(ctx.store, "SELECT * FROM desktop_requests").rows
+        assert {:ok, %{launches: [], events: first}} = TicketWorkerFixture.publication_tick(ctx, opts)
+        assert Enum.any?(first, &(&1.event == "TICKET_MR_ISSUED_UNKNOWN")), inspect(first) <> "\n" <> File.read!(config["stderrPath"]) <> "\n" <> File.read!(state_path)
+        assert Store.one!(ctx.store, "SELECT phase FROM ticket_mr_publications")["phase"] == "ISSUED_UNKNOWN"
+        {:ok, reopened} = Store.start_link(database: ctx.database)
+
+        try do
+          restarted = %{ctx | store: reopened, worker_context: %{ctx.worker_context | store: reopened}}
+          assert {:ok, %{launches: []}} = TicketWorkerFixture.publication_tick(restarted, opts)
+          assert Store.one!(reopened, "SELECT phase FROM ticket_mr_publications")["phase"] == "SUCCEEDED"
+          assert {:ok, %{launches: [], events: adopted}} = TicketWorkerFixture.publication_tick(restarted, opts)
+          assert Enum.any?(adopted, &(&1.event == "TICKET_MR_PUBLISHED"))
+          assert {:ok, published} = RunLedger.get(reopened, "run")
+          assert published["mr_iid"] == 42
+          assert {:ok, row} = TicketMrPublication.record_for_run(reopened, published)
+          assert Jason.decode!(row["receipt_json"])["outcome"] == "RECONCILED_EXISTING"
+          {:ok, snapshot} = TicketWorkerFixture.PublicationJiraReader.issue("PPL-123", store: reopened)
+          snapshot = Map.update!(snapshot, "comments", fn comments -> Enum.with_index(comments) |> Enum.map(fn {entry, index} -> Map.put(entry, "id", "history-#{index}") end) end)
+          Process.put(:publication_jira_snapshot, snapshot)
+
+          final_opts =
+            Keyword.merge(opts,
+              workspace: Path.join(ctx.worker_context.workspace_root, "factory-controller/scope"),
+              gitlab_app_server: AppServer,
+              jira_reader: TicketWorkerFixture.PublicationFinalJira,
+              jira_connector: TicketWorkerFixture.PublicationFinalJira,
+              jira_session: fn _, callback -> callback.(%{thread_id: "final-jira"}) end
+            )
+
+          assert {:ok, %{status: "REVIEW_READY"}} = TicketJiraFinalization.finish(reopened, "run", Map.put(ctx.factory, :task_transport, "desktop_broker"), final_opts)
+          assert Store.query!(reopened, "SELECT * FROM desktop_requests").rows == before
+        after
+          GenServer.stop(reopened)
+        end
+
+        http = File.read!(state_path) |> Jason.decode!()
+        assert http["posts"] == 1 and http["violations"] == []
+        messages = File.read!(trace) |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!(String.trim_leading(&1, "JSON:")))
+        refute Enum.any?(messages, &(&1["method"] in ~w(turn/start thread/resume thread/fork)))
+        refute Enum.any?(messages, &String.contains?(&1["method"], "send_message"))
+
+        for pid <- File.read!(config["pidsPath"]) |> String.split("\n", trim: true) do
+          assert {_, code} = System.cmd("/bin/kill", ["-0", pid], stderr_to_stdout: true)
+          assert code != 0
+        end
+      end)
+    after
+      if Port.info(server) do
+        Port.command(server, "stop\n")
+        assert_receive {^server, {:exit_status, 0}}, 10_000
+      end
+    end
+  end
+
   test "ephemeral connector scope never resumes a controller or starts a model and always closes" do
     scopes = [{"GitLab", &AppServer.with_gitlab_read_session/2}, {"Jira", &AppServer.with_jira_controller_session/2}, {"Jira", &AppServer.with_jira_read_session/2}]
 

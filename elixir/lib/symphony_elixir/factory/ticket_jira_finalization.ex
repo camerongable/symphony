@@ -319,10 +319,13 @@ defmodule SymphonyElixir.Factory.TicketJiraFinalization do
              snapshot_json: Jason.encode!(observation["issue"]),
              last_error: nil
            }),
-         {:ok, _} <- TicketChat.ready_for_run(store, run["run_id"]) do
+         {:ok, _} <- final_parent(store, run["run_id"], qualified) do
       {:ok, %{status: "REVIEW_READY", run: ready, model_invoked: false}}
     end
   end
+
+  defp final_parent(store, run_id, %{format: :direct_publication}), do: TicketChat.bound_for_run(store, run_id)
+  defp final_parent(store, run_id, _legacy), do: TicketChat.ready_for_run(store, run_id)
 
   defp comment(run) do
     Enum.join(

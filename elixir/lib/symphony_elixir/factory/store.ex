@@ -10,6 +10,27 @@ defmodule SymphonyElixir.Factory.Store do
   alias Exqlite.Result
   alias SymphonyElixir.Factory.WorkerFileIO
 
+  @mr_publication_table """
+  CREATE TABLE IF NOT EXISTS ticket_mr_publications (
+    operation_key TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(run_id),
+    project_id INTEGER NOT NULL CHECK(project_id > 0),
+    source_branch TEXT NOT NULL,
+    target_branch TEXT NOT NULL,
+    intent_json TEXT NOT NULL,
+    intent_sha256 TEXT NOT NULL,
+    phase TEXT NOT NULL CHECK(phase IN ('PREPARED','ISSUED_UNKNOWN','SUCCEEDED','FAILED_BEFORE_ISSUANCE')),
+    receipt_json TEXT,
+    receipt_sha256 TEXT,
+    error_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK((receipt_json IS NULL) = (receipt_sha256 IS NULL)),
+    CHECK((phase = 'SUCCEEDED') = (receipt_json IS NOT NULL))
+  )
+  """
+  @mr_publication_index "CREATE UNIQUE INDEX IF NOT EXISTS one_uncertain_mr_publication ON ticket_mr_publications(run_id,project_id,source_branch,target_branch) WHERE phase='ISSUED_UNKNOWN'"
+
   @mr_presend_table """
   CREATE TABLE IF NOT EXISTS ticket_mr_presend_consumptions (
     request_key TEXT PRIMARY KEY REFERENCES ticket_mr_claims(request_key),
@@ -931,7 +952,7 @@ defmodule SymphonyElixir.Factory.Store do
       MapSet.union(
         expected,
         MapSet.new(
-          ~w(ticket_ci_repair_diagnoses ticket_ci_repair_claims ticket_ci_generation_intents ticket_ci_generation_events ticket_push_input_retirements worker_instruction_snapshots worker_instruction_task_bindings ticket_ci_repair_reassessments ticket_mr_qualifications ticket_ci_repair_evidence_successors)
+          ~w(ticket_ci_repair_diagnoses ticket_ci_repair_claims ticket_ci_generation_intents ticket_ci_generation_events ticket_push_input_retirements worker_instruction_snapshots worker_instruction_task_bindings ticket_ci_repair_reassessments ticket_mr_qualifications ticket_ci_repair_evidence_successors ticket_mr_publications)
         )
       )
 
@@ -1023,6 +1044,7 @@ defmodule SymphonyElixir.Factory.Store do
 
   defp reader_columns_present?(connection) do
     required = %{
+      "ticket_mr_publications" => ~w(operation_key run_id project_id source_branch target_branch intent_json intent_sha256 phase receipt_json receipt_sha256 error_json created_at updated_at),
       "ticket_ordinary_generation_intents" => ~w(intent_key run_id verifier_request_key request_key operation binding_json binding_sha256 created_at),
       "ticket_ordinary_generation_events" => ~w(event_key intent_key event_type path predecessor_key receipt_json receipt_sha256 created_at),
       "ticket_human_empty_commit_imports" => ~w(import_key run_id request_key candidate_sha proof_json proof_sha256 created_at),
@@ -1180,6 +1202,7 @@ defmodule SymphonyElixir.Factory.Store do
     migrate_mr_presend_consumptions(connection)
     migrate_push_prepared_requalifications(connection)
     migrate_ci_round_identity(connection)
+    migrate_mr_publications(connection)
 
     :ok
   end
@@ -1218,7 +1241,45 @@ defmodule SymphonyElixir.Factory.Store do
   end
 
   defp mr_presend_current?(connection, versions) do
-    versions == Enum.map(1..54, &[&1]) and mr_presend_structure?(connection) and push_prepared_requalification_structure?(connection)
+    versions == Enum.map(1..55, &[&1]) and mr_presend_structure?(connection) and push_prepared_requalification_structure?(connection) and mr_publication_structure?(connection)
+  end
+
+  defp migrate_mr_publications(connection) do
+    unless one!(connection, "SELECT version FROM factory_schema_migrations WHERE version=55") do
+      transaction!(connection, fn tx ->
+        query!(tx, @mr_publication_table)
+        query!(tx, @mr_publication_index)
+
+        query!(
+          tx,
+          "CREATE TRIGGER mr_publication_identity BEFORE UPDATE OF operation_key,run_id,project_id,source_branch,target_branch,intent_json,intent_sha256,created_at ON ticket_mr_publications BEGIN SELECT RAISE(ABORT,'mr_publication_identity_immutable'); END"
+        )
+
+        query!(tx, "CREATE TRIGGER mr_publication_terminal BEFORE UPDATE ON ticket_mr_publications WHEN OLD.phase='SUCCEEDED' BEGIN SELECT RAISE(ABORT,'mr_publication_receipt_immutable'); END")
+        query!(tx, "CREATE TRIGGER mr_publication_delete BEFORE DELETE ON ticket_mr_publications BEGIN SELECT RAISE(ABORT,'mr_publication_history_required'); END")
+
+        query!(
+          tx,
+          "CREATE TRIGGER mr_publication_schema_rollback BEFORE DELETE ON factory_schema_migrations WHEN OLD.version=55 AND EXISTS(SELECT 1 FROM ticket_mr_publications) BEGIN SELECT RAISE(ABORT,'mr_publication_schema_required'); END"
+        )
+
+        query!(tx, "INSERT INTO factory_schema_migrations(version,applied_at) VALUES(55,?)", [iso_now()])
+      end)
+    end
+
+    unless mr_publication_structure?(connection), do: raise("MR publication schema invalid")
+  end
+
+  defp mr_publication_structure?(connection) do
+    table = one!(connection, "SELECT sql FROM sqlite_master WHERE type='table' AND name='ticket_mr_publications'")
+    index = one!(connection, "SELECT sql FROM sqlite_master WHERE type='index' AND name='one_uncertain_mr_publication'")
+
+    is_map(table) and is_map(index) and normalize_presend_sql(table["sql"]) == normalize_presend_sql(@mr_publication_table) and
+      normalize_presend_sql(index["sql"]) == normalize_presend_sql(@mr_publication_index) and
+      Enum.all?(
+        ~w(mr_publication_identity mr_publication_terminal mr_publication_delete mr_publication_schema_rollback),
+        &(not is_nil(one!(connection, "SELECT name FROM sqlite_master WHERE type='trigger' AND name=?", [&1])))
+      )
   end
 
   defp migrate_ci_round_identity(connection) do

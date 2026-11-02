@@ -94,11 +94,56 @@ One bounded controller tick performs this sequence:
    merge request, and terminal result in SQLite.
 7. Release the exact lease in an `after` path.
 
-The controller owns Jira writes, final Git push, GitLab draft-MR creation or
-update, and read-back. Child tasks receive provenanced snapshots and return
+The controller owns Jira writes, final Git push, GitLab draft-MR creation and
+read-back. Child tasks receive provenanced snapshots and return
 structured results; they do not need Jira or GitLab credentials. The factory
 never merges, undrafts, assigns reviewers, manages human review, or deploys to
 production.
+
+### Direct MR publication
+
+Fresh ticket publication uses one caller-owned GitLab connector session and fixed
+typed list/get/create operations, not a model chat, Desktop request, expiring
+owner handle, or mailbox. The generic GitLab connector remains read-only and
+specialists receive no connector access. Optional compatible advertised-schema
+changes do not require runtime qualification; incompatible required inputs or an
+approval/permission refusal remain explicit and have no fallback transport.
+
+The controller discovers all exact project/source/target matches across all
+states and scopes, with bounded complete pagination. It creates a reviewer-free
+draft only when discovery proves there is no match and creation is available.
+New drafts retain the pilot's existing assignee intent (11599766) and disable
+source-branch removal. This identity is not a general account-resolution service.
+An existing compatible draft is reused without writes, including description
+updates. The receipt distinguishes observed existing content from newly created
+content. Human-ready, reviewed, closed, merged, ambiguous, unsafe-removal, or
+unknown-removal state is never permission to replace or re-draft an MR.
+
+Schema 55's `ticket_mr_publications` journal binds run, contract, candidate,
+completed push, remote branches and intended content. `PREPARED` precedes any
+mutation; `ISSUED_UNKNOWN` survives a lost response and fences another creation,
+even if candidate or content changes. Restart performs discovery/readback only.
+`SUCCEEDED` receipts are immutable; `FAILED_BEFORE_ISSUANCE` records a proven
+pre-call refusal rather than an uncertain remote result. A pause, product hold,
+cancellation or changed contract after issuance does not discard the original
+effect: reconciliation records it under its original binding without granting
+new-action permission or advancing Jira. Readback-only recovery cannot create.
+
+Current receipts continue through exact-SHA CI adoption, independent verification,
+retained-MR authorization and Jira finalization without requiring parent-chat
+presentation acknowledgement. Durable questions/commands, control authority,
+candidate identity and independent acceptance remain enforced. Legacy issued or
+uncertain Desktop MR requests retain their original readback/settlement route
+and fence fresh publication; their history is not rewritten or replayed through
+the new writer. MR-only legacy mailbox/owner support remains while that inventory
+exists. No existing legacy request is retired automatically by this change.
+
+The connected local rehearsal uses the actual Elixir AppServer protocol and
+installed MCP provider against a synthetic loopback GitLab server. It is not live
+write-permission qualification. Live activation needs supported configured write
+exposure and an explicitly authorized exact operation. Historical schema-54
+cutover scripts require a separately reviewed migration-aware rollout workflow;
+this implementation does not alter those incident-specific scripts.
 
 ## Durable stage graph
 
