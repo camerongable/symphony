@@ -1297,6 +1297,12 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     SymphonyElixir.TicketChatFixture.runtime_fixture(ctx.root)
     bind_parent(ctx)
 
+    if ctx[:push_current] == true or ctx[:push_lifetime_cleanup] == true do
+      control = %{scope: "scope", dispatcher_id: "fixture-dispatcher"}
+      Control.initialize(ctx.store, control)
+      assert {:ok, _} = Control.activate(ctx.store, control, control.dispatcher_id)
+    end
+
     if ctx[:structured_review] do
       contract = Contract.bind("PPL-123", 2, "AC-1: preserve the fixture behavior.\n\n## Manual Validation\n- Required: no")
       {:ok, run} = RunLedger.get(ctx.store, "run")
@@ -13221,7 +13227,51 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     assert String.trim(git(run["worktree"], ["rev-parse", "HEAD"])) == run["candidate_sha"]
   end
 
-  @tag push_current: true
+  @tag push_current: true, push_control_guard: true
+  test "fresh publication refuses missing bound control before preparation or claim", ctx do
+    {context, options} = controller(ctx)
+    assert complete_stage(context, options)["state"] == "VERIFYING"
+    run = complete_stage(context, options)
+    counter = current_push_origin(ctx, "missing-control")
+    {:ok, snapshot} = JiraReader.issue(run["issue_key"], store: ctx.store)
+    {:ok, authorization} = TicketWorkerRunner.authorization(run, snapshot, DateTime.utc_now())
+    Store.query!(ctx.store, "DELETE FROM control WHERE scope='scope'")
+
+    for action <- [&TicketPush.prepare/4, &TicketPush.claim/4, &TicketPush.step/4] do
+      assert {:error, :ticket_push_current_action_unavailable} = action.(ctx.store, "run", authorization, options)
+      assert {:ok, ^run} = RunLedger.get(ctx.store, "run")
+      refute File.exists?(counter)
+    end
+  end
+
+  @tag push_current: true, push_control_guard: true
+  test "physical publication rejects a retained empty control snapshot without launching Git", ctx do
+    {context, options} = controller(ctx)
+    assert complete_stage(context, options)["state"] == "VERIFYING"
+    run = complete_stage(context, options)
+    counter = current_push_origin(ctx, "empty-control")
+    {:ok, snapshot} = JiraReader.issue(run["issue_key"], store: ctx.store)
+    {:ok, authorization} = TicketWorkerRunner.authorization(run, snapshot, DateTime.utc_now())
+    {:ok, claimed} = TicketPush.claim(ctx.store, "run", authorization, options)
+    {:ok, execution} = TicketPushIO.prepare(ctx.store, claimed, authorization, options)
+    execution = put_in(execution, ["action_facts", "controls"], [])
+
+    assert {:ok, receipt} =
+             TicketPushIO.execute(execution, fn pid, encoded ->
+               bound = Map.merge(claimed, %{"helper_pid" => pid, "execution_json" => encoded})
+               Store.query!(ctx.store, "UPDATE runs SET candidate_handoff=? WHERE run_id='run'", [Jason.encode!(bound)])
+               Store.query!(ctx.store, "DELETE FROM control WHERE scope='scope'")
+               {:ok, bound}
+             end)
+
+    {:ok, current} = RunLedger.get(ctx.store, "run")
+    assert {:ok, %{"outcome" => "NOT_STARTED", "child_pid" => nil}} = TicketPushIO.not_started_proof(receipt, Jason.decode!(current["candidate_handoff"]))
+    assert {:ok, %{status: "PUSH_NOT_STARTED_HELD"}} = TicketPush.step(ctx.store, "run", authorization, options)
+    assert {:ok, ^current} = RunLedger.get(ctx.store, "run")
+    refute File.exists?(counter)
+  end
+
+  @tag push_current: true, push_fence_race: true
   test "current push terminal nonissuance retries once with fresh authority after reopen", ctx do
     {context, options} = controller(ctx)
     assert complete_stage(context, options)["state"] == "VERIFYING"
@@ -13269,6 +13319,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
 
       marker = Path.join(spool, original["owner_nonce"] <> ".current-issued")
       File.write!(marker, original["execution_json"])
+      assert_current_spool_race_refused(%{ctx | store: reopened}, original, authorization, options, counter)
       assert {:error, :ticket_push_nonissuance_unproven} = TicketPush.step(reopened, "run", authorization, options)
       assert {:ok, ^rejected} = RunLedger.get(reopened, "run")
       File.rm!(marker)
@@ -13392,7 +13443,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     assert String.split(File.read!(counter), "\n", trim: true) == ["push"]
   end
 
-  for hold <- [:product_and_pause, :contract, :cancelled] do
+  for hold <- [:product_and_pause, :contract, :cancelled, :missing_control] do
     @tag push_current: true
     @current_hold hold
     test "current issued push settles across restart without advancing through #{@current_hold}", ctx do
@@ -13407,17 +13458,21 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
       operation = Task.async(fn -> TicketPushIO.execute(execution, &TicketPush.attach_execution(ctx.store, "run", &1, &2, authorization, options)) end)
       wait_current_push(Path.join(ctx.root, "held-started"), 200)
 
-      if @current_hold == :product_and_pause do
-        assert {:ok, _} = TicketChatCommands.open_question(ctx.store, "run", %{"question_key" => "Q-after-launch", "body" => "Keep this candidate?", "answers" => %{"yes" => true}})
-        config = %{scope: "scope", dispatcher_id: "fixture-dispatcher"}
-        Control.initialize(ctx.store, config)
-      else
-        if @current_hold == :cancelled do
+      case @current_hold do
+        :product_and_pause ->
+          assert {:ok, _} = TicketChatCommands.open_question(ctx.store, "run", %{"question_key" => "Q-after-launch", "body" => "Keep this candidate?", "answers" => %{"yes" => true}})
+          config = %{scope: "scope", dispatcher_id: "fixture-dispatcher"}
+          assert {:ok, _} = Control.pause(ctx.store, config, config.dispatcher_id)
+
+        :missing_control ->
+          Store.query!(ctx.store, "DELETE FROM control WHERE scope='scope'")
+
+        :cancelled ->
           assert {:ok, _} = RunLedger.update(ctx.store, "run", %{state: "CANCELLED"})
-        else
+
+        :contract ->
           contract = Contract.bind("PPL-123", run["spec_revision"] + 1, "A changed confirmed contract.\n\n## Manual Validation\n- Required: no")
           assert {:ok, _} = RunLedger.update(ctx.store, "run", %{spec_revision: contract.revision, contract_sha256: contract.sha256, contract_markdown: contract.markdown})
-        end
       end
 
       File.write!(Path.join(ctx.root, "held-release"), "continue")
@@ -13459,16 +13514,70 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
   end
 
   defp assert_current_receipt_upgrade(ctx, intent, receipt) do
+    with_current_push_reader(ctx, "release-b", fn raw -> raw <> "\n# Deliberately different release bytes for receipt compatibility.\n" end, fn module ->
+      assert {:ok, ^receipt} = module.readback(intent)
+      assert module.receipt_valid?(receipt, intent)
+      refute module.receipt_valid?(Jason.encode!(Map.put(Jason.decode!(receipt), "version", 99)), intent)
+      assert {:error, :ticket_push_program_changed} = module.execute(Jason.decode!(intent["execution_json"]), fn _, _ -> flunk("old release was reissued") end)
+    end)
+
+    assert {:ok, ^receipt} = TicketPushIO.readback(intent)
+  end
+
+  defp assert_current_spool_race_refused(ctx, intent, authorization, options, counter) do
+    execution = Jason.decode!(intent["execution_json"])
+    spool = execution["spool"]
+    saved = spool <> "-issued"
+    observed = Path.join(ctx.root, "spool-lookup.json")
+
+    boundary = """
+    original_stat = os.stat
+    def replace_spool_during_marker_lookup(path, *args, **kwargs):
+        if str(path).endswith(#{Jason.encode!(intent["owner_nonce"] <> ".current-issued")}):
+            descriptor = kwargs["dir_fd"]
+            original_inode = os.fstat(descriptor).st_ino
+            os.rename(#{Jason.encode!(spool)}, #{Jason.encode!(saved)})
+            os.mkdir(#{Jason.encode!(spool)}, 0o700)
+            with open(#{Jason.encode!(observed)}, "w") as record:
+                json.dump({"descriptor_inode": original_inode, "replacement_inode": original_stat(#{Jason.encode!(spool)}).st_ino}, record)
+        return original_stat(path, *args, **kwargs)
+    os.stat = replace_spool_during_marker_lookup
+    """
+
+    {:ok, before} = RunLedger.get(ctx.store, "run")
+
+    try do
+      with_current_push_reader(ctx, "fence-reader", fn raw -> String.replace(raw, "if __name__ == \"__main__\":", boundary <> "\nif __name__ == \"__main__\":") end, fn module ->
+        assert {:error, :ticket_push_nonissuance_unproven} = Store.transaction!(ctx.store, &module.current_fence_observation(&1, intent))
+      end)
+
+      result = observed |> File.read!() |> Jason.decode!()
+      assert result["descriptor_inode"] == execution["spool_inode"]
+      refute result["replacement_inode"] == execution["spool_inode"]
+      assert File.read!(Path.join(saved, intent["owner_nonce"] <> ".current-issued")) == intent["execution_json"]
+      assert {:error, :ticket_push_nonissuance_unproven} = TicketPush.step(ctx.store, "run", authorization, options)
+      assert {:ok, ^before} = RunLedger.get(ctx.store, "run")
+      assert Store.one!(ctx.store, "SELECT COUNT(*) AS count FROM events WHERE event_type='TICKET_PUSH_NOT_STARTED_RETRIED'")["count"] == 0
+      refute File.exists?(counter)
+    after
+      if File.dir?(saved) do
+        File.rmdir!(spool)
+        File.rename!(saved, spool)
+      end
+    end
+  end
+
+  defp with_current_push_reader(ctx, release, transform, verify) do
     original = Application.app_dir(:symphony_elixir)
     {:ok, original_priv} = SymphonyElixir.PathSafety.canonicalize(Path.join(original, "priv"))
     original_helper = Path.join(original_priv, "ticket_push_current.py")
     original_digest = :crypto.hash(:sha256, File.read!(original_helper))
-    app = Path.join(ctx.root, "release-b/lib/symphony_elixir")
+    app = Path.join(ctx.root, release <> "/lib/symphony_elixir")
     File.mkdir_p!(app)
     File.cp_r!(Path.join(original, "ebin"), Path.join(app, "ebin"))
     File.cp_r!(original_priv, Path.join(app, "priv"))
     helper = Path.join(app, "priv/ticket_push_current.py")
-    File.write!(helper, File.read!(helper) <> "\n# Deliberately different release bytes for receipt compatibility.\n")
+    File.write!(helper, transform.(File.read!(helper)))
     source = Path.expand("../../lib/symphony_elixir/factory/ticket_push_io.ex", __DIR__)
     module = Module.concat(__MODULE__, "CurrentReader#{System.unique_integer([:positive])}")
     text = String.replace(File.read!(source), "defmodule SymphonyElixir.Factory.TicketPushIO do", "defmodule #{inspect(module)} do", global: false)
@@ -13476,17 +13585,13 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     true = :code.replace_path(:symphony_elixir, String.to_charlist(Path.join(app, "ebin")))
 
     try do
-      assert {:ok, ^receipt} = module.readback(intent)
-      assert module.receipt_valid?(receipt, intent)
-      refute module.receipt_valid?(Jason.encode!(Map.put(Jason.decode!(receipt), "version", 99)), intent)
-      assert {:error, :ticket_push_program_changed} = module.execute(Jason.decode!(intent["execution_json"]), fn _, _ -> flunk("old release was reissued") end)
+      verify.(module)
     after
       true = :code.replace_path(:symphony_elixir, String.to_charlist(Path.join(original, "ebin")))
       :code.purge(module)
       :code.delete(module)
     end
 
-    assert {:ok, ^receipt} = TicketPushIO.readback(intent)
     assert :crypto.hash(:sha256, File.read!(original_helper)) == original_digest
   end
 

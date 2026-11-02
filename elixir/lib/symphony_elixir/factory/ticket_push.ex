@@ -312,6 +312,7 @@ defmodule SymphonyElixir.Factory.TicketPush do
          {:ok, origin} <- Worktree.origin_identity(%{"path" => run["repo_path"]}, run["worktree"]),
          {:ok, parent} <- TicketChat.bound_for_run(store, run["run_id"]),
          binding = binding(store, run, admitted, parent, origin),
+         {:ok, facts} <- TicketPushIO.current_action_facts(store, binding),
          encoded = Jason.encode!(binding),
          key = "ticket-push:" <> digest(encoded),
          true <- previous_key?(previous, key) or {:error, :ticket_push_binding_already_completed} do
@@ -333,6 +334,7 @@ defmodule SymphonyElixir.Factory.TicketPush do
          parent: parent,
          origin: origin,
          binding: binding,
+         publication_facts: facts,
          encoded: encoded,
          key: key,
          attrs: attrs,
@@ -355,6 +357,8 @@ defmodule SymphonyElixir.Factory.TicketPush do
          true <- Map.take(access_binding, ~w(path git_dir common_dir root_device root_inode)) == stringify(plan.admitted.checkout) or {:error, :ticket_push_checkout_changed},
          {:ok, current_parent} <- TicketChat.for_run(tx, run["run_id"]),
          true <- current_parent == plan.parent or plan.binding["publication_version"] == 2 or {:error, :ticket_push_parent_changed},
+         {:ok, facts} <- TicketPushIO.current_action_facts(tx, plan.binding),
+         true <- facts == plan.publication_facts or {:error, :ticket_push_current_action_unavailable},
          true <- binding(tx, run, plan.admitted, current_parent, plan.origin) == plan.binding or {:error, :ticket_push_binding_changed} do
       :ok
     else
@@ -1210,8 +1214,9 @@ defmodule SymphonyElixir.Factory.TicketPush do
          expected = expected_binding(store, run, admitted, parent, origin, stored_binding),
          expected = if(Map.has_key?(stored_binding, "bootstrap_recovery"), do: expected, else: Map.delete(expected, "bootstrap_recovery")),
          expected = if(Map.has_key?(stored_binding, "code_repair_round"), do: expected, else: Map.delete(expected, "code_repair_round")),
-         true <- stored_binding == expected or {:error, :ticket_push_binding_changed} do
-      {:ok, %{intent: intent, run: run, admitted: admitted, origin: origin, parent: parent, binding: stored_binding, policy_store: store}}
+         true <- stored_binding == expected or {:error, :ticket_push_binding_changed},
+         {:ok, facts} <- publication_facts(store, stored_binding) do
+      {:ok, %{intent: intent, run: run, admitted: admitted, origin: origin, parent: parent, binding: stored_binding, policy_store: store, publication_facts: facts}}
     else
       {:error, _} = error -> error
       _ -> {:error, :ticket_push_intent_invalid}
@@ -1220,6 +1225,9 @@ defmodule SymphonyElixir.Factory.TicketPush do
 
   defp expected_binding(store, run, admitted, parent, origin, %{"publication_version" => 2}), do: binding(store, run, admitted, parent, origin)
   defp expected_binding(store, run, admitted, parent, origin, _legacy), do: legacy_binding(store, run, admitted, parent, origin)
+
+  defp publication_facts(store, %{"publication_version" => 2} = binding), do: TicketPushIO.current_action_facts(store, binding)
+  defp publication_facts(_store, _binding), do: {:ok, nil}
 
   defp retained_successor_context(store, run, %{"ci_evidence_successor" => _} = binding) do
     retained_repair_context(store, run, binding)
@@ -1332,6 +1340,8 @@ defmodule SymphonyElixir.Factory.TicketPush do
          :ok <- TicketWorkerRunner.recheck_delivery_admission(tx, run, authorization, opts, observed.admitted),
          {:ok, parent} <- TicketChat.for_run(tx, run["run_id"]),
          true <- parent == observed.parent or observed.binding["publication_version"] == 2 or {:error, :ticket_push_parent_changed},
+         {:ok, facts} <- publication_facts(tx, observed.binding),
+         true <- facts == observed.publication_facts or {:error, :ticket_push_current_action_unavailable},
          expected = expected_binding(tx, run, observed.admitted, parent, observed.origin, observed.binding),
          expected = if(Map.has_key?(observed.binding, "bootstrap_recovery"), do: expected, else: Map.delete(expected, "bootstrap_recovery")),
          true <- expected == observed.binding or {:error, :ticket_push_binding_changed} do

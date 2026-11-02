@@ -46,7 +46,9 @@ historical review reports or parent acknowledgements.
 The helper holds the SQLite write lock through issuance-marker publication and
 child creation. Recovery may rotate a nonce under that same lock only with a
 typed terminal NOT_STARTED receipt or a proven absent issuance marker in the
-original attested spool. The old envelope and proof are retained in events.
+original attested spool. Absence is checked relative to its held directory
+descriptor, with pathname identity rechecked before nonce rotation. The old
+envelope and proof are retained in events.
 An absent PID or a replaced/missing/unreadable spool is not nonissuance proof;
 marker-present unknown effects remain unreissued. Receipt version 2 is stable
 data: a newer trusted reader can read it without executing old helper policy.

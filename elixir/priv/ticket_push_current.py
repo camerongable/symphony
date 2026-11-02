@@ -156,7 +156,7 @@ def launch(value, execution, module, spool, owned):
         require(all(connection.execute(sql, (execution["run_id"],)).fetchone() is None for sql in QUIET_QUERIES), "durable_hold")
         controls = [list(row) for row in connection.execute("SELECT scope,status,dispatcher_id,generation FROM control WHERE scope=?", (binding["controller_scope"],))]
         retained = [list(row) for row in connection.execute("SELECT request_key,status,binding_sha256,output_sha256,owner_stopped_at,owner_stop_json FROM worker_evidence WHERE run_id=? AND status!='CONSUMED' ORDER BY request_key", (execution["run_id"],))]
-        require(controls == execution["action_facts"]["controls"] and all(row[1] == "ACTIVE" for row in controls), "controller_changed")
+        require(len(controls) == 1 and controls[0][1] == "ACTIVE" and controls == execution["action_facts"]["controls"], "controller_changed")
         require(retained == execution["action_facts"]["retained_noncurrent_attempts"], "source_owner_changed")
         observed = datetime.datetime.fromisoformat(execution["authorization"]["observed_at"].replace("Z", "+00:00"))
         require(-5 <= (datetime.datetime.now(datetime.timezone.utc) - observed).total_seconds() <= 60, "authorization_expired")
@@ -249,15 +249,31 @@ def readback(value, execution, module, spool):
     return raw
 
 
+def fence_observation(value, execution, module, spool):
+    try:
+        os.stat(execution["invocation"] + ".current-issued", dir_fd=spool, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        raise ValueError("nonissuance_unproven")
+    current = module.directory(execution["spool"])
+    try:
+        require(module.identity(current) == module.identity(spool), "spool_changed")
+    finally:
+        os.close(current)
+    return json.dumps({"kind": "CURRENT_ISSUANCE_MARKER_ABSENT", "nonce": execution["invocation"], "execution_sha256": sha(value["execution_json"].encode()), "spool": {name: execution[name] for name in ("spool", "spool_device", "spool_inode")}}, separators=(",", ":")).encode()
+
+
 def main():
-    require(len(sys.argv) == 2 and sys.argv[1] in ("--execute", "--status"), "mode_rejected")
+    require(len(sys.argv) == 2 and sys.argv[1] in ("--execute", "--status", "--fence"), "mode_rejected")
     value = packet()
     execution = json.loads(value["execution_json"])
     require(execution["publication_version"] == 2 and re.fullmatch("[0-9a-f]{64}", execution["invocation"]), "version_rejected")
     module = companion(execution, sys.argv[1] == "--execute")
     spool = module.open_spool(execution)
     try:
-        raw = execute(value, execution, module, spool) if sys.argv[1] == "--execute" else readback(value, execution, module, spool)
+        action = {"--execute": execute, "--status": readback, "--fence": fence_observation}[sys.argv[1]]
+        raw = action(value, execution, module, spool)
         sys.stdout.buffer.write(len(raw).to_bytes(4, "big") + raw)
         sys.stdout.buffer.flush()
     finally:

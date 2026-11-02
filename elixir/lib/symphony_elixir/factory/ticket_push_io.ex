@@ -409,7 +409,8 @@ defmodule SymphonyElixir.Factory.TicketPushIO do
     controls = Store.query!(store, "SELECT scope,status,dispatcher_id,generation FROM control WHERE scope=?", [binding["controller_scope"]]).rows
 
     with :ok <- TicketChatCommands.progress_allowed(store, run_id),
-         false <- Enum.any?(controls, fn [_scope, status, _dispatcher, _generation] -> status != "ACTIVE" end),
+         [[scope, "ACTIVE", _dispatcher, _generation]] <- controls,
+         true <- scope == binding["controller_scope"],
          {:ok, run} <- RunLedger.get(store, run_id),
          true <- Map.take(run, Map.keys(binding) -- ~w(publication_version checkout origin verifier ci_preflight)) == Map.take(binding, Map.keys(run)),
          true <- current_mutators_quiet?(store, run_id) do
@@ -695,18 +696,16 @@ defmodule SymphonyElixir.Factory.TicketPushIO do
     with {:ok, execution} when is_map(execution) <- Jason.decode(intent["execution_json"] || "null"),
          true <- execution["publication_version"] == 2,
          true <- {execution["invocation"], execution["intent_json"], execution["intent_sha256"]} == {intent["owner_nonce"], intent["binding_json"], intent["binding_sha256"]},
-         {:ok, spool} <- PathSafety.canonicalize(execution["spool"]),
-         true <- spool == execution["spool"],
-         {:ok, %File.Stat{type: :directory} = stat} <- File.lstat(spool),
-         true <- {stat.major_device, stat.inode} == {execution["spool_device"], execution["spool_inode"]} and Bitwise.band(stat.mode, 0o777) == 0o700,
-         {:error, :enoent} <- File.lstat(Path.join(spool, intent["owner_nonce"] <> ".current-issued")) do
-      {:ok,
-       %{
-         "kind" => "CURRENT_ISSUANCE_MARKER_ABSENT",
-         "nonce" => intent["owner_nonce"],
-         "execution_sha256" => hash(intent["execution_json"]),
-         "spool" => Map.take(execution, ~w(spool spool_device spool_inode))
-       }}
+         {:ok, raw} <- exchange_encoded(execution, intent["helper_pid"], "--fence", nil, intent["execution_json"]),
+         {:ok, observation} <- Jason.decode(raw),
+         expected = %{
+           "kind" => "CURRENT_ISSUANCE_MARKER_ABSENT",
+           "nonce" => intent["owner_nonce"],
+           "execution_sha256" => hash(intent["execution_json"]),
+           "spool" => Map.take(execution, ~w(spool spool_device spool_inode))
+         },
+         true <- observation == expected do
+      {:ok, observation}
     else
       _ -> {:error, :ticket_push_nonissuance_unproven}
     end
@@ -988,7 +987,9 @@ defmodule SymphonyElixir.Factory.TicketPushIO do
     _ -> {:error, :ticket_push_unissuable_v1_unproven}
   end
 
-  defp exchange(execution, original_pid, mode, started) do
+  defp exchange(execution, original_pid, mode, started), do: exchange_encoded(execution, original_pid, mode, started, Jason.encode!(execution))
+
+  defp exchange_encoded(execution, original_pid, mode, started, encoded) do
     case exchange_helper(execution, mode) do
       {:ok, path} ->
         port =
@@ -1002,14 +1003,13 @@ defmodule SymphonyElixir.Factory.TicketPushIO do
 
         try do
           {:os_pid, pid} = Port.info(port, :os_pid)
-          encoded = Jason.encode!(execution)
           input = Jason.encode!(%{"execution_json" => encoded, "helper_pid" => original_pid || pid})
 
           result =
             cond do
               byte_size(input) > elem(transport_limits(execution), 0) -> {:error, :ticket_push_input_too_large}
               is_function(started, 2) -> attachment_ack(started.(pid, encoded), execution, pid, encoded)
-              is_nil(started) and mode == "--status" -> {:ok, %{}}
+              is_nil(started) and mode in ["--status", "--fence"] -> {:ok, %{}}
               true -> {:error, :ticket_push_transport_unproven}
             end
 
@@ -1032,6 +1032,7 @@ defmodule SymphonyElixir.Factory.TicketPushIO do
   # Status reads never inherit the longer write-operation lifetime.
   defp exchange_timeout("--execute"), do: 370_000
   defp exchange_timeout("--status"), do: 35_000
+  defp exchange_timeout("--fence"), do: 5_000
 
   defp attachment_ack({:error, _} = error, _execution, _pid, _encoded), do: error
 
@@ -1096,7 +1097,7 @@ defmodule SymphonyElixir.Factory.TicketPushIO do
 
   defp execution_helper(%{"publication_version" => 2} = execution, mode) do
     with {:ok, path} <- helper(execution["root"], :publication),
-         true <- mode == "--status" or (path == execution["helper_path"] and execution["helper_sha256"] == @publication_helper_sha) do
+         true <- mode in ["--status", "--fence"] or (path == execution["helper_path"] and execution["helper_sha256"] == @publication_helper_sha) do
       {:ok, path}
     else
       _ -> {:error, :ticket_push_program_changed}
