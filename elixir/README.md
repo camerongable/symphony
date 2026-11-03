@@ -2020,6 +2020,9 @@ not every unrelated Go file in the original candidate.
 CI repairs, verifier repairs and generated-only repairs use one confined executor
 and the same read-only recovery path. Only their scope validators differ. Existing
 prepared sessions retain their recorded immutable executor for readback.
+Later conversational input observations do not invalidate a retained generation
+intent. Accepted commands, questions, amendments, contract and source authority
+remain bound; each new execution seals and fences a fresh complete input snapshot.
 
 An interrupted read-only preview may receive two append-only retries after
 its original helper has stopped, provided no apply was issued. The controller

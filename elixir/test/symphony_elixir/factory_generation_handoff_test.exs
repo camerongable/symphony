@@ -2,6 +2,17 @@ defmodule SymphonyElixir.FactoryGenerationHandoffTest do
   use ExUnit.Case, async: false
   alias SymphonyElixir.Factory.{Store, TicketCiGeneration, TicketCiGenerationIO, WorkerFileIO}
 
+  test "later chat observations do not invalidate generation authority" do
+    prior = Map.new(~w(run tasks evidence access source base claims control commands questions amendments parent bootstrap file_operations instruction_snapshots instruction_bindings inputs), &{&1, %{"sha256" => &1}})
+    assert TicketCiGeneration.compatible_ledger?(prior, Map.put(prior, "inputs", %{"sha256" => "later conversation"}))
+
+    for field <- Map.keys(prior) -- ["inputs"] do
+      refute TicketCiGeneration.compatible_ledger?(prior, Map.put(prior, field, %{"sha256" => "changed authority"}))
+    end
+
+    refute TicketCiGeneration.compatible_ledger?(nil, prior)
+  end
+
   test "new generation sessions have one confined executor" do
     assert {:ok, binding} = TicketCiGenerationIO.binding(System.tmp_dir!(), 6)
     assert Path.basename(binding["helper_path"]) == "controller_generation_executor_v6.py"

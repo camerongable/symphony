@@ -544,7 +544,7 @@ defmodule SymphonyElixir.Factory.TicketCiGeneration do
          true <- (binding["operation"] == operation and binding["paths"] == paths and ordinary_intent?(row, binding, context.scope)) or {:error, :controller_generation_scope_unproven} do
       case event(store, row["intent_key"], "FINALIZED", "") do
         nil ->
-          with true <- binding["ledger"] == ledger_snapshot(store, context) or {:error, :controller_generation_binding_changed}, do: generate_intent(store, context, row, binding)
+          with true <- compatible_ledger?(binding["ledger"], ledger_snapshot(store, context)) or {:error, :controller_generation_binding_changed}, do: generate_intent(store, context, row, binding)
 
         final ->
           with :ok <- finalized_context(store, context, binding),
@@ -564,8 +564,15 @@ defmodule SymphonyElixir.Factory.TicketCiGeneration do
     prior = binding["run_preimage"]
 
     if is_map(prior) and Map.drop(prior, ~w(candidate_sha updated_at)) == Map.drop(context.run, ~w(candidate_sha updated_at)) and
-         Map.delete(binding["ledger"], "run") == Map.delete(current, "run"), do: :ok, else: {:error, :controller_generation_binding_changed}
+         compatible_ledger?(Map.delete(binding["ledger"], "run"), Map.delete(current, "run")), do: :ok, else: {:error, :controller_generation_binding_changed}
   end
+
+  @doc "Compares retained authority while allowing later conversational input observations."
+  @spec compatible_ledger?(map(), map()) :: boolean()
+  def compatible_ledger?(prior, current) when is_map(prior) and is_map(current),
+    do: Map.delete(prior, "inputs") == Map.delete(current, "inputs")
+
+  def compatible_ledger?(_, _), do: false
 
   defp finalized_bytes(_store, _context, _row, []), do: :ok
 
