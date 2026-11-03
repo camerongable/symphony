@@ -27,6 +27,7 @@ defmodule SymphonyElixir.Factory.FailedTurnRecovery do
   @closed_connection_message "connection is closed because of an error, disconnect or timeout"
   @closed_connection inspect(@closed_connection_message)
   @closed_connection_exception inspect({:worker_exception, :error, inspect(%DBConnection.ConnectionError{message: @closed_connection_message, severity: :error, reason: :error})})
+  @sqlite_rollback_exception inspect({:worker_exception, :error, inspect(%RuntimeError{message: "factory SQLite transaction failed: :rollback"})})
   @run_fields ~w(run_id state worktree branch candidate_sha spec_revision contract_sha256 implementation_iteration plan_markdown)
 
   defp native_history(opts), do: if(Keyword.has_key?(opts, :native_runtime), do: {:ok, opts[:native_history]}, else: legacy_native_history(opts))
@@ -406,7 +407,7 @@ defmodule SymphonyElixir.Factory.FailedTurnRecovery do
     if interrupted_mode?(opts),
       do:
         (old["failure_code"] == @closed_connection and task["failure_code"] == inspect(:worker_observation_failed)) or
-          (old["failure_code"] == @closed_connection_exception and task["failure_code"] == @closed_connection_exception),
+          (old["failure_code"] in [@closed_connection_exception, @sqlite_rollback_exception] and task["failure_code"] == old["failure_code"]),
       else: String.starts_with?(old["failure_code"] || "", "{:worker_turn_error,") and old["failure_code"] == task["failure_code"]
   end
 
@@ -577,7 +578,7 @@ defmodule SymphonyElixir.Factory.FailedTurnRecovery do
 
   defp native_failure_matches?(old, native, opts) do
     if interrupted_mode?(opts) do
-      native["status"] == "interrupted" and is_nil(native["error_json"]) and old["failure_code"] in [@closed_connection, @closed_connection_exception]
+      native["status"] == "interrupted" and is_nil(native["error_json"]) and old["failure_code"] in [@closed_connection, @closed_connection_exception, @sqlite_rollback_exception]
     else
       with "failed" <- native["status"],
            {:ok, error} when is_map(error) <- Jason.decode(native["error_json"] || "null") do

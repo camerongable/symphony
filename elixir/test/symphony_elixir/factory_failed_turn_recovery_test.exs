@@ -94,6 +94,24 @@ defmodule SymphonyElixir.FactoryFailedTurnRecoveryTest do
     assert {:ok, ^proof} = FailedTurnRecovery.prepare_interrupted(ctx.store, old["request_key"], "failed-turn", options)
   end
 
+  @tag :sqlite_rollback_recovery
+  test "an explicitly recovered SQLite rollback preserves the stopped attempt and partial edits", ctx do
+    {old, _, options} = interrupted(ctx, true)
+    reason = {:worker_exception, :error, inspect(%RuntimeError{message: "factory SQLite transaction failed: :rollback"})}
+    {:ok, _} = WorkerEvidence.reconcile_required(ctx.store, old["request_key"], reason)
+    {:ok, _} = TaskLedger.update(ctx.store, "writer", %{failure_code: inspect(reason)})
+    original = stopped(ctx, old)
+
+    assert {:error, _} = FailedTurnRecovery.prepare_automatic(ctx.store, old["request_key"], "failed-turn", Keyword.delete(options, :manual_interrupted))
+    assert {:ok, proof} = FailedTurnRecovery.prepare_interrupted(ctx.store, old["request_key"], "failed-turn", options)
+    assert proof["kind"] == "INTERRUPTED_TURN_QUIESCENCE"
+    assert proof["retry_policy"]["mode"] == "MANUAL_ONE_SHOT"
+    assert {:ok, ^original} = WorkerEvidence.get(ctx.store, old["request_key"])
+    assert File.read!(Path.join(ctx.path, "fixture.txt")) == "partial\n"
+    assert :ok = FailedTurnRecovery.start_preflight(ctx.store, proof, options)
+    assert {:ok, ^proof} = FailedTurnRecovery.prepare_interrupted(ctx.store, old["request_key"], "failed-turn", options)
+  end
+
   test "initial interrupted writers recover without inventing a candidate commit", ctx do
     {:ok, _} = RunLedger.update(ctx.store, "run", %{candidate_sha: nil, implementation_iteration: 0})
     {old, _, options} = interrupted(ctx, true)

@@ -1120,7 +1120,7 @@ human input and ambiguous starts deny recovery. Historical quiescence recovery
 does not become a fabricated owned-exit receipt.
 
 For a service-owned writer interrupted by the exact recorded controller
-connection-loss error, use `mise exec -- mix factory recover-interrupted-writer
+connection-loss error or SQLite transaction rollback, use `mise exec -- mix factory recover-interrupted-writer
 REQUEST_KEY INTERRUPTED_TURN --workflow WORKFLOW.local.md` only after proving
 the latest terminal native turn. This separate manual path checks persisted
 history and an empty, version-stable native input queue outside ledger
@@ -1129,7 +1129,9 @@ and journaled partial bytes while transferring source ownership to one new
 attempt. Launch rechecks the proof. Active source-cwd holders, queued human
 input, uncertain completion, changed bytes and missing evidence deny recovery;
 no owned-stop receipt is invented and a second interruption is not silently
-rearmed. This does not authorize direct worker messages or a Desktop restart.
+rearmed. The SQLite rollback classification enables only this explicitly authorized
+one-shot path; it does not trigger an automatic retry. This does not authorize
+direct worker messages or a Desktop restart.
 The corrected interrupted path uses the existing sole-controller ownership
 contract, not a new global native queue-CAS requirement. It validates the
 persisted queue schema and revision, proves the native writer lock is free
