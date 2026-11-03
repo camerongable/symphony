@@ -30,7 +30,6 @@ defmodule SymphonyElixir.Factory.TicketMrPublication do
     with {:ok, run} <- RunLedger.get(store, run_id),
          {:ok, row} <- record_for_run(store, run),
          intent = Jason.decode!(row["intent_json"]),
-         true <- Jason.decode!(row["receipt_json"])["outcome"] != "PRESERVED_HUMAN_STATE" or {:error, :gitlab_mr_human_state_preserved},
          true <- intent["scope"] == factory.scope or {:error, :ticket_mr_scope_changed} do
       GitLabMrWriter.with_session(intent["workspace"], opts, fn scoped ->
         with {:ok, delivery_opts} <- TicketWorkerRunner.delivery_review_options(store, run, scoped),
@@ -160,7 +159,7 @@ defmodule SymphonyElixir.Factory.TicketMrPublication do
 
     with {:ok, mr} <- GitLabMrWriter.fetch(intent, saved["iid"], opts),
          :ok <- remote_identity(intent, mr) do
-      if compatible_draft?(mr), do: advance(store, row, authorization, factory, opts), else: {:ok, %{status: "MR_HUMAN_STATE_PRESERVED", model_invoked: false}}
+      advance(store, row, mr, authorization, factory, opts)
     end
   end
 
@@ -189,7 +188,7 @@ defmodule SymphonyElixir.Factory.TicketMrPublication do
          {:ok, intent} <- intent(run, observed.push, factory, workspace, description),
          {:ok, row} <- prepare(store, run, intent, observed, authorization, factory, opts) do
       case row["phase"] do
-        "SUCCEEDED" -> advance(store, row, authorization, factory, opts)
+        "SUCCEEDED" -> refresh_settled(store, row, authorization, factory, opts)
         "ISSUED_UNKNOWN" -> reconcile(store, row, authorization, factory, opts)
         _ -> discover(store, row, authorization, factory, opts)
       end
@@ -388,19 +387,18 @@ defmodule SymphonyElixir.Factory.TicketMrPublication do
                  _ -> {:error, :ticket_mr_publication_changed}
                end
              end) do
-        advance(store, saved, authorization, factory, opts)
+        advance(store, saved, mr, authorization, factory, opts)
       end
     end
   end
 
-  defp advance(store, row, authorization, factory, opts) do
+  defp advance(store, row, mr, authorization, factory, opts) do
     intent = Jason.decode!(row["intent_json"])
-    receipt = Jason.decode!(row["receipt_json"])
 
     cond do
       opts[:reconciliation_only] == true -> {:ok, %{status: "MR_PUBLICATION_SETTLED_HELD", model_invoked: false}}
-      receipt["outcome"] == "PRESERVED_HUMAN_STATE" -> {:ok, %{status: "MR_HUMAN_STATE_PRESERVED", model_invoked: false}}
-      true -> advance_compatible(store, row, intent, receipt["mr"], authorization, factory, opts)
+      not compatible_draft?(mr) -> {:ok, %{status: "MR_HUMAN_STATE_PRESERVED", model_invoked: false}}
+      true -> advance_compatible(store, row, intent, mr, authorization, factory, opts)
     end
   end
 
@@ -481,7 +479,8 @@ defmodule SymphonyElixir.Factory.TicketMrPublication do
          get_in(mr, ["diff_refs", "head_sha"]) in [nil, intent["candidate_sha"]], do: :ok, else: {:error, :gitlab_mr_remote_identity_mismatch}
   end
 
-  defp compatible_draft?(mr), do: mr["state"] == "opened" and mr["draft"] == true and mr["reviewers"] == [] and mr["remove_source_branch"] == false and is_list(mr["assignees"])
+  # A future merge's branch-deletion preference does not authorize or prevent publication.
+  defp compatible_draft?(mr), do: mr["state"] == "opened" and mr["draft"] == true and mr["reviewers"] == [] and is_list(mr["assignees"])
 
   defp validate_record(row) do
     with {:ok, intent} <- Jason.decode(row["intent_json"]),

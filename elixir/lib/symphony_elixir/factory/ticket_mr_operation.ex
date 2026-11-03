@@ -202,7 +202,6 @@ defmodule SymphonyElixir.Factory.TicketMrOperation do
   defp retained_mr_record(store, run, :direct_publication) do
     with {:ok, row} <- TicketMrPublication.record_for_run(store, run),
          receipt = Jason.decode!(row["receipt_json"]),
-         true <- receipt["outcome"] != "PRESERVED_HUMAN_STATE",
          true <- {receipt["mr"]["iid"], receipt["mr"]["web_url"]} == {run["mr_iid"], run["mr_url"]} do
       {:ok, %{format: :direct_publication, publication: row}}
     else

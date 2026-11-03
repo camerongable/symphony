@@ -150,6 +150,50 @@ defmodule SymphonyElixir.FactoryTicketMrPublicationTest do
     refute_received {:mr_call, "update_merge_request", _}
   end
 
+  @tag :publication_hold_recovery
+  test "fresh preflight readback advances a historical hold after restart without rewriting its receipt" do
+    ctx = SymphonyElixir.TicketWorkerFixture.publication_fixture(%{ci_preflight: true})
+    {opts, mr} = remote_fixture(ctx)
+    human = Map.merge(mr, %{"draft" => false, "reviewers" => [%{"id" => "9"}]})
+    Process.put(:mr_catalog, Map.delete(Process.get(:mr_catalog), "create_merge_request"))
+    Process.put(:mr_responses, [{:ok, %{"structuredContent" => [human]}}, {:ok, %{"structuredContent" => human}}])
+    assert {:ok, %{status: "MR_HUMAN_STATE_PRESERVED"}} = TicketMrPublication.step(ctx.store, "run", ctx.authorization, ctx.factory, ctx.root, "Preserved content", opts)
+    assert {:ok, held} = RunLedger.get(ctx.store, "run")
+    assert {:ok, original} = TicketMrPublication.record_for_run(ctx.store, held)
+    assert Jason.decode!(original["receipt_json"])["outcome"] == "PRESERVED_HUMAN_STATE"
+    observed = mr |> Map.delete("remove_source_branch") |> Map.merge(%{"should_remove_source_branch" => nil, "force_remove_source_branch" => false})
+    {:ok, reopened} = Store.start_link(database: ctx.database)
+
+    try do
+      Process.put(:mr_responses, [{:ok, %{"structuredContent" => observed}}])
+      assert {:ok, %{status: "MR_PUBLICATION_NOT_ISSUED"}} = TicketMrPublication.step(reopened, "run", ctx.authorization, ctx.factory, ctx.root, "", Keyword.put(opts, :reconciliation_only, true))
+      assert {:ok, ^held} = RunLedger.get(reopened, "run")
+      Process.put(:mr_responses, [{:ok, %{"structuredContent" => observed}}])
+      assert {:ok, %{status: "MR_PUBLISHED", run: waiting}} = TicketMrPublication.step(reopened, "run", ctx.authorization, ctx.factory, ctx.root, "", opts)
+      assert waiting["state"] == "CI_WAITING" and waiting["candidate_sha"] == held["candidate_sha"]
+      assert waiting["mr_iid"] == 42 and waiting["mr_url"] == mr["web_url"]
+      assert {:ok, ^original} = TicketMrPublication.get(reopened, original["operation_key"])
+
+      assert :ok = TicketMrOperation.validate_retained_mr_history(reopened, waiting)
+      assert {:ok, retained} = TicketMrOperation.observe_retained_mr_history(reopened, waiting)
+      assert :ok = Store.transaction!(reopened, &TicketMrOperation.recheck_retained_mr_history(&1, waiting, retained))
+
+      for current <- [observed, Map.put(observed, "force_remove_source_branch", true), Map.drop(observed, ~w(should_remove_source_branch force_remove_source_branch))] do
+        Process.put(:mr_responses, [{:ok, %{"structuredContent" => current}}])
+        assert {:ok, receipt} = TicketMrOperation.current_delivery_receipt(reopened, "run", ctx.factory, opts)
+        assert receipt.publication == original
+        assert :ok = Store.transaction!(reopened, &TicketMrOperation.validate_delivery_receipt(&1, receipt, ctx.factory, opts))
+      end
+
+      Process.put(:mr_responses, [{:ok, %{"structuredContent" => human}}])
+      assert {:error, :gitlab_mr_human_state_preserved} = TicketMrOperation.current_delivery_receipt(reopened, "run", ctx.factory, opts)
+      refute_received {:mr_call, "create_merge_request", _}
+      refute_received {:mr_call, "update_merge_request", _}
+    after
+      GenServer.stop(reopened)
+    end
+  end
+
   test "direct preflight receipt survives restart and exact CI PASS admits an independent verifier" do
     ctx = SymphonyElixir.TicketWorkerFixture.publication_fixture(%{ci_preflight: true})
     {opts, mr} = remote_fixture(ctx)
@@ -307,7 +351,7 @@ defmodule SymphonyElixir.FactoryTicketMrPublicationTest do
     refute_received {:mr_call, "update_merge_request", _}
   end
 
-  test "human MR state and unsafe or unknown branch removal are preserved without any update" do
+  test "human draft reviewer and closed states are preserved without any update" do
     ctx = SymphonyElixir.TicketWorkerFixture.publication_fixture()
     {opts, mr} = remote_fixture(ctx)
     human = Map.merge(mr, %{"draft" => false, "title" => "Human-ready title", "reviewers" => [%{"id" => "9"}]})
@@ -322,8 +366,7 @@ defmodule SymphonyElixir.FactoryTicketMrPublicationTest do
           Map.put(mr, "state", "closed"),
           Map.put(mr, "state", "merged"),
           Map.put(mr, "reviewers", [%{"id" => "9"}]),
-          Map.put(mr, "remove_source_branch", true),
-          Map.delete(mr, "remove_source_branch")
+          Map.put(mr, "draft", false)
         ] do
       Process.put(:mr_responses, [{:ok, %{"structuredContent" => observed}}])
       assert {:ok, %{status: "MR_HUMAN_STATE_PRESERVED"}} = TicketMrPublication.step(ctx.store, "run", ctx.authorization, ctx.factory, ctx.root, "Never overwrite", opts)
@@ -331,6 +374,20 @@ defmodule SymphonyElixir.FactoryTicketMrPublicationTest do
     end
 
     assert {:ok, %{"mr_iid" => nil}} = RunLedger.get(ctx.store, "run")
+    refute_received {:mr_call, "create_merge_request", _}
+    refute_received {:mr_call, "update_merge_request", _}
+  end
+
+  @tag :publication_nullable_flags
+  test "a new preflight MR publishes with GitLab's nullable merge preference without another push" do
+    ctx = SymphonyElixir.TicketWorkerFixture.publication_fixture(%{ci_preflight: true})
+    {opts, mr} = remote_fixture(ctx)
+    mr = mr |> Map.delete("remove_source_branch") |> Map.merge(%{"should_remove_source_branch" => nil, "force_remove_source_branch" => false})
+    Process.put(:mr_responses, [{:ok, %{"structuredContent" => []}}, {:ok, %{"structuredContent" => mr}}, {:ok, %{"structuredContent" => mr}}])
+    assert {:ok, %{status: "MR_PUBLISHED", run: waiting}} = TicketMrPublication.step(ctx.store, "run", ctx.authorization, ctx.factory, ctx.root, "Preflight content", opts)
+    assert waiting["state"] == "CI_WAITING" and waiting["mr_iid"] == 42
+    assert waiting["candidate_handoff"] == ctx.publication_run["candidate_handoff"]
+    assert_receive {:mr_call, "create_merge_request", %{"remove_source_branch" => false, "draft" => true, "reviewer_ids" => []}}
     refute_received {:mr_call, "create_merge_request", _}
     refute_received {:mr_call, "update_merge_request", _}
   end

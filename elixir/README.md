@@ -563,6 +563,12 @@ Codex tasks. The controller retains Git push and draft-MR ownership.
 Configuration, safety boundaries, recovery, and cutover are documented in
 [Local factory control plane](../docs/factory-control-plane.md).
 
+Direct MR publication treats branch deletion as a future merge preference, not an
+admission condition. Creation still requests source-branch retention; readback never
+changes an existing MR. A historical publication hold remains immutable evidence,
+but a fresh exact-candidate, open, reviewer-free draft read can advance it normally.
+Current authority and human-input checks still apply before adoption.
+
 The `factory.ticket_supervisor` setting remains default-off:
 `{"enabled": false, "pilot_issue_keys": []}`. New run registrations record an
 immutable execution mode, while historical rows remain `NULL` and continue to
