@@ -1320,6 +1320,32 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Repair queued · no human action needed"
   end
 
+  test "a blocked repair shows its actual reason and human decision owner" do
+    name = Module.concat(__MODULE__, :BlockedRepairOrchestrator)
+    {:ok, _} = StaticOrchestrator.start_link(name: name, snapshot: static_snapshot(), refresh: :unavailable)
+
+    factory =
+      update_in(factory_dashboard_snapshot(), [:current_runs, Access.at(0)], fn run ->
+        Map.merge(run, %{
+          state: "REPAIRING",
+          review_stop: nil,
+          attention: %{
+            phase: "WRITER_BLOCKED",
+            blocking: true,
+            category: "DELIVERY",
+            reason: "The writer stopped: the test harness exceeds the required attempt count.",
+            next_action: "Correct the harness without changing the production retry policy."
+          }
+        })
+      end)
+
+    start_test_endpoint(orchestrator: name, snapshot_timeout_ms: 50, factory_observability: fn -> factory end)
+    {:ok, _view, html} = live(build_conn(), "/")
+    assert html =~ "test harness exceeds the required attempt count"
+    assert html =~ "Human decision"
+    assert html =~ "Correct the harness without changing the production retry policy."
+  end
+
   test "paused dashboard identifies Jira intake as a saved snapshot" do
     orchestrator_name = Module.concat(__MODULE__, :PausedFactoryDashboardOrchestrator)
 

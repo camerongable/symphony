@@ -1,15 +1,19 @@
 defmodule SymphonyElixir.Factory.TicketInfrastructureRecovery do
-  @moduledoc "Exact controller-authorized recovery of reconciled file IO, separate from human product decisions."
+  @moduledoc "Exact recovery of a stopped writer with reconciled edits, under infrastructure or explicit operator authority."
   alias SymphonyElixir.Factory.{RunLedger, Store, TaskLedger, TicketChat, WorkerEvidence, WorkerFileIO, WorkerFileTools, WorkspaceAccess}
 
   @body "Controller-authorized infrastructure recovery: file IO receipts have been reconciled. Preserve all existing edits and resume the unfinished slice under the unchanged contract. This is not a new human answer or product decision."
   @run_fields ~w(run_id state candidate_sha implementation_iteration spec_revision contract_sha256 worktree branch)
 
   @spec authorize(Store.connection(), String.t()) :: {:ok, map()} | {:error, term()}
-  def authorize(store, request_key) do
+  def authorize(store, request_key), do: authorize(store, request_key, nil)
+
+  @doc "Authorizes one continuation with recorded operator guidance; never changes contract, paths, or runtime permissions."
+  @spec authorize(Store.connection(), String.t(), map() | nil) :: {:ok, map()} | {:error, term()}
+  def authorize(store, request_key, operator) do
     Store.transaction!(store, fn tx ->
       with {:ok, completed} <- WorkerEvidence.completed_result(tx, request_key),
-           :ok <- recoverable(tx, completed),
+           :ok <- recoverable(tx, completed, operator),
            :ok <- WorkerFileTools.reconcile(tx, request_key),
            {:ok, files} <- files(tx, completed),
            disposition when is_map(disposition) <- disposition(tx, completed.run["run_id"], request_key) do
@@ -24,9 +28,14 @@ defmodule SymphonyElixir.Factory.TicketInfrastructureRecovery do
           "files" => files
         }
 
+        proof = if operator, do: Map.put(proof, "operator_guidance", operator), else: proof
         key = "TINF-" <> digest(Jason.encode!(proof))
         proof = Map.put(proof, "recovery_key", key)
-        persist(tx, completed.run["run_id"], "TICKET_INFRASTRUCTURE_RECOVERY_AUTHORIZED", proof)
+
+        case find(tx, "TICKET_INFRASTRUCTURE_RECOVERY_AUTHORIZED", &(&1["request_key"] == request_key)) do
+          existing when existing == nil or existing == proof -> persist(tx, completed.run["run_id"], "TICKET_INFRASTRUCTURE_RECOVERY_AUTHORIZED", proof)
+          _ -> {:error, :infrastructure_recovery_conflict}
+        end
       else
         {:error, _} = error -> error
         _ -> {:error, :infrastructure_recovery_disposition_unproven}
@@ -52,7 +61,7 @@ defmodule SymphonyElixir.Factory.TicketInfrastructureRecovery do
     with proof when is_map(proof) <- find(store, "TICKET_INFRASTRUCTURE_RECOVERY_AUTHORIZED", &(&1["recovery_key"] == key)),
          true <- key == "TINF-" <> digest(Jason.encode!(Map.delete(proof, "recovery_key"))),
          {:ok, completed} <- WorkerEvidence.completed_result(store, proof["request_key"]),
-         :ok <- recoverable(store, completed),
+         :ok <- recoverable(store, completed, proof["operator_guidance"]),
          true <- Map.take(completed.run, @run_fields) == proof["run"],
          true <- Map.take(completed.task, ~w(task_key thread_id turn_id prompt_sha256)) == proof["task"],
          true <- {completed.evidence["output_sha256"], completed.evidence["binding_sha256"]} == {proof["output_sha256"], proof["binding_sha256"]},
@@ -134,6 +143,12 @@ defmodule SymphonyElixir.Factory.TicketInfrastructureRecovery do
   @spec body() :: String.t()
   def body, do: @body
 
+  @spec body(Store.connection(), String.t()) :: String.t()
+  def body(store, key) do
+    proof = find(store, "TICKET_INFRASTRUCTURE_RECOVERY_AUTHORIZED", &(&1["recovery_key"] == key))
+    get_in(proof || %{}, ["operator_guidance", "instruction"]) || @body
+  end
+
   @spec superseded?(Store.connection(), map()) :: boolean()
   def superseded?(store, evidence) do
     with receipt when is_map(receipt) <- find(store, "TICKET_INFRASTRUCTURE_RECOVERY_APPLIED", &(&1["prior_request_key"] == evidence["request_key"])),
@@ -179,7 +194,7 @@ defmodule SymphonyElixir.Factory.TicketInfrastructureRecovery do
   defp descriptor(proof),
     do: %{"operational_recovery_key" => proof["recovery_key"], "request_key" => proof["request_key"], "disposition_key" => proof["disposition_key"], "thread_id" => proof["task"]["thread_id"]}
 
-  defp recoverable(store, completed) do
+  defp recoverable(store, completed, operator) do
     blockers = completed.output["blockers"]
 
     with :ok <- TicketChat.ordinary_delivery_eligibility(completed.run),
@@ -187,13 +202,23 @@ defmodule SymphonyElixir.Factory.TicketInfrastructureRecovery do
          true <- completed.run["state"] in ~w(WRITING REPAIRING REVIEW_WRITING),
          true <- completed.task["role"] == "feature-writer" and completed.task["status"] == "COMPLETE",
          true <- completed.output["status"] == "BLOCKED" and is_list(blockers) and blockers != [],
-         true <- Enum.all?(blockers, &(is_binary(&1) and String.contains?(&1, ["file_worker_helper_exit_unproven", "file_worker_edit_reconciliation_required"]))),
+         true <- Enum.all?(blockers, &is_binary/1),
+         true <- recovery_authorized?(blockers, operator),
          true <- WorkerEvidence.owner_stopped?(store, completed.evidence) do
       :ok
     else
       _ -> {:error, :infrastructure_recovery_not_eligible}
     end
   end
+
+  defp recovery_authorized?(blockers, nil),
+    do: Enum.all?(blockers, &String.contains?(&1, ["file_worker_helper_exit_unproven", "file_worker_edit_reconciliation_required"]))
+
+  defp recovery_authorized?(_blockers, %{"authorization_reference" => reference, "instruction" => instruction} = operator) do
+    map_size(operator) == 2 and Enum.all?([reference, instruction], &(is_binary(&1) and String.valid?(&1) and byte_size(&1) in 1..8192 and String.trim(&1) != ""))
+  end
+
+  defp recovery_authorized?(_, _), do: false
 
   defp human_input_clear?(store, run_id) do
     Store.one!(store, "SELECT question_key FROM ticket_chat_questions WHERE run_id = ? AND status = 'OPEN' LIMIT 1", [run_id]) == nil and

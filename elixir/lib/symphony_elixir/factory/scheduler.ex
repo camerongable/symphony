@@ -698,7 +698,7 @@ defmodule SymphonyElixir.Factory.Scheduler do
         Jason.encode!(%{
           "base_packet" => Jason.decode!(base_prompt),
           "controller_infrastructure_recovery" => key,
-          "recovery_instruction" => TicketInfrastructureRecovery.body(),
+          "recovery_instruction" => TicketInfrastructureRecovery.body(store, key),
           "blocked_writer_context" => disposition
         })
 

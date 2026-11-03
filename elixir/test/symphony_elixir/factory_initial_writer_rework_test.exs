@@ -674,6 +674,34 @@ defmodule SymphonyElixir.FactoryInitialWriterReworkTest do
     assert {:error, :infrastructure_recovery_not_eligible} = TicketInfrastructureRecovery.authorize(ctx.store, "reservation:request")
   end
 
+  test "explicit operator guidance resumes a blocked writer without inventing human chat input", ctx do
+    alias SymphonyElixir.Factory.TicketInfrastructureRecovery
+    blocked = blocked_initial_writer(ctx, :guided)
+
+    operator = %{
+      "authorization_reference" => "Explicit operator approval in the recovery chat",
+      "instruction" => "Fix only the test harness; preserve the production retry policy and all existing edits."
+    }
+
+    assert {:error, :infrastructure_recovery_not_eligible} = TicketInfrastructureRecovery.authorize(ctx.store, "reservation:request")
+
+    for invalid <- [%{}, Map.put(operator, "instruction", " "), Map.put(operator, "extra", "not admitted")] do
+      assert {:error, :infrastructure_recovery_not_eligible} = TicketInfrastructureRecovery.authorize(ctx.store, "reservation:request", invalid)
+    end
+
+    assert {:ok, proof} = TicketInfrastructureRecovery.authorize(ctx.store, "reservation:request", operator)
+    assert {:ok, ^proof} = TicketInfrastructureRecovery.authorize(ctx.store, "reservation:request", operator)
+    assert {:error, :infrastructure_recovery_conflict} = TicketInfrastructureRecovery.authorize(ctx.store, "reservation:request", Map.put(operator, "instruction", "Different guidance"))
+    assert :ok = TicketInfrastructureRecovery.preflight(ctx.store, proof["recovery_key"])
+    assert TicketInfrastructureRecovery.body(ctx.store, proof["recovery_key"]) == operator["instruction"]
+    assert {:ok, resume} = TicketInfrastructureRecovery.resume(ctx.store, "reservation:request")
+    assert {:ok, access} = WorkspaceAccess.transfer_blocked_source(ctx.store, "reservation", blocked.access["generation"], blocked.attrs, Map.merge(blocked.proof, resume))
+    assert access["generation"] == blocked.access["generation"] + 1
+    assert WorkerEvidence.get(ctx.store, "reservation:request") == {:ok, blocked.evidence}
+    assert Store.one!(ctx.store, "SELECT COUNT(*) AS count FROM ticket_chat_inputs")["count"] == 0
+    assert File.read!(Path.join(ctx.path, "fixture.txt")) == "partial implementation\n"
+  end
+
   test "infrastructure recovery rechecks exact partial bytes before transferring", ctx do
     alias SymphonyElixir.Factory.TicketInfrastructureRecovery
     blocked = blocked_initial_writer(ctx, :io)
@@ -951,7 +979,7 @@ defmodule SymphonyElixir.FactoryInitialWriterReworkTest do
     assert {:ok, %{status: "BLOCKED"}} = Scheduler.ticket_step(context, "run", opts(ctx))
     disposition = Store.one!(ctx.store, "SELECT payload_json FROM events WHERE run_id = 'run' AND event_type = 'TICKET_NATIVE_WRITER_BLOCKED'") |> Map.fetch!("payload_json") |> Jason.decode!()
 
-    if mode in [:unstaged, :io, :capability] do
+    if mode in [:unstaged, :io, :capability, :guided] do
       %{access: access, evidence: WorkerEvidence.get(ctx.store, "reservation:request") |> elem(1), proof: disposition, attrs: attrs(ctx, "SOURCE", "resumed"), chat: chat}
     else
       body = "Rework the current candidate."
@@ -965,6 +993,8 @@ defmodule SymphonyElixir.FactoryInitialWriterReworkTest do
       %{access: access, evidence: evidence, proof: proof, attrs: attrs(ctx, "SOURCE", "resumed")}
     end
   end
+
+  defp blocked_output(ctx, :guided), do: Map.put(blocked_output(ctx, :io), "blockers", ["The test harness does not match the production attempt limit."])
 
   defp blocked_output(ctx, :io) do
     alias SymphonyElixir.Factory.WorkerFileTools

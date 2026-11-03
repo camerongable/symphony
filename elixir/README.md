@@ -574,6 +574,11 @@ independently of the controller connector's workspace. The dashboard shows
 repairable CI failures as queued factory work, not human attention; repair limits
 and other blocking decisions remain visible. Validate includes waiting for CI,
 while Verify is independent code review. Queued and active repair appear in Build.
+When a writer stops blocked, its recorded reason and next action take precedence
+over old communication warnings. Explicit operator guidance can authorize one
+continuation through the existing reconciled-source recovery API; it preserves
+the original report and edits and does not expand paths, permissions, or the
+contract. Automatic infrastructure recovery retains its narrower eligibility.
 
 The `factory.ticket_supervisor` setting remains default-off:
 `{"enabled": false, "pilot_issue_keys": []}`. New run registrations record an

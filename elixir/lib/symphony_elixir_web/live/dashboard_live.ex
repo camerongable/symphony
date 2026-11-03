@@ -1239,6 +1239,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
       run[:state] == "READY_FOR_REVIEW" and ticket_mr(ticket) -> "Human review"
       run[:state] == "AWAITING_CONTRACT_INPUT" and current_question -> "Human decision"
       run[:failure_code] == "CI_REPAIR_EXHAUSTED" -> "Human decision"
+      get_in(run, [:attention, :phase]) == "WRITER_BLOCKED" -> "Human decision"
       get_in(run, [:attention, :phase]) == "REPAIR_QUEUED" -> "Factory · automatic CI repair"
       run[:state] == "CI_WAITING" and get_in(run, [:attention, :blocking]) != true -> "Factory · CI observation"
       run[:state] == "REPAIRING" and get_in(run, [:attention, :blocking]) != true -> "Factory · repair"

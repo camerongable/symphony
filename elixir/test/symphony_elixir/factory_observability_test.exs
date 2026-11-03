@@ -800,7 +800,12 @@ defmodule SymphonyElixir.FactoryObservabilityTest do
       open_questions: [],
       next_action: "Resume only after fixing the recorded blocker.",
       tasks: [],
-      writer_disposition: %{status: "BLOCKED"}
+      writer_disposition: %{
+        status: "BLOCKED",
+        request_key: "blocked-writer-request",
+        blockers: ["The pinned Cadence test harness exceeds the required attempt count."],
+        next_action: "Correct the test harness without changing the production retry policy."
+      }
     }
 
     options = [settings: %{factory: context.factory}, store: context.store, control_server: context.control_server, ticket_context: fn _, _ -> {:ok, packet} end]
@@ -809,7 +814,12 @@ defmodule SymphonyElixir.FactoryObservabilityTest do
     assert snapshot.overview.active == 0
     assert snapshot.overview.needs_attention == 1
     assert hd(snapshot.current_runs).state == "WRITING"
-    assert hd(snapshot.current_runs).ticket_context.writer_disposition == %{status: "BLOCKED"}
+    assert hd(snapshot.current_runs).ticket_context.writer_disposition == packet.writer_disposition
+    assert hd(snapshot.current_runs).attention.source == "WORKER_RESULT"
+    assert hd(snapshot.current_runs).attention.phase == "WRITER_BLOCKED"
+    assert hd(snapshot.current_runs).attention.blocking
+    assert hd(snapshot.current_runs).attention.reason =~ "pinned Cadence test harness"
+    assert hd(snapshot.current_runs).primary_next_action == packet.writer_disposition.next_action
 
     cleared = Keyword.put(options, :ticket_context, fn _, _ -> {:ok, Map.put(packet, :writer_disposition, nil)} end)
     assert Observability.snapshot(cleared).overview.by_issue["PPL-123"] == "ACTIVE"

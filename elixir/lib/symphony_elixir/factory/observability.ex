@@ -359,6 +359,7 @@ defmodule SymphonyElixir.Factory.Observability do
             control_attention(store, source),
             parent_collection_attention(store, source),
             report_attention(store, source),
+            blocked_writer_attention(run),
             ci_attention(store, source, factory),
             operation_attention(store, source),
             journal_attention(store, source),
@@ -414,6 +415,26 @@ defmodule SymphonyElixir.Factory.Observability do
           pending.evidence_at,
           pending.next_action
         )
+    end
+  end
+
+  defp blocked_writer_attention(run) do
+    case get_in(run, [:ticket_context, :writer_disposition]) do
+      %{status: "BLOCKED"} = disposition ->
+        reasons = disposition |> Map.get(:blockers, []) |> Enum.filter(&is_binary/1) |> Enum.take(3)
+        reason = if reasons == [], do: "The writer stopped with an unresolved blocker.", else: "The writer stopped: " <> Enum.join(reasons, " ")
+
+        notice(
+          "WORKER_RESULT",
+          "WRITER_BLOCKED",
+          Map.get(disposition, :request_key) || run.run_id,
+          String.slice(reason, 0, 2048),
+          run.updated_at,
+          Map.get(disposition, :next_action) || "Review the recorded blocker in the ticket chat before resuming."
+        )
+
+      _ ->
+        nil
     end
   end
 
@@ -1006,7 +1027,7 @@ defmodule SymphonyElixir.Factory.Observability do
           questions: Enum.map(context.open_questions || [], &Map.take(&1, ~w(question_key opened_at binding body answers))),
           actionable_question_count: Enum.count(context.open_questions || [], &(Map.get(&1, "binding") == "CURRENT")),
           next_action: context.next_action,
-          writer_disposition: Map.take(Map.get(context, :writer_disposition) || %{}, [:status]),
+          writer_disposition: Map.take(Map.get(context, :writer_disposition) || %{}, [:status, :request_key, :blockers, :next_action]),
           worker_tasks: context.tasks || [],
           attributed_usage: %{status: "UNKNOWN", tokens: nil, cost: nil, reason: "Per-run and per-turn factory token usage and cost are not recorded."},
           checkout_count: checkout_evidence(store, run.run_id),
