@@ -93,6 +93,11 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
       GenerationOriginRelease.activate_a()
     end
 
+    if context[:ci_preview_retry] do
+      assert {:ok, toolset} = TicketCiGenerationToolset.load()
+      Process.put(:fixture_project_id, String.to_integer(toolset["gitlab_project_id"]))
+    end
+
     if context[:ci_generated_only] || context[:ci_generated_only_fixture] do
       assert {:ok, toolset} = TicketCiGenerationToolset.load()
       assert toolset["available"] == true
@@ -1447,6 +1452,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
   defp complete_stage(context, options) do
     key = finish_worker(context, options)
     if context[:generation_root], do: generation_native_reader(context.store, context.generation_root, key)
+    if context[:ci_preview_retry], do: seed_interrupted_ci_preview(context, key)
 
     if context[:owned_generation_adoption_tick] && context[:generation_control] do
       {previous_tick, result} =
@@ -1462,6 +1468,87 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
       assert {:ok, %{status: "ADOPTED", run: run}} = Scheduler.ticket_step(context, "run", options)
       run
     end
+  end
+
+  defp seed_interrupted_ci_preview(context, request) do
+    alias SymphonyElixir.Factory.{TicketCiGeneration, TicketCiGenerationIO}
+    store = context.store
+    assert {:ok, %{status: "PREPARED"}} = TicketCiGeneration.prepare(store, request)
+    row = Store.one!(store, "SELECT * FROM ticket_ci_generation_intents WHERE request_key=? AND operation='GOFMT_DIFF'", [request])
+    assert is_map(row)
+    intent = Jason.decode!(row["binding_json"])
+    files = intent["observation"]["files"]
+    assert {:ok, transport} = TicketCiGenerationIO.binding(intent["run_preimage"]["worktree"])
+    key = fn type, path -> "ci-generation-event:" <> sha256(Jason.encode!([row["intent_key"], type, path])) end
+
+    tables =
+      ~w(runs factory_tasks worker_evidence workspace_access native_source_bindings ticket_review_bases ticket_ci_repair_claims control ticket_chat_commands ticket_chat_questions ticket_contract_amendments ticket_chats ticket_chat_runs desktop_requests ticket_chat_inputs worker_file_operations ticket_ci_generation_intents ticket_ci_generation_events)
+
+    columns = Map.new(tables, fn table -> {table, Store.query!(store, "PRAGMA table_info(#{table})").rows |> Enum.map(&Enum.at(&1, 1))} end)
+
+    binding =
+      intent["observation"]["spool"]
+      |> Map.merge(transport)
+      |> Map.merge(%{
+        "version" => 1,
+        "intent_key" => row["intent_key"],
+        "intent_sha256" => row["binding_sha256"],
+        "run_id" => "run",
+        "request_key" => request,
+        "scope" => intent["policy"]["scope"],
+        "ledger" => intent["ledger"],
+        "read_columns" => columns,
+        "tick" => Control.status(store, intent["policy"]["scope"]) |> Map.take(~w(scope tick_id dispatcher_id lease_expires_at)),
+        "toolset" => intent["toolset"],
+        "operation" => intent["operation"],
+        "paths" => intent["paths"],
+        "files" => files,
+        "root_device" => files["root_device"],
+        "root_inode" => files["root_inode"],
+        "started_key" => key.("EXECUTION_STARTED", ""),
+        "started_type" => "EXECUTION_STARTED",
+        "event_key" => key.("APPLY_CREATED", ""),
+        "proposal" => nil
+      })
+
+    port = Port.open({:spawn_executable, ~c"/usr/bin/python3"}, [:binary, :exit_status, args: ["-c", "import sys;sys.stdin.buffer.read(1)"]])
+    {:os_pid, pid} = Port.info(port, :os_pid)
+    true = Port.command(port, "x")
+    assert_receive {^port, {:exit_status, 0}}, 5_000
+
+    insert = fn type, value ->
+      raw = Jason.encode!(value)
+      Store.query!(store, "INSERT INTO ticket_ci_generation_events VALUES (?,?,?,'',NULL,?,?,?)", [key.(type, ""), row["intent_key"], type, raw, sha256(raw), DateTime.to_iso8601(DateTime.utc_now())])
+    end
+
+    insert.("EXECUTION_PREPARED", binding)
+    insert.("EXECUTION_STARTED", %{"helper_pid" => pid, "binding_json" => Jason.encode!(binding)})
+    insert.("UNCERTAIN", %{"version" => 1, "binding_sha256" => sha256(Jason.encode!(binding)), "reason" => "OWNED_RECEIPT_UNPROVEN"})
+    original = Store.query!(store, "SELECT * FROM ticket_ci_generation_events WHERE intent_key=? ORDER BY event_key", [row["intent_key"]]).rows
+    assert {:error, :controller_generation_pending} = TicketCiGeneration.commit_ready(store, request)
+
+    for {type, path} <- [{"BLOCKED", ""}, {"UNCERTAIN", "preview-retry:1"}, {"APPLY_PREPARED", hd(intent["paths"])}] do
+      assert {:error, :fixture_probe_rollback} =
+               Exqlite.transaction(store, fn tx ->
+                 raw = Jason.encode!(%{"version" => 1})
+
+                 Store.query!(tx, "INSERT INTO ticket_ci_generation_events VALUES (?,?,?,?,NULL,?,?,?)", [
+                   key.(type, path),
+                   row["intent_key"],
+                   type,
+                   path,
+                   raw,
+                   sha256(raw),
+                   DateTime.to_iso8601(DateTime.utc_now())
+                 ])
+
+                 assert {:ok, readback} = TicketCiGeneration.readback(tx, request)
+                 assert Enum.find(readback.intents, &(&1.intent_key == row["intent_key"])).preview_retry.status == "UNAVAILABLE"
+                 Exqlite.rollback(tx, :fixture_probe_rollback)
+               end)
+    end
+
+    assert Store.query!(store, "SELECT * FROM ticket_ci_generation_events WHERE intent_key=? ORDER BY event_key", [row["intent_key"]]).rows == original
   end
 
   defp finish_worker(context, options) do
@@ -5654,6 +5741,20 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     assert_mr_adoption(ctx)
   end
 
+  @tag :ci_preview_retry
+  @tag ci_connected_cycle: true,
+       broker_thread_id: "00000000-0000-0000-0000-000000000001",
+       mr_preflight: true,
+       ci_repair_fixture: true,
+       ci_repair_native: true,
+       ci_repair_scheduler_push: true,
+       timeout: 360_000
+  test "a lost read-only CI preview retries once and completes normal publication without losing history", ctx do
+    assert_mr_adoption(ctx)
+    assert Store.one!(ctx.store, "SELECT COUNT(*) AS n FROM ticket_ci_generation_events WHERE event_type='UNCERTAIN'")["n"] == 1
+    assert Store.one!(ctx.store, "SELECT COUNT(*) AS n FROM ticket_ci_generation_events WHERE event_type='EXECUTION_RECEIPT' AND path='preview-retry:1'")["n"] == 1
+  end
+
   @tag broker_thread_id: "00000000-0000-0000-0000-000000000001", mr_preflight: true
   @tag ci_repair_fixture: true, ci_repair_native: true, ci_repair_non_go: true, ci_round_identity: true, timeout: 240_000
   test "a normal CI repair claims round eleven once and publishes without increasing its attempt budget", ctx do
@@ -7096,7 +7197,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
               if ctx[:ci_generation_pending] do
                 assert_generation_pending(ctx, context, options, first)
               else
-                second = complete_stage(context, options)
+                second = complete_stage(Map.put(context, :ci_preview_retry, ctx[:ci_preview_retry]), options)
                 assert second["state"] == "CI_PUSHING" and second["code_repair_round"] == run["code_repair_round"] + 1
                 assert Store.one!(ctx.store, "SELECT thread_id FROM factory_tasks WHERE task_key='run:feature-writer'") == source
                 assert Store.one!(ctx.store, "SELECT COUNT(*) AS count FROM ticket_ci_repair_claims")["count"] == 1
@@ -7329,7 +7430,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
   defp handoff_reopen?(ctx, round), do: ctx[:ci_handoff_acceptance] == true and round == 4
 
   defp maybe_generation_owner(ctx, context, factory) do
-    if @generation_fixture_available or ctx[:ci_repair_non_go] == true or ctx[:ordinary_go_generation] == true or
+    if @generation_fixture_available or ctx[:ci_preview_retry] == true or ctx[:ci_repair_non_go] == true or ctx[:ordinary_go_generation] == true or
          ctx[:ci_generated_only] == true do
       generation_owner(ctx, context, factory)
     else
