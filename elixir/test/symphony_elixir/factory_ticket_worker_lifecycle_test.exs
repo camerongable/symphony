@@ -1452,7 +1452,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
   defp complete_stage(context, options) do
     key = finish_worker(context, options)
     if context[:generation_root], do: generation_native_reader(context.store, context.generation_root, key)
-    if context[:ci_preview_retry], do: seed_interrupted_ci_preview(context, key)
+    if context[:ci_preview_retry] || context[:ordinary_preview_retry], do: seed_interrupted_ci_preview(context, key)
 
     if context[:owned_generation_adoption_tick] && context[:generation_control] do
       {previous_tick, result} =
@@ -1474,11 +1474,15 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     alias SymphonyElixir.Factory.{TicketCiGeneration, TicketCiGenerationIO}
     store = context.store
     assert {:ok, %{status: "PREPARED"}} = TicketCiGeneration.prepare(store, request)
-    row = Store.one!(store, "SELECT * FROM ticket_ci_generation_intents WHERE request_key=? AND operation='GOFMT_DIFF'", [request])
+    ordinary = context[:ordinary_preview_retry] == true
+    intents = if ordinary, do: "ticket_ordinary_generation_intents", else: "ticket_ci_generation_intents"
+    events = if ordinary, do: "ticket_ordinary_generation_events", else: "ticket_ci_generation_events"
+    operation = if ordinary, do: "GAZELLE_DIFF", else: "GOFMT_DIFF"
+    row = Store.one!(store, "SELECT * FROM #{intents} WHERE request_key=? AND operation=?", [request, operation])
     assert is_map(row)
     intent = Jason.decode!(row["binding_json"])
     files = intent["observation"]["files"]
-    assert {:ok, transport} = TicketCiGenerationIO.binding(intent["run_preimage"]["worktree"])
+    assert {:ok, transport} = TicketCiGenerationIO.binding(intent["run_preimage"]["worktree"], if(ordinary, do: 2, else: 1))
     key = fn type, path -> "ci-generation-event:" <> sha256(Jason.encode!([row["intent_key"], type, path])) end
 
     tables =
@@ -1519,7 +1523,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     insert = fn type, path, value ->
       raw = Jason.encode!(value)
 
-      Store.query!(store, "INSERT INTO ticket_ci_generation_events VALUES (?,?,?,?,NULL,?,?,?)", [
+      Store.query!(store, "INSERT INTO #{events} VALUES (?,?,?,?,NULL,?,?,?)", [
         key.(type, path),
         row["intent_key"],
         type,
@@ -1535,8 +1539,8 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     insert.("UNCERTAIN", "", %{"version" => 1, "binding_sha256" => sha256(Jason.encode!(binding)), "reason" => "OWNED_RECEIPT_UNPROVEN"})
     assert {:ok, first_readback} = TicketCiGeneration.readback(store, request)
     assert Enum.find(first_readback.intents, &(&1.intent_key == row["intent_key"])).preview_retry.execution_path == "preview-retry:1"
-    first_uncertain = Store.one!(store, "SELECT * FROM ticket_ci_generation_events WHERE event_key=?", [key.("UNCERTAIN", "")])
-    first_started = Store.one!(store, "SELECT * FROM ticket_ci_generation_events WHERE event_key=?", [key.("EXECUTION_STARTED", "")])
+    first_uncertain = Store.one!(store, "SELECT * FROM #{events} WHERE event_key=?", [key.("UNCERTAIN", "")])
+    first_started = Store.one!(store, "SELECT * FROM #{events} WHERE event_key=?", [key.("EXECUTION_STARTED", "")])
 
     retry = %{
       "execution_path" => "preview-retry:1",
@@ -1546,17 +1550,23 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
       "original_started_sha256" => first_started["receipt_sha256"]
     }
 
-    assert {:ok, second_transport} = TicketCiGenerationIO.binding(binding["root"], 4)
+    assert {:ok, second_transport} = TicketCiGenerationIO.binding(binding["root"], if(ordinary, do: 6, else: 4))
 
     second_binding =
       binding
       |> Map.merge(second_transport)
-      |> Map.merge(%{"generation_version" => 4, "execution_path" => "preview-retry:1", "preview_retry" => retry, "started_key" => key.("EXECUTION_STARTED", "preview-retry:1")})
+      |> Map.merge(%{
+        "generation_version" => if(ordinary, do: 6, else: 4),
+        "execution_path" => "preview-retry:1",
+        "preview_retry" => retry,
+        "started_key" => key.("EXECUTION_STARTED", "preview-retry:1")
+      })
 
+    second_binding = if ordinary, do: Map.put(second_binding, "generation_mode", "ordinary"), else: second_binding
     insert.("EXECUTION_PREPARED", "preview-retry:1", second_binding)
     insert.("EXECUTION_STARTED", "preview-retry:1", %{"helper_pid" => pid, "binding_json" => Jason.encode!(second_binding)})
     insert.("UNCERTAIN", "preview-retry:1", %{"version" => 1, "binding_sha256" => sha256(Jason.encode!(second_binding)), "reason" => "OWNED_RECEIPT_UNPROVEN"})
-    original = Store.query!(store, "SELECT * FROM ticket_ci_generation_events WHERE intent_key=? ORDER BY event_key", [row["intent_key"]]).rows
+    original = Store.query!(store, "SELECT * FROM #{events} WHERE intent_key=? ORDER BY event_key", [row["intent_key"]]).rows
     assert {:error, :controller_generation_pending} = TicketCiGeneration.commit_ready(store, request)
 
     for {type, path} <- [{"BLOCKED", ""}, {"UNCERTAIN", "preview-retry:2"}, {"APPLY_PREPARED", hd(intent["paths"])}] do
@@ -1564,7 +1574,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
                Exqlite.transaction(store, fn tx ->
                  raw = Jason.encode!(%{"version" => 1})
 
-                 Store.query!(tx, "INSERT INTO ticket_ci_generation_events VALUES (?,?,?,?,NULL,?,?,?)", [
+                 Store.query!(tx, "INSERT INTO #{events} VALUES (?,?,?,?,NULL,?,?,?)", [
                    key.(type, path),
                    row["intent_key"],
                    type,
@@ -1580,7 +1590,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
                end)
     end
 
-    assert Store.query!(store, "SELECT * FROM ticket_ci_generation_events WHERE intent_key=? ORDER BY event_key", [row["intent_key"]]).rows == original
+    assert Store.query!(store, "SELECT * FROM #{events} WHERE intent_key=? ORDER BY event_key", [row["intent_key"]]).rows == original
   end
 
   defp finish_worker(context, options) do
@@ -6228,6 +6238,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
        verifier_repair_cycle: true,
        ordinary_final_rollover: true,
        ordinary_go_generation: true,
+       ordinary_preview_retry: true,
        timeout: 900_000
   test "ordinary Go moves across CONTINUE slices generate missing BUILD before no-edit COMPLETE push", ctx do
     assert_mr_adoption(ctx)
@@ -8366,8 +8377,8 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
 
   defp continue_repair_slice(ctx, context, options, slice) do
     cond do
-      ctx[:capability_recovery_native] and slice == 1 -> capability_recovery_source_cycle(ctx, context, options)
-      ctx[:operator_verifier_repair] and slice == 1 -> complete_operator_source_tick(ctx, context, options)
+      ctx[:capability_recovery_native] == true and slice == 1 -> capability_recovery_source_cycle(ctx, context, options)
+      ctx[:operator_verifier_repair] == true and slice == 1 -> complete_operator_source_tick(ctx, context, options)
       true -> complete_stage(context, options)
     end
   end
@@ -8609,58 +8620,71 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
       maybe_retire_ordinary_fixture_rejection(ctx, context, factory, options, verified)
       assert {:ok, intent} = TicketPush.prepare(ctx.store, "run", push_authorization(ctx.store, verified), options)
       binding = Jason.decode!(intent["binding_json"])
-      assert binding["ordinary_verifier_repair"]["kind"] == "ORDINARY_VERIFIER_REPAIR_PREFLIGHT_V1"
-      refute Map.has_key?(binding, "ci_repair")
-      assert {:ok, negative_execution} = TicketPushIO.prepare(ctx.store, intent, push_authorization(ctx.store, verified), options)
-      assert_generation_rejection_publisher(ctx, negative_execution)
 
-      if ctx[:verifier_plain_cycle] && !ctx[:ordinary_go_generation] && !ctx[:verifier_legacy_packet],
-        do: assert_legacy_plain_v9_preflight(ctx, negative_execution, binding, verified)
+      if binding["publication_version"] == 2 do
+        assert binding["candidate_sha"] == verified["candidate_sha"]
+        assert binding["source_owner"]["status"] == "CONSUMED"
+        assert {:ok, %{run: preflight}} = TicketPush.step(ctx.store, "run", push_authorization(ctx.store, verified), options)
+        assert preflight["state"] == "CI_MR_CREATING"
+        assert {:ok, proof} = TicketPush.completed_proof(ctx.store, "run")
+        assert proof.binding["candidate_sha"] == verified["candidate_sha"]
+        remaining = (ctx[:verifier_repair_cycles] || 1) - 1
+        next = ctx |> Map.put(:verifier_repair_cycle, remaining > 0) |> Map.put(:verifier_repair_cycles, remaining) |> Map.put(:ci_evidence_large_frame, true) |> Map.put(:mr_qualification, true)
+        assert_repaired_mr(next, context, factory, options, preflight, mr)
+      else
+        assert binding["ordinary_verifier_repair"]["kind"] == "ORDINARY_VERIFIER_REPAIR_PREFLIGHT_V1"
+        refute Map.has_key?(binding, "ci_repair")
+        assert {:ok, negative_execution} = TicketPushIO.prepare(ctx.store, intent, push_authorization(ctx.store, verified), options)
+        assert_generation_rejection_publisher(ctx, negative_execution)
 
-      proof_payload = Path.join(ctx.root, "ordinary-preflight-check.json")
-      File.write!(proof_payload, Jason.encode!(%{"execution" => negative_execution, "binding" => binding, "run" => verified}))
+        if ctx[:verifier_plain_cycle] && !ctx[:ordinary_go_generation] && !ctx[:verifier_legacy_packet],
+          do: assert_legacy_plain_v9_preflight(ctx, negative_execution, binding, verified)
 
-      proof_script =
-        "import importlib.util,json,sqlite3,sys; d=json.load(open(sys.argv[1])); s=importlib.util.spec_from_file_location('physical',sys.argv[3]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); c=sqlite3.connect('file:'+sys.argv[2]+'?mode=ro',uri=True); c.row_factory=sqlite3.Row; m.retained_history(c,d['execution'],d['binding'],d['run'])"
+        proof_payload = Path.join(ctx.root, "ordinary-preflight-check.json")
+        File.write!(proof_payload, Jason.encode!(%{"execution" => negative_execution, "binding" => binding, "run" => verified}))
 
-      proof_script = generation_rejection_proof_script(ctx, proof_script)
+        proof_script =
+          "import importlib.util,json,sqlite3,sys; d=json.load(open(sys.argv[1])); s=importlib.util.spec_from_file_location('physical',sys.argv[3]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); c=sqlite3.connect('file:'+sys.argv[2]+'?mode=ro',uri=True); c.row_factory=sqlite3.Row; m.retained_history(c,d['execution'],d['binding'],d['run'])"
 
-      proof_script =
-        "import subprocess,sys; p=subprocess.Popen([sys.executable,'-I','-S','-B','-c'," <>
-          inspect(proof_script) <> ",*sys.argv[1:]],stdin=subprocess.PIPE); code=p.wait(timeout=60); p.stdin.close(); sys.exit(code)"
+        proof_script = generation_rejection_proof_script(ctx, proof_script)
 
-      assert {_, 0} =
-               System.cmd("/usr/bin/python3", ["-I", "-S", "-B", "-c", proof_script, proof_payload, ctx.database, negative_execution["helper_path"]], stderr_to_stdout: true)
+        proof_script =
+          "import subprocess,sys; p=subprocess.Popen([sys.executable,'-I','-S','-B','-c'," <>
+            inspect(proof_script) <> ",*sys.argv[1:]],stdin=subprocess.PIPE); code=p.wait(timeout=60); p.stdin.close(); sys.exit(code)"
 
-      negative_database = Path.join(ctx.root, "ordinary-proof-round-#{verified["code_repair_round"]}.sqlite")
-      assert {_, 0} = System.cmd("sqlite3", [ctx.database, ".backup '#{negative_database}'"])
+        assert {_, 0} =
+                 System.cmd("/usr/bin/python3", ["-I", "-S", "-B", "-c", proof_script, proof_payload, ctx.database, negative_execution["helper_path"]], stderr_to_stdout: true)
 
-      push_options =
-        if ctx[:slow_push_admission] do
-          Keyword.put(options, :after_acquisition_observation, fn ->
-            unless Process.get(:slow_final_push_admission) do
-              Process.put(:slow_final_push_admission, true)
-              Process.sleep(11_000)
-            end
+        negative_database = Path.join(ctx.root, "ordinary-proof-round-#{verified["code_repair_round"]}.sqlite")
+        assert {_, 0} = System.cmd("sqlite3", [ctx.database, ".backup '#{negative_database}'"])
 
-            :ok
-          end)
-        else
-          options
-        end
+        push_options =
+          if ctx[:slow_push_admission] do
+            Keyword.put(options, :after_acquisition_observation, fn ->
+              unless Process.get(:slow_final_push_admission) do
+                Process.put(:slow_final_push_admission, true)
+                Process.sleep(11_000)
+              end
 
-      assert {:ok, %{run: preflight}} = TicketPush.step(ctx.store, "run", push_authorization(ctx.store, verified), push_options)
-      if ctx[:slow_push_admission], do: assert(Process.get(:slow_final_push_admission))
-      assert preflight["state"] == "CI_MR_CREATING"
-      assert_ordinary_retirement_archive(ctx, preflight)
-      remaining = (ctx[:verifier_repair_cycles] || 1) - 1
-      next = ctx |> Map.put(:verifier_repair_cycle, remaining > 0) |> Map.put(:verifier_repair_cycles, remaining) |> Map.put(:ci_evidence_large_frame, true) |> Map.put(:mr_qualification, true)
-      assert_repaired_mr(next, context, factory, options, preflight, mr)
-      assert {:ok, negative_store} = Store.start_link(database: negative_database)
-      negative_context = %{ctx | store: negative_store, database: negative_database}
-      assert_ordinary_repair_negatives(negative_context, verified)
-      assert_ordinary_physical_negatives(negative_context, negative_execution, binding, verified)
-      GenServer.stop(negative_store)
+              :ok
+            end)
+          else
+            options
+          end
+
+        assert {:ok, %{run: preflight}} = TicketPush.step(ctx.store, "run", push_authorization(ctx.store, verified), push_options)
+        if ctx[:slow_push_admission], do: assert(Process.get(:slow_final_push_admission))
+        assert preflight["state"] == "CI_MR_CREATING"
+        assert_ordinary_retirement_archive(ctx, preflight)
+        remaining = (ctx[:verifier_repair_cycles] || 1) - 1
+        next = ctx |> Map.put(:verifier_repair_cycle, remaining > 0) |> Map.put(:verifier_repair_cycles, remaining) |> Map.put(:ci_evidence_large_frame, true) |> Map.put(:mr_qualification, true)
+        assert_repaired_mr(next, context, factory, options, preflight, mr)
+        assert {:ok, negative_store} = Store.start_link(database: negative_database)
+        negative_context = %{ctx | store: negative_store, database: negative_database}
+        assert_ordinary_repair_negatives(negative_context, verified)
+        assert_ordinary_physical_negatives(negative_context, negative_execution, binding, verified)
+        GenServer.stop(negative_store)
+      end
     else
       assert verified["state"] == "PUSHING"
       assert Store.one!(ctx.store, "SELECT COUNT(*) AS count FROM ticket_ci_repair_claims")["count"] == if(future_cycles, do: if(ctx[:late_ten_budget], do: 9, else: 4), else: 1)
@@ -8927,30 +8951,42 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
       assert_protected_ordinary_generation(ctx, context, options, key, run, original)
     end
 
-    assert {:ok, %{status: "PREPARED", intents: intents}} = TicketCiGeneration.prepare(ctx.store, key)
+    intents =
+      if ctx[:ordinary_preview_retry] do
+        seed_interrupted_ci_preview(Map.put(context, :ordinary_preview_retry, true), key)
+        assert {:ok, %{intents: prepared}} = TicketCiGeneration.readback(ctx.store, key)
+        prepared
+      else
+        assert {:ok, %{status: "PREPARED", intents: prepared}} = TicketCiGeneration.prepare(ctx.store, key)
+        prepared
+      end
+
     assert length(intents) == 2
 
     assert_generation_rejection_observation(ctx)
 
     assert {:error, :controller_generation_pending} = TicketCiGeneration.commit_ready(ctx.store, key)
     assert_raise Exqlite.Error, fn -> Store.query!(ctx.store, "UPDATE workspace_access SET released_at='fixture-release' WHERE reservation_key=?", [worker["reservation_key"]]) end
-    [intent | _] = intents
 
-    assert {:error, :ordinary_uncertainty_rollback} =
-             Exqlite.transaction(ctx.store, fn tx ->
-               raw = Jason.encode!(%{"version" => 1, "reason" => "fixture lost response"})
+    unless ctx[:ordinary_preview_retry] do
+      [intent | _] = intents
 
-               Store.query!(tx, "INSERT INTO ticket_ordinary_generation_events VALUES (?,?, 'UNCERTAIN','',NULL,?,?,?)", [
-                 "fixture-uncertain",
-                 intent.intent_key,
-                 raw,
-                 sha256(raw),
-                 DateTime.to_iso8601(DateTime.utc_now())
-               ])
+      assert {:error, :ordinary_uncertainty_rollback} =
+               Exqlite.transaction(ctx.store, fn tx ->
+                 raw = Jason.encode!(%{"version" => 1, "reason" => "fixture lost response"})
 
-               assert {:error, :controller_generation_pending} = TicketCiGeneration.commit_ready(tx, key)
-               Exqlite.rollback(tx, :ordinary_uncertainty_rollback)
-             end)
+                 Store.query!(tx, "INSERT INTO ticket_ordinary_generation_events VALUES (?,?, 'UNCERTAIN','',NULL,?,?,?)", [
+                   "fixture-uncertain",
+                   intent.intent_key,
+                   raw,
+                   sha256(raw),
+                   DateTime.to_iso8601(DateTime.utc_now())
+                 ])
+
+                 assert {:error, :controller_generation_pending} = TicketCiGeneration.commit_ready(tx, key)
+                 Exqlite.rollback(tx, :ordinary_uncertainty_rollback)
+               end)
+    end
 
     generated = with_generation_rejection_origin(ctx, fn -> TicketCiGeneration.complete(ctx.store, key, run, original) end)
     assert_generation_rejection_programs(ctx)

@@ -617,7 +617,7 @@ defmodule SymphonyElixir.Factory.TicketCiGeneration do
         {:ok, nil}
 
       values when length(values) in 1..2 ->
-        with true <- String.starts_with?(key, "ci-generation:"),
+        with true <- String.starts_with?(key, ["ci-generation:", "ordinary-generation:"]),
              {:ok, retry} <- retry_chain(store, key, values, nil, 1) do
           applied = Store.one!(store, "SELECT event_key FROM #{event_table(key)} WHERE intent_key=? AND event_type LIKE 'APPL%' LIMIT 1", [key])
           receipt = event(store, key, "EXECUTION_RECEIPT", retry["execution_path"])
@@ -652,10 +652,10 @@ defmodule SymphonyElixir.Factory.TicketCiGeneration do
          true <- original["operation"] in ~w(GAZELLE_DIFF GOFMT_DIFF),
          true <-
            if(previous,
-             do: original["generation_version"] in [4, 5] and original["preview_retry"] == previous and original["execution_path"] == path,
-             else: original["generation_version"] in [nil, 1, 5]
+             do: original["generation_version"] in [4, 5, 6] and original["preview_retry"] == previous and original["execution_path"] == path,
+             else: original["generation_version"] in [nil, 1, 2, 3, 5, 6]
            ),
-         true <- uncertainty["binding_sha256"] == prepared["receipt_sha256"] and uncertainty["reason"] == "OWNED_RECEIPT_UNPROVEN",
+         true <- uncertainty["binding_sha256"] == prepared["receipt_sha256"] and uncertainty["reason"] in ~w(OWNED_RECEIPT_UNPROVEN READ_ONLY_TOOL_FAILED),
          true <- is_integer(old["helper_pid"]) and old["helper_pid"] > 0 do
       retry = %{
         "execution_path" => "preview-retry:#{index}",
@@ -678,7 +678,7 @@ defmodule SymphonyElixir.Factory.TicketCiGeneration do
          started when is_map(started) <- event(store, key, "EXECUTION_STARTED", retry["execution_path"]),
          {:ok, owner} <- checked_object(started["receipt_json"], started["receipt_sha256"]),
          true <- owner["binding_json"] == value["binding_json"] and owner["helper_pid"] == value["helper_pid"],
-         true <- binding["preview_retry"] == retry and binding["generation_version"] in [4, 5] and binding["intent_key"] == key,
+         true <- binding["preview_retry"] == retry and binding["generation_version"] in [4, 5, 6] and binding["intent_key"] == key,
          :ok <- valid_receipt(binding, value),
          do: true,
          else: (_ -> false)
@@ -692,8 +692,8 @@ defmodule SymphonyElixir.Factory.TicketCiGeneration do
     case event(store, row["intent_key"], type, path) do
       nil ->
         with {:ok, retry} <- preview_retry(store, row["intent_key"]),
-             :ok <- retry_owner_stopped(store, retry, proposal),
-             {:ok, transport} <- TicketCiGenerationIO.binding(context.run["worktree"], if(retry || generation_version(context) == 1, do: 5, else: generation_version(context))),
+             :ok <- retry_owner_stopped(store, row["intent_key"], retry, proposal),
+             {:ok, transport} <- TicketCiGenerationIO.binding(context.run["worktree"], 6),
              {:ok, current_toolset} <- TicketCiGenerationToolset.load(),
              true <- current_toolset == intent["toolset"] or {:error, :controller_generation_toolset_changed},
              :ok <- recheck_context(store, context),
@@ -727,8 +727,14 @@ defmodule SymphonyElixir.Factory.TicketCiGeneration do
               "proposal" => proposal
             })
 
-          sealed = if generation_version(context) == 3, do: Map.put(sealed, "generation_version", 3), else: sealed
-          sealed = if retry || generation_version(context) == 1, do: Map.merge(sealed, %{"generation_version" => 5, "gazelle_external_mode" => "static"}), else: sealed
+          mode =
+            case generation_version(context) do
+              2 -> "ordinary"
+              3 -> "generated_only"
+              _ -> "ci"
+            end
+
+          sealed = Map.merge(sealed, %{"generation_version" => 6, "generation_mode" => mode, "gazelle_external_mode" => "static"})
           sealed = if retry, do: Map.merge(sealed, %{"preview_retry" => retry, "execution_path" => path}), else: sealed
 
           with :ok <- append_event(store, row, type, path, sealed), do: {:ok, sealed}
@@ -743,11 +749,11 @@ defmodule SymphonyElixir.Factory.TicketCiGeneration do
 
   defp current_tick(store, context), do: Control.status(store, context.policy["scope"]) |> Map.take(~w(scope tick_id dispatcher_id lease_expires_at))
 
-  defp retry_owner_stopped(_store, nil, _proposal), do: :ok
-  defp retry_owner_stopped(_store, _retry, proposal) when is_map(proposal), do: :ok
+  defp retry_owner_stopped(_store, _key, nil, _proposal), do: :ok
+  defp retry_owner_stopped(_store, _key, _retry, proposal) when is_map(proposal), do: :ok
 
-  defp retry_owner_stopped(store, retry, nil) do
-    with row when is_map(row) <- Store.one!(store, "SELECT receipt_json,receipt_sha256 FROM ticket_ci_generation_events WHERE event_key=?", [retry["original_started_key"]]),
+  defp retry_owner_stopped(store, key, retry, nil) do
+    with row when is_map(row) <- Store.one!(store, "SELECT receipt_json,receipt_sha256 FROM #{event_table(key)} WHERE event_key=?", [retry["original_started_key"]]),
          {:ok, owner} <- checked_object(row["receipt_json"], row["receipt_sha256"]),
          {_, code} when code != 0 <- System.cmd("/bin/kill", ["-0", Integer.to_string(owner["helper_pid"])], stderr_to_stdout: true),
          do: :ok,
@@ -799,6 +805,12 @@ defmodule SymphonyElixir.Factory.TicketCiGeneration do
           end
 
         case result do
+          {:ok, %{"kind" => "CONTROLLER_GENERATION_FAILED", "reason" => reason}}
+          when reason in ~w(generation_tool_timeout generation_tool_failed generation_output_unproven generation_control_unproven) ->
+            with :ok <- append_event(store, row, "UNCERTAIN", path, %{"version" => 1, "binding_sha256" => digest(Jason.encode!(binding)), "reason" => "READ_ONLY_TOOL_FAILED", "tool_error" => reason}) do
+              {:error, {:controller_generation_tool_failed, reason}}
+            end
+
           {:ok, receipt} ->
             with :ok <- valid_receipt(binding, receipt), :ok <- append_event(store, row, finished_type, path, receipt), do: {:ok, receipt}
 
@@ -988,7 +1000,12 @@ defmodule SymphonyElixir.Factory.TicketCiGeneration do
     Enum.reduce_while(rows, {:ok, []}, fn [key, raw, hash], {:ok, result} ->
       with {:ok, _} <- checked_object(raw, hash),
            {:ok, events} <- read_events(store, key) do
-        {:cont, {:ok, [%{intent_key: key, binding_sha256: hash, events: events, preview_retry: retry_readback(store, key), owned_receipts: status_receipts(store, key)} | result]}}
+        {:cont,
+         {:ok,
+          [
+            %{intent_key: key, binding_sha256: hash, events: events, preview_retry: retry_readback(store, key), last_failure: last_failure(store, key), owned_receipts: status_receipts(store, key)}
+            | result
+          ]}}
       else
         _ -> {:halt, {:error, :controller_generation_journal_unproven}}
       end
@@ -1000,6 +1017,20 @@ defmodule SymphonyElixir.Factory.TicketCiGeneration do
   end
 
   def readback(_, _), do: {:error, :controller_generation_journal_unproven}
+
+  defp last_failure(store, key) do
+    with row when is_map(row) <-
+           Store.one!(
+             store,
+             "SELECT receipt_json,receipt_sha256 FROM #{event_table(key)} WHERE intent_key=? AND event_type IN ('UNCERTAIN','BLOCKED') ORDER BY created_at DESC,event_key DESC LIMIT 1",
+             [key]
+           ),
+         {:ok, value} <- checked_object(row["receipt_json"], row["receipt_sha256"]) do
+      Map.take(value, ~w(reason tool_error))
+    else
+      _ -> nil
+    end
+  end
 
   defp retry_readback(store, key) do
     case preview_retry(store, key) do
