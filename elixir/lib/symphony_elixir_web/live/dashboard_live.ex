@@ -1320,7 +1320,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
     |> Enum.reject(&blocking_attention?/1)
   end
 
-  defp communication_warning?(ticket), do: ticket_signals(ticket) != []
+  defp communication_warning?(ticket), do: Enum.any?(ticket_signals(ticket), &(&1[:category] == "COMMUNICATION"))
   defp ticket_mark(%{bucket: "NEEDS_ATTENTION"}), do: "status-mark mark-attention"
   defp ticket_mark(%{bucket: "REVIEW_READY"}), do: "status-mark mark-ready"
   defp ticket_mark(_ticket), do: "status-mark mark-neutral"

@@ -6920,6 +6920,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     alias SymphonyElixir.Factory.TicketCiRepair
     Process.put(:ci_repair_fixture_store, ctx.store)
     factory = put_in(factory.ticket_supervisor["ci_repair"], "native_bounded_v1")
+    factory = if ctx[:ci_connected_cycle], do: put_in(factory.repositories["grail"]["ci_preflight"], "draft_mr"), else: factory
     factory = capability_factory(factory, ctx)
 
     factory =
@@ -7663,6 +7664,19 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     assert Jason.decode!(rejection)["child_pid"] == nil
     assert {:ok, old_sha} = Worktree.read_remote_branch(%{"path" => ctx.repo}, second["branch"])
     refute old_sha == second["candidate_sha"]
+  end
+
+  defp assert_repaired_push(%{ci_connected_cycle: true} = ctx, second, _reviewed, options) do
+    {:ok, parent_options} = empty_parent_reader_options(ctx.store, "run")
+    normal_options = options |> Keyword.delete(:workspace) |> Keyword.put(:app_server, PushNativeReader)
+    assert {:ok, %{launches: [], events: events}} = normal_poll(ctx.scheduler_context, normal_options, parent_options)
+    assert Enum.any?(events, &(&1.event == "TICKET_PUSH_COMPLETED")), inspect(events)
+    assert {:ok, pushed} = RunLedger.get(ctx.store, "run")
+    assert pushed["state"] == "CI_MR_CREATING"
+    assert {:ok, pushed_sha} = Worktree.read_remote_branch(%{"path" => ctx.repo}, pushed["branch"])
+    assert pushed_sha == second["candidate_sha"]
+    assert {:ok, _} = TicketPush.completed_proof(ctx.store, "run")
+    pushed
   end
 
   defp assert_repaired_push(%{ci_repair_scheduler_push: true} = ctx, second, reviewed, options) do
