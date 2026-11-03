@@ -1295,6 +1295,31 @@ defmodule SymphonyElixir.ExtensionsTest do
     refute html =~ "Open ticket chat"
   end
 
+  test "repairable CI displays queued factory work instead of a human next action" do
+    name = Module.concat(__MODULE__, :QueuedCiRepairOrchestrator)
+    {:ok, _} = StaticOrchestrator.start_link(name: name, snapshot: static_snapshot(), refresh: :unavailable)
+
+    factory =
+      update_in(factory_dashboard_snapshot(), [:current_runs, Access.at(0)], fn run ->
+        Map.merge(run, %{
+          state: "CI_WAITING",
+          review_stop: nil,
+          attention: %{
+            phase: "REPAIR_QUEUED",
+            blocking: false,
+            category: "AUTOMATION",
+            reason: "CI failed; automatic repair is queued.",
+            next_action: "The factory will repair the failed CI checks; no human action is required."
+          }
+        })
+      end)
+
+    start_test_endpoint(orchestrator: name, snapshot_timeout_ms: 50, factory_observability: fn -> factory end)
+    {:ok, _view, html} = live(build_conn(), "/")
+    assert html =~ "Queued for repair"
+    assert html =~ "Repair queued · no human action needed"
+  end
+
   test "paused dashboard identifies Jira intake as a saved snapshot" do
     orchestrator_name = Module.concat(__MODULE__, :PausedFactoryDashboardOrchestrator)
 

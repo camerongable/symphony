@@ -365,7 +365,7 @@ defmodule SymphonyElixir.Factory.TicketCiRepair do
          true <-
            (digest(evidence["binding_json"]) == evidence["binding_sha256"] and task["output_json"] == evidence["output_json"] and task["prompt_sha256"] == binding["input_sha256"]) or
              {:error, :ci_repair_source_unproven},
-         {:ok, native_options} <- WorkerEvidence.runtime_options(binding, opts),
+         {:ok, native_options} <- WorkerEvidence.runtime_options(binding, Keyword.put(opts, :workspace, task["workspace"])),
          reader = if(Keyword.has_key?(native_options, :native_runtime), do: AppServer, else: Keyword.get(opts, :app_server, AppServer)),
          {:ok, native} <-
            reader.read_native_thread(

@@ -1238,6 +1238,10 @@ defmodule SymphonyElixirWeb.DashboardLive do
       get_in(run, [:attention, :source]) == "BROKER" -> "Factory · MR handoff needs attention"
       run[:state] == "READY_FOR_REVIEW" and ticket_mr(ticket) -> "Human review"
       run[:state] == "AWAITING_CONTRACT_INPUT" and current_question -> "Human decision"
+      run[:failure_code] == "CI_REPAIR_EXHAUSTED" -> "Human decision"
+      get_in(run, [:attention, :phase]) == "REPAIR_QUEUED" -> "Factory · automatic CI repair"
+      run[:state] == "CI_WAITING" and get_in(run, [:attention, :blocking]) != true -> "Factory · CI observation"
+      run[:state] == "REPAIRING" and get_in(run, [:attention, :blocking]) != true -> "Factory · repair"
       get_in(run, [:worker_execution, :running_proven]) === true -> "Factory · recorded observation, not a current heartbeat"
       true -> nil
     end
@@ -1245,9 +1249,11 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp ticket_responsibility(_ticket), do: nil
 
+  defp ticket_phase(%{run: %{attention: %{phase: "REPAIR_QUEUED"}}}), do: "Queued for repair"
   defp ticket_phase(%{run: run}) when is_map(run), do: if(run[:review_stop], do: "Review stopped", else: humanize_factory_code(run[:state]))
   defp ticket_phase(%{diagnostics: [_ | _]}), do: "Current record unproven"
   defp ticket_phase(_ticket), do: "Intake observed"
+  defp ticket_stage(%{run: %{attention: %{phase: "REPAIR_QUEUED"}}}), do: "Build"
   defp ticket_stage(%{run: run}) when is_map(run), do: if(run[:review_stop], do: "Verify", else: workflow_stage(run[:state]))
   defp ticket_stage(%{run_records: [_ | _]}), do: nil
   defp ticket_stage(%{intake: issue}) when is_map(issue), do: "Intake"
@@ -1257,6 +1263,9 @@ defmodule SymphonyElixirWeb.DashboardLive do
   defp ticket_activity(_ticket), do: "No worker activity is established by this intake record."
 
   defp ticket_activity_summary(%{run: %{state: "ADMITTING_WRITER"}}), do: "Preparing to start"
+  defp ticket_activity_summary(%{run: %{attention: %{phase: "REPAIR_QUEUED"}}}), do: "Repair queued · no human action needed"
+  defp ticket_activity_summary(%{run: %{state: "CI_WAITING"}}), do: "Waiting for CI results"
+  defp ticket_activity_summary(%{run: %{state: "REPAIRING"}}), do: "Repairing findings"
 
   defp ticket_activity_summary(%{run: run}) when is_map(run) do
     case get_in(run, [:worker_execution, :status]) do

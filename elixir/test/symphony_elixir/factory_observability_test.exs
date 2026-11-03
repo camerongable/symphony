@@ -755,6 +755,12 @@ defmodule SymphonyElixir.FactoryObservabilityTest do
     assert hd(blocked_ci.current_runs).attention.failed_jobs |> Enum.map(& &1.url) == ["https://gitlab.example/group/repo/-/jobs/100", nil]
     assert blocked_ci.overview.delivery_blocked == 1 and blocked_ci.overview.communication_attention == 1
     assert hd(blocked_ci.current_runs).primary_next_action =~ "independent verification remains gated"
+    Store.query!(context.store, "INSERT INTO ticket_ci_repair_diagnoses VALUES ('repairable','parent-attention',?,99,'{}','fixture','{}','fixture','REPAIRABLE','2026-10-13T23:59:00Z')", [sha])
+    repair_options = Keyword.put(options, :settings, %{factory: Map.put(context.factory, :ticket_supervisor, %{"enabled" => true, "all_eligible_tickets" => true, "ci_repair" => "native_bounded_v1"})})
+    repairable = Observability.snapshot(repair_options)
+    assert repairable.overview.needs_attention == 0
+    assert hd(repairable.current_runs).attention.blocking == false
+    assert hd(repairable.current_runs).primary_next_action =~ "repair"
     {:ok, _} = RunLedger.update(context.store, "parent-attention", %{ci_evidence_json: Jason.encode!(Map.put(evidence, "sha", String.duplicate("b", 40)))})
     assert hd(Observability.snapshot(options).current_runs).attention.source == "PARENT_SYNC"
     {:ok, _} = RunLedger.update(context.store, "parent-attention", %{ci_evidence_json: nil})

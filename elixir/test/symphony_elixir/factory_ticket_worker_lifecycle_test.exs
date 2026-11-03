@@ -4401,7 +4401,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
         writer_disk_gb: 20,
         cleanup: %{},
         queue: %{"assignee" => "currentUser()", "statuses" => ["To Do", "In Dev"], "factory_labels" => ["ai-ready", "ai-running"]},
-        ticket_supervisor: %{"enabled" => true, "pilot_issue_keys" => ["PPL-123"]}
+        ticket_supervisor: if(context[:retain_ci_policy], do: context.factory.ticket_supervisor, else: %{"enabled" => true, "pilot_issue_keys" => ["PPL-123"]})
       })
 
     context = Map.merge(context, %{factory: factory, ticket_options: options})
@@ -5544,6 +5544,47 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     assert Store.one!(ctx.store, "SELECT COUNT(*) AS count FROM workspace_access WHERE released_at IS NULL")["count"] == 1
   end
 
+  @tag :ci_connector_workspace
+  test "stopped source restores isolated storage independently of connector cwd", ctx do
+    alias SymphonyElixir.Factory.{NativeRuntimeRoute, TicketCiRepair}
+    {context, options} = controller(ctx)
+    run = complete_stage(context, options)
+    assert run["state"] == "VERIFYING"
+    evidence = Store.one!(ctx.store, "SELECT * FROM worker_evidence WHERE task_key='run:feature-writer' AND status='CONSUMED'")
+    descriptor = %{"version" => 1, "codex_home" => Path.join(ctx.root, "source-codex"), "sqlite_home" => Path.join(ctx.root, "source-sqlite")}
+
+    for path <- [descriptor["codex_home"], descriptor["sqlite_home"]] do
+      File.mkdir!(path)
+      File.chmod!(path, 0o700)
+    end
+
+    assert {:ok, route} = NativeRuntimeRoute.validate(descriptor)
+    assert {:ok, origin} = NativeRuntimeRoute.origin(route)
+    binding = evidence["binding_json"] |> Jason.decode!() |> Map.merge(%{"binding_version" => 2, "native_runtime" => origin})
+    encoded = Jason.encode!(binding)
+    digest = :crypto.hash(:sha256, encoded) |> Base.encode16(case: :lower)
+    Store.query!(ctx.store, "UPDATE worker_evidence SET binding_json=?,binding_sha256=? WHERE request_key=?", [encoded, digest, evidence["request_key"]])
+    generation_native_reader(ctx.store, ctx.root, evidence["request_key"])
+    command = Path.join(ctx.root, "runtime-fixture")
+    previous_home = System.get_env("CODEX_HOME") || Path.join(System.user_home!(), ".codex")
+    config = Jason.encode!(%{"id" => 15, "result" => %{"config" => %{"sqlite_home" => descriptor["sqlite_home"]}}})
+
+    script =
+      File.read!(command)
+      |> String.replace(Jason.encode!(previous_home), Jason.encode!(descriptor["codex_home"]))
+      |> String.replace("esac", "*'\"method\":\"config/read\"'*) printf '%s\\n' '#{config}' ;;\nesac")
+
+    File.write!(command, script)
+    connector_cwd = Path.join(ctx.root, "connector")
+    File.mkdir!(connector_cwd)
+    opts = [workspace: connector_cwd, native_runtime: route]
+    assert {:ok, source} = TicketCiRepair.observe_stopped_source(ctx.store, run, opts)
+    assert source.request["cwd"] == ctx.path
+    assert source.native["cwd"] == ctx.path
+    assert source.evidence["binding_json"] == encoded
+    assert {:error, :worker_native_runtime_conflict} = TicketCiRepair.observe_stopped_source(ctx.store, run, Keyword.put(opts, :native_home, Path.join(ctx.root, "wrong-home")))
+  end
+
   @tag broker_thread_id: "00000000-0000-0000-0000-000000000001"
   test "ordinary MR adoption qualifies current remote state without replay or Jira finalization", ctx do
     assert_mr_adoption(ctx)
@@ -5598,6 +5639,18 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
   @tag broker_thread_id: "00000000-0000-0000-0000-000000000001", mr_preflight: true
   @tag ci_repair_fixture: true, ci_repair_native: true, ci_repair_non_go: true, timeout: 180_000
   test "a non-Go repair completes without loading or invoking the Go toolset", ctx do
+    assert_mr_adoption(ctx)
+  end
+
+  @tag :ci_connected_cycle
+  @tag broker_thread_id: "00000000-0000-0000-0000-000000000001",
+       mr_preflight: true,
+       ci_repair_fixture: true,
+       ci_repair_native: true,
+       ci_repair_non_go: true,
+       ci_repair_scheduler_push: true,
+       timeout: 300_000
+  test "failed CI repairs and republishes through normal scheduler ownership", ctx do
     assert_mr_adoption(ctx)
   end
 
@@ -7062,6 +7115,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
                 {:ok, %{run: second}} = RunLedger.update(ctx.store, "run", %{code_repair_round: run["code_repair_round"] + 1})
                 assert {:ok, reviewed} = TicketWorkerRunner.delivery_authorization(ctx.store, second, review_snapshot, DateTime.utc_now(), options)
 
+                context = if ctx[:ci_connected_cycle], do: Map.put(context, :retain_ci_policy, true), else: context
                 push_ctx = if ctx[:ci_repair_scheduler_push] || ctx[:push_packet_circulation] || ctx[:push_origin_recovery_child], do: Map.put(ctx, :scheduler_context, context), else: ctx
 
                 case assert_repaired_push(push_ctx, second, reviewed, options) do
@@ -7232,7 +7286,7 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
   end
 
   defp current_ci_policy_fixture?(ctx) do
-    ctx[:ci_generated_only] == true or ctx[:ci_admission_metadata] == true or ctx[:push_packet_history] == true or ctx[:ci_round_identity] == true or
+    ctx[:ci_connected_cycle] == true or ctx[:ci_generated_only] == true or ctx[:ci_admission_metadata] == true or ctx[:push_packet_history] == true or ctx[:ci_round_identity] == true or
       (ctx[:verifier_repair_cycle] == true and ctx[:ci_evidence_successor] != true)
   end
 

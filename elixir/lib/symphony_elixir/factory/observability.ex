@@ -359,7 +359,7 @@ defmodule SymphonyElixir.Factory.Observability do
             control_attention(store, source),
             parent_collection_attention(store, source),
             report_attention(store, source),
-            ci_attention(source),
+            ci_attention(store, source, factory),
             operation_attention(store, source),
             journal_attention(store, source),
             mr_preclaim_attention(store, source),
@@ -755,7 +755,7 @@ defmodule SymphonyElixir.Factory.Observability do
       is_binary(request["prompt"]) and String.contains?(request["prompt"], "Controller-observed AS-OF presentation only; not human input or source authority.")
   end
 
-  defp ci_attention(run) do
+  defp ci_attention(store, run, factory) do
     evidence = decode_map(run["ci_evidence_json"])
 
     if run["state"] == "CI_WAITING" and evidence["status"] == "BLOCK" and is_binary(run["candidate_sha"]) and
@@ -771,6 +771,18 @@ defmodule SymphonyElixir.Factory.Observability do
       jobs = if is_list(jobs), do: jobs, else: []
       jobs = jobs |> Enum.filter(&is_map/1) |> Enum.map(fn job -> %{name: bounded_reason(job["name"]), status: bounded_reason(job["status"]), url: safe_ci_url(job["web_url"], run["mr_url"])} end)
 
+      policy = value(factory, :ticket_supervisor, %{})
+
+      repairable =
+        policy["ci_repair"] == "native_bounded_v1" and
+          SymphonyElixir.Factory.Policy.ticket_selected?(policy, run["issue_key"]) and
+          is_nil(run["failure_code"]) and
+          Store.one!(store, "SELECT diagnosis_key FROM ticket_ci_repair_diagnoses WHERE run_id=? AND candidate_sha=? AND pipeline_id=? AND verdict='REPAIRABLE' LIMIT 1", [
+            run["run_id"],
+            run["candidate_sha"],
+            run["ci_pipeline_id"]
+          ]) != nil
+
       notice(
         "CI",
         "BLOCK",
@@ -780,6 +792,18 @@ defmodule SymphonyElixir.Factory.Observability do
         "Inspect the bound failed pipeline and jobs; independent verification remains gated on CI passing."
       )
       |> Map.merge(%{pipeline_url: safe_ci_url(evidence["pipeline_url"], run["mr_url"]), failed_jobs: jobs})
+      |> then(fn signal ->
+        if repairable,
+          do:
+            Map.merge(signal, %{
+              blocking: false,
+              category: "AUTOMATION",
+              phase: "REPAIR_QUEUED",
+              reason: "CI failed; automatic repair is queued.",
+              next_action: "The factory will repair the failed CI checks; no human action is required."
+            }),
+          else: signal
+      end)
     end
   end
 
@@ -793,6 +817,7 @@ defmodule SymphonyElixir.Factory.Observability do
   defp safe_ci_url(_url, _mr_url), do: nil
 
   defp primary_action(_run, %{blocking: true, next_action: action}), do: action
+  defp primary_action(_run, %{phase: "REPAIR_QUEUED", next_action: action}), do: action
   defp primary_action(%{state: "CI_MR_CREATING"}, _signal), do: "Adopt the exact pushed candidate into the recorded draft MR, then qualify its pipeline."
   defp primary_action(%{state: "CI_WAITING"}, _signal), do: "Qualify the current MR pipeline; independent verification waits for CI to pass."
   defp primary_action(%{state: "READY_FOR_REVIEW"}, _signal), do: "Review the recorded draft MR."
@@ -1433,7 +1458,7 @@ defmodule SymphonyElixir.Factory.Observability do
   defp presentation_only_attention?(run), do: communication_only_attention?(run)
 
   defp communication_only_attention?(run),
-    do: run.attention != nil and Enum.all?(run.attention_signals, &(&1.category == "COMMUNICATION" and not &1.blocking)) and not projected_run_blocked?(run) and is_nil(run.handoff_attention)
+    do: run.attention != nil and Enum.all?(run.attention_signals, &(not &1.blocking)) and not projected_run_blocked?(run) and is_nil(run.handoff_attention)
 
   defp overview_unblocked_state(issue, run, tasks) do
     cond do

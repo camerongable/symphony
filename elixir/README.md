@@ -569,6 +569,12 @@ changes an existing MR. A historical publication hold remains immutable evidence
 but a fresh exact-candidate, open, reviewer-free draft read can advance it normally.
 Current authority and human-input checks still apply before adoption.
 
+CI repair restores the completed writer's recorded workspace and native storage
+independently of the controller connector's workspace. The dashboard shows
+repairable CI failures as queued factory work, not human attention; repair limits
+and other blocking decisions remain visible. Validate includes waiting for CI,
+while Verify is independent code review. Queued and active repair appear in Build.
+
 The `factory.ticket_supervisor` setting remains default-off:
 `{"enabled": false, "pilot_issue_keys": []}`. New run registrations record an
 immutable execution mode, while historical rows remain `NULL` and continue to
