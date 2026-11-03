@@ -756,6 +756,9 @@ can inspect/edit its exact checkout. Writes require the full-file SHA-256 (or
 `ABSENT` for a new file in an existing directory), bounded UTF-8 contents, and
 the current request/thread/turn/reservation generation. Symlinks, hardlinks,
 control paths, connectors, shell tools and permission escalation are denied.
+Ordinary reads and directory listings check the checkout once, outside SQLite.
+Their file I/O also runs outside the database transaction; short ledger checks
+before and after the read reject results if worker authority changes in flight.
 Read paths prefixed with exact ASCII `.symphony-base/` resolve only the immutable contract-base SHA already bound to the
 current worker and persisted review base; callers cannot select a Git revision.
 This virtual namespace is available only through `repo_read` and `repo_read_binary`;

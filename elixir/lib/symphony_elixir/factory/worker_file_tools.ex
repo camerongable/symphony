@@ -124,8 +124,7 @@ defmodule SymphonyElixir.Factory.WorkerFileTools do
   @spec execute(map(), String.t(), term(), map()) :: map()
   def execute(capability, tool, arguments, identity) do
     result =
-      with :ok <- valid_call(tool, arguments, identity),
-           {:ok, _} <- authorize(capability, identity) do
+      with :ok <- valid_call(tool, arguments, identity) do
         dispatch(capability, tool, arguments, identity)
       end
 
@@ -175,21 +174,30 @@ defmodule SymphonyElixir.Factory.WorkerFileTools do
   defp matching(_value, _expected, reason), do: {:error, reason}
 
   defp authorize(cap, identity) do
+    with {:ok, observed} <- authorization_state(cap, identity, :physical),
+         {:ok, _} <- pinned_checkout(observed.run, observed.access, observed.binding) do
+      {:ok, observed.access}
+    end
+  end
+
+  defp authorization_state(cap, identity, observation) do
     with {:ok, evidence} <- WorkerEvidence.get(cap.store, cap.key),
          :ok <- matching({evidence["owner_id"], evidence["binding_sha256"]}, {cap.owner, cap.binding_sha256}, :file_worker_binding_changed),
          :ok <- matching(active?(evidence), true, :file_worker_not_active),
          :ok <- matching(native_identity(evidence), native_identity(identity), :file_worker_identity_mismatch),
          {:ok, binding} <- intact_binding(evidence),
-         {:ok, access} <- WorkspaceAccess.validate(cap.store, binding["reservation_key"], binding["reservation_generation"]),
+         {:ok, access} <- workspace_authority(cap.store, binding, observation),
          {:ok, run} <- RunLedger.get(cap.store, evidence["run_id"]),
          {:ok, task} <- TaskLedger.get(cap.store, evidence["task_key"]),
          :ok <- matching({file_writer?(binding), access["mode"]}, {true, "SOURCE"}, :file_worker_policy_required),
          :ok <- current_inputs(task, binding),
-         :ok <- matching(run["candidate_sha"] in [nil, binding["expected_sha"]], true, :file_worker_candidate_changed),
-         {:ok, _} <- pinned_checkout(run, access, binding) do
-      {:ok, access}
+         :ok <- matching(run["candidate_sha"] in [nil, binding["expected_sha"]], true, :file_worker_candidate_changed) do
+      {:ok, %{access: access, binding: binding, run: Map.take(run, ~w(repo_path worktree branch candidate_sha spec_revision contract_sha256 state))}}
     end
   end
+
+  defp workspace_authority(store, binding, :physical), do: WorkspaceAccess.validate(store, binding["reservation_key"], binding["reservation_generation"])
+  defp workspace_authority(store, binding, :held), do: WorkspaceAccess.validate_held(store, binding["reservation_key"], binding["reservation_generation"])
 
   defp native_identity(%{"thread_id" => thread, "turn_id" => turn}), do: {thread, turn}
   defp native_identity(%{"threadId" => thread, "turnId" => turn}), do: {thread, turn}
@@ -214,24 +222,43 @@ defmodule SymphonyElixir.Factory.WorkerFileTools do
         get_in(binding, ["policy", "source_access"]) == "read" and
         get_in(binding, ["policy", "file_tools_sha256"]) == tool_contract_sha256()
 
-  defp dispatch(cap, "repo_write", args, identity), do: write(cap, args, identity)
-  defp dispatch(cap, "repo_delete", args, identity), do: write(cap, args, identity)
-  defp dispatch(cap, "repo_mkdir", args, identity), do: write(cap, args, identity)
-  defp dispatch(cap, "repo_write_binary", args, identity), do: write(cap, args, identity)
+  defp dispatch(cap, tool, args, identity) when tool in ~w(repo_write repo_delete repo_mkdir repo_write_binary) do
+    with {:ok, _} <- authorize(cap, identity), do: write(cap, args, identity)
+  end
 
   defp dispatch(cap, tool, %{"path" => ".symphony-base/" <> path} = args, identity) when tool in ~w(repo_read repo_read_binary) do
-    if byte_size(args["path"]) <= 1024,
-      do: read_revision(cap, tool, Map.put(args, "path", path), identity),
-      else: {:error, :file_worker_path_rejected}
+    with {:ok, _} <- authorize(cap, identity),
+         true <- byte_size(args["path"]) <= 1024 or {:error, :file_worker_path_rejected} do
+      read_revision(cap, tool, Map.put(args, "path", path), identity)
+    end
   end
 
   defp dispatch(cap, tool, args, identity) do
-    Store.transaction!(cap.store, fn tx ->
-      with {:ok, access} <- authorize(%{cap | store: tx}, identity),
-           :ok <- valid_path(args["path"], tool == "repo_list") do
-        inspect_path(tool, access, args)
-      end
-    end)
+    with :ok <- valid_path(args["path"], tool == "repo_list"),
+         {:ok, observed} <- read_authority(cap, identity),
+         :ok <- read_checkout(cap.store, observed),
+         {:ok, value} <- inspect_path(tool, observed.access, args),
+         {:ok, ^observed} <- read_authority(cap, identity) do
+      {:ok, value}
+    else
+      {:ok, _changed} -> {:error, :file_worker_authority_changed}
+      error -> error
+    end
+  end
+
+  defp read_authority(cap, identity),
+    do: Store.transaction!(cap.store, fn tx -> authorization_state(%{cap | store: tx}, identity, :held) end, mode: :deferred)
+
+  defp read_checkout(store, %{access: access, run: run, binding: binding}) do
+    with true <- is_binary(run["worktree"]) or {:error, :workspace_binding_missing},
+         {:ok, path} <- SymphonyElixir.PathSafety.canonicalize(run["worktree"]),
+         :ok <- matching(path, access["canonical_path"], :workspace_identity_changed),
+         {:ok, checkout} <- pinned_checkout(run, access, binding),
+         {:ok, root} <- Jason.decode(access["binding_json"]),
+         :ok <- matching({checkout.path, checkout.git_dir, checkout.common_dir}, {access["canonical_path"], access["git_dir"], access["common_dir"]}, :workspace_identity_changed),
+         :ok <- matching({checkout.root_device, checkout.root_inode}, {root["root_device"], root["root_inode"]}, :workspace_root_identity_changed),
+         :ok <- WorkerFileIO.workspace_allowed?(store, access["canonical_path"]),
+         do: :ok
   end
 
   defp read_revision(cap, tool, args, identity) do

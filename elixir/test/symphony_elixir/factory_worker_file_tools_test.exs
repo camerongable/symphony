@@ -2,7 +2,7 @@ defmodule SymphonyElixir.FactoryWorkerFileToolsTest do
   # Native helper deadlines must not compete with unrelated process-heavy modules.
   use ExUnit.Case, async: false
   import SymphonyElixir.TicketWorkerFixture
-  alias SymphonyElixir.Factory.{RunLedger, Store, TaskLedger, TicketWorkerRunner}
+  alias SymphonyElixir.Factory.{Control, RunLedger, Store, TaskLedger, TicketWorkerRunner, Worktree}
   alias SymphonyElixir.Factory.{WorkerEvidence, WorkerFileIO, WorkerFileTools, WorkspaceAccess}
   setup :setup_fixture
 
@@ -426,6 +426,107 @@ defmodule SymphonyElixir.FactoryWorkerFileToolsTest do
 
     assert Enum.map(WorkerFileTools.tool_specs(), & &1["name"]) ==
              ~w(repo_read repo_list repo_write repo_delete repo_mkdir repo_read_binary repo_write_binary)
+  end
+
+  @tag :file_read_isolation
+  test "slow repository reads and listings leave the scheduler database available", ctx do
+    cap = prepare(ctx)
+    config = %{scope: "read-isolation", dispatcher_id: "dispatcher"}
+    Control.initialize(ctx.store, config)
+    assert {:ok, _} = Control.activate(ctx.store, config, "dispatcher")
+
+    for {tool, args} <- [
+          {"repo_read", %{"path" => "fixture.txt", "start_line" => 1}},
+          {"repo_read_binary", %{"path" => "fixture.txt", "offset" => 0}},
+          {"repo_list", %{"path" => "."}}
+        ] do
+      parent = self()
+
+      reader =
+        Task.async(fn ->
+          Process.put({Worktree, :before_identity_command}, fn
+            ["branch", "--show-current"] ->
+              send(parent, {:read_git_waiting, self()})
+              receive do: (:continue_read -> :ok)
+
+            _ ->
+              :ok
+          end)
+
+          call(cap, tool, args)
+        end)
+
+      try do
+        assert %{"success" => true} = finish_responsive_read(reader, ctx.store, config)
+      after
+        Task.shutdown(reader, :brutal_kill)
+      end
+    end
+  end
+
+  @tag :file_read_isolation
+  test "ownership revoked during a repository read cannot return source bytes", ctx do
+    cap = prepare(ctx)
+    parent = self()
+
+    reader =
+      Task.async(fn ->
+        Process.put({Worktree, :before_identity_command}, fn
+          ["branch", "--show-current"] ->
+            Process.delete({Worktree, :before_identity_command})
+            send(parent, {:read_git_waiting, self()})
+            receive do: (:continue_read -> :ok)
+
+          _ ->
+            :ok
+        end)
+
+        read(cap)
+      end)
+
+    try do
+      assert_receive {:read_git_waiting, pid}, 5_000
+      assert {:ok, %{"status" => "RECONCILE_REQUIRED"}} = WorkerEvidence.reconcile_required(ctx.store, cap.key, :ownership_revoked)
+      send(pid, :continue_read)
+      assert %{"success" => false} = result = Task.await(reader, 20_000)
+      assert decoded(result) == %{"error" => ":file_worker_not_active"}
+      assert File.read!(Path.join(ctx.path, "fixture.txt")) == "base\n"
+    after
+      Task.shutdown(reader, :brutal_kill)
+    end
+  end
+
+  @tag :file_read_isolation
+  test "a changed run checkout cannot read through the previous reservation", ctx do
+    cap = prepare(ctx)
+
+    for path <- [ctx.repo, nil] do
+      assert {:ok, _} = RunLedger.update(ctx.store, "run", %{worktree: path})
+      assert %{"success" => false} = read(cap)
+    end
+  end
+
+  defp finish_responsive_read(%Task{pid: pid, ref: ref} = reader, store, config) do
+    receive do
+      {:read_git_waiting, ^pid} ->
+        scheduler =
+          Task.async(fn ->
+            %{result: "ACQUIRED", tick_id: tick} = Control.acquire_tick(store, config, "dispatcher")
+            Control.release_tick(store, config, "dispatcher", tick)
+          end)
+
+        result = Task.yield(scheduler, 1_000)
+        send(pid, :continue_read)
+        if is_nil(result), do: Task.shutdown(scheduler, :brutal_kill)
+        assert {:ok, %{result: "RELEASED"}} = result
+        finish_responsive_read(reader, store, config)
+
+      {^ref, result} ->
+        Process.demonitor(ref, [:flush])
+        result
+    after
+      20_000 -> flunk("repository read did not complete")
+    end
   end
 
   test "a real failed reader cannot report success or grant source authority", ctx do

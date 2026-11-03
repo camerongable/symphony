@@ -258,6 +258,21 @@ defmodule SymphonyElixir.Factory.WorkspaceAccess do
     end
   end
 
+  @doc "Rechecks held checkout authority using only ledger facts; it does not observe the filesystem."
+  @spec validate_held(Store.connection(), String.t(), pos_integer()) :: {:ok, map()} | {:error, term()}
+  def validate_held(store, key, generation) do
+    with {:ok, row} <- get(store, key),
+         true <- (row["generation"] == generation and is_nil(row["released_at"])) or {:error, :stale_workspace_reservation},
+         {:ok, binding} <- Jason.decode(row["binding_json"]),
+         {:ok, run} <- RunLedger.get(store, row["run_id"]),
+         :ok <- current_task(store, row, binding),
+         :ok <- current_initial_base(store, row, binding, run),
+         :ok <- checkout_intent_available(store, %{path: row["canonical_path"], common_dir: row["common_dir"]}, run["branch"], nil),
+         true <- Map.take(run, ~w(spec_revision contract_sha256 branch)) == Map.take(binding, ~w(spec_revision contract_sha256 branch)) or {:error, :workspace_input_changed} do
+      {:ok, row}
+    end
+  end
+
   @spec validate(Store.connection(), String.t(), pos_integer(), keyword()) :: {:ok, map()} | {:error, term()}
   def validate(store, key, generation, opts \\ []) do
     with {:ok, row} <- get(store, key),
