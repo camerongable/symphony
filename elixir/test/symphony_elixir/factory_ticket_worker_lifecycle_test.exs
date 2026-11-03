@@ -1516,18 +1516,50 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
     true = Port.command(port, "x")
     assert_receive {^port, {:exit_status, 0}}, 5_000
 
-    insert = fn type, value ->
+    insert = fn type, path, value ->
       raw = Jason.encode!(value)
-      Store.query!(store, "INSERT INTO ticket_ci_generation_events VALUES (?,?,?,'',NULL,?,?,?)", [key.(type, ""), row["intent_key"], type, raw, sha256(raw), DateTime.to_iso8601(DateTime.utc_now())])
+
+      Store.query!(store, "INSERT INTO ticket_ci_generation_events VALUES (?,?,?,?,NULL,?,?,?)", [
+        key.(type, path),
+        row["intent_key"],
+        type,
+        path,
+        raw,
+        sha256(raw),
+        DateTime.to_iso8601(DateTime.utc_now())
+      ])
     end
 
-    insert.("EXECUTION_PREPARED", binding)
-    insert.("EXECUTION_STARTED", %{"helper_pid" => pid, "binding_json" => Jason.encode!(binding)})
-    insert.("UNCERTAIN", %{"version" => 1, "binding_sha256" => sha256(Jason.encode!(binding)), "reason" => "OWNED_RECEIPT_UNPROVEN"})
+    insert.("EXECUTION_PREPARED", "", binding)
+    insert.("EXECUTION_STARTED", "", %{"helper_pid" => pid, "binding_json" => Jason.encode!(binding)})
+    insert.("UNCERTAIN", "", %{"version" => 1, "binding_sha256" => sha256(Jason.encode!(binding)), "reason" => "OWNED_RECEIPT_UNPROVEN"})
+    assert {:ok, first_readback} = TicketCiGeneration.readback(store, request)
+    assert Enum.find(first_readback.intents, &(&1.intent_key == row["intent_key"])).preview_retry.execution_path == "preview-retry:1"
+    first_uncertain = Store.one!(store, "SELECT * FROM ticket_ci_generation_events WHERE event_key=?", [key.("UNCERTAIN", "")])
+    first_started = Store.one!(store, "SELECT * FROM ticket_ci_generation_events WHERE event_key=?", [key.("EXECUTION_STARTED", "")])
+
+    retry = %{
+      "execution_path" => "preview-retry:1",
+      "original_uncertain_key" => first_uncertain["event_key"],
+      "original_uncertain_sha256" => first_uncertain["receipt_sha256"],
+      "original_started_key" => first_started["event_key"],
+      "original_started_sha256" => first_started["receipt_sha256"]
+    }
+
+    assert {:ok, second_transport} = TicketCiGenerationIO.binding(binding["root"], 4)
+
+    second_binding =
+      binding
+      |> Map.merge(second_transport)
+      |> Map.merge(%{"generation_version" => 4, "execution_path" => "preview-retry:1", "preview_retry" => retry, "started_key" => key.("EXECUTION_STARTED", "preview-retry:1")})
+
+    insert.("EXECUTION_PREPARED", "preview-retry:1", second_binding)
+    insert.("EXECUTION_STARTED", "preview-retry:1", %{"helper_pid" => pid, "binding_json" => Jason.encode!(second_binding)})
+    insert.("UNCERTAIN", "preview-retry:1", %{"version" => 1, "binding_sha256" => sha256(Jason.encode!(second_binding)), "reason" => "OWNED_RECEIPT_UNPROVEN"})
     original = Store.query!(store, "SELECT * FROM ticket_ci_generation_events WHERE intent_key=? ORDER BY event_key", [row["intent_key"]]).rows
     assert {:error, :controller_generation_pending} = TicketCiGeneration.commit_ready(store, request)
 
-    for {type, path} <- [{"BLOCKED", ""}, {"UNCERTAIN", "preview-retry:1"}, {"APPLY_PREPARED", hd(intent["paths"])}] do
+    for {type, path} <- [{"BLOCKED", ""}, {"UNCERTAIN", "preview-retry:2"}, {"APPLY_PREPARED", hd(intent["paths"])}] do
       assert {:error, :fixture_probe_rollback} =
                Exqlite.transaction(store, fn tx ->
                  raw = Jason.encode!(%{"version" => 1})
@@ -5751,8 +5783,8 @@ defmodule SymphonyElixir.FactoryTicketWorkerLifecycleTest do
        timeout: 360_000
   test "a lost read-only CI preview retries once and completes normal publication without losing history", ctx do
     assert_mr_adoption(ctx)
-    assert Store.one!(ctx.store, "SELECT COUNT(*) AS n FROM ticket_ci_generation_events WHERE event_type='UNCERTAIN'")["n"] == 1
-    assert Store.one!(ctx.store, "SELECT COUNT(*) AS n FROM ticket_ci_generation_events WHERE event_type='EXECUTION_RECEIPT' AND path='preview-retry:1'")["n"] == 1
+    assert Store.one!(ctx.store, "SELECT COUNT(*) AS n FROM ticket_ci_generation_events WHERE event_type='UNCERTAIN'")["n"] == 2
+    assert Store.one!(ctx.store, "SELECT COUNT(*) AS n FROM ticket_ci_generation_events WHERE event_type='EXECUTION_RECEIPT' AND path='preview-retry:2'")["n"] == 1
   end
 
   @tag broker_thread_id: "00000000-0000-0000-0000-000000000001", mr_preflight: true

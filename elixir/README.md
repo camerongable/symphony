@@ -2017,11 +2017,13 @@ receipts, but retain the stopped-writer, exact source/round/input and commit
 fences. Formatting considers actual edits and committed repair descendants,
 not every unrelated Go file in the original candidate.
 
-An interrupted v1 CI read-only preview may receive one append-only retry after
+An interrupted CI read-only preview may receive two append-only retries after
 its original helper has stopped, provided no apply was issued. The controller
 retains the original uncertainty and binds the retry to fresh ownership and
 unchanged source evidence. Normal confined apply and finalization are still
 required before committing; uncertain writes and pushes are never replayed.
+New CI previews use Gazelle's static external resolution mode: existing repository
+metadata resolves dependencies without a writable remote cache or network access.
 
 The original worker output remains immutable. Separately receipted formatting
 and generated BUILD paths are united only for the controller's exact commit;

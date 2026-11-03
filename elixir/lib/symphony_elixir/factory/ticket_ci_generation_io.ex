@@ -21,6 +21,9 @@ defmodule SymphonyElixir.Factory.TicketCiGenerationIO do
   @retry_helper Path.expand("../../../priv/controller_generation_executor_v4.py", __DIR__)
   @external_resource @retry_helper
   @retry_helper_sha :crypto.hash(:sha256, File.read!(@retry_helper)) |> Base.encode16(case: :lower)
+  @static_helper Path.expand("../../../priv/controller_generation_executor_v5.py", __DIR__)
+  @external_resource @static_helper
+  @static_helper_sha :crypto.hash(:sha256, File.read!(@static_helper)) |> Base.encode16(case: :lower)
   @limit 2_097_152
 
   @spec observe(map(), [String.t()], 1 | 2 | 3) :: {:ok, map()} | {:error, atom()}
@@ -105,7 +108,7 @@ defmodule SymphonyElixir.Factory.TicketCiGenerationIO do
     end
   end
 
-  @spec binding(Path.t(), 1 | 2 | 3 | 4) :: {:ok, map()} | {:error, atom()}
+  @spec binding(Path.t(), 1 | 2 | 3 | 4 | 5) :: {:ok, map()} | {:error, atom()}
   def binding(root, version \\ 1) do
     with {:ok, helper} <- helper(root, version) do
       {:ok,
@@ -166,6 +169,7 @@ defmodule SymphonyElixir.Factory.TicketCiGenerationIO do
 
   defp execution_version(%{"generation_version" => 3}), do: 3
   defp execution_version(%{"generation_version" => 4}), do: 4
+  defp execution_version(%{"generation_version" => 5}), do: 5
 
   defp execution_version(binding) do
     if String.starts_with?(binding["intent_key"] || "", "ordinary-generation:"), do: 2, else: 1
@@ -228,9 +232,10 @@ defmodule SymphonyElixir.Factory.TicketCiGenerationIO do
   defp helper_sha(2), do: @ordinary_helper_sha
   defp helper_sha(3), do: @generated_helper_sha
   defp helper_sha(4), do: @retry_helper_sha
+  defp helper_sha(5), do: @static_helper_sha
 
   defp helper(root, version) do
-    with true <- version in [1, 2, 3, 4],
+    with true <- version in [1, 2, 3, 4, 5],
          {:ok, path} <- PathSafety.canonicalize(Application.app_dir(:symphony_elixir, "priv/controller_generation_executor_v#{version}.py")),
          :ok <- WorkerFileIO.program_outside_source(path, root),
          {:ok, raw} <- File.read(path),
