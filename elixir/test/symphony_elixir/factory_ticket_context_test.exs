@@ -6,6 +6,48 @@ defmodule SymphonyElixir.FactoryTicketContextTest do
 
   setup :setup_fixture
 
+  test "chat and dashboard expose current CI and a durable factory hold before large details", ctx do
+    sha = String.duplicate("a", 40)
+
+    {:ok, _} =
+      RunLedger.update(ctx.store, "run", %{state: "PUSHING", ci_evidence_json: Jason.encode!(%{status: "PASS", sha: sha, pipeline_id: 123}), plan_markdown: String.duplicate("details", 10_000)})
+
+    assert :ok = RunLedger.record_stage_outcome(ctx.store, "run", "verified_ci_rollover_prior_unproven")
+    assert :ok = RunLedger.record_stage_outcome(ctx.store, "run", "verified_ci_rollover_prior_unproven")
+    assert {:ok, packet} = TicketContext.context(ctx.store, "run")
+    assert packet.status.ci == %{status: "PASS", candidate_sha: sha, pipeline_id: 123, binding: "EXACT"}
+    assert packet.status.hold.reason == "verified_ci_rollover_prior_unproven"
+    assert packet.status.hold.action_owner == "FACTORY_MAINTENANCE"
+    assert byte_size(Jason.encode!(packet.status)) < 2_048
+    assert String.starts_with?(TicketContext.encode(packet), "{\n  \"status\":")
+    assert Jason.decode!(TicketContext.encode(packet))["plan"] != nil
+    assert {:ok, dashboard} = TicketContext.dashboard(ctx.store, "run")
+    assert Map.drop(dashboard.status, [:observed_at]) == Map.drop(packet.status, [:observed_at])
+    assert {:ok, material} = TicketContext.presentation_data(ctx.store, ctx.chat["chat_key"], packet)
+    assert {:ok, fresh} = TicketContext.context(ctx.store, "run")
+    assert {:ok, fresh_material} = TicketContext.presentation_data(ctx.store, ctx.chat["chat_key"], fresh)
+    assert SymphonyElixir.Factory.TicketChatOutbox.presentation_fingerprint(material) == SymphonyElixir.Factory.TicketChatOutbox.presentation_fingerprint(fresh_material)
+    assert Enum.count(packet.journal, &(&1["event_type"] == "TICKET_STAGE_OUTCOME")) == 1
+
+    factory = %{enabled: true, scope: "scope", dispatcher_id: "controller", lease_seconds: 240, repositories: %{}}
+    control = start_supervised!({ControlServer, store: ctx.store, factory: factory, name: nil})
+    options = [settings: %{factory: factory}, store: ctx.store, control_server: control]
+    assert [%{attention_signals: signals}] = Observability.snapshot(options).current_runs
+    assert Enum.any?(signals, &(&1.source == "FACTORY" and &1.phase == "STEP_DEFERRED" and &1.blocking and &1.reason =~ "verified_ci_rollover_prior_unproven"))
+
+    {:ok, _} = RunLedger.update(ctx.store, "run", %{candidate_sha: String.duplicate("b", 40)})
+    assert {:ok, changed} = TicketContext.context(ctx.store, "run")
+    assert changed.status.hold == nil
+    assert changed.status.ci.status == "UNPROVEN_OR_STALE"
+
+    assert :ok = RunLedger.record_stage_outcome(ctx.store, "run", "temporary_reader_timeout")
+    assert :ok = RunLedger.record_stage_outcome(ctx.store, "run", nil)
+    assert {:ok, recovered} = TicketContext.context(ctx.store, "run")
+    assert recovered.status.hold == nil
+    assert {:ok, recovered_material} = TicketContext.presentation_data(ctx.store, ctx.chat["chat_key"], recovered)
+    refute SymphonyElixir.Factory.TicketChatOutbox.presentation_fingerprint(material) == SymphonyElixir.Factory.TicketChatOutbox.presentation_fingerprint(recovered_material)
+  end
+
   test "staged and accepted material decisions remain explicit without treating raw chat text as authority", ctx do
     body = "Rework the current candidate."
     {:ok, staged} = stage(ctx, "decision-state", body, [%{"operation" => "request_rework"}])
@@ -91,7 +133,7 @@ defmodule SymphonyElixir.FactoryTicketContextTest do
     Store.query!(ctx.store, "UPDATE runs SET contract_markdown = ?, contract_sha256 = ? WHERE run_id = 'run'", [contract.markdown, contract.sha256])
     before = Store.one!(ctx.store, "SELECT COUNT(*) AS count FROM events")
     assert {:ok, packet} = TicketContext.context(ctx.store, "run")
-    assert packet.ticket_cli.prefix =~ "elixir -pa \"_build/dev/lib/*/ebin\" -S mix factory.ticket"
+    assert packet.ticket_cli.prefix == "./scripts/factory-broker ticket"
     assert packet.contract.binding == "EXACT"
     assert byte_size(Jason.encode!(packet)) <= 16_384
     assert byte_size(packet.summary) <= 2048
@@ -194,10 +236,12 @@ defmodule SymphonyElixir.FactoryTicketContextTest do
 
     assert {:ok, %{latest_verifier: %{current_binding: "EXACT", historical_status: "PASS"}}} = TicketContext.context(ctx.store, "run")
     {:ok, packet} = TicketContext.context(ctx.store, "run")
+    assert packet.status.verifier.status == "PASS"
     assert {:ok, receipt_detail} = TicketContext.details(ctx.store, ctx.chat["chat_key"], packet.latest_verifier.receipt.artifact_ref)
     assert Jason.decode!(receipt_detail.text)["result"] == result
     Store.query!(ctx.store, "UPDATE runs SET spec_revision = 2 WHERE run_id = 'run'")
     assert {:ok, %{latest_verifier: %{current_binding: "UNPROVEN_OR_STALE", historical_status: "PASS"}}} = TicketContext.context(ctx.store, "run")
+    assert {:ok, %{status: %{verifier: %{status: "UNPROVEN_OR_STALE"}}}} = TicketContext.context(ctx.store, "run")
     Store.query!(ctx.store, "UPDATE runs SET spec_revision = 1 WHERE run_id = 'run'")
     Store.query!(ctx.store, "UPDATE desktop_requests SET prompt = 'tampered' WHERE request_key = ?", [request["request_key"]])
     assert {:ok, %{latest_verifier: %{current_binding: "UNPROVEN_OR_STALE"}}} = TicketContext.context(ctx.store, "run")

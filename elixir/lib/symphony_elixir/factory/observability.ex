@@ -359,6 +359,7 @@ defmodule SymphonyElixir.Factory.Observability do
             control_attention(store, source),
             parent_collection_attention(store, source),
             report_attention(store, source),
+            stage_attention(run),
             blocked_writer_attention(run),
             ci_attention(store, source, factory),
             operation_attention(store, source),
@@ -415,6 +416,17 @@ defmodule SymphonyElixir.Factory.Observability do
           pending.evidence_at,
           pending.next_action
         )
+    end
+  end
+
+  defp stage_attention(run) do
+    case get_in(run, [:ticket_context, :status, :hold]) do
+      %{reason: reason, observed_at: at, action_owner: owner, next_action: action} ->
+        notice("FACTORY", "STEP_DEFERRED", run.run_id, "Factory step deferred: " <> reason, at, action)
+        |> Map.merge(%{blocking: owner == "FACTORY_MAINTENANCE", category: "FACTORY", action_owner: owner})
+
+      _ ->
+        nil
     end
   end
 
@@ -839,6 +851,7 @@ defmodule SymphonyElixir.Factory.Observability do
 
   defp primary_action(_run, %{blocking: true, next_action: action}), do: action
   defp primary_action(_run, %{phase: "REPAIR_QUEUED", next_action: action}), do: action
+  defp primary_action(_run, %{phase: "STEP_DEFERRED", next_action: action}), do: action
   defp primary_action(%{state: "CI_MR_CREATING"}, _signal), do: "Adopt the exact pushed candidate into the recorded draft MR, then qualify its pipeline."
   defp primary_action(%{state: "CI_WAITING"}, _signal), do: "Qualify the current MR pipeline; independent verification waits for CI to pass."
   defp primary_action(%{state: "READY_FOR_REVIEW"}, _signal), do: "Review the recorded draft MR."
@@ -1023,6 +1036,7 @@ defmodule SymphonyElixir.Factory.Observability do
           candidate_sha: get_in(context, [:run, "candidate_sha"]),
           contract_revision: get_in(context, [:run, "spec_revision"]),
           ci: context.ci,
+          status: Map.get(context, :status),
           validation: context.manual_validation,
           questions: Enum.map(context.open_questions || [], &Map.take(&1, ~w(question_key opened_at binding body answers))),
           actionable_question_count: Enum.count(context.open_questions || [], &(Map.get(&1, "binding") == "CURRENT")),

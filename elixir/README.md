@@ -945,6 +945,13 @@ reads a <=16 KB projection with a <=2 KB summary. `details`, `journal` and
 explicit collection counts. A stale artifact reports `stale_artifact`; refresh
 context rather than treating newer bytes as the older evidence.
 
+CLI context output starts with a compact `status` containing the current candidate,
+candidate-bound CI and verifier outcomes, publication receipt phase and any current
+factory hold. Dashboard and chat use this same projection. Truncated details do
+not mean evidence is absent. Controller deferrals are recorded once per changed
+stage/outcome and clear on success or stage progression; observation timestamps
+alone do not produce another chat presentation.
+
 `stage` accepts a strict base64 JSON proposal while the parent is active and
 returns `PENDING`. The controller's mechanical native reader initializes and
 calls `thread/read` only; it never resumes the parent or starts a generation.

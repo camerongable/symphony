@@ -36,6 +36,11 @@ defmodule SymphonyElixir.Factory.TicketContext do
     Store.transaction!(store, &context_transaction(&1, run_id))
   end
 
+  @doc "Keeps the complete compact status ahead of optional evidence in CLI output."
+  @spec encode(map()) :: String.t()
+  def encode(%{status: status} = packet), do: Jason.encode!(Jason.OrderedObject.new([{:status, status} | Map.to_list(Map.delete(packet, :status))]), pretty: true)
+  def encode(packet), do: Jason.encode!(packet, pretty: true)
+
   @doc "Projects current dashboard fields without serializing retained delivery history."
   @spec dashboard(Store.connection(), String.t()) :: {:ok, map()} | {:error, term()}
   def dashboard(store, run_id) do
@@ -57,6 +62,7 @@ defmodule SymphonyElixir.Factory.TicketContext do
 
       {:ok,
        %{
+         status: status_summary(store, run),
          identity: Map.take(chat, ~w(chat_key scope_key issue_id issue_key repo_key generation thread_id context_sequence)),
          run: Map.take(run, @run_fields),
          tasks: Enum.map(tasks, &task_projection/1),
@@ -224,6 +230,7 @@ defmodule SymphonyElixir.Factory.TicketContext do
       ])
 
     %{
+      status: status_summary(store, run),
       identity: Map.take(chat, ~w(chat_key scope_key issue_id issue_key repo_key generation thread_id context_sequence)),
       ticket_cli: %{
         prefix: SymphonyElixir.Factory.TicketContextReader.cli_prefix(),
@@ -378,7 +385,7 @@ defmodule SymphonyElixir.Factory.TicketContext do
 
   defp material_fields(value) when is_list(value), do: Enum.map(value, &material_fields/1)
   defp material_fields(value), do: value
-  defp volatile?(key), do: to_string(key) in ~w(occurred_at context_sequence updated_at updatedAt recorded_at checked_at ci_last_checked_at opened_at)
+  defp volatile?(key), do: to_string(key) in ~w(occurred_at observed_at context_sequence updated_at updatedAt recorded_at checked_at ci_last_checked_at opened_at)
 
   defp contract_binding(%{"spec_revision" => revision, "contract_markdown" => markdown} = run)
        when is_integer(revision) and revision > 0 and is_binary(markdown) do
@@ -386,6 +393,65 @@ defmodule SymphonyElixir.Factory.TicketContext do
   end
 
   defp contract_binding(_run), do: "UNAVAILABLE"
+
+  defp status_summary(store, run) do
+    ci = decode(run["ci_evidence_json"])
+    ci_exact = is_binary(run["candidate_sha"]) and ci["sha"] == run["candidate_sha"]
+    review = verifier(store, run)
+    review_exact = review[:current_binding] == "EXACT" and review[:candidate_sha] == run["candidate_sha"]
+    publication = decode(run["candidate_handoff"])
+    outcome = RunLedger.stage_outcome(store, run)
+    reason = if outcome, do: outcome["reason"]
+
+    hold =
+      if is_binary(reason) do
+        maintenance = reason == "verified_ci_rollover_prior_unproven"
+
+        %{
+          reason: reason,
+          observed_at: outcome["observed_at"],
+          action_owner: if(maintenance, do: "FACTORY_MAINTENANCE", else: "FACTORY"),
+          next_action:
+            if(maintenance,
+              do: "Fix the factory's final publication compatibility check; do not rerun CI or request another code repair.",
+              else: "The factory will retry this step. Inspect this reason if it continues without progress."
+            )
+        }
+      end
+
+    %{
+      observed_at: DateTime.utc_now() |> DateTime.to_iso8601(),
+      run_id: run["run_id"],
+      issue_key: run["issue_key"],
+      state: run["state"],
+      candidate_sha: run["candidate_sha"],
+      updated_at: run["updated_at"],
+      ci: %{
+        status: if(ci_exact, do: ci["status"] || "NOT_RECORDED", else: "UNPROVEN_OR_STALE"),
+        candidate_sha: ci["sha"],
+        pipeline_id: ci["pipeline_id"],
+        binding: if(ci_exact, do: "EXACT", else: "UNPROVEN_OR_STALE")
+      },
+      verifier: %{
+        status: if(review_exact, do: review[:historical_status], else: "UNPROVEN_OR_STALE"),
+        candidate_sha: review[:candidate_sha],
+        binding: if(review_exact, do: "EXACT", else: "UNPROVEN_OR_STALE")
+      },
+      publication: %{phase: publication["phase"], remote_sha: publication["remote_sha"]},
+      hold: hold,
+      next_action:
+        cond do
+          hold ->
+            hold.next_action
+
+          run["state"] == "PUSHING" and ci_exact and ci["status"] == "PASS" and review_exact and review[:historical_status] == "PASS" ->
+            "The factory is finalizing publication for the verified candidate; no new code repair or CI run is indicated."
+
+          true ->
+            next_action(run, %{})
+        end
+    }
+  end
 
   defp verifier(store, run) do
     key = "#{run["run_id"]}:change-verifier:#{run["verifier_round"]}"

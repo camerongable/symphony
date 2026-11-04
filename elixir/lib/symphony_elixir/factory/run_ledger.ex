@@ -464,6 +464,36 @@ defmodule SymphonyElixir.Factory.RunLedger do
     end
   end
 
+  @stage_binding ~w(state candidate_sha spec_revision contract_sha256 verifier_round code_repair_round updated_at)
+
+  @doc "Records a changed controller outcome without treating repeated ticks as ticket progress."
+  @spec record_stage_outcome(Store.connection(), String.t(), String.t() | nil) :: :ok | {:error, term()}
+  def record_stage_outcome(connection, run_id, reason) do
+    Store.transaction!(connection, fn tx ->
+      with {:ok, run} <- get(tx, run_id) do
+        prior = stage_outcome(tx, run)
+        payload = %{"binding" => Map.take(run, @stage_binding), "reason" => reason && String.slice(reason, 0, 256)}
+
+        if (reason != nil or prior != nil) and (prior == nil or Map.drop(prior, ["observed_at"]) != payload),
+          do: record_event!(tx, "TICKET_STAGE_OUTCOME", run_id, payload)
+
+        :ok
+      end
+    end)
+  end
+
+  @doc "Returns only the latest controller outcome bound to this exact recorded stage."
+  @spec stage_outcome(Store.connection(), map()) :: map() | nil
+  def stage_outcome(connection, run) do
+    with row when is_map(row) <- Store.one!(connection, "SELECT payload_json,occurred_at FROM events WHERE run_id=? AND event_type='TICKET_STAGE_OUTCOME' ORDER BY id DESC LIMIT 1", [run["run_id"]]),
+         {:ok, payload} when is_map(payload) <- Jason.decode(row["payload_json"]),
+         true <- payload["binding"] == Map.take(run, @stage_binding) do
+      Map.put(payload, "observed_at", row["occurred_at"])
+    else
+      _ -> nil
+    end
+  end
+
   @doc """
   Lists runs, optionally restricted to one state.
   """

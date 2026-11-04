@@ -68,7 +68,7 @@ defmodule Mix.Tasks.Factory.Ticket do
          {:ok, store} <- open_store(action, settings.factory.database) do
       try do
         case execute(action, store, opts) do
-          {:ok, result} -> Mix.shell().info(Jason.encode!(result, pretty: true))
+          {:ok, result} -> Mix.shell().info(TicketContext.encode(result))
           {:error, reason} -> Mix.raise("Ticket operation failed: #{inspect(reason)}")
         end
       after

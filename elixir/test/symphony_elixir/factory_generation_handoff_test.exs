@@ -3,7 +3,12 @@ defmodule SymphonyElixir.FactoryGenerationHandoffTest do
   alias SymphonyElixir.Factory.{Store, TicketCiGeneration, TicketCiGenerationIO, WorkerFileIO}
 
   test "later chat observations do not invalidate generation authority" do
-    prior = Map.new(~w(run tasks evidence access source base claims control commands questions amendments parent bootstrap file_operations instruction_snapshots instruction_bindings inputs), &{&1, %{"sha256" => &1}})
+    prior =
+      Map.new(
+        ~w(run tasks evidence access source base claims control commands questions amendments parent bootstrap file_operations instruction_snapshots instruction_bindings inputs),
+        &{&1, %{"sha256" => &1}}
+      )
+
     assert TicketCiGeneration.compatible_ledger?(prior, Map.put(prior, "inputs", %{"sha256" => "later conversation"}))
 
     for field <- Map.keys(prior) -- ["inputs"] do

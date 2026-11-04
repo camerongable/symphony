@@ -2701,11 +2701,13 @@ defmodule SymphonyElixir.Factory.Scheduler do
   rescue
     error ->
       Logger.warning("Factory ticket deferred issue_identifier=#{run["issue_key"]} run_id=#{run["run_id"]} reason=ticket_step_exception:#{inspect(error.__struct__)}")
+      record_ticket_stage_outcome(context.store, run["run_id"], {:error, {:ticket_step_exception, error.__struct__}})
       add_event(acc, run["issue_key"], "TICKET_DEFERRED", failure_code({:ticket_step_exception, error.__struct__}))
   end
 
   defp ticket_tick_result(context, run, options, acc) do
     result = ticket_tick_step(context, run, options)
+    record_ticket_stage_outcome(context.store, run["run_id"], result)
 
     case result do
       {:ok, %{status: "LAUNCHED", launch: launch}} ->
@@ -2724,6 +2726,19 @@ defmodule SymphonyElixir.Factory.Scheduler do
         Logger.warning("Factory ticket deferred issue_identifier=#{run["issue_key"]} run_id=#{run["run_id"]} reason=#{ticket_deferral_code(reason, 3)}")
         add_event(acc, run["issue_key"], "TICKET_DEFERRED", failure_code(reason))
     end
+  end
+
+  defp record_ticket_stage_outcome(store, run_id, result) do
+    reason =
+      case result do
+        {:error, reason} -> ticket_deferral_code(reason, 3)
+        {:ok, %{status: "AMENDMENT_DEFERRED", reason: reason}} -> ticket_deferral_code(reason, 3)
+        _ -> nil
+      end
+
+    RunLedger.record_stage_outcome(store, run_id, reason)
+  rescue
+    _ -> Logger.warning("Unable to record ticket stage outcome run_id=#{run_id}")
   end
 
   defp ticket_tick_step(context, %{"state" => "FAILED"} = run, options),
