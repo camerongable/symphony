@@ -463,7 +463,7 @@ defmodule SymphonyElixir.Factory.TicketPush do
   defp same_completed_content?(binding, run, legacy_fields) do
     fields =
       if binding["publication_version"] == 2,
-        do: ~w(run_id issue_key repo_path worktree branch base_branch candidate_sha spec_revision contract_sha256 code_repair_round),
+        do: ~w(run_id issue_key repo_path worktree branch base_branch candidate_sha spec_revision contract_sha256),
         else: legacy_fields
 
     Map.take(binding, fields) == Map.take(run, fields)
@@ -696,7 +696,7 @@ defmodule SymphonyElixir.Factory.TicketPush do
 
       true ->
         # The receipt owns past publication; fresh admission owns the current review.
-        action_binding = Map.merge(binding, Map.take(run, ~w(state verifier_round)))
+        action_binding = Map.merge(binding, Map.take(run, ~w(state verifier_round code_repair_round)))
 
         with true <- same_completed_content?(binding, run, identity),
              {:ok, fresh} <- refresh_push_authorization(run, authorization, opts),
