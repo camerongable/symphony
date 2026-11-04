@@ -6,6 +6,22 @@ defmodule SymphonyElixir.FactoryTicketContextTest do
 
   setup :setup_fixture
 
+  test "chat and dashboard describe the factory's next step without asking the user to reconcile it", ctx do
+    for {state, action} <- [
+          {"CI_WAITING", "Factory: waiting for CI results; if CI fails, automatic repair is considered within the configured limit."},
+          {"VERIFYING", "Factory: independently reviewing the candidate against the ticket and prior findings."},
+          {"MR_CREATING", "Factory: finalizing the existing merge request and review evidence; no new push is indicated."},
+          {"READY_FOR_REVIEW", "You: review the merge request. Further source changes require an explicit rework request."}
+        ] do
+      {:ok, _} = RunLedger.update(ctx.store, "run", %{state: state})
+      assert {:ok, chat} = TicketContext.context(ctx.store, "run")
+      assert {:ok, dashboard} = TicketContext.dashboard(ctx.store, "run")
+      assert chat.status.next_action == action
+      assert dashboard.status.next_action == action
+      assert chat.next_action == action
+    end
+  end
+
   test "chat and dashboard expose current CI and a durable factory hold before large details", ctx do
     sha = String.duplicate("a", 40)
 
@@ -249,7 +265,7 @@ defmodule SymphonyElixir.FactoryTicketContextTest do
     assert {:ok, %{latest_verifier: %{current_binding: "UNPROVEN_OR_STALE"}}} = TicketContext.context(ctx.store, "run")
     assert {:ok, _} = RunLedger.update(ctx.store, "run", %{state: "READY_FOR_REVIEW"})
     assert {:ok, %{next_action: action}} = TicketContext.context(ctx.store, "run")
-    assert action =~ "Review"
+    assert action =~ "review the merge request"
   end
 
   test "all collections have scoped paging; writer and validator evidence survive long histories", ctx do

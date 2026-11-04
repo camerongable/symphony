@@ -1,5 +1,8 @@
 # Symphony Elixir
 
+Read-only [factory operations reports](docs/factory-operations.md) show recorded
+stage/adoption latency and storage-maintenance inventory without changing handoffs.
+
 Completed-turn recovery reads native history without starting a thread or model
 turn, only after a recognized timeout/port-exit failure and genuine original stop.
 It requires the bound latest completed turn, an explicit nil error, one identified

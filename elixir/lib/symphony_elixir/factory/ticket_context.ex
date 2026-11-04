@@ -655,8 +655,16 @@ defmodule SymphonyElixir.Factory.TicketContext do
   defp next_action(run, _writer_disposition) do
     case run["state"] do
       "AWAITING_CONTRACT_INPUT" -> "Await a read-backed answer to the current question; no work is authorized by this context."
-      state when state in ~w(READY_FOR_REVIEW DELIVERED) -> "Review the recorded MR; source rework requires explicit admission."
-      _ -> "Reconcile the recorded stage and exact evidence before admitting the next action."
+      "ADMITTING_WRITER" -> "Factory: preparing the checkout and admitting the writer; no running worker is implied yet."
+      "WRITING" -> "Factory: waiting for the writer's result, then adopting the candidate."
+      "REPAIRING" -> "Factory: repairing the recorded findings within the configured repair limit."
+      "VERIFYING" -> "Factory: independently reviewing the candidate against the ticket and prior findings."
+      "CI_WAITING" -> "Factory: waiting for CI results; if CI fails, automatic repair is considered within the configured limit."
+      state when state in ~w(PUSHING CI_PUSHING) -> "Factory: publishing the candidate and recording the remote result."
+      state when state in ~w(MR_CREATING CI_MR_CREATING) -> "Factory: finalizing the existing merge request and review evidence; no new push is indicated."
+      "AWAITING_VALIDATION" -> "Factory: completing the ticket's required validation for the exact candidate."
+      state when state in ~w(READY_FOR_REVIEW DELIVERED) -> "You: review the merge request. Further source changes require an explicit rework request."
+      _ -> "Inspect the recorded hold or ticket chat for the next action."
     end
   end
 

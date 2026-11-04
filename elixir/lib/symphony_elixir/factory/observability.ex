@@ -852,11 +852,9 @@ defmodule SymphonyElixir.Factory.Observability do
   defp primary_action(_run, %{blocking: true, next_action: action}), do: action
   defp primary_action(_run, %{phase: "REPAIR_QUEUED", next_action: action}), do: action
   defp primary_action(_run, %{phase: "STEP_DEFERRED", next_action: action}), do: action
-  defp primary_action(%{state: "CI_MR_CREATING"}, _signal), do: "Adopt the exact pushed candidate into the recorded draft MR, then qualify its pipeline."
-  defp primary_action(%{state: "CI_WAITING"}, _signal), do: "Qualify the current MR pipeline; independent verification waits for CI to pass."
-  defp primary_action(%{state: "READY_FOR_REVIEW"}, _signal), do: "Review the recorded draft MR."
-  defp primary_action(%{state: "AWAITING_VALIDATION"}, _signal), do: "Complete the contracted validation for the exact candidate."
-  defp primary_action(run, _signal), do: get_in(run, [:ticket_context, :next_action]) || "Continue the recorded delivery stage through its existing controller operation."
+
+  defp primary_action(run, _signal),
+    do: get_in(run, [:ticket_context, :status, :next_action]) || get_in(run, [:ticket_context, :next_action]) || "Continue the recorded delivery stage through its existing controller operation."
 
   defp check_attention(store, run, now, stale_seconds) do
     row =
