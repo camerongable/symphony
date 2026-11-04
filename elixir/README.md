@@ -2137,6 +2137,11 @@ candidate SHA; stale MR references never authorize another push or acceptance
 of an older pipeline. Versioned programs and the previous publishing release's
 read-only receipt origin remain retained across rollout.
 
+Completed publication-v2 receipts bind content, repository and contract identity,
+not a later lifecycle phase or verifier round. Finalizing the same candidate
+rechecks current delivery admission and the remote branch without issuing another
+push or rewriting the historical receipt. Legacy receipt comparisons are unchanged.
+
 A completed native worker whose terminal acknowledgement was lost may retain a
 genuine nonzero owned stop. Publication accepts that stop only with one exact
 `NATIVE_COMPLETION_RECEIPT_V1` event atomically recorded with its recovered result.

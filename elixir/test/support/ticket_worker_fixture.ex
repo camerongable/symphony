@@ -60,6 +60,14 @@ defmodule SymphonyElixir.TicketWorkerFixture do
     remote = Path.join(ctx.root, "publication.git")
     git(ctx.root, ["init", "--bare", remote])
     git(ctx.repo, ["remote", "add", "origin", remote])
+
+    if ctx[:count_pushes] do
+      receiver = Path.join(ctx.root, "count-receive-pack")
+      File.write!(receiver, "#!/bin/sh\necho push >> '#{Path.join(ctx.root, "push-count")}'\nexec /Library/Developer/CommandLineTools/usr/bin/git receive-pack \"$@\"\n")
+      File.chmod!(receiver, 0o700)
+      git(ctx.repo, ["config", "remote.origin.receivepack", receiver])
+    end
+
     {:ok, run} = RunLedger.get(ctx.store, "run")
     {:ok, snapshot} = PublicationJiraReader.issue(run["issue_key"], store: ctx.store)
     {:ok, authorization} = TicketWorkerRunner.authorization(run, snapshot, DateTime.utc_now())
