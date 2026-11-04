@@ -103,6 +103,7 @@ defmodule SymphonyElixir.FactoryPushUnattachedRetirementTest do
     receipt = %{path: "/missing", sha256: sha}
     audit = Application.app_dir(:symphony_elixir, "priv/ticket_push_preissuance_audit_v2.json") |> File.read!() |> Jason.decode!()
     exact = %{run_id: audit["operation"]["run_id"], nonce: audit["owner_nonce"], envelope_sha256: audit["original_envelope_sha256"]}
+
     for rejected <- [exact, %{exact | nonce: sha}, %{exact | envelope_sha256: sha}, operation] do
       assert {:error, :unattached_retirement_protected_history_changed} =
                TicketPushUnattachedRetirement.prepare_preissuance(ctx.store, rejected, receipt, %{}, operator_tick: tick)

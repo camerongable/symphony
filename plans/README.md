@@ -4,7 +4,20 @@ Generated on 2026-10-01. These are implementation handoffs, not statements that
 the proposed runtime has passed acceptance. Read each plan completely, retain
 the existing safety boundaries, and execute its gates in order.
 
-## Execution order and status
+## Current work
+
+Use the [active backlog](backlog.md) for remaining work and priorities. Current
+deployed baseline: `5d830ab` (November 3 operations/reporting release). The
+automated disk-reclamation item is recorded but explicitly not started.
+
+The table below preserves historical status as recorded during each rollout.
+It is not an instruction to restart old work. In particular, Plans 002/006's
+ordinary-delivery foundation and Plan 009's old incident have been carried
+forward or superseded; required manual-validation and native-cleanup acceptance
+remain separate backlog items. Later Plan 020 and publication compatibility work
+are deployed; PPL-10240 reached Ready for review on the same verified candidate.
+
+## Historical execution order and acceptance records
 
 | Plan | Title | Priority | Effort | Depends on | Status |
 | --- | --- | --- | --- | --- | --- |

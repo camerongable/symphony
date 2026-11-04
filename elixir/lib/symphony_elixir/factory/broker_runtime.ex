@@ -313,9 +313,18 @@ defmodule SymphonyElixir.Factory.BrokerRuntime do
            nil <- Store.one!(tx, "SELECT request_key FROM ticket_mr_claims WHERE request_key=?", [context.key]),
            {:ok, run} <- RunLedger.get(tx, context.prepared.run["run_id"]),
            true <- Map.take(run, fields) == Map.take(context.prepared.run, fields) and run["state"] == context.prepared.run["state"] do
-        payload = Map.take(run, fields) |> Map.merge(%{
-          "version" => 1, "request_key" => context.key, "payload_sha256" => request["payload_sha256"],
-          "stage" => run["state"], "action" => Atom.to_string(context.action), "phase" => phase, "reason_code" => reason})
+        payload =
+          Map.take(run, fields)
+          |> Map.merge(%{
+            "version" => 1,
+            "request_key" => context.key,
+            "payload_sha256" => request["payload_sha256"],
+            "stage" => run["state"],
+            "action" => Atom.to_string(context.action),
+            "phase" => phase,
+            "reason_code" => reason
+          })
+
         raw = Jason.encode!(payload)
         prior = Store.one!(tx, "SELECT id FROM events WHERE run_id=? AND event_type='MR_OWNER_PRECLAIM_FAILED' AND payload_json=? LIMIT 1", [run["run_id"], raw])
 
